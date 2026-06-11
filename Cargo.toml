@@ -1,0 +1,38 @@
+[workspace]
+members = ["agent", "channel-masque", "webrtc-app"]
+resolver = "3"
+
+[workspace.dependencies]
+anyhow = "1"
+argh = "0.1.10"
+axum = { version = "0.8", default-features = false }
+axum-h3 = { git = "https://github.com/masa-koz/tonic-h3.git", branch = "masa-koz/add-msquic-async" }
+channel-masque = { path = "channel-masque" }
+bytes = "1"
+futures = "0.3"
+futures-concurrency = "7.6.3"
+h3 = { git = "https://github.com/hyperium/h3", rev = "refs/pull/340/head" }
+h3-datagram = { git = "https://github.com/hyperium/h3", rev = "refs/pull/340/head" }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "refs/pull/340/head" }
+h3-util = { git = "https://github.com/masa-koz/tonic-h3.git", branch = "masa-koz/add-msquic-async", default-features = false }
+http = "1"
+http-body = "1"
+http-body-util = "0.1.3"
+hyper = { version = "1" , default-features = false}
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+serde = { version = "1.0.164", features = ["derive", "rc" ] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["full"] }
+tokio-tungstenite = "0.29"
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", default-features = false }
+tower-http = { version = "0.6.8", features = ["full"] }
+tower-jwt = { git = "https://github.com/masa-koz/tower-jwt.git", branch = "masa-koz/use-latest" }
+tracing = "0.1.40"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "time", "tracing-log"] }
+webrtc = "0.17"

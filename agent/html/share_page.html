@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebRTC Debug UI</title>
+
+<style>
+body {
+  font-family: sans-serif;
+  padding: 20px;
+}
+
+.status {
+  margin-bottom: 10px;
+}
+
+.good { color: green; }
+.bad { color: red; }
+.warn { color: orange; }
+
+#log {
+  border: 1px solid #ccc;
+  height: 200px;
+  overflow-y: auto;
+  padding: 8px;
+}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+
+<h2>WebRTC Debug</h2>
+
+<div class="status">WS: <span id="ws">❌</span></div>
+<div class="status">ICE: <span id="ice">new</span></div>
+<div class="status">DataChannel: <span id="dc">❌</span></div>
+<div class="status">Latency: <span id="latency">-</span></div>
+<div class="status">Jitter: <span id="jitter">-</span></div>
+<div class="status">↓ RX: <span id="bitrateRx">-</span></div>
+<div class="status">↑ TX: <span id="bitrateTx">-</span></div>
+<div class="status">Loss: <span id="loss">-</span></div>
+<h3>Connected peers</h3>
+<ul id="peers"></ul>
+<hr>
+
+<input id="input" placeholder="Type message..." />
+<button onclick="send()">Send</button>
+
+<pre id="log"></pre>
+
+<h3>Chat</h3>
+<div id="chat" style="border:1px solid #ccc; height:200px; overflow:auto;"></div>
+<input id="msg" placeholder="Type message..." />
+<button onclick="sendChat()">Send</button>
+
+<h3>Latency Graph</h3>
+<canvas id="latencyChart" width="400" height="150"></canvas>
+<h3>Bitrate Graph</h3>
+<canvas id="bitrateChart" width="400" height="150"></canvas>
+<h3>Packet Loss Graph</h3>
+<canvas id="lossChart" width="400" height="150"></canvas>
+
+<script>
+// ======== 基本情報 ========
+const sessionId = location.pathname.split("/").pop();
+const peerId = crypto.randomUUID();
+
+const log = (msg) => {
+  const el = document.getElementById("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+};
+
+const set = (id, value) => {
+  document.getElementById(id).textContent = value;
+};
+
+// ======== WebSocket ========
+const ws = new WebSocket(
+  `wss://masque.seera-networks.com:8443/sessions/${sessionId}/ws`
+);
+
+function sendWS(msg) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+ws.onopen = () => {
+  set("ws", "✅");
+  log("WS connected");
+
+  // ✅ join
+  sendWS({
+    type: "join",
+    from: peerId,
+    payload: {
+      behind_agent: false
+    }
+  });
+
+  start();
+};
+
+// ======== WebRTC ========
+const pc = new RTCPeerConnection();
+let dc;
+
+// ✅ candidateキュー
+const pendingCandidates = [];
+
+// -------- ICE状態 --------
+pc.oniceconnectionstatechange = () => {
+  const s = pc.iceConnectionState;
+  set("ice", s);
+
+  if (s === "connected" || s === "completed") {
+    document.getElementById("ice").className = "good";
+  } else if (s === "failed") {
+    document.getElementById("ice").className = "bad";
+  } else {
+    document.getElementById("ice").className = "warn";
+  }
+};
+
+// -------- DataChannel --------
+dc = pc.createDataChannel("chat");
+
+dc.onopen = () => {
+  set("dc", "✅");
+  log("DataChannel open");
+  startPing(dc);
+};
+
+dc.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+
+  // ✅ ping受信 → echo
+  if (msg.type === "ping") {
+    dc.send(JSON.stringify({
+      type: "pong",
+      id: msg.id,
+      t: msg.t
+    }));
+    return;
+  }
+
+  // ✅ pong受信
+  if (msg.type === "pong") {
+    if (lossState.inFlight.has(msg.id)) {
+      lossState.received++;
+      lossState.inFlight.delete(msg.id);
+    }
+    return;
+  }
+
+  if (msg.type === "echo") {
+    log("remote: " + msg.text);
+  }
+
+  // ✅ チャットメッセージ受信
+  if (msg.type === "chat") {
+    addChat(`${msg.from}: ${msg.text}`);
+  }
+
+};
+
+// ======== signaling受信 ========
+ws.onmessage = async (ev) => {
+  const msg = JSON.parse(ev.data);
+
+  // 自分宛以外は無視
+  if (msg.to && msg.to !== peerId) return;
+
+  // ===== answer =====
+  if (msg.type === "answer") {
+    log("answer received");
+
+    await pc.setRemoteDescription(msg.payload);
+
+    // ✅ pending candidate flush
+    for (const c of pendingCandidates) {
+      log("apply candidate: " + c.candidate);
+      await pc.addIceCandidate(c);
+    }
+    pendingCandidates.length = 0;
+  }
+
+  // ===== candidate =====
+  if (msg.type === "candidate") {
+    const c = msg.payload;
+
+    if (pc.remoteDescription == null) {
+      log("queue candidate");
+      pendingCandidates.push(c);
+    } else {
+      await pc.addIceCandidate(c);
+    }
+  }
+
+  // ===== peersリスト更新 =====
+  if (msg.type === "peers") {
+    renderPeers(msg.payload);
+  }
+};
+
+// ======== offer生成 ========
+async function start() {
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  sendWS({
+    type: "offer",
+    from: peerId,
+    to: "app",
+    payload: offer
+  });
+}
+
+// ======== send ========
+function send() {
+  const input = document.getElementById("input");
+
+  log("you: " + input.value);
+
+  dc.send(JSON.stringify({
+    type: "message",
+    text: input.value
+  }));
+
+  input.value = "";
+}
+
+function startPing(dc) {
+  setInterval(() => {
+    const id = Math.random().toString(36).slice(2);
+    const now = performance.now();
+
+    lossState.sent++;
+    lossState.inFlight.set(id, now);
+
+    dc.send(JSON.stringify({
+      type: "ping",
+      id: id,
+      t: now
+    }));
+
+  }, 1000);
+}
+
+
+function cleanupTimeouts() {
+  const now = performance.now();
+
+  for (const [id, ts] of lossState.inFlight) {
+    if (now - ts > 3000) { // 3秒以上
+      lossState.inFlight.delete(id);
+      // lost扱い
+    }
+  }
+}
+
+setInterval(cleanupTimeouts, 500);
+
+window.addEventListener("beforeunload", () => {
+  dc.close();
+  pc.close();
+  ws.close();
+});
+
+function renderPeers(peers) {
+  const ul = document.getElementById("peers");
+  ul.innerHTML = "";
+
+  peers.forEach(id => {
+    const li = document.createElement("li");
+
+    if (id === peerId) {
+      li.textContent = id + " (you)";
+    } else {
+      li.textContent = id;
+    }
+
+    ul.appendChild(li);
+  });
+}
+
+
+function addChat(text) {
+  const el = document.getElementById("chat");
+  el.innerHTML += text + "<br>";
+  el.scrollTop = el.scrollHeight;
+}
+
+function sendChat() {
+  const input = document.getElementById("msg");
+
+  const msg = {
+    type: "chat",
+    from: peerId,
+    text: input.value
+  };
+
+  dc.send(JSON.stringify(msg));
+
+  addChat("me: " + input.value);
+
+  input.value = "";
+}
+
+document.getElementById("msg").addEventListener("keydown", e => {
+  if (e.key === "Enter") sendChat();
+});
+
+// ======== stats ========
+let counter = 0;
+let lossCounter = 0;
+const statsState = {
+  last: {
+    bytesReceived: null,
+    bytesSent: null,
+    timestamp: null,
+    rxBps: 0,
+    txBps: 0,
+  },
+  history: {
+    rx: [],
+    tx: [],
+    labels: []
+  }
+};
+
+const lossState = {
+  sent: 0,
+  received: 0,
+  inFlight: new Map(), // id → timestamp
+  history: []
+};
+
+async function updateStats() {
+  const stats = await pc.getStats();
+
+  for (const r of stats.values()) {
+    if (r.type === "candidate-pair" && r.state === "succeeded") {
+      if (r.currentRoundTripTime !== undefined) {
+        const ms = r.currentRoundTripTime * 1000;
+        set("latency", ms.toFixed(1) + " ms");
+
+        // ✅ グラフ更新
+        latencyData.push(ms);
+        latencyLabels.push(counter++);
+
+        // 古いデータを削除（最大50点）
+        if (latencyData.length > 50) {
+          latencyData.shift();
+          latencyLabels.shift();
+        }
+
+
+        const jitter = calculateJitter(latencyData);
+        document.getElementById("jitter").innerText = jitter.toFixed(1) + " ms";
+
+        jitterData.push(jitter);
+        if (jitterData.length > 50) {
+          jitterData.shift();
+        }
+        chart.update();
+      }
+    }
+
+
+    // ✅ DataChannel用
+    if (r.type === "transport") {
+      if (r.bytesReceived !== undefined) {
+        bytesReceived = r.bytesReceived;
+      }
+      if (r.bytesSent !== undefined) {
+        bytesSent = r.bytesSent;
+      }
+    }
+  }
+
+  // ✅ bitrate計算
+  const { rx, tx } = updateBitrate(bytesReceived, bytesSent);
+
+  // ✅ UI更新
+  if (rx !== null) {
+    document.getElementById("bitrateRx").innerText = formatBitrate(rx);
+  }
+
+  if (tx !== null) {
+    document.getElementById("bitrateTx").innerText = formatBitrate(tx);
+  }
+
+  // ✅ グラフ
+  pushHistory(rx, tx);
+
+  const raw = calculatePacketLoss();
+  const loss = getSmoothedLoss(raw);
+
+  document.getElementById("loss").innerText =
+    loss.toFixed(2) + " %";
+  pushLoss(loss);
+  lossChart.update();
+}
+
+setInterval(updateStats, 1000);
+
+function calculateJitter(values) {
+  if (values.length < 2) return 0;
+
+  let sum = 0;
+  for (let i = 1; i < values.length; i++) {
+    sum += Math.abs(values[i] - values[i - 1]);
+  }
+
+  return sum / (values.length - 1);
+}
+
+function updateBitrate(bytesReceived, bytesSent) {
+  const now = performance.now();
+  const last = statsState.last;
+
+  // 初回は初期化
+  if (last.timestamp === null) {
+    last.timestamp = now;
+    last.bytesReceived = bytesReceived ?? 0;
+    last.bytesSent = bytesSent ?? 0;
+    return { rx: null, tx: null };
+  }
+
+  const deltaTime = (now - last.timestamp) / 1000; // 秒
+
+  // 防御
+  if (deltaTime <= 0) {
+    return { rx: null, tx: null };
+  }
+
+  let rx = null;
+  let tx = null;
+
+  if (bytesReceived !== undefined && bytesReceived !== null) {
+    const delta = bytesReceived - last.bytesReceived;
+    rx = (delta * 8) / deltaTime; // bits/sec
+    last.bytesReceived = bytesReceived;
+  }
+
+  if (bytesSent !== undefined && bytesSent !== null) {
+    const delta = bytesSent - last.bytesSent;
+    tx = (delta * 8) / deltaTime;
+    last.bytesSent = bytesSent;
+  }
+
+  last.timestamp = now;
+
+  // ✅ スムージング（かなり重要）
+  const alpha = 0.7;
+
+  if (rx !== null) {
+    last.rxBps = last.rxBps * (1 - alpha) + rx * alpha;
+  }
+
+  if (tx !== null) {
+    last.txBps = last.txBps * (1 - alpha) + tx * alpha;
+  }
+
+  return {
+    rx: last.rxBps,
+    tx: last.txBps
+  };
+}
+
+function formatBitrate(bps) {
+  if (bps == null) return "-";
+
+  if (bps > 1_000_000) {
+    return (bps / 1_000_000).toFixed(2) + " Mbps";
+  } else if (bps > 1000) {
+    return (bps / 1000).toFixed(1) + " kbps";
+  } else {
+    return Math.round(bps) + " bps";
+  }
+}
+
+function pushHistory(rx, tx) {
+  const h = statsState.history;
+
+  h.labels.push("");
+  h.rx.push(rx ?? null);
+  h.tx.push(tx ?? null);
+
+  // ✅ 最大長制限
+  if (h.labels.length > 50) {
+    h.labels.shift();
+    h.rx.shift();
+    h.tx.shift();
+  }
+
+  bitrateChart.update();
+}
+
+function calculatePacketLoss() {
+  const sent = lossState.sent;
+  const received = lossState.received;
+
+  if (sent === 0) return 0;
+
+  const lost = sent - received;
+
+  return (lost / sent) * 100;
+}
+
+let smoothedLoss = 0;
+
+function getSmoothedLoss(raw) {
+  smoothedLoss = smoothedLoss * 0.8 + raw * 0.2;
+  return smoothedLoss;
+}
+
+function pushLoss(value) {
+  lossHistory.push(value);
+  lossLabels.push(lossCounter++);
+
+  if (lossHistory.length > 50) {
+    lossHistory.shift();
+    lossLabels.shift();
+  }
+}
+
+const latencyData = [];
+const jitterData = [];
+const latencyLabels = [];
+const bitrateHistory = [];
+const lossHistory = [];
+const lossLabels = [];
+
+const ctx = document.getElementById('latencyChart').getContext('2d');
+
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: latencyLabels,
+    datasets: [{
+      label: 'Latency (ms)',
+      data: latencyData,
+      borderColor: 'blue',
+      tension: 0.2
+    },
+    {
+      label: 'Jitter (ms)',
+      data: jitterData,
+      borderColor: 'red',
+      tension: 0.2
+    }]
+  },
+  options: {
+    animation: false,
+    scales: {
+      y: {
+        beginAtZero: true,
+        title: {
+          display: true,
+          text: 'ms'
+        }
+      }
+    }
+  }
+});
+
+const ctx2 = document.getElementById("bitrateChart").getContext("2d");
+
+const bitrateChart = new Chart(ctx2, {
+  type: "line",
+  data: {
+    labels: statsState.history.labels,
+    datasets: [
+      {
+        label: "RX",
+        data: statsState.history.rx,
+        borderColor: "blue",
+        tension: 0.2
+      },
+      {
+        label: "TX",
+        data: statsState.history.tx,
+        borderColor: "green",
+        tension: 0.2
+      }
+    ]
+  },
+  options: {
+    animation: false,
+    scales: {
+      y: {
+        beginAtZero: true,
+        title: {
+          display: true,
+          text: "bps"
+        }
+      }
+    }
+  }
+});
+
+const ctx3 = document.getElementById('lossChart').getContext('2d');
+
+const lossChart = new Chart(ctx3, {
+  type: 'line',
+  data: {
+    labels: lossLabels,
+    datasets: [{
+      label: 'Packet Loss (%)',
+      data: lossHistory,
+      borderColor: 'orange',
+      tension: 0.2
+    }]
+  },
+  options: {
+    animation: false,
+    scales: {
+      y: {
+        beginAtZero: true,
+        title: {
+          display: true,
+          text: 'Packet Loss (%)'
+        }
+      }
+    }
+  }
+});
+</script>
+
+</body>
+</html>
