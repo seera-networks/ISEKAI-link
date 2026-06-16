@@ -2,10 +2,9 @@
 
 **Remote control, without the network headaches.**
 
-![ISEKAI Link Diagram](./docs/diagram.png)
+<img src="./docs/diagram.png" width="100%" alt="ISEKAI Link Diagram"/>
 
-Turn any device into a real-time endpoint.  
-Access and control robots, cameras, and IoT devices from anywhere — instantly.
+**Access and control robots, cameras, and IoT devices from anywhere — in real time.**
 
 ---
 
