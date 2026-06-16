@@ -4,7 +4,10 @@
 
 <img src="./docs/diagram.png" width="100%" alt="ISEKAI Link Diagram"/>
 
-**Access and control robots, cameras, and IoT devices from anywhere — in real time.**
+**Control your devices from anywhere — in real time.**
+
+ISEKAI Link connects your devices automatically<br>
+and switches to direct P2P for low-latency control.
 
 ---
 
@@ -17,48 +20,28 @@ Building real-time remote control over the internet is hard:
 - WebRTC requires signaling servers and tuning  
 - Cloud routing introduces delays  
 
-You end up fighting the network instead of building your product.
+You end up fighting the network instead of building your product — and your users feel the latency.
 
 ---
 
 ## ✨ What ISEKAI Link does
+ISEKAI Link handles networking for you:
 
-ISEKAI Link handles networking for you.
+- Connect automatically
+- Switch to direct P2P when possible
+- Fall back when needed
 
-1. Connect via ISEKAI Link server  
-2. Automatically switch to direct peer-to-peer  
-3. Maintain the best possible connection  
+**No setup required.**
 
-**No setup. No network configuration. Just works.**
 
 ---
 
 ## ⚡ Key Features
 
-### ✅ Low latency
-Direct P2P connections minimize delay.  
-Control devices in real time.
-
----
-
-### ✅ Reliable connectivity
-Automatic fallback to relay when needed.  
-Always stay connected, even behind strict NATs.
-
----
-
-### ✅ Secure by default
-All communication is end-to-end encrypted using QUIC.
-
----
-
-### ✅ Developer-friendly
-No need to handle:
-- NAT traversal  
-- Signaling servers  
-- Reconnection logic  
-
-Focus on your application.
+- ✅ Low latency (direct P2P)
+- ✅ Reliable (automatic fallback)
+- ✅ Secure (end-to-end encryption)
+- ✅ Zero setup (no networking required)
 
 ---
 
@@ -87,18 +70,18 @@ Access local devices or services securely from anywhere.
 ## 🔧 Under the hood
 ISEKAI Link combines modern networking technologies:
 
-- Built-in WebRTC signaling
-- QUIC-based encrypted transport
-- Automatic NAT traversal (hole punching)
 - Direct peer-to-peer connections
-- Smart relay fallback
+- Automatic NAT traversal (hole punching)
+- QUIC-based encrypted transport
+- Built-in WebRTC signaling
 
 ## ⚙️ Advanced networking (optional)
 For advanced use cases:
 
-- Access local UDP services securely
+- Securely access local UDP services from anywhere
 - Build custom real-time protocols
-- Extend beyond standard WebRTC
+- Use ISEKAI Link beyond WebRTC limitations
+
 
 ISEKAI Link adapts to your needs.
 
@@ -115,4 +98,4 @@ It delivers a complete real-time control experience.
 Stop dealing with networking.
 Start building real-time applications.
 
-👉 Coming soon / Contact us
+👉 Interested? Reach out or watch this repo for updates.
