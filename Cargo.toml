@@ -6,7 +6,7 @@ resolver = "3"
 anyhow = "1"
 argh = "0.1.10"
 axum = { version = "0.8", default-features = false }
-axum-h3 = { git = "https://github.com/masa-koz/tonic-h3.git", branch = "masa-koz/add-msquic-async" }
+axum-h3 = { git = "https://github.com/masa-koz/tonic-h3.git", branch = "masa-koz/add-msquic-async-qmux-01-fix-h3-dgram" }
 channel-masque = { path = "channel-masque" }
 bytes = "1"
 futures = "0.3"
@@ -14,7 +14,7 @@ futures-concurrency = "7.6.3"
 h3 = { git = "https://github.com/hyperium/h3", rev = "refs/pull/340/head" }
 h3-datagram = { git = "https://github.com/hyperium/h3", rev = "refs/pull/340/head" }
 h3-quinn = { git = "https://github.com/hyperium/h3", rev = "refs/pull/340/head" }
-h3-util = { git = "https://github.com/masa-koz/tonic-h3.git", branch = "masa-koz/add-msquic-async", default-features = false }
+h3-util = { git = "https://github.com/masa-koz/tonic-h3.git", branch = "masa-koz/add-msquic-async-qmux-01-fix-h3-dgram", default-features = false }
 http = "1"
 http-body = "1"
 http-body-util = "0.1.3"

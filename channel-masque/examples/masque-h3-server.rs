@@ -25,7 +25,8 @@ use bytes::Bytes;
 use h3_util::msquic_async::{H3MsQuicAsyncConnector, h3_msquic_async::msquic};
 use http::{
     Request, Uri,
-    header::{HeaderName, HeaderValue}, uri::{Authority, Scheme},
+    header::{HeaderName, HeaderValue},
+    uri::{Authority, Scheme},
 };
 use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -38,10 +39,22 @@ use tracing_subscriber::EnvFilter;
 
 // ── MASQUE client (msquic) setup ─────────────────────────────────────────────
 
-fn make_msquic_async_reg_and_config()
--> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
-    let registration = msquic::Registration::new(&msquic::RegistrationConfig::default())?;
-    let alpn = [msquic::BufferRef::from("h3")];
+fn make_msquic_async_reg_and_config(
+    registration: Option<Arc<msquic::Registration>>,
+    is_qmux: bool,
+) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
+    let registration = if let Some(registration) = registration {
+        registration
+    } else {
+        Arc::new(msquic::Registration::new(
+            &msquic::RegistrationConfig::default(),
+        )?)
+    };
+    let alpn = if !is_qmux {
+        [msquic::BufferRef::from("h3")]
+    } else {
+        [msquic::BufferRef::from("h3qx-01")]
+    };
     let configuration = msquic::Configuration::open(
         &registration,
         &alpn,
@@ -60,7 +73,7 @@ fn make_msquic_async_reg_and_config()
     let cred_config = msquic::CredentialConfig::new_client()
         .set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
     configuration.load_credential(&cred_config)?;
-    Ok((Arc::new(registration), Arc::new(configuration)))
+    Ok((registration, Arc::new(configuration)))
 }
 
 // ── quinn / H3 server setup ──────────────────────────────────────────────────
@@ -207,8 +220,9 @@ async fn create_normal_channel(
     uri: Uri,
     reg: Arc<msquic::Registration>,
     config: Arc<msquic::Configuration>,
+    config_qmux: Arc<msquic::Configuration>,
 ) -> anyhow::Result<channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>> {
-    let connector = H3MsQuicAsyncConnector::new(uri.clone(), config, reg);
+    let connector = H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg);
     let channel = channel_masque::H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
     Ok(channel)
 }
@@ -353,7 +367,10 @@ async fn set_udp_mode(
         tracing::info!("UDP mode already set to desired value, no change needed");
         return Ok(());
     } else {
-        tracing::info!("UDP mode needs to be changed to {}, sending request", if is_shared { "shared" } else { "dedicated" });
+        tracing::info!(
+            "UDP mode needs to be changed to {}, sending request",
+            if is_shared { "shared" } else { "dedicated" }
+        );
     }
 
     let udp_mode_request = serde_json::json!(UdpModeSettingRequest {
@@ -473,9 +490,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Set up the MASQUE client (msquic → CONNECT-UDP) ──────────────────────
     let uri: Uri = cmd_opts.target.parse()?;
-    let (reg, config) = make_msquic_async_reg_and_config()?;
+    let (reg, config) = make_msquic_async_reg_and_config(None, false)?;
+    let (reg, config_qmux) = make_msquic_async_reg_and_config(Some(reg), true)?;
 
-    let channel = create_normal_channel(uri.clone(), reg.clone(), config.clone()).await?;
+    let channel = create_normal_channel(uri.clone(), reg.clone(), config.clone(), config_qmux.clone()).await?;
 
     // ── Fetch the public address assigned by the MASQUE server for this client.
     let public_addr = get_public_address(uri.clone(), &cmd_opts.jwt, channel.clone()).await?;
@@ -511,7 +529,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Connect to MASQUE proxy, registering the H3 server's local address ───
     let connector =
-        h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, reg.clone());
+        h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg.clone());
     let channel = channel_masque::H3Channel::<
         _,
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,

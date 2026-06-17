@@ -10,10 +10,22 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceBuilder;
 use tower_http::auth::AddAuthorizationLayer;
 
-fn make_msquic_async_reg_and_config()
--> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
-    let registration = msquic::Registration::new(&msquic::RegistrationConfig::default())?;
-    let alpn = [msquic::BufferRef::from("h3")];
+fn make_msquic_async_reg_and_config(
+    registration: Option<Arc<msquic::Registration>>,
+    is_qmux: bool,
+) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
+    let registration = if let Some(registration) = registration {
+        registration
+    } else {
+        Arc::new(msquic::Registration::new(
+            &msquic::RegistrationConfig::default(),
+        )?)
+    };
+    let alpn = if !is_qmux {
+        [msquic::BufferRef::from("h3")]
+    } else {
+        [msquic::BufferRef::from("h3qx-01")]
+    };
     let configuration = msquic::Configuration::open(
         &registration,
         &alpn,
@@ -31,7 +43,7 @@ fn make_msquic_async_reg_and_config()
     let cred_config = msquic::CredentialConfig::new_client()
         .set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
     configuration.load_credential(&cred_config)?;
-    Ok((Arc::new(registration), Arc::new(configuration)))
+    Ok((registration, Arc::new(configuration)))
 }
 
 #[derive(FromArgs, Clone)]
@@ -56,9 +68,11 @@ async fn main() -> anyhow::Result<()> {
     let cmd_opts: CmdOptions = argh::from_env();
 
     let uri: Uri = cmd_opts.target.parse()?;
-    let (reg, config) = make_msquic_async_reg_and_config()?;
+    let (reg, config) = make_msquic_async_reg_and_config(None, false)?;
+    let (reg, config_qmux) = make_msquic_async_reg_and_config(Some(reg), true)?;
+
     let connector =
-        h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, reg.clone());
+        h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg.clone());
     // let (conn_sender, mut conn_receiver) = mpsc::channel(1);
     // let connector = connector.with_channel(conn_sender);
     let channel = channel_masque::H3Channel::<
