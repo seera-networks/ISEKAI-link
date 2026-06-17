@@ -23,6 +23,7 @@ use tracing_subscriber::EnvFilter;
 
 fn make_msquic_async_client_config(
     registration: Option<Arc<msquic::Registration>>,
+    is_qmux: bool,
 ) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
     let registration = if let Some(registration) = registration {
         registration
@@ -31,7 +32,11 @@ fn make_msquic_async_client_config(
             &msquic::RegistrationConfig::default(),
         )?)
     };
-    let alpn = [msquic::BufferRef::from("h3")];
+    let alpn = if !is_qmux {
+        [msquic::BufferRef::from("h3")]
+    } else {
+        [msquic::BufferRef::from("h3qx-01")]
+    };
     let configuration = msquic::Configuration::open(
         &registration,
         &alpn,
@@ -53,6 +58,7 @@ fn make_msquic_async_client_config(
 
 fn make_msquic_async_listner(
     registration: Option<Arc<msquic::Registration>>,
+    is_qmux: bool,
     addr: Option<SocketAddr>,
     cert_pem: &str,
     key_pem: &str,
@@ -64,7 +70,11 @@ fn make_msquic_async_listner(
             &msquic::RegistrationConfig::default(),
         )?)
     };
-    let alpn = [msquic::BufferRef::from("h3")];
+    let alpn = if !is_qmux {
+        [msquic::BufferRef::from("h3")]
+    } else {
+        [msquic::BufferRef::from("h3qx-01")]
+    };
     let configuration = msquic::Configuration::open(
         &registration,
         &alpn,
@@ -111,8 +121,9 @@ async fn create_normal_channel(
     uri: Uri,
     reg: Arc<msquic::Registration>,
     config: Arc<msquic::Configuration>,
+    config_qmux: Arc<msquic::Configuration>,
 ) -> anyhow::Result<channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>> {
-    let connector = H3MsQuicAsyncConnector::new(uri.clone(), config, reg);
+    let connector = H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg);
     let channel = channel_masque::H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
     Ok(channel)
 }
@@ -271,13 +282,14 @@ async fn create_masque_channel(
     uri: Uri,
     reg: Arc<msquic::Registration>,
     config: Arc<msquic::Configuration>,
+    config_qmux: Arc<msquic::Configuration>,
 ) -> anyhow::Result<
     channel_masque::H3Channel<
         h3_util::msquic_async::H3MsQuicAsyncConnector,
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
     >,
 > {
-    let connector = h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, reg);
+    let connector = h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg);
     let channel = channel_masque::H3Channel::<
         _,
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
@@ -479,9 +491,10 @@ async fn main() -> anyhow::Result<()> {
     let cmd_opts: CmdOptions = argh::from_env();
 
     let uri: Uri = cmd_opts.target.parse()?;
-    let (reg, config) = make_msquic_async_client_config(None)?;
+    let (reg, config) = make_msquic_async_client_config(None, false)?;
+    let (reg, config_qmux) = make_msquic_async_client_config(Some(reg), true)?;
 
-    let normal_channel = create_normal_channel(uri.clone(), reg.clone(), config.clone()).await?;
+    let normal_channel = create_normal_channel(uri.clone(), reg.clone(), config.clone(), config_qmux.clone()).await?;
     let session_id =
         create_signaling_session(uri.clone(), &cmd_opts.jwt, normal_channel.clone()).await?;
     tracing::info!("created signaling session with ID: {}", session_id);
@@ -501,6 +514,7 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = "127.0.0.1:0".parse()?;
     let (reg, listener) = make_msquic_async_listner(
         Some(reg),
+        false,
         Some(listen_addr),
         &cert_info.cert_pem,
         &cert_info.key_pem,
@@ -522,7 +536,7 @@ async fn main() -> anyhow::Result<()> {
 
     let handle_svc_h3 = create_h3_server(acceptor, router, server_token.clone()).await?;
 
-    let channel = create_masque_channel(uri.clone(), reg.clone(), config)
+    let channel = create_masque_channel(uri.clone(), reg.clone(), config, config_qmux.clone())
         .await
         .map_err(|e| {
             tracing::error!("Failed to create MASQUE channel: {e:?}");
