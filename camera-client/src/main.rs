@@ -121,7 +121,10 @@ impl eframe::App for MyApp {
             )
             .unwrap();
 
-            let image = egui::ColorImage::from_rgb([640, 480], rgb.data_bytes().unwrap());
+            let image = egui::ColorImage::from_rgb(
+                [rgb.cols() as usize, rgb.rows() as usize],
+                rgb.data_bytes().unwrap(),
+            );
 
             if let Some(tex) = &mut self.texture {
                 tex.set(image, egui::TextureOptions::default());
