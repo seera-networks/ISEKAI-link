@@ -123,59 +123,58 @@ async fn main() -> eframe::Result<()> {
 
     let mut tasks = JoinSet::new();
 
-    tasks.spawn_blocking(move || {
+    tasks.spawn(async move {
         let addr: SocketAddr = "127.0.0.1:4567".parse()?;
-        let (_registration, listener) = make_msquic_async_listener(
-            None,
-            Some(addr),
-            include_str!("../certs/server.crt"),
-            include_str!("../certs/server.key"),
-        )?;
+        let (_registration, listener) = tokio::task::block_in_place(|| {
+            make_msquic_async_listener(
+                None,
+                Some(addr),
+                include_str!("../certs/server.crt"),
+                include_str!("../certs/server.key"),
+            )
+        })?;
         tracing::info!("listening on {}", listener.local_addr()?);
 
-        tokio::spawn(async move {
-            let mut txs = Vec::new();
-            loop {
-                tokio::select! {
-                    conn = listener.accept() => {
-                        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(100);
-                        txs.push(tx);
-                        match conn {
-                           Ok(conn) => {
-                                tokio::spawn(async move {
-                                    while let Some(jpeg_data) = rx.recv().await {
-                                        tracing::debug!("sending jpeg data to client, size: {}", jpeg_data.len());
-                                        let mut stream = conn.open_outbound_stream(msquic_async::StreamType::Unidirectional, false).await?;
-                                        stream.write_all(&jpeg_data).await?;
-                                        poll_fn(|cx| stream.poll_finish_write(cx)).await?;
-                                    }
-                                    anyhow::Ok(())
-                                });
-                            }
-                           Err(err) => {
-                               tracing::error!("error on accept connection: {}", err);
-                               break;
-                            }
-                        }
-                    }
-                    jpeg_data = mjpeg_rx.recv() => {
-                        if let Some(jpeg_data) = jpeg_data {
-                            txs.retain(|tx| !tx.is_closed());
-                            for tx in &txs {
-                                if tx.send(jpeg_data.clone()).await.is_err() {
-                                    tracing::error!("failed to send jpeg data to client");
+        let mut txs = Vec::new();
+        loop {
+            tokio::select! {
+                conn = listener.accept() => {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(100);
+                    txs.push(tx);
+                    match conn {
+                       Ok(conn) => {
+                            tokio::spawn(async move {
+                                while let Some(jpeg_data) = rx.recv().await {
+                                    tracing::debug!("sending jpeg data to client, size: {}", jpeg_data.len());
+                                    let mut stream = conn.open_outbound_stream(msquic_async::StreamType::Unidirectional, false).await?;
+                                    stream.write_all(&jpeg_data).await?;
+                                    poll_fn(|cx| stream.poll_finish_write(cx)).await?;
                                 }
-                            }
-                        } else {
-                            tracing::error!("mjpeg_rx closed");
-                            break;
+                                anyhow::Ok(())
+                            });
+                        }
+                       Err(err) => {
+                           tracing::error!("error on accept connection: {}", err);
+                           break;
                         }
                     }
                 }
+                jpeg_data = mjpeg_rx.recv() => {
+                    if let Some(jpeg_data) = jpeg_data {
+                        txs.retain(|tx| !tx.is_closed());
+                        for tx in &txs {
+                            if tx.send(jpeg_data.clone()).await.is_err() {
+                                tracing::error!("failed to send jpeg data to client");
+                            }
+                        }
+                    } else {
+                        tracing::error!("mjpeg_rx closed");
+                        break;
+                    }
+                }
             }
+        }
 
-            anyhow::Ok(())
-        });
         anyhow::Ok(())
     });
 
