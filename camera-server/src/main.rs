@@ -223,10 +223,16 @@ async fn main() -> eframe::Result<()> {
 
             imgcodecs::imencode(".jpg", &frame, &mut buf, &params).unwrap();
 
-            let jpeg_data = Bytes::copy_from_slice(&buf.as_slice());
-            if mjpeg_tx.try_send(jpeg_data).is_err() {
-                tracing::error!("failed to send jpeg data to mjpeg_tx");
-                break;
+            let jpeg_data = Bytes::copy_from_slice(buf.as_slice());
+            match mjpeg_tx.try_send(jpeg_data) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Drop this frame under backpressure.
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::error!("mjpeg_tx closed");
+                    break;
+                }
             }
 
             // FPS制御
