@@ -10,7 +10,7 @@ use opencv::{
 use std::{future::poll_fn, net::SocketAddr, sync::Arc, sync::mpsc, thread};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 
-fn make_msquic_async_listner(
+fn make_msquic_async_listener(
     registration: Option<Arc<msquic::Registration>>,
     addr: Option<SocketAddr>,
     cert_pem: &str,
@@ -126,7 +126,7 @@ async fn main() -> eframe::Result<()> {
 
     tasks.spawn_blocking(move || {
         let addr: SocketAddr = "127.0.0.1:4567".parse()?;
-        let (_registration, listener) = make_msquic_async_listner(
+        let (_registration, listener) = make_msquic_async_listener(
             None,
             Some(addr),
             include_str!("../certs/server.crt"),
