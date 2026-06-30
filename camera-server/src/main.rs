@@ -63,7 +63,6 @@ fn make_msquic_async_listener(
 
     #[cfg(windows)]
     {
-        use schannel::RawPointer;
         use schannel::cert_context::{CertContext, KeySpec};
         use schannel::cert_store::{CertAdd, Memory};
         use schannel::crypt_prov::{AcquireOptions, ProviderType};
