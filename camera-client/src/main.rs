@@ -54,17 +54,22 @@ async fn main() -> eframe::Result<()> {
             match conn.accept_inbound_uni_stream().await {
                 Ok(mut stream) => {
                     let stream_id = stream.id().unwrap();
-                    let tx_clone = tx.clone();
                     tracing::debug!("Inbound stream {stream_id} accepted");
-                    tokio::spawn(async move {
-                        let mut data = Vec::new();
-                        stream.read_to_end(&mut data).await?;
-                        tracing::debug!("Inbound stream {stream_id} read {} bytes", data.len());
-                        tx_clone
-                            .send((stream_id, Bytes::copy_from_slice(&data)))
-                            .await?;
-                        anyhow::Ok(())
-                    });
+                    let mut data = Vec::new();
+                    if let Err(e) = stream.read_to_end(&mut data).await {
+                        tracing::error!("Failed to read stream {stream_id}: {:?}", e);
+                        continue;
+                    }
+                    tracing::debug!("Inbound stream {stream_id} read {} bytes", data.len());
+                    match tx.try_send((stream_id, Bytes::copy_from_slice(&data))) {
+                        Ok(_) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::debug!("Frame channel full, dropping frame {stream_id}");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            break;
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to accept inbound stream: {:?}", e);
