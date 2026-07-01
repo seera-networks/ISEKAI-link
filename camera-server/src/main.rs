@@ -74,6 +74,7 @@ fn make_msquic_async_listener(
         use schannel::cert_context::{CertContext, KeySpec};
         use schannel::cert_store::{CertAdd, Memory};
         use schannel::crypt_prov::{AcquireOptions, ProviderType};
+        use schannel::RawPointer;
 
         let mut store = Memory::new().unwrap().into_store();
 
