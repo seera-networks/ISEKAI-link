@@ -7,7 +7,15 @@ use opencv::{
     prelude::*,
     videoio,
 };
-use std::{future::poll_fn, net::SocketAddr, sync::Arc, sync::mpsc, thread};
+use std::{
+    future::poll_fn,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 
 fn make_msquic_async_listener(
@@ -121,6 +129,9 @@ async fn main() -> eframe::Result<()> {
     let (tx, rx) = mpsc::channel();
     let (mjpeg_tx, mut mjpeg_rx) = tokio::sync::mpsc::channel::<Bytes>(100);
 
+    let is_streaming = Arc::new(AtomicBool::new(false));
+    let is_streaming_camera = Arc::clone(&is_streaming);
+
     let mut tasks = JoinSet::new();
 
     tasks.spawn(async move {
@@ -185,6 +196,11 @@ async fn main() -> eframe::Result<()> {
         cam.set(videoio::CAP_PROP_FRAME_HEIGHT, 480.0)?;
 
         loop {
+            if !is_streaming_camera.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(33));
+                continue;
+            }
+
             let mut frame = Mat::default();
             cam.read(&mut frame).unwrap();
 
@@ -253,24 +269,24 @@ async fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| Box::new(MyApp::new(rx))),
+        Box::new(|_cc| Box::new(MyApp::new(rx, is_streaming))),
     )
 }
 
 struct MyApp {
     rx: mpsc::Receiver<([usize; 2], Bytes)>,
     texture: Option<egui::TextureHandle>,
-    is_streaming: bool,
+    is_streaming: Arc<AtomicBool>,
     resolution: usize,
     log: String,
 }
 
 impl MyApp {
-    fn new(rx: mpsc::Receiver<([usize; 2], Bytes)>) -> Self {
+    fn new(rx: mpsc::Receiver<([usize; 2], Bytes)>, is_streaming: Arc<AtomicBool>) -> Self {
         Self {
             rx,
             texture: None,
-            is_streaming: false,
+            is_streaming,
             resolution: 0,
             log: "Ready.".to_string(),
         }
@@ -299,7 +315,7 @@ impl eframe::App for MyApp {
             // ✅ 状態表示
             ui.label(format!(
                 "Status: {}",
-                if self.is_streaming {
+                if self.is_streaming.load(Ordering::Relaxed) {
                     "Streaming"
                 } else {
                     "Stopped"
@@ -333,14 +349,14 @@ impl eframe::App for MyApp {
             }
 
             // ✅ Start / Stopボタン
-            if !self.is_streaming {
+            if !self.is_streaming.load(Ordering::Relaxed) {
                 if ui.button("▶ Start").clicked() {
-                    self.is_streaming = true;
+                    self.is_streaming.store(true, Ordering::Relaxed);
                     self.log = "Streaming started.".to_string();
                 }
             } else {
                 if ui.button("■ Stop").clicked() {
-                    self.is_streaming = false;
+                    self.is_streaming.store(false, Ordering::Relaxed);
                     self.log = "Streaming stopped.".to_string();
                 }
             }
