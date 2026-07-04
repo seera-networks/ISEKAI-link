@@ -36,9 +36,13 @@ async fn run_isekai_connection(
     let (reg, config) = make_msquic_async_client_config(None, "h3")?;
     let (reg, config_qmux) = make_msquic_async_client_config(Some(reg), "h3qx-01")?;
 
-    let normal_channel =
-        create_normal_channel(uri.clone(), reg.clone(), config.clone(), config_qmux.clone())
-            .await?;
+    let normal_channel = create_normal_channel(
+        uri.clone(),
+        reg.clone(),
+        config.clone(),
+        config_qmux.clone(),
+    )
+    .await?;
     let public_addr = get_public_address(uri.clone(), &jwt, normal_channel.clone()).await?;
 
     let cert_info = get_certificate(uri.clone(), &jwt, normal_channel).await?;
@@ -137,18 +141,24 @@ async fn main() -> eframe::Result<()> {
     let (tx, rx) = mpsc::channel();
     let is_streaming = Arc::new(AtomicBool::new(false));
     let is_streaming_camera = Arc::clone(&is_streaming);
+    let is_terminated = Arc::new(AtomicBool::new(false));
+    let is_terminated_camera = Arc::clone(&is_terminated);
 
     let mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>> =
         Arc::new(Mutex::new(None));
     let mjpeg_tx_holder_camera = Arc::clone(&mjpeg_tx_holder);
 
     // ✅ カメラスレッド起動
-    tokio::task::spawn_blocking(move || {
+    let camera_task_handle = tokio::task::spawn_blocking(move || {
         let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY).unwrap();
         cam.set(videoio::CAP_PROP_FRAME_WIDTH, 640.0)?;
         cam.set(videoio::CAP_PROP_FRAME_HEIGHT, 480.0)?;
 
         loop {
+            if is_terminated_camera.load(Ordering::Relaxed) {
+                tracing::debug!("camera task terminating");
+                break;
+            }
             if !is_streaming_camera.load(Ordering::Relaxed) {
                 thread::sleep(std::time::Duration::from_millis(33));
                 continue;
@@ -208,12 +218,20 @@ async fn main() -> eframe::Result<()> {
         anyhow::Ok(())
     });
 
-    let options = eframe::NativeOptions::default();
-    eframe::run_native(
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]),
+        ..Default::default()
+    };
+    let res = eframe::run_native(
         "Camera Stream App",
         options,
         Box::new(|_cc| Box::new(MyApp::new(rx, is_streaming, mjpeg_tx_holder))),
-    )
+    );
+    tracing::debug!("eframe exited, stopping camera task");
+    is_terminated.store(true, Ordering::Relaxed);
+    camera_task_handle.await.unwrap().unwrap();
+    tracing::debug!("camera task finished");
+    res
 }
 
 struct MyApp {
@@ -232,7 +250,6 @@ struct MyApp {
     rx: mpsc::Receiver<([usize; 2], Bytes)>,
     texture: Option<egui::TextureHandle>,
     is_streaming: Arc<AtomicBool>,
-    resolution: usize,
 
     // ログ表示用ローカルコピー
     log: String,
@@ -245,7 +262,7 @@ impl MyApp {
         mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
     ) -> Self {
         Self {
-            target: "https://127.0.0.1:8443".to_string(),
+            target: "https://link2.isekai.tools:8443".to_string(),
             jwt: String::new(),
             is_open: false,
             open_task: None,
@@ -255,7 +272,6 @@ impl MyApp {
             rx,
             texture: None,
             is_streaming,
-            resolution: 0,
             log: "Ready.".to_string(),
         }
     }
@@ -373,30 +389,6 @@ impl eframe::App for MyApp {
 
             ui.separator();
 
-            // ✅ 解像度選択
-            ui.horizontal(|ui| {
-                ui.label("Resolution:");
-                egui::ComboBox::from_id_source("resolution")
-                    .selected_text(match self.resolution {
-                        0 => "640x480",
-                        1 => "1280x720",
-                        _ => "1920x1080",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.resolution, 0, "640x480");
-                        ui.selectable_value(&mut self.resolution, 1, "1280x720");
-                        ui.selectable_value(&mut self.resolution, 2, "1920x1080");
-                    });
-            });
-
-            ui.separator();
-
-            if let Some(texture) = &self.texture {
-                ui.image(texture);
-            } else {
-                ui.label("Loading camera feed...");
-            }
-
             // ✅ Start / Stopボタン
             if !self.is_streaming.load(Ordering::Relaxed) {
                 if ui.button("▶ Start").clicked() {
@@ -413,6 +405,16 @@ impl eframe::App for MyApp {
             // ✅ ログ表示
             ui.label("Log:");
             ui.text_edit_multiline(&mut self.log);
+
+            ui.separator();
+
+            egui::ScrollArea::both().show(ui, |ui| {
+                if let Some(texture) = &self.texture {
+                    ui.image(texture);
+                } else {
+                    ui.label("Loading camera feed...");
+                }
+            });
         });
 
         if open_clicked {
@@ -425,4 +427,3 @@ impl eframe::App for MyApp {
         ctx.request_repaint();
     }
 }
-
