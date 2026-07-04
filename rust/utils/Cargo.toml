@@ -1,0 +1,26 @@
+[package]
+name = "isekai-link-utils"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+channel-masque = { workspace = true }
+h3-util = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true, features = ["channel"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+base64 = { workspace = true }
+schannel = { workspace = true }
+windows = { workspace = true, features = ["Win32_Security_Cryptography"]}

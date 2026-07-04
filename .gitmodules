@@ -1,0 +1,6 @@
+[submodule "submodules/tonic-h3"]
+	path = submodules/tonic-h3
+	url = https://github.com/masa-koz/tonic-h3.git
+[submodule "submodules/msquic-async-rs"]
+	path = submodules/msquic-async-rs
+	url = https://github.com/masa-koz/msquic-async-rs.git

@@ -1,6 +1,12 @@
+use argh::FromArgs;
 use bytes::Bytes;
 use eframe::egui;
-use msquic_async::msquic;
+use http::Uri;
+use isekai_link_utils::{
+    create_forward_masque_connection, create_masque_channel, create_normal_channel,
+    get_certificate, get_public_address, make_msquic_async_client_config,
+    make_msquic_async_listener,
+};
 use opencv::{
     core::{self, AlgorithmHint},
     imgcodecs, imgproc,
@@ -11,112 +17,23 @@ use std::{
     future::poll_fn,
     net::SocketAddr,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc,
     },
     thread,
 };
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 
-fn make_msquic_async_listener(
-    registration: Option<Arc<msquic::Registration>>,
-    addr: Option<SocketAddr>,
-    cert_pem: &str,
-    key_pem: &str,
-) -> anyhow::Result<(Arc<msquic::Registration>, msquic_async::Listener)> {
-    let registration = if let Some(registration) = registration {
-        registration
-    } else {
-        Arc::new(msquic::Registration::new(
-            &msquic::RegistrationConfig::default(),
-        )?)
-    };
-    let alpn = [msquic::BufferRef::from("sample")];
-    let configuration = msquic::Configuration::open(
-        &registration,
-        &alpn,
-        Some(
-            &&&msquic::Settings::new()
-                .set_IdleTimeoutMs(30_000)
-                .set_MaximumMtu(1200)
-                .set_KeepAliveIntervalMs(10_000)
-                .set_DestCidUpdateIdleTimeoutMs(0)
-                .set_PeerBidiStreamCount(100)
-                .set_PeerUnidiStreamCount(100)
-                .set_DatagramReceiveEnabled()
-                .set_StreamMultiReceiveEnabled(),
-        ),
-    )?;
-
-    #[cfg(not(windows))]
-    {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-        let mut cert_file = NamedTempFile::new()?;
-        cert_file.write_all(cert_pem.as_bytes())?;
-        let cert_path = cert_file.into_temp_path();
-        let cert_path = cert_path.to_string_lossy().into_owned();
-
-        let mut key_file = NamedTempFile::new()?;
-        key_file.write_all(key_pem.as_bytes())?;
-        let key_path = key_file.into_temp_path();
-        let key_path = key_path.to_string_lossy().into_owned();
-
-        let cred_config =
-            msquic::CredentialConfig::new().set_credential(msquic::Credential::CertificateFile(
-                msquic::CertificateFile::new(key_path.to_string(), cert_path.to_string()),
-            ));
-        configuration.load_credential(&cred_config)?;
-    }
-
-    #[cfg(windows)]
-    {
-        use schannel::cert_context::{CertContext, KeySpec};
-        use schannel::cert_store::{CertAdd, Memory};
-        use schannel::crypt_prov::{AcquireOptions, ProviderType};
-        use schannel::RawPointer;
-
-        let mut store = Memory::new().unwrap().into_store();
-
-        let name = String::from("msquic-async-example");
-
-        let cert_ctx = CertContext::from_pem(cert_pem).unwrap();
-
-        let mut options = AcquireOptions::new();
-        options.container(&name);
-
-        let type_ = ProviderType::rsa_full();
-
-        let mut container = match options.acquire(type_) {
-            Ok(container) => container,
-            Err(_) => options.new_keyset(true).acquire(type_).unwrap(),
-        };
-        container
-            .import()
-            .import_pkcs8_pem(key_pem.as_bytes())
-            .unwrap();
-
-        cert_ctx
-            .set_key_prov_info()
-            .container(&name)
-            .type_(type_)
-            .keep_open(true)
-            .key_spec(KeySpec::key_exchange())
-            .set()
-            .unwrap();
-
-        let context = store.add_cert(&cert_ctx, CertAdd::Always).unwrap();
-
-        let cred_config = msquic::CredentialConfig::new().set_credential(
-            msquic::Credential::CertificateContext(unsafe { context.as_ptr() }),
-        );
-
-        configuration.load_credential(&cred_config)?;
-    };
-
-    let listener = msquic_async::Listener::new(&registration, configuration)?;
-    listener.start(&alpn, addr)?;
-    Ok((registration, listener))
+#[derive(FromArgs, Clone)]
+/// server args
+pub struct CmdOptions {
+    /// target address of the MASQUE server
+    #[argh(option, default = "String::from(\"https://127.0.0.1:8443\")")]
+    target: String,
+    /// JWT for authentication, if the server requires it
+    #[argh(option, default = "String::from(\"\")")]
+    jwt: String,
 }
 
 #[tokio::main]
@@ -126,6 +43,7 @@ async fn main() -> eframe::Result<()> {
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
         .with_writer(std::io::stderr)
         .init();
+    let cmd_opts: CmdOptions = argh::from_env();
 
     let (tx, rx) = mpsc::channel();
     let (mjpeg_tx, mut mjpeg_rx) = tokio::sync::mpsc::channel::<Bytes>(100);
@@ -136,16 +54,44 @@ async fn main() -> eframe::Result<()> {
     let mut tasks = JoinSet::new();
 
     tasks.spawn(async move {
-        let addr: SocketAddr = "127.0.0.1:4567".parse()?;
-        let (_registration, listener) = tokio::task::block_in_place(|| {
-            make_msquic_async_listener(
-                None,
-                Some(addr),
-                include_str!("../certs/server.crt"),
-                include_str!("../certs/server.key"),
-            )
-        })?;
-        tracing::info!("listening on {}", listener.local_addr()?);
+        let uri: Uri = cmd_opts.target.parse()?;
+
+        let (reg, config) = make_msquic_async_client_config(None, "h3")?;
+        let (reg, config_qmux) = make_msquic_async_client_config(Some(reg), "h3qx-01")?;
+
+        let normal_channel = create_normal_channel(uri.clone(), reg.clone(), config.clone(), config_qmux.clone()).await?;
+        let public_addr = get_public_address(uri.clone(), &cmd_opts.jwt, normal_channel.clone()).await?;
+
+        let cert_info = get_certificate(uri.clone(), &cmd_opts.jwt, normal_channel).await?;
+        tracing::info!(
+            "got certificate for hostname {}, public address: {}",
+            cert_info.hostname,
+            public_addr
+        );
+
+        let mut tasks = JoinSet::new();
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse()?;
+        let (reg, listener) = make_msquic_async_listener(
+            Some(reg),
+            "sample",
+            Some(listen_addr),
+            &cert_info.cert_pem,
+            &cert_info.key_pem,
+            Some(&cert_info.pkcs12),
+        )?;
+        let listen_addr = listener.local_addr()?;
+        tracing::info!("camera server local listening on: {}", listen_addr);
+
+        let channel = create_masque_channel(uri.clone(), reg.clone(), config, config_qmux.clone())
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create MASQUE channel: {e:?}");
+                anyhow::anyhow!("Failed to create MASQUE channel: {e:?}")
+            })?;
+
+        create_forward_masque_connection(&cmd_opts.jwt, listen_addr, channel.clone(), &mut tasks)
+            .await?;
 
         let mut txs = Vec::new();
         loop {
@@ -256,7 +202,7 @@ async fn main() -> eframe::Result<()> {
         anyhow::Ok(())
     });
 
-    tokio::spawn(async move{
+    tokio::spawn(async move {
         while let Some(res) = tasks.join_next().await {
             tracing::info!("task completed");
             if let Err(err) = res? {

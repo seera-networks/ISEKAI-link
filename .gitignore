@@ -1,3 +1,1 @@
-/bound-udp-server/logs
-/bound-udp-server/public_address.db
-/target
+/rust/target

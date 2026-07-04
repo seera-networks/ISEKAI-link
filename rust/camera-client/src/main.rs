@@ -49,7 +49,7 @@ async fn main() -> eframe::Result<()> {
     tokio::spawn(async move {
         let (registration, configuration) = make_msquic_async_client_config(None)?;
         let conn = msquic_async::Connection::new(&registration)?;
-        conn.start(&configuration, "127.0.0.1", 4567).await?;
+        conn.start(&configuration, "153.127.33.247", 15640).await?;
         loop {
             match conn.accept_inbound_uni_stream().await {
                 Ok(mut stream) => {

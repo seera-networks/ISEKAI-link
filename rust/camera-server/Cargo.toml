@@ -5,13 +5,24 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
+argh = { workspace = true }
 bytes = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+channel-masque = { workspace = true }
+h3-util = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true, features = ["channel"] }
+isekai-link-utils = { workspace = true }
 msquic-async = { workspace = true }
 opencv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
