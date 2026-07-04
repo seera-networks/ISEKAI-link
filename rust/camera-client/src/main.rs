@@ -76,7 +76,13 @@ impl MyApp {
     fn connect(&mut self) {
         let (tx, rx) = mpsc::channel::<(u64, Bytes)>(100);
         let addr = self.server_addr.clone();
-        let port: u16 = self.server_port.parse().unwrap_or(15640);
+        let port: u16 = self.server_port.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                "Invalid port '{}', falling back to default 15640",
+                self.server_port
+            );
+            15640
+        });
 
         let handle = tokio::spawn(async move {
             let (registration, configuration) = make_msquic_async_client_config(None)?;
