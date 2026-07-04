@@ -320,6 +320,7 @@ pub async fn create_forward_masque_connection(
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
     >,
     tasks: &mut JoinSet<Result<(), anyhow::Error>>,
+    public_addresses_out: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 ) -> anyhow::Result<()> {
     let channel = ServiceBuilder::new()
         .layer(AddAuthorizationLayer::bearer(jwt))
@@ -339,6 +340,14 @@ pub async fn create_forward_masque_connection(
             match event {
                 channel_masque::MasqueClientEvent::PublicAddresses(public_addrs) => {
                     tracing::info!("public addresses: {:?}", public_addrs);
+                    if let Some(ref out) = public_addresses_out {
+                        let formatted = public_addrs
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        *out.lock().unwrap() = Some(formatted);
+                    }
                 }
                 channel_masque::MasqueClientEvent::NewRemoteHost(
                     remote_addr,
