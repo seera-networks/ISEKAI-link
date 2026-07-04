@@ -44,112 +44,178 @@ async fn main() -> eframe::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let (tx, rx) = mpsc::channel::<(u64, Bytes)>(100);
-
-    tokio::spawn(async move {
-        let (registration, configuration) = make_msquic_async_client_config(None)?;
-        let conn = msquic_async::Connection::new(&registration)?;
-        conn.start(&configuration, "153.127.33.247", 15640).await?;
-        loop {
-            match conn.accept_inbound_uni_stream().await {
-                Ok(mut stream) => {
-                    let stream_id = stream.id().unwrap();
-                    tracing::debug!("Inbound stream {stream_id} accepted");
-                    let mut data = Vec::new();
-                    if let Err(e) = stream.read_to_end(&mut data).await {
-                        tracing::error!("Failed to read stream {stream_id}: {:?}", e);
-                        continue;
-                    }
-                    tracing::debug!("Inbound stream {stream_id} read {} bytes", data.len());
-                    match tx.try_send((stream_id, Bytes::copy_from_slice(&data))) {
-                        Ok(_) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::debug!("Frame channel full, dropping frame {stream_id}");
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to accept inbound stream: {:?}", e);
-                    break;
-                }
-            }
-        }
-        anyhow::Ok(())
-    });
-
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Camera Client App",
         options,
-        Box::new(|_cc| Box::new(MyApp::new(rx))),
+        Box::new(|_cc| Box::new(MyApp::new())),
     )
 }
 
 struct MyApp {
-    rx: mpsc::Receiver<(u64, Bytes)>,
+    server_addr: String,
+    server_port: String,
+    connected: bool,
+    rx: Option<mpsc::Receiver<(u64, Bytes)>>,
+    conn_task: Option<tokio::task::AbortHandle>,
     texture: Option<egui::TextureHandle>,
 }
 
 impl MyApp {
-    fn new(rx: mpsc::Receiver<(u64, Bytes)>) -> Self {
-        Self { rx, texture: None }
+    fn new() -> Self {
+        Self {
+            server_addr: "153.127.33.247".to_string(),
+            server_port: "15640".to_string(),
+            connected: false,
+            rx: None,
+            conn_task: None,
+            texture: None,
+        }
+    }
+
+    fn connect(&mut self) {
+        let (tx, rx) = mpsc::channel::<(u64, Bytes)>(100);
+        let addr = self.server_addr.clone();
+        let port: u16 = self.server_port.parse().unwrap_or(15640);
+
+        let handle = tokio::spawn(async move {
+            let (registration, configuration) = make_msquic_async_client_config(None)?;
+            let conn = msquic_async::Connection::new(&registration)?;
+            conn.start(&configuration, &addr, port).await?;
+            loop {
+                match conn.accept_inbound_uni_stream().await {
+                    Ok(mut stream) => {
+                        let stream_id = stream.id().unwrap();
+                        tracing::debug!("Inbound stream {stream_id} accepted");
+                        let mut data = Vec::new();
+                        if let Err(e) = stream.read_to_end(&mut data).await {
+                            tracing::error!("Failed to read stream {stream_id}: {:?}", e);
+                            continue;
+                        }
+                        tracing::debug!("Inbound stream {stream_id} read {} bytes", data.len());
+                        match tx.try_send((stream_id, Bytes::copy_from_slice(&data))) {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::debug!(
+                                    "Frame channel full, dropping frame {stream_id}"
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to accept inbound stream: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            anyhow::Ok(())
+        });
+
+        self.conn_task = Some(handle.abort_handle());
+        self.rx = Some(rx);
+        self.connected = true;
+    }
+
+    fn disconnect(&mut self) {
+        if let Some(handle) = self.conn_task.take() {
+            handle.abort();
+        }
+        self.rx = None;
+        self.connected = false;
+        self.texture = None;
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ✅ 新しいフレーム受信（最新のみ使う）
-        let mut largest_seq = 0;
-        while let Ok((seq, data)) = self.rx.try_recv() {
-            if seq > largest_seq || largest_seq == 0 {
-                largest_seq = seq;
-            } else {
-                tracing::debug!("Discarding old frame with seq {seq}");
-                continue;
+        // 新しいフレーム受信（最新のみ使う）
+        if let Some(rx) = &mut self.rx {
+            let mut largest_seq = 0u64;
+            let mut new_image: Option<egui::ColorImage> = None;
+            while let Ok((seq, data)) = rx.try_recv() {
+                if seq > largest_seq || largest_seq == 0 {
+                    largest_seq = seq;
+                    let mat = imgcodecs::imdecode(
+                        &opencv::core::Vector::from_slice(&data),
+                        imgcodecs::IMREAD_COLOR,
+                    )
+                    .unwrap();
+
+                    let mut rgb = opencv::core::Mat::default();
+                    opencv::imgproc::cvt_color(
+                        &mat,
+                        &mut rgb,
+                        opencv::imgproc::COLOR_BGR2RGB,
+                        0,
+                        AlgorithmHint::ALGO_HINT_DEFAULT,
+                    )
+                    .unwrap();
+
+                    new_image = Some(egui::ColorImage::from_rgb(
+                        [rgb.cols() as usize, rgb.rows() as usize],
+                        rgb.data_bytes().unwrap(),
+                    ));
+                } else {
+                    tracing::debug!("Discarding old frame with seq {seq}");
+                }
             }
-            let mat = imgcodecs::imdecode(
-                &opencv::core::Vector::from_slice(&data),
-                imgcodecs::IMREAD_COLOR,
-            )
-            .unwrap();
-
-            let mut rgb = opencv::core::Mat::default();
-            opencv::imgproc::cvt_color(
-                &mat,
-                &mut rgb,
-                opencv::imgproc::COLOR_BGR2RGB,
-                0,
-                AlgorithmHint::ALGO_HINT_DEFAULT,
-            )
-            .unwrap();
-
-            let image = egui::ColorImage::from_rgb(
-                [rgb.cols() as usize, rgb.rows() as usize],
-                rgb.data_bytes().unwrap(),
-            );
-
-            if let Some(tex) = &mut self.texture {
-                tex.set(image, egui::TextureOptions::default());
-            } else {
-                self.texture =
-                    Some(ctx.load_texture("camera", image, egui::TextureOptions::default()));
+            if let Some(image) = new_image {
+                if let Some(tex) = &mut self.texture {
+                    tex.set(image, egui::TextureOptions::default());
+                } else {
+                    self.texture =
+                        Some(ctx.load_texture("camera", image, egui::TextureOptions::default()));
+                }
             }
         }
 
+        let mut connect_clicked = false;
+        let mut disconnect_clicked = false;
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("📷 Camera Stream");
+
+            ui.horizontal(|ui| {
+                ui.label("Server:");
+                ui.add_enabled(
+                    !self.connected,
+                    egui::TextEdit::singleline(&mut self.server_addr),
+                );
+                ui.label("Port:");
+                ui.add_enabled(
+                    !self.connected,
+                    egui::TextEdit::singleline(&mut self.server_port),
+                );
+                if self.connected {
+                    if ui.button("Disconnect").clicked() {
+                        disconnect_clicked = true;
+                    }
+                } else if ui.button("Connect").clicked() {
+                    connect_clicked = true;
+                }
+            });
 
             ui.separator();
 
             if let Some(texture) = &self.texture {
                 ui.image(texture);
+            } else if self.connected {
+                ui.label("Waiting for camera feed...");
             } else {
-                ui.label("Loading camera feed...");
+                ui.label("Not connected.");
             }
         });
+
+        if connect_clicked {
+            self.connect();
+        }
+        if disconnect_clicked {
+            self.disconnect();
+        }
+
         ctx.request_repaint();
     }
 }
