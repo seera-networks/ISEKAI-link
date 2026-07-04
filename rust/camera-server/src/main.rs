@@ -7,7 +7,7 @@ use isekai_link_utils::{
     make_msquic_async_listener,
 };
 use opencv::{
-    core::{self},
+    core::{self, AlgorithmHint},
     imgcodecs, imgproc,
     prelude::*,
     videoio,
@@ -168,6 +168,7 @@ async fn main() -> eframe::Result<()> {
                 &mut rgb,
                 imgproc::COLOR_BGR2RGB,
                 0,
+                AlgorithmHint::ALGO_HINT_DEFAULT,
             )
             .unwrap();
 
