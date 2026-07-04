@@ -308,8 +308,13 @@ impl eframe::App for MyApp {
             }
         }
 
-        // ✅ 共有ログを同期
-        self.log = self.log_shared.lock().unwrap().clone();
+        // ✅ 共有ログを同期（変更があった場合のみ更新）
+        {
+            let shared = self.log_shared.lock().unwrap();
+            if *shared != self.log {
+                self.log = shared.clone();
+            }
+        }
 
         let mut open_clicked = false;
         let mut close_clicked = false;
