@@ -289,7 +289,12 @@ async fn create_masque_channel(
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
     >,
 > {
-    let connector = h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg);
+    let connector = h3_util::msquic_async::H3MsQuicAsyncConnector::new(
+        uri.clone(),
+        config,
+        Some(config_qmux),
+        reg,
+    );
     let channel = channel_masque::H3Channel::<
         _,
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
@@ -501,7 +506,13 @@ async fn main() -> anyhow::Result<()> {
     let (reg, config) = make_msquic_async_client_config(None, false)?;
     let (reg, config_qmux) = make_msquic_async_client_config(Some(reg), true)?;
 
-    let normal_channel = create_normal_channel(uri.clone(), reg.clone(), config.clone(), config_qmux.clone()).await?;
+    let normal_channel = create_normal_channel(
+        uri.clone(),
+        reg.clone(),
+        config.clone(),
+        config_qmux.clone(),
+    )
+    .await?;
     let session_id =
         create_signaling_session(uri.clone(), &cmd_opts.jwt, normal_channel.clone()).await?;
     tracing::info!("created signaling session with ID: {}", session_id);
@@ -599,7 +610,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     shutdown_token.cancel();
-    std::mem::drop(channel);
 
     while let Some(result) = tasks.join_next().await {
         match result {
@@ -608,6 +618,7 @@ async fn main() -> anyhow::Result<()> {
             Err(err) => tracing::error!("MasqueClient task join error during shutdown: {err:?}"),
         }
     }
+    std::mem::drop(channel);
 
     if let Err(e) = handle_svc_h3.await {
         tracing::error!("H3 server task error: {e:?}");
