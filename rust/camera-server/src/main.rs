@@ -6,6 +6,7 @@ use isekai_link_utils::{
     get_certificate, get_public_address, make_msquic_async_client_config,
     make_msquic_async_listener,
 };
+use msquic_async::msquic;
 use opencv::{
     core::{self, AlgorithmHint},
     imgcodecs, imgproc,
@@ -23,17 +24,20 @@ use std::{
     thread,
 };
 use tokio::{io::AsyncWriteExt, task::JoinSet};
+use tokio_util::sync::CancellationToken;
 
 async fn run_isekai_connection(
+    reg: Arc<msquic::Registration>,
     target: String,
     jwt: String,
     mut mjpeg_rx: tokio::sync::mpsc::Receiver<Bytes>,
     public_address_out: Arc<Mutex<Option<String>>>,
     log_out: Arc<Mutex<String>>,
+    shutdown_token: CancellationToken,
 ) -> anyhow::Result<()> {
     let uri: Uri = target.parse()?;
 
-    let (reg, config) = make_msquic_async_client_config(None, "h3")?;
+    let (reg, config) = make_msquic_async_client_config(Some(reg), "h3")?;
     let (reg, config_qmux) = make_msquic_async_client_config(Some(reg), "h3qx-01")?;
 
     let normal_channel = create_normal_channel(
@@ -81,8 +85,9 @@ async fn run_isekai_connection(
     create_forward_masque_connection(
         &jwt,
         listen_addr,
-        channel.clone(),
+        channel,
         &mut tasks,
+        shutdown_token.clone(),
         Some(Arc::clone(&public_address_out)),
     )
     .await?;
@@ -90,6 +95,10 @@ async fn run_isekai_connection(
     let mut txs = Vec::new();
     loop {
         tokio::select! {
+            _ = shutdown_token.cancelled() => {
+                tracing::debug!("shutdown signal received, exiting ISEKAI connection task");
+                break;
+            }
             conn = listener.accept() => {
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(100);
                 txs.push(tx);
@@ -127,6 +136,11 @@ async fn run_isekai_connection(
         }
     }
 
+    tracing::debug!("ISEKAI connection task shutting down, waiting for tasks to finish");
+    tasks.join_all().await;
+    tracing::debug!("ISEKAI connection task exiting");
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Give some time for tasks to finish
+
     anyhow::Ok(())
 }
 
@@ -137,6 +151,8 @@ async fn main() -> eframe::Result<()> {
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
         .with_writer(std::io::stderr)
         .init();
+
+    let reg = Arc::new(msquic::Registration::new(&msquic::RegistrationConfig::default()).unwrap());
 
     let (tx, rx) = mpsc::channel();
     let is_streaming = Arc::new(AtomicBool::new(false));
@@ -225,12 +241,14 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| Box::new(MyApp::new(rx, is_streaming, mjpeg_tx_holder))),
+        Box::new(|_cc| Box::new(MyApp::new(reg, rx, is_streaming, mjpeg_tx_holder))),
     );
     tracing::debug!("eframe exited, stopping camera task");
     is_terminated.store(true, Ordering::Relaxed);
     camera_task_handle.await.unwrap().unwrap();
     tracing::debug!("camera task finished");
+    let metrics = tokio::runtime::Handle::current().metrics();
+    tracing::debug!("Tokio runtime alive tasks: {}", metrics.num_alive_tasks());
     res
 }
 
@@ -240,8 +258,10 @@ struct MyApp {
     jwt: String,
     is_open: bool,
 
+    reg: Arc<msquic::Registration>,
     // 非同期タスクとの共有状態
     open_task: Option<tokio::task::AbortHandle>,
+    shutdown_token: Option<CancellationToken>,
     mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
     public_address: Arc<Mutex<Option<String>>>,
     log_shared: Arc<Mutex<String>>,
@@ -257,15 +277,18 @@ struct MyApp {
 
 impl MyApp {
     fn new(
+        reg: Arc<msquic::Registration>,
         rx: mpsc::Receiver<([usize; 2], Bytes)>,
         is_streaming: Arc<AtomicBool>,
         mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
     ) -> Self {
         Self {
+            reg,
             target: "https://link2.isekai.tools:8443".to_string(),
             jwt: String::new(),
             is_open: false,
             open_task: None,
+            shutdown_token: None,
             mjpeg_tx_holder,
             public_address: Arc::new(Mutex::new(None)),
             log_shared: Arc::new(Mutex::new("Ready.".to_string())),
@@ -287,23 +310,39 @@ impl MyApp {
 
         *log_shared.lock().unwrap() = "Connecting...".to_string();
 
+        let shutdown_token = CancellationToken::new();
+        let shutdown_token_clone = shutdown_token.clone();
+        let reg = Arc::clone(&self.reg);
         let handle = tokio::spawn(async move {
             let log_for_error = Arc::clone(&log_shared);
-            if let Err(e) =
-                run_isekai_connection(target, jwt, mjpeg_rx, public_address, log_shared).await
+            if let Err(e) = run_isekai_connection(
+                reg,
+                target,
+                jwt,
+                mjpeg_rx,
+                public_address,
+                log_shared,
+                shutdown_token_clone,
+            )
+            .await
             {
                 tracing::error!("ISEKAI connection failed: {e:?}");
                 *log_for_error.lock().unwrap() = format!("Error: {e}");
             }
+            tracing::debug!("ISEKAI connection task finished");
         });
         self.open_task = Some(handle.abort_handle());
+        self.shutdown_token = Some(shutdown_token);
         self.is_open = true;
     }
 
     fn close(&mut self) {
-        if let Some(handle) = self.open_task.take() {
-            handle.abort();
+        if let Some(token) = self.shutdown_token.take() {
+            token.cancel();
         }
+        // if let Some(handle) = self.open_task.take() {
+        //     handle.abort();
+        // }
         *self.mjpeg_tx_holder.lock().unwrap() = None;
         *self.public_address.lock().unwrap() = None;
         *self.log_shared.lock().unwrap() = "Closed.".to_string();

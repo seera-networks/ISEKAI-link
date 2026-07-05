@@ -8,6 +8,7 @@ use h3_datagram::{
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::mpsc, sync::oneshot};
+use tokio_util::sync::CancellationToken;
 
 /// Object-safe wrapper for sending QUIC datagrams, enabling type erasure of the
 /// concrete `DatagramSender<H, Bytes>` type so it can be carried through `ProxyState`.
@@ -128,6 +129,7 @@ impl Controller {
 pub async fn thread(
     mut rx: mpsc::Receiver<Message>,
     mut datagram_sender: Box<dyn ErasedSender>,
+    shutdown_token: CancellationToken,
 ) -> anyhow::Result<()> {
     let notification_tx = match rx.recv().await {
         Some(Message::Start(notification_tx, resp_tx)) => {
@@ -153,6 +155,10 @@ pub async fn thread(
     let mut compression_info = HashMap::new();
     loop {
         tokio::select! {
+            _ = shutdown_token.cancelled() => {
+                tracing::debug!("shutdown signal received, exiting from_udp_to_quic thread");
+                break;
+            }
             msg = rx.recv() => {
                 match msg {
                     Some(Message::Start(_, resp_tx)) => {

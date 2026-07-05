@@ -39,6 +39,7 @@ use http_body::Frame;
 use http_body_util::{BodyDataStream, StreamBody};
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 pub mod masque;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024;
@@ -486,19 +487,19 @@ where
                     loop {
                         tokio::select! {
                             res = std::future::poll_fn(|cx| driver.poll_close(cx)) => {
-                                tracing::trace!("h3 driver ended: {res:?}");
+                                tracing::debug!("h3 driver ended: {res:?}");
                                 let _ = tx.send(());
                                 break;
                             }
                             res = stream_id_rx.recv(), if !stream_id_rx.is_closed() => {
                                 let Some(stream_id) = res else { continue };
-                                tracing::trace!("datagram_sender requested for {stream_id}");
+                                tracing::debug!("datagram_sender requested for {stream_id}");
                                 let datagram_sender = driver.get_datagram_sender(stream_id);
                                 if let Err(_) = datagram_sender_tx.send(
                                     Box::new(datagram_sender) as
                                         Box<dyn crate::masque::from_udp_to_quic::ErasedSender>
                                     ).await {
-                                    tracing::trace!("datagram_sender channel closed");
+                                    tracing::debug!("datagram_sender channel closed");
                                 }
                             }
                         }
@@ -664,13 +665,15 @@ where
     pub async fn start(
         &mut self,
         mode: MasqueClientMode,
+        shutdown_token: CancellationToken,
     ) -> Result<tokio::sync::mpsc::Receiver<MasqueClientEvent>, h3_util::Error> {
-        self.start_impl(mode).await
+        self.start_impl(mode, shutdown_token).await
     }
 
     async fn start_impl(
         &mut self,
         mode: MasqueClientMode,
+        shutdown_token: CancellationToken,
     ) -> Result<tokio::sync::mpsc::Receiver<MasqueClientEvent>, h3_util::Error> {
         let (req_body_tx, req_body_rx): (
             tokio::sync::mpsc::Sender<Result<Frame<Bytes>, ReqBodyErr>>,
@@ -733,9 +736,14 @@ where
         };
 
         // Spawn the UDP-to-QUIC forwarding thread now that authentication has passed.
+        let shutdown_token_clone = shutdown_token.clone();
         self.executor.execute(async move {
-            if let Err(e) =
-                crate::masque::from_udp_to_quic::thread(from_udp_to_quic_rx, datagram_sender).await
+            if let Err(e) = crate::masque::from_udp_to_quic::thread(
+                from_udp_to_quic_rx,
+                datagram_sender,
+                shutdown_token_clone,
+            )
+            .await
             {
                 tracing::error!("from_udp_to_quic::thread exited with error: {e}");
             }
@@ -829,6 +837,10 @@ where
             let mut buf = BytesMut::new();
             loop {
                 tokio::select! {
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!("Shutdown signal received, stopping MasqueClient event loop");
+                        break;
+                    }
                     msg = notification_rx_from_quic.recv() => {
                         match msg {
                             Some(crate::masque::from_quic_to_udp::Notification::NewSocket(socket, remote_addr, connected)) => {
@@ -1103,6 +1115,7 @@ where
                     }
                 }
             }
+            tracing::debug!("MasqueClient event loop exited");
         });
         Ok(event_rx)
     }

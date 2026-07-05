@@ -9,6 +9,7 @@ use http_body_util::{BodyExt, Full, StreamBody};
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tower_http::auth::AddAuthorizationLayer;
 
@@ -320,6 +321,7 @@ pub async fn create_forward_masque_connection(
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
     >,
     tasks: &mut JoinSet<Result<(), anyhow::Error>>,
+    shutdown_token: CancellationToken,
     public_addresses_out: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 ) -> anyhow::Result<()> {
     let channel = ServiceBuilder::new()
@@ -330,7 +332,7 @@ pub async fn create_forward_masque_connection(
 
     tasks.spawn(async move {
         let mut events = client
-            .start(channel_masque::MasqueClientMode::Forward(listen_addr))
+            .start(channel_masque::MasqueClientMode::Forward(listen_addr), shutdown_token)
             .await
             .map_err(|e| {
                 tracing::error!("Failed to start MasqueClient: {e:?}");
@@ -393,6 +395,7 @@ pub async fn create_forward_masque_connection(
                 }
             }
         }
+        tracing::debug!("MasqueClient event loop exited");
         Ok::<(), anyhow::Error>(())
     });
     Ok(())
