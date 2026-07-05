@@ -618,7 +618,6 @@ async fn main() -> anyhow::Result<()> {
             Err(err) => tracing::error!("MasqueClient task join error during shutdown: {err:?}"),
         }
     }
-    std::mem::drop(channel);
 
     if let Err(e) = handle_svc_h3.await {
         tracing::error!("H3 server task error: {e:?}");
