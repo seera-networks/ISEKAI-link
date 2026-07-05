@@ -305,6 +305,7 @@ async fn create_webrtc_masque_connection(
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
     >,
     tasks: &mut JoinSet<Result<(), anyhow::Error>>,
+    shutdown_token: CancellationToken,
 ) -> anyhow::Result<()> {
     let channel = ServiceBuilder::new()
         .layer(AddAuthorizationLayer::bearer(jwt))
@@ -322,7 +323,7 @@ async fn create_webrtc_masque_connection(
 
     tasks.spawn(async move {
         let mut events = client
-            .start(channel_masque::MasqueClientMode::WebRTC)
+            .start(channel_masque::MasqueClientMode::WebRTC, shutdown_token)
             .await
             .map_err(|e| {
                 tracing::error!("Failed to start MasqueClient: {e:?}");
@@ -377,6 +378,7 @@ async fn create_webrtc_masque_connection(
                 }
             }
         }
+        tracing::debug!("MasqueClient WebRTC event loop exited");
         Ok::<(), anyhow::Error>(())
     });
     Ok(())
@@ -390,6 +392,7 @@ async fn create_forward_masque_connection(
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
     >,
     tasks: &mut JoinSet<Result<(), anyhow::Error>>,
+    shutdown_token: CancellationToken,
 ) -> anyhow::Result<()> {
     let channel = ServiceBuilder::new()
         .layer(AddAuthorizationLayer::bearer(jwt))
@@ -399,7 +402,10 @@ async fn create_forward_masque_connection(
 
     tasks.spawn(async move {
         let mut events = client
-            .start(channel_masque::MasqueClientMode::Forward(listen_addr))
+            .start(
+                channel_masque::MasqueClientMode::Forward(listen_addr),
+                shutdown_token,
+            )
             .await
             .map_err(|e| {
                 tracing::error!("Failed to start MasqueClient: {e:?}");
@@ -454,6 +460,7 @@ async fn create_forward_masque_connection(
                 }
             }
         }
+        tracing::debug!("MasqueClient forward event loop exited");
         Ok::<(), anyhow::Error>(())
     });
     Ok(())
@@ -523,7 +530,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("service h3 listening on: {}", listen_addr);
     let acceptor = H3MsQuicAsyncAcceptor::new(listener);
 
-    let server_token = CancellationToken::new();
+    let shutdown_token = CancellationToken::new();
 
     let router = axum::Router::new()
         .route("/", axum::routing::get(|| async { "Hello, World!" }))
@@ -534,7 +541,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/s/{session_id}", axum::routing::get(share_page));
 
-    let handle_svc_h3 = create_h3_server(acceptor, router, server_token.clone()).await?;
+    let handle_svc_h3 = create_h3_server(acceptor, router, shutdown_token.clone()).await?;
 
     let channel = create_masque_channel(uri.clone(), reg.clone(), config, config_qmux.clone())
         .await
@@ -543,12 +550,24 @@ async fn main() -> anyhow::Result<()> {
             anyhow::anyhow!("Failed to create MASQUE channel: {e:?}")
         })?;
 
-    create_forward_masque_connection(&cmd_opts.jwt, listen_addr, channel.clone(), &mut tasks)
-        .await?;
+    create_forward_masque_connection(
+        &cmd_opts.jwt,
+        listen_addr,
+        channel.clone(),
+        &mut tasks,
+        shutdown_token.clone(),
+    )
+    .await?;
 
     for _ in 0..cmd_opts.num_connections {
-        create_webrtc_masque_connection(&cmd_opts.jwt, &session_id, channel.clone(), &mut tasks)
-            .await?;
+        create_webrtc_masque_connection(
+            &cmd_opts.jwt,
+            &session_id,
+            channel.clone(),
+            &mut tasks,
+            shutdown_token.clone(),
+        )
+        .await?;
     }
 
     let authority: Authority = format!("{}:{}", cert_info.hostname, public_addr.port()).parse()?;
@@ -561,8 +580,13 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
-            _ = tasks.join_next(), if !tasks.is_empty() => {
-                tracing::info!("MasqueClient proxy tasks finished");
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) => tracing::info!("MasqueClient task finished"),
+                    Some(Ok(Err(err))) => tracing::error!("MasqueClient task failed: {err:?}"),
+                    Some(Err(err)) => tracing::error!("MasqueClient task join error: {err:?}"),
+                    None => {}
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("received Ctrl-C, shutting down");
@@ -574,19 +598,22 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    server_token.cancel(); // trigger shutdown of the H3 server
+    shutdown_token.cancel();
+    std::mem::drop(channel);
+
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => tracing::info!("MasqueClient task shut down cleanly"),
+            Ok(Err(err)) => tracing::error!("MasqueClient task failed during shutdown: {err:?}"),
+            Err(err) => tracing::error!("MasqueClient task join error during shutdown: {err:?}"),
+        }
+    }
+
     if let Err(e) = handle_svc_h3.await {
         tracing::error!("H3 server task error: {e:?}");
     } else {
         tracing::info!("H3 server task finished");
     }
-
-    if !tasks.is_empty() {
-        tracing::info!("aborting remaining tasks...");
-        tasks.shutdown().await;
-    }
-    std::mem::drop(channel); // close the channel to trigger graceful shutdown of MasqueClient
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await; // give it a moment to shut down gracefully
 
     anyhow::Ok(())
 }
