@@ -33,6 +33,7 @@ use http_body_util::{BodyExt, Full, StreamBody};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{convert::Infallible, io::BufReader, net::SocketAddr, sync::Arc};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tower_http::{auth::AddAuthorizationLayer, set_header::SetRequestHeaderLayer};
 use tracing_subscriber::EnvFilter;
@@ -432,7 +433,7 @@ async fn set_udp_mode(
 /// masque-h3-server: serve HTTP/3 behind a MASQUE UDP proxy
 pub struct CmdOptions {
     /// target address of the MASQUE server
-    #[argh(option, default = "String::from(\"https://127.0.0.1:8443\")")]
+    #[argh(option, default = "String::from(\"https://link2.isekai.tools:8443\")")]
     target: String,
     /// JWT for authentication, if the server requires it
     #[argh(option, default = "String::from(\"\")")]
@@ -472,6 +473,7 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_ansi(true)
+            .with_writer(std::io::stdout)
             .init();
     } else {
         let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
@@ -488,12 +490,19 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
+    tracing::info!("Starting masque-h3-server with target: {}", cmd_opts.target);
     // ── Set up the MASQUE client (msquic → CONNECT-UDP) ──────────────────────
     let uri: Uri = cmd_opts.target.parse()?;
     let (reg, config) = make_msquic_async_reg_and_config(None, false)?;
     let (reg, config_qmux) = make_msquic_async_reg_and_config(Some(reg), true)?;
 
-    let channel = create_normal_channel(uri.clone(), reg.clone(), config.clone(), config_qmux.clone()).await?;
+    let channel = create_normal_channel(
+        uri.clone(),
+        reg.clone(),
+        config.clone(),
+        config_qmux.clone(),
+    )
+    .await?;
 
     // ── Fetch the public address assigned by the MASQUE server for this client.
     let public_addr = get_public_address(uri.clone(), &cmd_opts.jwt, channel.clone()).await?;
@@ -528,8 +537,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ── Connect to MASQUE proxy, registering the H3 server's local address ───
-    let connector =
-        h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg.clone());
+    let connector = h3_util::msquic_async::H3MsQuicAsyncConnector::new(
+        uri.clone(),
+        config,
+        Some(config_qmux),
+        reg.clone(),
+    );
     let channel = channel_masque::H3Channel::<
         _,
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,
@@ -561,10 +574,15 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
     println!("You can connect to the H3 server through the MASQUE proxy at: {server_uri}");
 
+    let shutdown_token = CancellationToken::new();
+    let shutdown_token_clone = shutdown_token.clone();
     let mut client = channel_masque::MasqueClient::new(channel, None);
     let proxy_handle = tokio::spawn(async move {
         let mut events = client
-            .start(channel_masque::MasqueClientMode::Forward(h3_server_addr))
+            .start(
+                channel_masque::MasqueClientMode::Forward(h3_server_addr),
+                shutdown_token_clone,
+            )
             .await
             .map_err(|e| {
                 tracing::error!("MasqueClient start failed: {e:?}");
@@ -632,6 +650,7 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("received Ctrl-C, shutting down");
+                shutdown_token.cancel();
                 break;
             }
         }

@@ -7,6 +7,7 @@ use http_body_util::StreamBody;
 use std::{convert::Infallible, sync::Arc};
 use tokio::net::UdpSocket;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::auth::AddAuthorizationLayer;
 
@@ -71,8 +72,12 @@ async fn main() -> anyhow::Result<()> {
     let (reg, config) = make_msquic_async_reg_and_config(None, false)?;
     let (reg, config_qmux) = make_msquic_async_reg_and_config(Some(reg), true)?;
 
-    let connector =
-        h3_util::msquic_async::H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg.clone());
+    let connector = h3_util::msquic_async::H3MsQuicAsyncConnector::new(
+        uri.clone(),
+        config,
+        Some(config_qmux),
+        reg.clone(),
+    );
     // let (conn_sender, mut conn_receiver) = mpsc::channel(1);
     // let connector = connector.with_channel(conn_sender);
     let channel = channel_masque::H3Channel::<
@@ -87,9 +92,14 @@ async fn main() -> anyhow::Result<()> {
     let local_addr = socket.local_addr()?;
     let mut client = channel_masque::MasqueClient::new(channel, None);
 
+    let shutdown_token = CancellationToken::new();
+    let shutdown_token_clone = shutdown_token.clone();
     let proxy_handle = tokio::spawn(async move {
         let mut events = client
-            .start(channel_masque::MasqueClientMode::Forward(local_addr))
+            .start(
+                channel_masque::MasqueClientMode::Forward(local_addr),
+                shutdown_token_clone,
+            )
             .await
             .map_err(|e| {
                 tracing::error!("Failed to start MasqueClient: {e:?}");
@@ -155,6 +165,11 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("MasqueClient proxy task finished");
                 break;
             }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received Ctrl-C, shutting down");
+                shutdown_token.cancel();
+                break;
+            }
             res = socket.recv_from(&mut buf) => {
                 let (len, addr) = match res {
                     Ok(res) => res,
@@ -168,6 +183,5 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     Ok(())
 }
