@@ -7,7 +7,7 @@ use http::{Request, Uri};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody};
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
-use tokio::task::JoinSet;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceBuilder, ServiceExt};
@@ -21,9 +21,26 @@ pub struct CertificateResponse {
     pub pkcs12: String,
 }
 
+/// Body for `PUT /udp_mode`.
+///
+/// `mode` must be `"shared"`, `"dedicated"`, or `null` / omitted to reset
+/// to the server default.
+#[derive(Debug, serde::Serialize)]
+pub struct UdpModeSettingRequest {
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UdpModeSettingResponse {
+    /// `"shared"`, `"dedicated"`, or `null` (server default).
+    pub mode: Option<String>,
+}
+
 pub fn make_msquic_async_client_config(
     registration: Option<Arc<msquic::Registration>>,
     alpn: &str,
+    disable_verification: bool,
+    enable_natt: bool,
 ) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
     let registration = if let Some(registration) = registration {
         registration
@@ -33,21 +50,28 @@ pub fn make_msquic_async_client_config(
         )?)
     };
     let alpn = [msquic::BufferRef::from(alpn)];
-    let configuration = msquic::Configuration::open(
-        &registration,
-        &alpn,
-        Some(
-            &msquic::Settings::new()
-                .set_IdleTimeoutMs(30_000)
-                .set_DestCidUpdateIdleTimeoutMs(0)
-                .set_PeerBidiStreamCount(100)
-                .set_PeerUnidiStreamCount(100)
-                .set_DatagramReceiveEnabled()
-                .set_StreamMultiReceiveEnabled(),
-        ),
-    )?;
+    let settings = msquic::Settings::new()
+        .set_IdleTimeoutMs(30_000)
+        .set_KeepAliveIntervalMs(1000)
+        .set_DestCidUpdateIdleTimeoutMs(0)
+        .set_PeerBidiStreamCount(100)
+        .set_PeerUnidiStreamCount(100)
+        .set_DatagramReceiveEnabled()
+        .set_StreamMultiReceiveEnabled();
+
+    let settings = if enable_natt {
+        settings.set_AddAddressMode(msquic::AddAddressMode::NatTraversal)
+    } else {
+        settings
+    };
+    let configuration = msquic::Configuration::open(&registration, &alpn, Some(&settings))?;
 
     let cred_config = msquic::CredentialConfig::new_client();
+    let cred_config = if disable_verification {
+        cred_config.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION)
+    } else {
+        cred_config
+    };
     configuration.load_credential(&cred_config)?;
     Ok((registration, Arc::new(configuration)))
 }
@@ -74,8 +98,7 @@ pub fn make_msquic_async_listener(
         Some(
             &&&msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
-                .set_MaximumMtu(1200)
-                .set_KeepAliveIntervalMs(10_000)
+                .set_KeepAliveIntervalMs(1000)
                 .set_DestCidUpdateIdleTimeoutMs(0)
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
@@ -289,11 +312,106 @@ pub async fn get_public_address(
     Ok(String::from_utf8(data.to_vec())?.parse()?)
 }
 
+pub async fn get_udp_mode(
+    uri: Uri,
+    jwt: &str,
+    channel: channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
+) -> anyhow::Result<UdpModeSettingResponse> {
+    let mut channel = ServiceBuilder::new()
+        .option_layer((!jwt.is_empty()).then(|| AddAuthorizationLayer::bearer(jwt)))
+        .service(channel);
+    let uri = Uri::builder()
+        .scheme(uri.scheme().cloned().expect("URI scheme is required"))
+        .authority(uri.authority().cloned().expect("URI authority is required"))
+        .path_and_query("/udp_mode")
+        .build()?;
+    let request = Request::builder()
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let response = channel
+        .ready()
+        .await
+        .map_err(|e| {
+            tracing::error!("channel ready error: {e}");
+            anyhow::anyhow!("channel ready error: {e}")
+        })?
+        .call(request)
+        .await
+        .map_err(|e| {
+            tracing::error!("channel call error: {e}");
+            anyhow::anyhow!("channel call error: {e}")
+        })?;
+    let data = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| {
+            tracing::error!("response body collect error: {e}");
+            anyhow::anyhow!("response body collect error: {e}")
+        })?
+        .to_bytes();
+    Ok(serde_json::from_slice::<UdpModeSettingResponse>(&data)?)
+}
+
+pub async fn set_udp_mode(
+    uri: Uri,
+    jwt: &str,
+    channel: channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
+    mode: &str,
+) -> anyhow::Result<UdpModeSettingResponse> {
+    let mut channel = ServiceBuilder::new()
+        .option_layer((!jwt.is_empty()).then(|| AddAuthorizationLayer::bearer(jwt)))
+        .service(channel);
+    let uri = Uri::builder()
+        .scheme(uri.scheme().cloned().expect("URI scheme is required"))
+        .authority(uri.authority().cloned().expect("URI authority is required"))
+        .path_and_query("/udp_mode")
+        .build()?;
+    let udp_mode_setting_request = UdpModeSettingRequest {
+        mode: Some(mode.to_string()),
+    };
+    let request = Request::builder()
+        .uri(uri)
+        .method("PUT")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(serde_json::to_vec(
+            &udp_mode_setting_request,
+        )?)))
+        .unwrap();
+
+    let response = channel
+        .ready()
+        .await
+        .map_err(|e| {
+            tracing::error!("channel ready error: {e}");
+            anyhow::anyhow!("channel ready error: {e}")
+        })?
+        .call(request)
+        .await
+        .map_err(|e| {
+            tracing::error!("channel call error: {e}");
+            anyhow::anyhow!("channel call error: {e}")
+        })?;
+    let data = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| {
+            tracing::error!("response body collect error: {e}");
+            anyhow::anyhow!("response body collect error: {e}")
+        })?
+        .to_bytes();
+    Ok(serde_json::from_slice::<UdpModeSettingResponse>(&data)?)
+}
+
 pub async fn create_masque_channel(
     uri: Uri,
     reg: Arc<msquic::Registration>,
     config: Arc<msquic::Configuration>,
     config_qmux: Arc<msquic::Configuration>,
+    conn_tx: Option<mpsc::Sender<msquic_async::Connection>>,
 ) -> anyhow::Result<
     channel_masque::H3Channel<
         h3_util::msquic_async::H3MsQuicAsyncConnector,
@@ -306,6 +424,12 @@ pub async fn create_masque_channel(
         Some(config_qmux),
         reg,
     );
+    let connector = if let Some(conn_tx) = conn_tx {
+        connector.with_channel(conn_tx)
+    } else {
+        connector
+    };
+
     let channel = channel_masque::H3Channel::<
         _,
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,

@@ -8,6 +8,8 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+egui_plot = { workspace = true }
+isekai-link-utils = { workspace = true }
 msquic-async = { workspace = true }
 opencv = { workspace = true }
 tokio = { workspace = true }

@@ -1,10 +1,12 @@
 use bytes::Bytes;
 use eframe::egui;
+use futures::stream::{self, StreamExt};
+use futures_concurrency::stream::StreamGroup;
 use http::Uri;
 use isekai_link_utils::{
     create_forward_masque_connection, create_masque_channel, create_normal_channel,
-    get_certificate, get_public_address, make_msquic_async_client_config,
-    make_msquic_async_listener,
+    get_certificate, get_public_address, get_udp_mode, make_msquic_async_client_config,
+    make_msquic_async_listener, set_udp_mode,
 };
 use msquic_async::msquic;
 use opencv::{
@@ -37,8 +39,8 @@ async fn run_isekai_connection(
 ) -> anyhow::Result<()> {
     let uri: Uri = target.parse()?;
 
-    let (reg, config) = make_msquic_async_client_config(Some(reg), "h3")?;
-    let (reg, config_qmux) = make_msquic_async_client_config(Some(reg), "h3qx-01")?;
+    let (reg, config) = make_msquic_async_client_config(Some(reg), "h3", false, false)?;
+    let (reg, config_qmux) = make_msquic_async_client_config(Some(reg), "h3qx-01", false, false)?;
 
     let normal_channel = create_normal_channel(
         uri.clone(),
@@ -48,6 +50,15 @@ async fn run_isekai_connection(
     )
     .await?;
     let public_addr = get_public_address(uri.clone(), &jwt, normal_channel.clone()).await?;
+    let udp_mode = get_udp_mode(uri.clone(), &jwt, normal_channel.clone()).await?;
+    tracing::info!(
+        "got public address: {}, udp mode: {:?}",
+        public_addr,
+        udp_mode
+    );
+    if udp_mode.mode != Some("dedicated".to_string()) {
+        set_udp_mode(uri.clone(), &jwt, normal_channel.clone(), "dedicated").await?;
+    }
 
     let cert_info = get_certificate(uri.clone(), &jwt, normal_channel).await?;
     tracing::info!(
@@ -75,12 +86,19 @@ async fn run_isekai_connection(
     let listen_addr = listener.local_addr()?;
     tracing::info!("camera server local listening on: {}", listen_addr);
 
-    let channel = create_masque_channel(uri.clone(), reg.clone(), config, config_qmux.clone())
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to create MASQUE channel: {e:?}");
-            anyhow::anyhow!("Failed to create MASQUE channel: {e:?}")
-        })?;
+    let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel(100);
+    let channel = create_masque_channel(
+        uri.clone(),
+        reg.clone(),
+        config,
+        config_qmux.clone(),
+        Some(conn_tx),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create MASQUE channel: {e:?}");
+        anyhow::anyhow!("Failed to create MASQUE channel: {e:?}")
+    })?;
 
     create_forward_masque_connection(
         &jwt,
@@ -92,24 +110,97 @@ async fn run_isekai_connection(
     )
     .await?;
 
+    let mut conn_event_group = StreamGroup::new();
     let mut txs = Vec::new();
+    let mut migrating_addr = None;
     loop {
+        let shutdown_token_clone = shutdown_token.clone(); 
         tokio::select! {
             _ = shutdown_token.cancelled() => {
                 tracing::debug!("shutdown signal received, exiting ISEKAI connection task");
                 break;
+            }
+            conn = conn_rx.recv() => {
+                if let Some(conn) = conn {
+                    let conn_event = Box::pin(stream::unfold(
+                        conn,
+                        |conn| async move {
+                            match poll_fn(|cx| conn.poll_event(cx)).await {
+                                Ok(event) => Some((event, conn)),
+                                Err(err) => {
+                                    tracing::error!("error on connection event: {}", err);
+                                    None
+                                }
+                            }
+                        },
+                    ));
+                    conn_event_group.insert(conn_event);
+                } else {
+                    tracing::error!("conn_rx closed");
+                    break;
+                }
+            }
+            ret = conn_event_group.next(), if !conn_event_group.is_empty() => {
+                match ret {
+                    Some(event) => {
+                        tracing::info!("connection event: {:?}", event);
+                        match event {
+                            msquic_async::ConnectionEvent::NotifyObservedAddress{ local_address, observed_address } => {
+                                migrating_addr = Some((local_address, observed_address));
+                            }
+                            _ => {},
+                        }
+                    }
+                    None => {
+                        tracing::debug!("connection event stream closed");
+                        break;
+                    }
+                }
             }
             conn = listener.accept() => {
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(100);
                 txs.push(tx);
                 match conn {
                     Ok(conn) => {
-                        tokio::spawn(async move {
-                            while let Some(jpeg_data) = rx.recv().await {
-                                tracing::debug!("sending jpeg data to client, size: {}", jpeg_data.len());
-                                let mut stream = conn.open_outbound_stream(msquic_async::StreamType::Unidirectional, false).await?;
-                                stream.write_all(&jpeg_data).await?;
-                                poll_fn(|cx| stream.poll_finish_write(cx)).await?;
+                        if let Some((local_addr, observed_addr)) = &migrating_addr {
+                            tracing::info!("Add bound address: {}", local_addr);
+                            conn.add_bound_addr(local_addr.clone())?;
+                            tracing::info!("Add observed address: {}", observed_addr);
+                            conn.add_observed_addr(local_addr.clone(), observed_addr.clone())?;
+                        }
+                        tasks.spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = shutdown_token_clone.cancelled() => {
+                                        tracing::debug!("shutdown signal received, exiting ISEKAI per connection task");
+                                        break;
+                                    }
+                                    ret = poll_fn(|cx| conn.poll_event(cx)) => {
+                                        match ret {
+                                            Ok(event) => {
+                                                tracing::info!("connection event: {:?}", event);
+                                            }
+                                            Err(err) => {
+                                                tracing::error!("error on connection event: {}", err);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    ret = rx.recv() => {
+                                        match ret {
+                                            Some(jpeg_data) => {
+                                                tracing::debug!("sending jpeg data to client, size: {}", jpeg_data.len());
+                                                let mut stream = conn.open_outbound_stream(msquic_async::StreamType::Unidirectional, false).await?;
+                                                stream.write_all(&jpeg_data).await?;
+                                                poll_fn(|cx| stream.poll_finish_write(cx)).await?;
+                                            }
+                                            None => {
+                                                tracing::debug!("jpeg data channel closed");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             anyhow::Ok(())
                         });
@@ -136,6 +227,7 @@ async fn run_isekai_connection(
         }
     }
 
+    std::mem::drop(conn_event_group);
     tracing::debug!("ISEKAI connection task shutting down, waiting for tasks to finish");
     tasks.join_all().await;
     tracing::debug!("ISEKAI connection task exiting");
@@ -146,10 +238,11 @@ async fn run_isekai_connection(
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
+    // console_subscriber::init();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-        .with_writer(std::io::stderr)
+        .with_writer(std::io::stdout)
         .init();
 
     let reg = Arc::new(msquic::Registration::new(&msquic::RegistrationConfig::default()).unwrap());
@@ -238,17 +331,18 @@ async fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]),
         ..Default::default()
     };
+    let reg_clone = Arc::clone(&reg);
     let res = eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| Box::new(MyApp::new(reg, rx, is_streaming, mjpeg_tx_holder))),
+        Box::new(|_cc| Ok(Box::new(MyApp::new(reg_clone, rx, is_streaming, is_terminated, mjpeg_tx_holder)))),
     );
-    tracing::debug!("eframe exited, stopping camera task");
-    is_terminated.store(true, Ordering::Relaxed);
+    tracing::debug!("eframe exited, waiting camera task stopped");
     camera_task_handle.await.unwrap().unwrap();
     tracing::debug!("camera task finished");
     let metrics = tokio::runtime::Handle::current().metrics();
     tracing::debug!("Tokio runtime alive tasks: {}", metrics.num_alive_tasks());
+    tracing::debug!("reg's count: {}", Arc::strong_count(&reg));
     res
 }
 
@@ -260,7 +354,7 @@ struct MyApp {
 
     reg: Arc<msquic::Registration>,
     // 非同期タスクとの共有状態
-    open_task: Option<tokio::task::AbortHandle>,
+    open_wait: Option<mpsc::Receiver<()>>,
     shutdown_token: Option<CancellationToken>,
     mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
     public_address: Arc<Mutex<Option<String>>>,
@@ -270,6 +364,7 @@ struct MyApp {
     rx: mpsc::Receiver<([usize; 2], Bytes)>,
     texture: Option<egui::TextureHandle>,
     is_streaming: Arc<AtomicBool>,
+    is_terminated: Arc<AtomicBool>,
 
     // ログ表示用ローカルコピー
     log: String,
@@ -280,6 +375,7 @@ impl MyApp {
         reg: Arc<msquic::Registration>,
         rx: mpsc::Receiver<([usize; 2], Bytes)>,
         is_streaming: Arc<AtomicBool>,
+        is_terminated: Arc<AtomicBool>,
         mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
     ) -> Self {
         Self {
@@ -287,7 +383,7 @@ impl MyApp {
             target: "https://link2.isekai.tools:8443".to_string(),
             jwt: String::new(),
             is_open: false,
-            open_task: None,
+            open_wait: None,
             shutdown_token: None,
             mjpeg_tx_holder,
             public_address: Arc::new(Mutex::new(None)),
@@ -295,6 +391,7 @@ impl MyApp {
             rx,
             texture: None,
             is_streaming,
+            is_terminated,
             log: "Ready.".to_string(),
         }
     }
@@ -313,6 +410,8 @@ impl MyApp {
         let shutdown_token = CancellationToken::new();
         let shutdown_token_clone = shutdown_token.clone();
         let reg = Arc::clone(&self.reg);
+        
+        let (open_wait_tx, open_wait_rx) = mpsc::channel();
         let handle = tokio::spawn(async move {
             let log_for_error = Arc::clone(&log_shared);
             if let Err(e) = run_isekai_connection(
@@ -329,9 +428,9 @@ impl MyApp {
                 tracing::error!("ISEKAI connection failed: {e:?}");
                 *log_for_error.lock().unwrap() = format!("Error: {e}");
             }
-            tracing::debug!("ISEKAI connection task finished");
+            let _ = open_wait_tx.send(()); // Notify that the task has finished
         });
-        self.open_task = Some(handle.abort_handle());
+        self.open_wait = Some(open_wait_rx);
         self.shutdown_token = Some(shutdown_token);
         self.is_open = true;
     }
@@ -340,9 +439,11 @@ impl MyApp {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
-        // if let Some(handle) = self.open_task.take() {
-        //     handle.abort();
-        // }
+        if let Some(open_wait_rx) = self.open_wait.take() {
+            tracing::debug!("Waiting for ISEKAI connection task to finish");
+            let _ = open_wait_rx.recv();
+            tracing::debug!("ISEKAI connection task finished");
+        }
         *self.mjpeg_tx_holder.lock().unwrap() = None;
         *self.public_address.lock().unwrap() = None;
         *self.log_shared.lock().unwrap() = "Closed.".to_string();
@@ -464,5 +565,15 @@ impl eframe::App for MyApp {
         }
 
         ctx.request_repaint();
+    }
+
+    fn on_exit(&mut self) {
+        tracing::debug!("on_exit begin");
+        self.close();
+        self.is_terminated.store(true, Ordering::Relaxed);
+        tracing::debug!("on_exit end");
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
     }
 }

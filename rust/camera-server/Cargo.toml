@@ -6,9 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }
+channel-masque = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
-channel-masque = { workspace = true }
+futures = { workspace = true }
+futures-concurrency = { workspace = true }
 h3-util = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }

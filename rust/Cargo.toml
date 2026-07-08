@@ -11,8 +11,9 @@ axum-h3 = { path = "../submodules/tonic-h3/axum-h3" }
 base64 = "0.22.1"
 channel-masque = { path = "channel-masque" }
 bytes = "1"
-eframe = "0.27"
-egui = "0.27"
+eframe = "0.34.3"
+egui = "0.34.3"
+egui_plot = "0.35.0"
 futures = "0.3"
 futures-concurrency = "7.6.3"
 h3 = { git = "https://github.com/hyperium/h3", rev = "refs/pull/340/head" }
