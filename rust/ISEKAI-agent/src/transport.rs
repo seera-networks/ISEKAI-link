@@ -126,6 +126,17 @@ pub(crate) fn make_client_config(
                 .set_StreamMultiReceiveEnabled(),
         ),
     )?;
-    configuration.load_credential(&msquic::CredentialConfig::new_client())?;
+    let mut credential = msquic::CredentialConfig::new_client();
+    // Dev/testing only: accept a self-signed proxy certificate when the operator
+    // explicitly opts in via `ISEKAI_INSECURE_SKIP_VERIFY`. Never set in prod.
+    if std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some() {
+        tracing::warn!(
+            "ISEKAI_INSECURE_SKIP_VERIFY set: skipping proxy TLS certificate validation"
+        );
+        credential = credential.set_credential_flags(
+            msquic::CredentialFlags::CLIENT | msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION,
+        );
+    }
+    configuration.load_credential(&credential)?;
     Ok((registration, Arc::new(configuration)))
 }
