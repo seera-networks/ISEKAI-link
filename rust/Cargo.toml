@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent", "camera-client", "camera-server", "channel-masque", "utils", "webrtc-app"]
+members = ["agent", "camera-client", "camera-server", "channel-masque", "ISEKAI-agent", "utils", "webrtc-app"]
 resolver = "3"
 package.edition = "2021"
 
@@ -26,12 +26,18 @@ hyper = { version = "1" , default-features = false}
 isekai-link-utils = { path = "utils" }
 msquic-async = { path = "../submodules/msquic-async-rs/msquic-async", default-features = false, features = ["tokio", "msquic-seera"] }
 opencv = { version = "0.99", default-features = false, features = ["videoio", "imgproc", "imgcodecs"] }
+# ECDSA P-256 / JWK for the P2P Connect Endpoint keypair, PoP and endpoint id.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "jwk", "pem", "pkcs8", "std"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+rand = "0.8.4"
 rustls = "0.23"
 rustls-pemfile = "2"
 schannel = "0.1.27"
 serde = { version = "1.0.164", features = ["derive", "rc" ] }
 serde_json = "1"
+sha2 = "0.10"
+thiserror = "2.0.16"
+time = { version = "0.3", features = ["parsing", "formatting"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["full"] }
