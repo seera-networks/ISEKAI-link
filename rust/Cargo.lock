@@ -2811,6 +2811,7 @@ name = "isekai-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argh",
  "axum",
  "base64",
  "bytes",
@@ -2833,6 +2834,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

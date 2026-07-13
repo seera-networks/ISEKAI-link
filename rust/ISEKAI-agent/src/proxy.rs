@@ -36,7 +36,7 @@ pub trait ControlPlaneTransport {
 }
 
 /// An RFC 9457 problem-details error body (spec §8.0).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Problem {
     #[serde(rename = "type")]
     pub type_uri: String,
@@ -87,7 +87,7 @@ pub struct Candidate {
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerListener {
     pub listener_id: String,
     pub owner_endpoint: String,
@@ -102,7 +102,7 @@ pub struct PeerListener {
     pub active_connections: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capability {
     pub capability_id: String,
     /// The opaque token — hand this to the initiator out of band.
@@ -114,13 +114,13 @@ pub struct Capability {
     pub expires_at: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayInfo {
     pub masque_uri: String,
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConnection {
     pub connection_id: String,
     pub state: String,
