@@ -256,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
                 let handle = open_connect_relay(
                     &a.proxy_url,
                     auth0,
-                    &relay.session_id,
+                    &conn.connection_id,
                     &relay.masque_uri,
                     local_bind,
                 )

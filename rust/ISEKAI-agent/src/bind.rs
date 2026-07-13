@@ -151,13 +151,13 @@ impl Drop for ConnectRelay {
 /// The H3 connection targets `proxy_url` (the proxy we already dial); only the
 /// **path** of `masque_uri` is used as the CONNECT-UDP target, since the
 /// masque_uri authority may differ from `proxy_url`. The session carries
-/// `seera-signaling-session-id: <session_id>` so the proxy binds this leg to the
-/// relay rendezvous (ephemeral loopback source). Returns the bound local
-/// address.
+/// `seera-signaling-session-id: <connection_id>` so the proxy binds this leg to
+/// the relay rendezvous (ephemeral loopback source) — the same identifier the
+/// target's bind leg uses. Returns the bound local address.
 pub async fn open_connect_relay(
     proxy_url: &str,
     auth0_token: &str,
-    session_id: &str,
+    connection_id: &str,
     masque_uri: &str,
     local_bind: SocketAddr,
 ) -> anyhow::Result<ConnectRelay> {
@@ -179,7 +179,7 @@ pub async fn open_connect_relay(
         .layer(AddAuthorizationLayer::bearer(auth0_token))
         .layer(SetRequestHeaderLayer::appending(
             HeaderName::from_static("seera-signaling-session-id"),
-            HeaderValue::from_str(session_id).context("invalid session id header value")?,
+            HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
         ))
         .service(channel);
 
