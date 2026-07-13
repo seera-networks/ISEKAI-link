@@ -19,3 +19,4 @@
 pub mod endpoint;
 pub mod identity;
 pub mod pop;
+pub mod proxy;
