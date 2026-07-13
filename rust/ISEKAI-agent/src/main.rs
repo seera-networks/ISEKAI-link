@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use argh::FromArgs;
-use isekai_agent::bind::open_bind_session;
+use isekai_agent::bind::{open_bind_session, open_connect_relay};
 use isekai_agent::endpoint::EndpointKey;
 use isekai_agent::identity::IdentityClient;
 use isekai_agent::proxy::{Candidate, CandidateType, ControlPlaneTransport, ProxyClient};
@@ -142,6 +142,13 @@ struct Connect {
     /// candidate `type,address,port` (repeatable)
     #[argh(option)]
     candidate: Vec<String>,
+    /// auth0 token for the relay data path; when set, opens the CONNECT-UDP
+    /// relay leg after connecting and runs it until Ctrl-C
+    #[argh(option)]
+    auth0_token: Option<String>,
+    /// local UDP address to bind for the relay leg (default 127.0.0.1:0)
+    #[argh(option)]
+    relay_local_addr: Option<String>,
 }
 
 /// Get a peer connection's current state.
@@ -230,11 +237,43 @@ async fn main() -> anyhow::Result<()> {
         Command::Connect(a) => {
             let client = proxy_client(&a.proxy_url, &a.key, &a.token)?;
             let candidates = parse_candidates(&a.candidate)?;
-            print_json(
-                &client
-                    .peer_connect(&a.capability, &a.listener_id, &a.protocol, &candidates)
-                    .await?,
-            )
+            let conn = client
+                .peer_connect(&a.capability, &a.listener_id, &a.protocol, &candidates)
+                .await?;
+            print_json(&conn)?;
+            // When an Auth0 token is supplied, open the CONNECT-UDP relay leg to
+            // the returned masque_uri and run it until Ctrl-C.
+            if let Some(auth0) = a.auth0_token.as_deref() {
+                let relay = conn.relay.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("connect response has no relay info; cannot open relay leg")
+                })?;
+                let local_bind: SocketAddr = a
+                    .relay_local_addr
+                    .as_deref()
+                    .unwrap_or("127.0.0.1:0")
+                    .parse()
+                    .context("invalid --relay-local-addr")?;
+                let handle = open_connect_relay(
+                    &a.proxy_url,
+                    auth0,
+                    &relay.session_id,
+                    &relay.masque_uri,
+                    local_bind,
+                )
+                .await?;
+                print_json(&serde_json::json!({
+                    "relay_local_addr": handle.local_addr.to_string(),
+                }))?;
+                tracing::info!(
+                    "relay leg running; send UDP to {} (Ctrl-C to stop)",
+                    handle.local_addr
+                );
+                tokio::signal::ctrl_c()
+                    .await
+                    .context("waiting for Ctrl-C")?;
+                handle.close().await;
+            }
+            Ok(())
         }
         Command::GetConnection(a) => {
             let client = proxy_client(&a.proxy_url, &a.key, &a.token)?;
