@@ -2813,6 +2813,11 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "bytes",
+ "channel-masque",
+ "h3-util",
+ "http",
+ "http-body-util",
  "p256",
  "rand 0.8.6",
  "reqwest",
@@ -2822,6 +2827,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tower",
 ]
 
 [[package]]
