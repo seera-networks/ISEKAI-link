@@ -17,4 +17,5 @@
 //! `channel-masque`), and the MASQUE bind session build on top of these.
 
 pub mod endpoint;
+pub mod identity;
 pub mod pop;

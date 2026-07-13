@@ -135,7 +135,7 @@ mod tests {
             &pop.nonce,
             body,
         );
-        let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(pop.signature).unwrap()).unwrap();
+        let sig = Signature::from_der(&URL_SAFE_NO_PAD.decode(pop.signature).unwrap()).unwrap();
         let public = p256::PublicKey::from_jwk_str(&key.public_jwk().to_string()).unwrap();
         let vk = p256::ecdsa::VerifyingKey::from(public);
         assert!(vk.verify(canonical.as_bytes(), &sig).is_ok());

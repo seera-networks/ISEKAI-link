@@ -84,11 +84,15 @@ impl EndpointKey {
     }
 
     /// Sign `message` (ECDSA P-256 / SHA-256), returning the base64url of the
-    /// fixed-length (IEEE P1363 `r ‖ s`) signature — the form the proxy's PoP
-    /// verifier accepts.
+    /// **ASN.1 DER** signature.
+    ///
+    /// DER is the encoding the Identity API requires (its verifier only accepts
+    /// DER) and that the MASQUE proxy also accepts (its PoP verifier tries the
+    /// fixed `r‖s` form first, then falls back to DER), so it works for every
+    /// P2P Connect request.
     pub fn sign_b64url(&self, message: &[u8]) -> String {
         let signature: Signature = self.signing.sign(message);
-        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes())
     }
 }
 
@@ -161,7 +165,7 @@ mod tests {
         let key = EndpointKey::generate();
         let sig_b64 = key.sign_b64url(b"hello");
         let bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
-        let signature = Signature::from_slice(&bytes).unwrap();
+        let signature = Signature::from_der(&bytes).unwrap();
         let public = p256::PublicKey::from_jwk_str(&key.public_jwk().to_string()).unwrap();
         let vk = p256::ecdsa::VerifyingKey::from(public);
         assert!(vk.verify(b"hello", &signature).is_ok());
