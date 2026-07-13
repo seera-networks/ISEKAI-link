@@ -611,6 +611,11 @@ pub enum MasqueClientMode {
     Forward(SocketAddr),
     /// WebRTC mode
     WebRTC,
+    /// Concrete-target CONNECT-UDP forward proxy: received (context id 0)
+    /// payloads are delivered to this channel instead of being routed to a
+    /// managed per-peer socket. The client bridges them to a local UDP socket
+    /// via [`masque::connect_udp`].
+    ConnectUdp(tokio::sync::mpsc::Sender<Bytes>),
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +665,82 @@ where
             executor: executor.unwrap_or_else(SharedExec::tokio),
             phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Establish a **concrete-target** CONNECT-UDP session (RFC 9298 classic) to
+    /// `target_path` (the path of a relay `masque_uri`) and bridge it to
+    /// `socket` as a forward proxy: datagrams from the socket are tunneled with
+    /// context id 0, and tunnel datagrams are returned to the socket's most
+    /// recently seen source (see [`masque::connect_udp`]). Runs on the executor
+    /// until `shutdown_token` fires.
+    ///
+    /// Unlike [`Self::start`], this uses the concrete target path — not the
+    /// wildcard bind path — and needs no `proxy-public-address` header or
+    /// COMPRESSION_ASSIGN capsules. `headers` carries the data-path
+    /// `Authorization` (Auth0) and `seera-signaling-session-id`.
+    pub async fn start_connect_udp(
+        &mut self,
+        target_path: &str,
+        headers: Vec<(String, String)>,
+        socket: std::sync::Arc<tokio::net::UdpSocket>,
+        shutdown_token: CancellationToken,
+    ) -> Result<(), h3_util::Error> {
+        let (req_body_tx, req_body_rx) =
+            tokio::sync::mpsc::channel::<Result<Frame<Bytes>, ReqBodyErr>>(1);
+        let mut req_build = Request::builder()
+            .method(Method::CONNECT)
+            .uri(target_path)
+            .header("capsule-protocol", "?1")
+            .extension(Protocol::CONNECT_UDP);
+        for (name, value) in &headers {
+            req_build = req_build.header(name, value);
+        }
+        let req = req_build.body(StreamBody::new(ReceiverStream::new(req_body_rx)))?;
+
+        futures::future::poll_fn(|cx| self.channel.poll_ready(cx)).await?;
+        let mut resp = self.channel.call(req).await?;
+        resp.status().is_success().then_some(()).ok_or_else(|| {
+            anyhow::anyhow!("CONNECT-UDP request failed with status: {}", resp.status())
+        })?;
+
+        let Some(proxy_state) = resp
+            .extensions_mut()
+            .remove::<std::sync::Arc<crate::masque::ProxyState>>()
+        else {
+            return Err(anyhow::anyhow!("missing ProxyState in response extensions").into());
+        };
+        let datagram_sender = {
+            let mut guard = proxy_state
+                .datagram_sender
+                .lock()
+                .map_err(|_| anyhow::anyhow!("datagram_sender mutex poisoned"))?;
+            guard.take()
+        };
+        let Some(datagram_sender) = datagram_sender else {
+            return Err(anyhow::anyhow!("datagram_sender already consumed").into());
+        };
+
+        // Deliver received context-0 payloads to the bridge.
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
+        proxy_state
+            .from_quic_to_udp
+            .register_stream_id(MasqueClientMode::ConnectUdp(inbound_tx))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to register connect-udp stream: {e}"))?;
+
+        let tx = crate::masque::connect_udp::QuicDatagramTx(datagram_sender);
+        self.executor.execute(async move {
+            // Keep the request-body sender and response alive so the H3 request
+            // stream — and the datagram flow — stays open for the session.
+            let _req_body_tx = req_body_tx;
+            let _resp = resp;
+            if let Err(e) =
+                crate::masque::connect_udp::run_bridge(socket, tx, inbound_rx, shutdown_token).await
+            {
+                tracing::error!("connect-udp bridge exited with error: {e}");
+            }
+        });
+        Ok(())
     }
 
     pub async fn start(

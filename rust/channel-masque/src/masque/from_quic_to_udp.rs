@@ -171,7 +171,7 @@ where
                             if resp_tx.send(Err(anyhow::anyhow!("no socket found for stream id {} and addr {}", stream_id, addr))).is_err() {
                                 tracing::debug!("NotifySocketConnected response receiver dropped");
                             }
-                            continue;                            
+                            continue;
                         };
                         if let Some(queued_datagram) = queued_datagrams.remove(&(stream_id, addr)) {
                             for datagram in queued_datagram {
@@ -231,6 +231,16 @@ where
                     tracing::error!("failed to decode var int from datagram");
                     continue;
                 };
+                // Concrete-target CONNECT-UDP forward proxy: deliver the
+                // context-stripped payload straight to the client bridge instead
+                // of resolving a per-peer socket. `try_send` drops on a full
+                // channel, matching stateless UDP semantics.
+                if let Some(crate::MasqueClientMode::ConnectUdp(tx)) = modes.get(&stream_id) {
+                    if let Err(e) = tx.try_send(bytes::Bytes::copy_from_slice(payload)) {
+                        tracing::debug!("connect-udp inbound drop for stream {}: {}", stream_id, e);
+                    }
+                    continue;
+                }
                 let addr = match compression_info.get(&(stream_id, context_id)) {
                     Some(Some(addr)) => *addr,
                     Some(None) => {
@@ -331,6 +341,11 @@ where
                                 tracing::error!("no notification sender for stream id {}", stream_id);
                             }
                             socket
+                        }
+                        crate::MasqueClientMode::ConnectUdp(_) => {
+                            // Payloads for this mode are delivered to the client
+                            // bridge above and never reach socket creation.
+                            continue;
                         }
                         crate::MasqueClientMode::WebRTC => {
                             let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.with_context(|| "failed to bind UDP socket")?);

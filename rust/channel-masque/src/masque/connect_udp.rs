@@ -30,6 +30,19 @@ pub trait DatagramTx: Send {
     fn send(&mut self, datagram: Bytes) -> anyhow::Result<()>;
 }
 
+/// [`DatagramTx`] backed by an established CONNECT-UDP session's QUIC datagram
+/// sender (the `ProxyState` `datagram_sender`). The framed bytes (context id +
+/// payload) are handed to the sender, which adds the HTTP Datagram flow id.
+pub struct QuicDatagramTx(pub Box<dyn crate::masque::from_udp_to_quic::ErasedSender>);
+
+impl DatagramTx for QuicDatagramTx {
+    fn send(&mut self, datagram: Bytes) -> anyhow::Result<()> {
+        self.0
+            .send(datagram)
+            .map_err(|e| anyhow::anyhow!("QUIC datagram send failed: {e:?}"))
+    }
+}
+
 /// Frame a UDP payload as an uncompressed (context id `0`) HTTP Datagram.
 fn frame_context0(payload: &[u8]) -> Bytes {
     let mut d = BytesMut::with_capacity(payload.len() + 1);
