@@ -98,7 +98,7 @@ impl ControlPlaneTransport for MasqueH3Transport {
 
 /// Build an msquic client registration + configuration (ALPN `h3` or `h3qx-01`
 /// for qmux), mirroring the `agent` crate's client setup.
-fn make_client_config(
+pub(crate) fn make_client_config(
     registration: Option<Arc<msquic::Registration>>,
     is_qmux: bool,
 ) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {

@@ -2817,6 +2817,7 @@ dependencies = [
  "channel-masque",
  "h3-util",
  "http",
+ "http-body",
  "http-body-util",
  "p256",
  "rand 0.8.6",
@@ -2827,7 +2828,11 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "tower",
+ "tower-http",
+ "tracing",
 ]
 
 [[package]]

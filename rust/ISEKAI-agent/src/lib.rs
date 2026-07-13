@@ -24,3 +24,7 @@ pub mod proxy;
 /// msquic HTTP/3 transport for the proxy control plane (feature `msquic`).
 #[cfg(feature = "msquic")]
 pub mod transport;
+
+/// MASQUE bind session for P2P relay (feature `msquic`).
+#[cfg(feature = "msquic")]
+pub mod bind;
