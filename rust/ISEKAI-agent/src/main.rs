@@ -205,13 +205,44 @@ struct Bind {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_env("SEERA_LOG"))
         .with_writer(std::io::stderr)
         .init();
 
     let cli: Cli = argh::from_env();
+    let result = dispatch(cli).await;
+
+    // One-shot CLI over msquic. msquic's `Registration` spawns native worker
+    // threads that outlive `main`, so a normal return would hang the process
+    // (and thus any script driving the CLI). Going through `std::process::exit`
+    // is no good either: it runs libc atexit / msquic's C++ static destructors,
+    // which race those worker threads and abort with SIGABRT. `_exit(2)`
+    // terminates immediately, skipping destructors — safe here because the
+    // command's output is already flushed to stdout/stderr below.
+    use std::io::Write as _;
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            1
+        }
+    };
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe { libc_exit(code) }
+}
+
+// Raw libc `_exit`: immediate process termination without running atexit
+// handlers or C++ static destructors (see the note in `main`). Always linked
+// (Rust binaries link libc), so no extra dependency is required.
+unsafe extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
+}
+
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
         Command::Keygen(a) => keygen(a),
         Command::Token(a) => token(a).await,
