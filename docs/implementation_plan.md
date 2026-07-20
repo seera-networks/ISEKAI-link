@@ -155,11 +155,11 @@ treats `0` as the target payload. This matches the server's context-0 handling
 
 Add options to `Connect` (main.rs):
 
-- `--auth0-token <JWT>` — the MASQUE data path authenticates with the **Auth0**
-  token, not the Endpoint Token (mirrors `bind.rs`). Required to run the relay.
+- `--relay` — switches `connect` from one-shot to running the relay leg. The
+  data path authenticates with the same `--token` / `--key` as the control
+  plane (see §4.3); no separate data-path credential is needed.
 - `--relay-local-addr <ip:port>` — local UDP socket to bind (default
-  `127.0.0.1:0`). Presence of this flag (or always, if `--auth0-token` given)
-  switches `connect` from one-shot to running the relay leg.
+  `127.0.0.1:0`).
 
 Flow:
 1. Call `peer_connect` (as today) and obtain `relay.masque_uri` and
@@ -169,10 +169,10 @@ Flow:
 3. `ConnectUdpForward::start` with:
    - `local_bind` = `--relay-local-addr`,
    - `target_path` = path component of `masque_uri`,
-   - headers: `Authorization: Bearer <auth0>` and
-     `seera-signaling-session-id: <relay.session_id>` (so the proxy binds this
-     initiator leg to an ephemeral loopback source for the rendezvous — see the
-     server-side phase-5 `read_public_address` change).
+   - headers: `Authorization: Bearer <endpoint_token>`, the PoP headers (§4.3)
+     and `seera-signaling-session-id: <relay.session_id>` (so the proxy binds
+     this initiator leg to an ephemeral loopback source for the rendezvous —
+     see the server-side phase-5 `read_public_address` change).
 4. Print the bound local address (JSON) so the application knows where to send,
    then run until Ctrl-C / shutdown.
 
@@ -186,10 +186,22 @@ shared pieces into a small helper if convenient.
 
 ### 4.3 Auth and headers
 
-- Data-path auth: `Authorization: Bearer <auth0_token>` (Auth0), whose `sub`
-  must own/party the P2P connection (server enforces).
+The data path authenticates exactly like the control plane (spec §13); the
+proxy authorizes the relay edge against the **Endpoint**, so an Auth0 token —
+which only identifies the user — no longer reaches a relay edge at all.
+
+- `Authorization: Bearer <endpoint_token>`. No Auth0 token: the Endpoint Token
+  already carries the user `sub` (spec §15.1).
+- `X-Endpoint-Id`, `X-PoP-Nonce`, `X-PoP-Timestamp`, `X-PoP-Signature` — the
+  PoP signature covers `CONNECT`, the request path, and an **empty body**
+  (spec §8.0, CONNECT-UDP variant: a CONNECT-UDP body is the capsule stream and
+  cannot be hashed at request time). The signed path is
+  `/.well-known/masque/udp/%2A/%2A/` (`channel_masque::CONNECT_UDP_BIND_PATH`)
+  for the bind leg, and the `masque_uri` path for the initiator leg.
 - `seera-signaling-session-id: <relay.session_id>` correlates the leg to the
   relay edge for the rendezvous binding.
+
+The signing Endpoint must be a party of the P2P connection (server enforces).
 
 ### 4.4 Proxy authority vs. `masque_uri` host
 
@@ -221,8 +233,8 @@ Parse `masque_uri` and use its `path_and_query`, discarding its authority.
 rust/channel-masque/src/masque/connect_udp.rs   (new) concrete-target CONNECT-UDP forward proxy
 rust/channel-masque/src/masque/mod.rs           (mod) pub mod connect_udp;
 rust/channel-masque/src/lib.rs                  (var) re-export ConnectUdpForward/Config; share request/datagram helpers
-rust/ISEKAI-agent/src/main.rs                   (var) Connect gains --auth0-token / --relay-local-addr; run the relay leg
-rust/ISEKAI-agent/src/bind.rs                   (var) factor out the shared msquic-config / header helper (optional)
+rust/ISEKAI-agent/src/main.rs                   (var) Connect gains --relay / --relay-local-addr; Bind takes --key/--token; run the relay leg
+rust/ISEKAI-agent/src/bind.rs                   (var) Endpoint Token + PoP on both legs; shared signing helper
 docs/implementation_plan.md                     (this document)
 ```
 

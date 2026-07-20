@@ -143,10 +143,11 @@ struct Connect {
     /// candidate `type,address,port` (repeatable)
     #[argh(option)]
     candidate: Vec<String>,
-    /// auth0 token for the relay data path; when set, opens the CONNECT-UDP
-    /// relay leg after connecting and runs it until Ctrl-C
-    #[argh(option)]
-    auth0_token: Option<String>,
+    /// open the CONNECT-UDP relay leg after connecting and run it until Ctrl-C.
+    /// The data path authenticates with the same Endpoint Token and key as the
+    /// control plane (--token / --key)
+    #[argh(switch)]
+    relay: bool,
     /// local UDP address to bind for the relay leg (default 127.0.0.1:0)
     #[argh(option)]
     relay_local_addr: Option<String>,
@@ -201,9 +202,13 @@ struct Bind {
     /// proxy base URL
     #[argh(option)]
     proxy_url: String,
-    /// auth0 access token (the MASQUE data path authenticates with Auth0)
+    /// path to the Endpoint PKCS#8 PEM key (for PoP)
     #[argh(option)]
-    auth0_token: String,
+    key: PathBuf,
+    /// endpoint Token (Bearer) — the MASQUE data path authenticates with the
+    /// Endpoint Token + PoP, not with an Auth0 token
+    #[argh(option)]
+    token: String,
     /// connection id to tag the bind session with
     #[argh(option)]
     connection_id: String,
@@ -300,9 +305,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .peer_connect(&a.capability, &a.listener_id, &a.protocol, &candidates)
                 .await?;
             print_json(&conn)?;
-            // When an Auth0 token is supplied, open the CONNECT-UDP relay leg to
-            // the returned masque_uri and run it until Ctrl-C.
-            if let Some(auth0) = a.auth0_token.as_deref() {
+            // With --relay, open the CONNECT-UDP relay leg to the returned
+            // masque_uri and run it until Ctrl-C.
+            if a.relay {
                 let relay = conn.relay.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("connect response has no relay info; cannot open relay leg")
                 })?;
@@ -314,7 +319,8 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     .context("invalid --relay-local-addr")?;
                 let handle = open_connect_relay(
                     &a.proxy_url,
-                    auth0,
+                    &a.token,
+                    &load_key(&a.key)?,
                     &conn.connection_id,
                     &relay.masque_uri,
                     local_bind,
@@ -388,8 +394,9 @@ async fn token(a: Token) -> anyhow::Result<()> {
 }
 
 async fn run_bind(a: Bind) -> anyhow::Result<()> {
+    let key = load_key(&a.key)?;
     let mut session =
-        open_bind_session(&a.proxy_url, &a.auth0_token, &a.connection_id, a.forward_to)?;
+        open_bind_session(&a.proxy_url, &a.token, &key, &a.connection_id, a.forward_to)?;
     eprintln!(
         "bind session open for connection {} (forwarding to {}); Ctrl-C to stop",
         a.connection_id, a.forward_to

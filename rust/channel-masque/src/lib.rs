@@ -44,6 +44,14 @@ pub mod masque;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024;
 
+/// The `:path` of a CONNECT-UDP **bind** request (`{target}`/`{port}` both the
+/// wildcard `*`, percent-encoded).
+///
+/// Exported because a caller that signs the request — P2P Connect requires a
+/// PoP signature over the exact request path (spec §8.0) — must sign the same
+/// string [`MasqueClient::start`] puts on the wire.
+pub const CONNECT_UDP_BIND_PATH: &str = "/.well-known/masque/udp/%2A/%2A/";
+
 pub fn decode_var_int(data: &[u8]) -> Option<(u64, &[u8])> {
     if data.is_empty() {
         return None;
@@ -762,7 +770,7 @@ where
         ) = tokio::sync::mpsc::channel(1);
         let req_build = Request::builder()
             .method(Method::CONNECT)
-            .uri("/.well-known/masque/udp/%2A/%2A/")
+            .uri(CONNECT_UDP_BIND_PATH)
             .header("connect-udp-bind", "?1")
             .header("capsule-protocol", "?1")
             .extension(Protocol::CONNECT_UDP);
