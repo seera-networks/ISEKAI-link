@@ -212,23 +212,29 @@ struct Bind {
     forward_to: SocketAddr,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_env("SEERA_LOG"))
         .with_writer(std::io::stderr)
         .init();
 
     let cli: Cli = argh::from_env();
-    let result = dispatch(cli).await;
 
-    // `dispatch` has returned, so every transport, bind session and relay leg it
-    // built is dropped and the only msquic handles left are the ones held by the
-    // background h3 drivers. Draining the registration ends those drivers and
-    // closes their connections, after which `RegistrationClose` returns promptly
-    // and the native worker threads are gone — so a normal exit no longer races
-    // them.
-    let drained = shutdown_msquic(MSQUIC_DRAIN_TIMEOUT).await;
+    let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
+    let (result, drained) = runtime.block_on(async {
+        let result = dispatch(cli).await;
+        // `dispatch` has returned, so every transport, bind session and relay
+        // leg it built is dropped and the only msquic handles left are the ones
+        // held by the background h3 drivers. Draining the registration ends
+        // those drivers and closes their connections, after which
+        // `RegistrationClose` returns promptly.
+        let drained = shutdown_msquic(MSQUIC_DRAIN_TIMEOUT).await;
+        (result, drained)
+    });
+    // Join the worker threads before exiting: msquic's `MsQuicClose` runs from a
+    // process destructor, and it must not race tokio tasks that could still be
+    // touching msquic.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
     use std::io::Write as _;
     let code = match result {
@@ -259,6 +265,9 @@ async fn main() {
 /// hard. Generous: this only elapses if a handle leaked, and the fallback path
 /// is a `_exit(2)` that skips destructors.
 const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the tokio worker threads to finish after the drain.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Raw libc `_exit`: immediate process termination without running atexit
 // handlers or C++ static destructors (see the note in `main`). Always linked
