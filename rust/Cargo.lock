@@ -2335,7 +2335,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/hyperium/h3?rev=refs%2Fpull%2F340%2Fhead#385da3ad93407ec8eed15172f63561f6fb2bca40"
+source = "git+https://github.com/hyperium/h3?rev=385da3ad93407ec8eed15172f63561f6fb2bca40#385da3ad93407ec8eed15172f63561f6fb2bca40"
 dependencies = [
  "bytes",
  "fastrand 2.4.1",
@@ -2348,7 +2348,7 @@ dependencies = [
 [[package]]
 name = "h3-datagram"
 version = "0.0.2"
-source = "git+https://github.com/hyperium/h3?rev=refs%2Fpull%2F340%2Fhead#385da3ad93407ec8eed15172f63561f6fb2bca40"
+source = "git+https://github.com/hyperium/h3?rev=385da3ad93407ec8eed15172f63561f6fb2bca40#385da3ad93407ec8eed15172f63561f6fb2bca40"
 dependencies = [
  "bytes",
  "h3",
@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "h3-msquic-async"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2370,7 +2370,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/hyperium/h3?rev=refs%2Fpull%2F340%2Fhead#385da3ad93407ec8eed15172f63561f6fb2bca40"
+source = "git+https://github.com/hyperium/h3?rev=385da3ad93407ec8eed15172f63561f6fb2bca40#385da3ad93407ec8eed15172f63561f6fb2bca40"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3195,7 +3195,7 @@ dependencies = [
 
 [[package]]
 name = "msquic-async"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "futures-io",

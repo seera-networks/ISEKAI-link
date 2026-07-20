@@ -22,13 +22,13 @@ use tower_http::{auth::AddAuthorizationLayer, set_header::SetRequestHeaderLayer}
 use tracing_subscriber::EnvFilter;
 
 fn make_msquic_async_client_config(
-    registration: Option<Arc<msquic::Registration>>,
+    registration: Option<Arc<msquic_async::Registration>>,
     is_qmux: bool,
-) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
+) -> anyhow::Result<(Arc<msquic_async::Registration>, Arc<msquic::Configuration>)> {
     let registration = if let Some(registration) = registration {
         registration
     } else {
-        Arc::new(msquic::Registration::new(
+        Arc::new(msquic_async::Registration::new(
             &msquic::RegistrationConfig::default(),
         )?)
     };
@@ -37,8 +37,7 @@ fn make_msquic_async_client_config(
     } else {
         [msquic::BufferRef::from("h3qx-01")]
     };
-    let configuration = msquic::Configuration::open(
-        &registration,
+    let configuration = registration.open_configuration(
         &alpn,
         Some(
             &msquic::Settings::new()
@@ -57,16 +56,16 @@ fn make_msquic_async_client_config(
 }
 
 fn make_msquic_async_listner(
-    registration: Option<Arc<msquic::Registration>>,
+    registration: Option<Arc<msquic_async::Registration>>,
     is_qmux: bool,
     addr: Option<SocketAddr>,
     cert_pem: &str,
     key_pem: &str,
-) -> anyhow::Result<(Arc<msquic::Registration>, msquic_async::Listener)> {
+) -> anyhow::Result<(Arc<msquic_async::Registration>, msquic_async::Listener)> {
     let registration = if let Some(registration) = registration {
         registration
     } else {
-        Arc::new(msquic::Registration::new(
+        Arc::new(msquic_async::Registration::new(
             &msquic::RegistrationConfig::default(),
         )?)
     };
@@ -75,8 +74,7 @@ fn make_msquic_async_listner(
     } else {
         [msquic::BufferRef::from("h3qx-01")]
     };
-    let configuration = msquic::Configuration::open(
-        &registration,
+    let configuration = registration.open_configuration(
         &alpn,
         Some(
             &&&msquic::Settings::new()
@@ -119,7 +117,7 @@ fn make_msquic_async_listner(
 
 async fn create_normal_channel(
     uri: Uri,
-    reg: Arc<msquic::Registration>,
+    reg: Arc<msquic_async::Registration>,
     config: Arc<msquic::Configuration>,
     config_qmux: Arc<msquic::Configuration>,
 ) -> anyhow::Result<channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>> {
@@ -280,7 +278,7 @@ async fn create_h3_server(
 
 async fn create_masque_channel(
     uri: Uri,
-    reg: Arc<msquic::Registration>,
+    reg: Arc<msquic_async::Registration>,
     config: Arc<msquic::Configuration>,
     config_qmux: Arc<msquic::Configuration>,
 ) -> anyhow::Result<

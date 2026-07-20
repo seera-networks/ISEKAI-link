@@ -27,7 +27,7 @@ use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 async fn run_isekai_connection(
-    reg: Arc<msquic::Registration>,
+    reg: Arc<msquic_async::Registration>,
     target: String,
     jwt: String,
     mut mjpeg_rx: tokio::sync::mpsc::Receiver<Bytes>,
@@ -152,7 +152,8 @@ async fn main() -> eframe::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let reg = Arc::new(msquic::Registration::new(&msquic::RegistrationConfig::default()).unwrap());
+    let reg =
+        Arc::new(msquic_async::Registration::new(&msquic::RegistrationConfig::default()).unwrap());
 
     let (tx, rx) = mpsc::channel();
     let is_streaming = Arc::new(AtomicBool::new(false));
@@ -258,7 +259,7 @@ struct MyApp {
     jwt: String,
     is_open: bool,
 
-    reg: Arc<msquic::Registration>,
+    reg: Arc<msquic_async::Registration>,
     // 非同期タスクとの共有状態
     open_task: Option<tokio::task::AbortHandle>,
     shutdown_token: Option<CancellationToken>,
@@ -277,7 +278,7 @@ struct MyApp {
 
 impl MyApp {
     fn new(
-        reg: Arc<msquic::Registration>,
+        reg: Arc<msquic_async::Registration>,
         rx: mpsc::Receiver<([usize; 2], Bytes)>,
         is_streaming: Arc<AtomicBool>,
         mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,

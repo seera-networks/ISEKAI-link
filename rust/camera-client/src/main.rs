@@ -6,18 +6,17 @@ use std::sync::Arc;
 use tokio::{io::AsyncReadExt, sync::mpsc};
 
 fn make_msquic_async_client_config(
-    registration: Option<Arc<msquic::Registration>>,
-) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
+    registration: Option<Arc<msquic_async::Registration>>,
+) -> anyhow::Result<(Arc<msquic_async::Registration>, Arc<msquic::Configuration>)> {
     let registration = if let Some(registration) = registration {
         registration
     } else {
-        Arc::new(msquic::Registration::new(
+        Arc::new(msquic_async::Registration::new(
             &msquic::RegistrationConfig::default(),
         )?)
     };
     let alpn = [msquic::BufferRef::from("sample")];
-    let configuration = msquic::Configuration::open(
-        &registration,
+    let configuration = registration.open_configuration(
         &alpn,
         Some(
             &msquic::Settings::new()

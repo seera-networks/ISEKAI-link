@@ -12,7 +12,7 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use channel_masque::H3Channel;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
-use h3_util::msquic_async::h3_msquic_async::msquic;
+use h3_util::msquic_async::h3_msquic_async::{msquic, msquic_async};
 use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full};
 use tower::{Service, ServiceExt};
@@ -99,12 +99,12 @@ impl ControlPlaneTransport for MasqueH3Transport {
 /// Build an msquic client registration + configuration (ALPN `h3` or `h3qx-01`
 /// for qmux), mirroring the `agent` crate's client setup.
 pub(crate) fn make_client_config(
-    registration: Option<Arc<msquic::Registration>>,
+    registration: Option<Arc<msquic_async::Registration>>,
     is_qmux: bool,
-) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
+) -> anyhow::Result<(Arc<msquic_async::Registration>, Arc<msquic::Configuration>)> {
     let registration = match registration {
         Some(registration) => registration,
-        None => Arc::new(msquic::Registration::new(
+        None => Arc::new(msquic_async::Registration::new(
             &msquic::RegistrationConfig::default(),
         )?),
     };
@@ -113,8 +113,7 @@ pub(crate) fn make_client_config(
     } else {
         [msquic::BufferRef::from("h3")]
     };
-    let configuration = msquic::Configuration::open(
-        &registration,
+    let configuration = registration.open_configuration(
         &alpn,
         Some(
             &msquic::Settings::new()

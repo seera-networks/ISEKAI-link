@@ -22,7 +22,10 @@
 ///   masque-h3-server [--target <url>] [--jwt <token>]
 use argh::FromArgs;
 use bytes::Bytes;
-use h3_util::msquic_async::{H3MsQuicAsyncConnector, h3_msquic_async::msquic};
+use h3_util::msquic_async::{
+    H3MsQuicAsyncConnector,
+    h3_msquic_async::{msquic, msquic_async},
+};
 use http::{
     Request, Uri,
     header::{HeaderName, HeaderValue},
@@ -41,13 +44,13 @@ use tracing_subscriber::EnvFilter;
 // ── MASQUE client (msquic) setup ─────────────────────────────────────────────
 
 fn make_msquic_async_reg_and_config(
-    registration: Option<Arc<msquic::Registration>>,
+    registration: Option<Arc<msquic_async::Registration>>,
     is_qmux: bool,
-) -> anyhow::Result<(Arc<msquic::Registration>, Arc<msquic::Configuration>)> {
+) -> anyhow::Result<(Arc<msquic_async::Registration>, Arc<msquic::Configuration>)> {
     let registration = if let Some(registration) = registration {
         registration
     } else {
-        Arc::new(msquic::Registration::new(
+        Arc::new(msquic_async::Registration::new(
             &msquic::RegistrationConfig::default(),
         )?)
     };
@@ -56,8 +59,7 @@ fn make_msquic_async_reg_and_config(
     } else {
         [msquic::BufferRef::from("h3qx-01")]
     };
-    let configuration = msquic::Configuration::open(
-        &registration,
+    let configuration = registration.open_configuration(
         &alpn,
         Some(
             &&msquic::Settings::new()
@@ -219,7 +221,7 @@ struct UdpModeSettingResponse {
 
 async fn create_normal_channel(
     uri: Uri,
-    reg: Arc<msquic::Registration>,
+    reg: Arc<msquic_async::Registration>,
     config: Arc<msquic::Configuration>,
     config_qmux: Arc<msquic::Configuration>,
 ) -> anyhow::Result<channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>> {
