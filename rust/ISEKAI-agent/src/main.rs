@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use argh::FromArgs;
@@ -14,7 +15,7 @@ use isekai_agent::bind::{open_bind_session, open_connect_relay};
 use isekai_agent::endpoint::EndpointKey;
 use isekai_agent::identity::IdentityClient;
 use isekai_agent::proxy::{Candidate, CandidateType, ControlPlaneTransport, ProxyClient};
-use isekai_agent::transport::MasqueH3Transport;
+use isekai_agent::transport::{MasqueH3Transport, shutdown_msquic};
 
 /// ISEKAI P2P Connect agent.
 #[derive(FromArgs)]
@@ -221,13 +222,14 @@ async fn main() {
     let cli: Cli = argh::from_env();
     let result = dispatch(cli).await;
 
-    // One-shot CLI over msquic. msquic's `Registration` spawns native worker
-    // threads that outlive `main`, so a normal return would hang the process
-    // (and thus any script driving the CLI). Going through `std::process::exit`
-    // is no good either: it runs libc atexit / msquic's C++ static destructors,
-    // which race those worker threads and abort with SIGABRT. `_exit(2)`
-    // terminates immediately, skipping destructors — safe here because the
-    // command's output is already flushed to stdout/stderr below.
+    // `dispatch` has returned, so every transport, bind session and relay leg it
+    // built is dropped and the only msquic handles left are the ones held by the
+    // background h3 drivers. Draining the registration ends those drivers and
+    // closes their connections, after which `RegistrationClose` returns promptly
+    // and the native worker threads are gone — so a normal exit no longer races
+    // them.
+    let drained = shutdown_msquic(MSQUIC_DRAIN_TIMEOUT).await;
+
     use std::io::Write as _;
     let code = match result {
         Ok(()) => 0,
@@ -238,8 +240,25 @@ async fn main() {
     };
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+
+    if drained {
+        std::process::exit(code);
+    }
+
+    // The drain timed out, so msquic handles are still live and its worker
+    // threads are still running. Returning normally would hang this one-shot CLI
+    // (and any script driving it), and `std::process::exit` would run libc
+    // atexit / msquic's C++ static destructors, which race those threads and
+    // abort with SIGABRT. `_exit(2)` terminates immediately, skipping
+    // destructors — safe here because output is already flushed above.
+    tracing::warn!("msquic drain timed out; exiting without running destructors");
     unsafe { libc_exit(code) }
 }
+
+/// How long to wait for msquic handles to close before giving up and exiting
+/// hard. Generous: this only elapses if a handle leaked, and the fallback path
+/// is a `_exit(2)` that skips destructors.
+const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Raw libc `_exit`: immediate process termination without running atexit
 // handlers or C++ static destructors (see the note in `main`). Always linked

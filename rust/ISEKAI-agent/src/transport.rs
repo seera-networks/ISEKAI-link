@@ -6,7 +6,8 @@
 //! msquic-served proxy. Header injection (Endpoint Token + PoP) is done by the
 //! caller ([`crate::proxy::ProxyClient`]); this just performs the exchange.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Bytes;
@@ -96,17 +97,87 @@ impl ControlPlaneTransport for MasqueH3Transport {
     }
 }
 
+/// The process-wide msquic registration.
+///
+/// One registration per process, so [`shutdown_msquic`] has a single thing to
+/// drain: every connection the CLI opens (control plane, bind session, relay
+/// leg) hangs off it, and `wait_idle()` only means "safe to close" if nothing
+/// else is still running on a registration we forgot about.
+///
+/// The `Option` exists so `shutdown_msquic` can `take()` the last strong
+/// reference and let `RegistrationClose` run at a point where we know it will
+/// not block.
+static REGISTRATION: Mutex<Option<Arc<msquic_async::Registration>>> = Mutex::new(None);
+
+/// The shared registration, opening it on first use.
+fn shared_registration() -> anyhow::Result<Arc<msquic_async::Registration>> {
+    let mut slot = REGISTRATION.lock().expect("registration mutex poisoned");
+    if let Some(registration) = slot.as_ref() {
+        return Ok(registration.clone());
+    }
+    let registration = Arc::new(msquic_async::Registration::new(
+        &msquic::RegistrationConfig::default(),
+    )?);
+    *slot = Some(registration.clone());
+    Ok(registration)
+}
+
+/// Shut the msquic registration down and wait until every connection and stream
+/// derived from it has been closed. Returns `false` if `timeout` elapsed first.
+///
+/// Call this once, after everything holding an msquic handle has been dropped
+/// and before leaving `main`. `shutdown()` asks the connections to go away,
+/// which ends the background h3 drivers holding them; `wait_idle()` then
+/// resolves once the last handle is closed, which is exactly the condition
+/// under which `RegistrationClose` returns promptly instead of blocking in
+/// `CxPlatRundownReleaseAndWait`.
+///
+/// On timeout the registration is deliberately **leaked** rather than dropped:
+/// something still holds a handle, so `RegistrationClose` would block forever,
+/// and the caller is expected to fall back to a hard exit.
+pub async fn shutdown_msquic(timeout: Duration) -> bool {
+    let registration = REGISTRATION
+        .lock()
+        .expect("registration mutex poisoned")
+        .take();
+    let Some(registration) = registration else {
+        // No msquic work happened this run (e.g. `keygen`).
+        return true;
+    };
+    registration.shutdown();
+    match tokio::time::timeout(timeout, registration.wait_idle()).await {
+        Ok(()) => {
+            // Last strong reference, so this runs RegistrationClose, which now
+            // has nothing left to wait for.
+            drop(registration);
+            true
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?timeout,
+                "msquic registration still has live handles; skipping RegistrationClose"
+            );
+            std::mem::forget(registration);
+            false
+        }
+    }
+}
+
 /// Build an msquic client registration + configuration (ALPN `h3` or `h3qx-01`
 /// for qmux), mirroring the `agent` crate's client setup.
+///
+/// The returned [`msquic::Configuration`] is intentionally *not* tracked by
+/// `wait_idle()` (a configuration's rundown reference outlives
+/// `ConfigurationClose`), so callers must drop it before the registration —
+/// which they do, since the connector owning it is dropped well before
+/// [`shutdown_msquic`] runs.
 pub(crate) fn make_client_config(
     registration: Option<Arc<msquic_async::Registration>>,
     is_qmux: bool,
 ) -> anyhow::Result<(Arc<msquic_async::Registration>, Arc<msquic::Configuration>)> {
     let registration = match registration {
         Some(registration) => registration,
-        None => Arc::new(msquic_async::Registration::new(
-            &msquic::RegistrationConfig::default(),
-        )?),
+        None => shared_registration()?,
     };
     let alpn = if is_qmux {
         [msquic::BufferRef::from("h3qx-01")]
