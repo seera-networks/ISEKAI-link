@@ -13,6 +13,7 @@ use anyhow::{Context, bail};
 use argh::FromArgs;
 use isekai_agent::bind::{open_bind_session, open_connect_relay};
 use isekai_agent::endpoint::EndpointKey;
+use isekai_agent::https::HttpsTransport;
 use isekai_agent::identity::IdentityClient;
 use isekai_agent::proxy::{Candidate, CandidateType, ControlPlaneTransport, ProxyClient};
 use isekai_agent::transport::{MasqueH3Transport, shutdown_msquic};
@@ -50,9 +51,12 @@ struct Keygen {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "token")]
 struct Token {
-    /// identity API base URL (e.g. https://identity.isekai.link)
+    /// identity API base URL (HTTPS only, e.g. https://identity.isekai.link:8443)
     #[argh(option)]
     identity_url: String,
+    /// talk to the Identity API over HTTP/3 (QUIC) instead of HTTP/1.1 + HTTP/2
+    #[argh(switch)]
+    identity_http3: bool,
     /// auth0 access token (Bearer)
     #[argh(option)]
     auth0_token: String,
@@ -374,15 +378,15 @@ fn keygen(a: Keygen) -> anyhow::Result<()> {
 
 async fn token(a: Token) -> anyhow::Result<()> {
     let key = load_key(&a.key)?;
-    let client = IdentityClient::new(&a.identity_url);
-    let token = if a.register {
-        client
-            .register_and_issue(&a.auth0_token, &key, a.device_name.as_deref(), a.ttl)
-            .await?
+    // The Identity API serves h1/h2 on TCP+TLS and h3 on QUIC at the same port.
+    // Default to the TCP listener; `--identity-http3` picks the QUIC one, which
+    // reuses the msquic H3 stack the proxy control plane already speaks.
+    let token = if a.identity_http3 {
+        let client = IdentityClient::new(MasqueH3Transport::connect(&a.identity_url)?);
+        issue(&client, &a, &key).await?
     } else {
-        client
-            .issue_token(&a.auth0_token, &key, None, None, a.ttl)
-            .await?
+        let client = IdentityClient::new(HttpsTransport::connect(&a.identity_url)?);
+        issue(&client, &a, &key).await?
     };
     print_json(&serde_json::json!({
         "endpoint_token": token.endpoint_token,
@@ -391,6 +395,25 @@ async fn token(a: Token) -> anyhow::Result<()> {
         "permissions": token.permissions,
         "protocols": token.protocols,
     }))
+}
+
+/// Register (when asked) and issue an Endpoint Token, over whichever transport
+/// the caller built.
+async fn issue<T: ControlPlaneTransport>(
+    client: &IdentityClient<T>,
+    a: &Token,
+    key: &EndpointKey,
+) -> anyhow::Result<isekai_agent::identity::EndpointToken> {
+    let token = if a.register {
+        client
+            .register_and_issue(&a.auth0_token, key, a.device_name.as_deref(), a.ttl)
+            .await?
+    } else {
+        client
+            .issue_token(&a.auth0_token, key, None, None, a.ttl)
+            .await?
+    };
+    Ok(token)
 }
 
 async fn run_bind(a: Bind) -> anyhow::Result<()> {

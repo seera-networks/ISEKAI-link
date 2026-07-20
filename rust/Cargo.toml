@@ -31,7 +31,9 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "jwk",
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
 rand = "0.8.4"
 # HTTP(S) client for the Identity API (registration + Endpoint Token, plain HTTPS).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `http2` so ALPN can negotiate h2 with the Identity API, which serves h1/h2 on
+# TCP+TLS (and h3 on QUIC, reached through the msquic transport instead).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 schannel = "0.1.27"

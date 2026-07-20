@@ -29,7 +29,6 @@ msquic = [
     "dep:tower-http",
     "dep:tokio-stream",
     "dep:tokio-util",
-    "dep:tracing",
     "dep:argh",
     "dep:tracing-subscriber",
 ]
@@ -47,6 +46,9 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+# Not optional: the HTTPS transport warns when TLS validation is skipped, and
+# that path exists in every build.
+tracing = { workspace = true }
 
 # msquic H3 transport + MASQUE bind session (feature `msquic`).
 channel-masque = { workspace = true, optional = true }
@@ -59,7 +61,6 @@ tower = { workspace = true, optional = true, features = ["util"] }
 tower-http = { workspace = true, optional = true, features = ["auth", "set-header"] }
 tokio-stream = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]

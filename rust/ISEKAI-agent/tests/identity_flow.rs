@@ -13,6 +13,7 @@ use axum::routing::post;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use isekai_agent::endpoint::EndpointKey;
+use isekai_agent::https::HttpsTransport;
 use isekai_agent::identity::IdentityClient;
 use p256::ecdsa::Signature;
 use serde_json::{Value, json};
@@ -77,7 +78,11 @@ async fn register_and_issue_sends_correct_requests() {
     });
 
     let key = EndpointKey::generate();
-    let client = IdentityClient::new(format!("http://{addr}"));
+    // The mock speaks cleartext h1; the transport is the same one that talks
+    // h1/h2 over TLS to the real Identity API.
+    let client = IdentityClient::new(
+        HttpsTransport::connect(&format!("http://{addr}")).expect("transport builds"),
+    );
     let token = client
         .register_and_issue("AUTH0_AT", &key, Some("test-device"), Some(900))
         .await

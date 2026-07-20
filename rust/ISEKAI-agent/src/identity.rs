@@ -1,11 +1,14 @@
 //! Identity API client (spec §8.1 / §8.2): Endpoint registration and Endpoint
 //! Token acquisition.
 //!
-//! The Identity API (`ISEKAI-identity`) is a plain-HTTPS service, so this client
-//! uses `reqwest`. Every call carries the user's Auth0 Access Token as
-//! `Authorization: Bearer`; token issuance additionally requires Proof-of-
-//! Possession over the request. Signatures use base64url(DER), the encoding the
-//! Identity API requires.
+//! The Identity API (`ISEKAI-identity`) is HTTPS-only and serves HTTP/1.1 and
+//! HTTP/2 on TCP plus HTTP/3 on QUIC at the same port, so this client is generic
+//! over [`ControlPlaneTransport`]: pair it with [`crate::https::HttpsTransport`]
+//! for h1/h2 or [`crate::transport::MasqueH3Transport`] for h3.
+//!
+//! Every call carries the user's Auth0 Access Token as `Authorization: Bearer`;
+//! token issuance additionally requires Proof-of-Possession over the request.
+//! Signatures use base64url(DER), the encoding the Identity API requires.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -14,12 +17,13 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::endpoint::EndpointKey;
 use crate::pop;
+use crate::proxy::ControlPlaneTransport;
 
 /// Errors from Identity API calls.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
-    #[error("HTTP transport error: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("transport error: {0}")]
+    Transport(#[from] anyhow::Error),
     #[error("Identity API returned {status}: {body}")]
     Api { status: u16, body: String },
     #[error("failed to format timestamp")]
@@ -57,24 +61,18 @@ pub struct EndpointToken {
     pub protocols: Vec<String>,
 }
 
-/// A client for the ISEKAI Identity API.
+/// A client for the ISEKAI Identity API over `T`.
+///
+/// The transport owns the base URL, so every request here is a path.
 #[derive(Debug, Clone)]
-pub struct IdentityClient {
-    base_url: String,
-    http: reqwest::Client,
+pub struct IdentityClient<T> {
+    transport: T,
 }
 
-impl IdentityClient {
-    /// Create a client for the Identity API at `base_url`
-    /// (e.g. `https://identity.isekai.link`).
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self::with_client(base_url, reqwest::Client::new())
-    }
-
-    /// Create a client with a caller-provided [`reqwest::Client`].
-    pub fn with_client(base_url: impl Into<String>, http: reqwest::Client) -> Self {
-        let base_url = base_url.into().trim_end_matches('/').to_owned();
-        Self { base_url, http }
+impl<T: ControlPlaneTransport> IdentityClient<T> {
+    /// Create a client that speaks to the Identity API over `transport`.
+    pub fn new(transport: T) -> Self {
+        Self { transport }
     }
 
     /// §8.1.1 — request a registration challenge for `key`.
@@ -156,46 +154,44 @@ impl IdentityClient {
         self.issue_token(auth0_token, key, None, None, ttl).await
     }
 
-    async fn post<T: for<'de> Deserialize<'de>>(
+    async fn post<R: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         auth0_token: &str,
         pop: Option<&pop::PopHeaders>,
         body: Value,
-    ) -> Result<T, IdentityError> {
+    ) -> Result<R, IdentityError> {
         let bytes = serde_json::to_vec(&body).expect("json body serializes");
         self.post_bytes(path, auth0_token, pop, bytes).await
     }
 
-    async fn post_bytes<T: for<'de> Deserialize<'de>>(
+    async fn post_bytes<R: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         auth0_token: &str,
         pop: Option<&pop::PopHeaders>,
         body: Vec<u8>,
-    ) -> Result<T, IdentityError> {
-        let mut req = self
-            .http
-            .post(format!("{}{path}", self.base_url))
-            .header("authorization", format!("Bearer {auth0_token}"))
-            .header("content-type", "application/json")
-            .body(body);
+    ) -> Result<R, IdentityError> {
+        let mut headers = vec![
+            ("authorization".to_owned(), format!("Bearer {auth0_token}")),
+            ("content-type".to_owned(), "application/json".to_owned()),
+        ];
         if let Some(pop) = pop {
-            for (name, value) in pop.as_pairs() {
-                req = req.header(name, value);
-            }
+            headers.extend(
+                pop.as_pairs()
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), value.to_owned())),
+            );
         }
-        let resp = req.send().await?;
-        let status = resp.status();
-        let bytes = resp.bytes().await?;
-        if !status.is_success() {
+        let resp = self.transport.send("POST", path, &headers, body).await?;
+        if !(200..300).contains(&resp.status) {
             return Err(IdentityError::Api {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&bytes).into_owned(),
+                status: resp.status,
+                body: String::from_utf8_lossy(&resp.body).into_owned(),
             });
         }
-        serde_json::from_slice(&bytes).map_err(|e| IdentityError::Api {
-            status: status.as_u16(),
+        serde_json::from_slice(&resp.body).map_err(|e| IdentityError::Api {
+            status: resp.status,
             body: format!("invalid response JSON: {e}"),
         })
     }
