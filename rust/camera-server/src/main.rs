@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use camera_core::{P2pConfig, ServerCommand, ServerInfo};
 use eframe::egui;
 use http::Uri;
 use isekai_link_utils::{
@@ -23,6 +24,7 @@ use std::{
     },
     thread,
 };
+use tokio::sync::oneshot;
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -253,11 +255,40 @@ async fn main() -> eframe::Result<()> {
     res
 }
 
+/// How the camera stream reaches clients.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Mode {
+    /// Legacy: proxy-issued cert + public address, client dials it directly.
+    Direct,
+    /// P2P Connect: stream over the MASQUE relay (no public address).
+    P2p,
+}
+
+/// Shared runtime state of a running P2P server, updated by the async task and
+/// read by the UI.
+#[derive(Default)]
+struct P2pShared {
+    info: Option<ServerInfo>,
+    capability: Option<String>,
+    status: String,
+}
+
 struct MyApp {
     // 接続設定
+    mode: Mode,
     target: String,
     jwt: String,
     is_open: bool,
+
+    // P2P 接続設定
+    identity_url: String,
+    proxy_url: String,
+    auth0_token: String,
+    key_path: String,
+    protocol: String,
+    register: bool,
+    client_endpoint_id: String,
+    client_connection_id: String,
 
     reg: Arc<msquic_async::Registration>,
     // 非同期タスクとの共有状態
@@ -266,6 +297,10 @@ struct MyApp {
     mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
     public_address: Arc<Mutex<Option<String>>>,
     log_shared: Arc<Mutex<String>>,
+
+    // P2P 実行時の共有状態
+    p2p_shared: Arc<Mutex<P2pShared>>,
+    p2p_commands: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ServerCommand>>>>,
 
     // カメラ表示
     rx: mpsc::Receiver<([usize; 2], Bytes)>,
@@ -285,14 +320,25 @@ impl MyApp {
     ) -> Self {
         Self {
             reg,
+            mode: Mode::Direct,
             target: "https://link2.isekai.tools:8443".to_string(),
             jwt: String::new(),
             is_open: false,
+            identity_url: "https://identity.isekai.link:8443".to_string(),
+            proxy_url: "https://proxy.isekai.link:8443".to_string(),
+            auth0_token: String::new(),
+            key_path: "camera-server-endpoint.pem".to_string(),
+            protocol: "isekai-validator-v1".to_string(),
+            register: true,
+            client_endpoint_id: String::new(),
+            client_connection_id: String::new(),
             open_task: None,
             shutdown_token: None,
             mjpeg_tx_holder,
             public_address: Arc::new(Mutex::new(None)),
             log_shared: Arc::new(Mutex::new("Ready.".to_string())),
+            p2p_shared: Arc::new(Mutex::new(P2pShared::default())),
+            p2p_commands: Arc::new(Mutex::new(None)),
             rx,
             texture: None,
             is_streaming,
@@ -301,6 +347,13 @@ impl MyApp {
     }
 
     fn open(&mut self) {
+        match self.mode {
+            Mode::Direct => self.open_direct(),
+            Mode::P2p => self.open_p2p(),
+        }
+    }
+
+    fn open_direct(&mut self) {
         let (mjpeg_tx, mjpeg_rx) = tokio::sync::mpsc::channel::<Bytes>(100);
         *self.mjpeg_tx_holder.lock().unwrap() = Some(mjpeg_tx);
 
@@ -337,6 +390,121 @@ impl MyApp {
         self.is_open = true;
     }
 
+    fn open_p2p(&mut self) {
+        let (mjpeg_tx, mjpeg_rx) = tokio::sync::mpsc::channel::<Bytes>(100);
+        *self.mjpeg_tx_holder.lock().unwrap() = Some(mjpeg_tx);
+
+        let shutdown = CancellationToken::new();
+        self.shutdown_token = Some(shutdown.clone());
+        *self.p2p_shared.lock().unwrap() = P2pShared {
+            status: "P2P: connecting...".to_string(),
+            ..Default::default()
+        };
+        *self.p2p_commands.lock().unwrap() = None;
+
+        let reg = Arc::clone(&self.reg);
+        let shared = Arc::clone(&self.p2p_shared);
+        let cmd_holder = Arc::clone(&self.p2p_commands);
+        let identity_url = self.identity_url.clone();
+        let proxy_url = self.proxy_url.clone();
+        let auth0_token = self.auth0_token.clone();
+        let protocol = self.protocol.clone();
+        let register = self.register;
+        let key_path = self.key_path.clone();
+
+        let handle = tokio::spawn(async move {
+            let key = match camera_core::load_or_generate_key(std::path::Path::new(&key_path)) {
+                Ok(key) => key,
+                Err(e) => {
+                    shared.lock().unwrap().status = format!("key error: {e:#}");
+                    return;
+                }
+            };
+            let cfg = P2pConfig {
+                identity_url,
+                identity_http3: false,
+                proxy_url,
+                auth0_token,
+                protocol,
+                register,
+                device_name: Some("camera-server".to_string()),
+                token_ttl: None,
+                key,
+            };
+            match camera_core::spawn_p2p_server(Some(reg), cfg, mjpeg_rx, shutdown).await {
+                Ok(server) => {
+                    {
+                        let mut s = shared.lock().unwrap();
+                        s.status = format!(
+                            "listener {} ready (endpoint {})",
+                            server.info.listener_id, server.info.endpoint_id
+                        );
+                        s.info = Some(server.info);
+                    }
+                    *cmd_holder.lock().unwrap() = Some(server.commands);
+                }
+                Err(e) => {
+                    shared.lock().unwrap().status = format!("P2P error: {e:#}");
+                }
+            }
+        });
+        self.open_task = Some(handle.abort_handle());
+        self.is_open = true;
+    }
+
+    /// Ask the running P2P server for a capability for `allowed_endpoint`, then
+    /// store it for display. No-op if the server isn't up yet.
+    fn issue_capability(&self, allowed_endpoint: String) {
+        let Some(cmd_tx) = self.p2p_commands.lock().unwrap().clone() else {
+            self.p2p_shared.lock().unwrap().status = "P2P server not ready".to_string();
+            return;
+        };
+        let shared = Arc::clone(&self.p2p_shared);
+        tokio::spawn(async move {
+            let (reply, rx) = oneshot::channel();
+            let cmd = ServerCommand::IssueCapability {
+                allowed_endpoint,
+                ttl: None,
+                reply,
+            };
+            if cmd_tx.send(cmd).await.is_err() {
+                shared.lock().unwrap().status = "P2P server stopped".to_string();
+                return;
+            }
+            match rx.await {
+                Ok(Ok(capability)) => shared.lock().unwrap().capability = Some(capability),
+                Ok(Err(e)) => shared.lock().unwrap().status = format!("capability failed: {e:#}"),
+                Err(_) => {}
+            }
+        });
+    }
+
+    /// Attach the relay bind leg for `connection_id`. No-op if the server isn't
+    /// up yet.
+    fn bind_connection(&self, connection_id: String) {
+        let Some(cmd_tx) = self.p2p_commands.lock().unwrap().clone() else {
+            self.p2p_shared.lock().unwrap().status = "P2P server not ready".to_string();
+            return;
+        };
+        let shared = Arc::clone(&self.p2p_shared);
+        tokio::spawn(async move {
+            let (reply, rx) = oneshot::channel();
+            let cmd = ServerCommand::Bind {
+                connection_id,
+                reply,
+            };
+            if cmd_tx.send(cmd).await.is_err() {
+                shared.lock().unwrap().status = "P2P server stopped".to_string();
+                return;
+            }
+            match rx.await {
+                Ok(Ok(())) => shared.lock().unwrap().status = "relay bound; streaming".to_string(),
+                Ok(Err(e)) => shared.lock().unwrap().status = format!("bind failed: {e:#}"),
+                Err(_) => {}
+            }
+        });
+    }
+
     fn close(&mut self) {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
@@ -346,8 +514,92 @@ impl MyApp {
         // }
         *self.mjpeg_tx_holder.lock().unwrap() = None;
         *self.public_address.lock().unwrap() = None;
+        *self.p2p_commands.lock().unwrap() = None;
+        *self.p2p_shared.lock().unwrap() = P2pShared {
+            status: "Closed.".to_string(),
+            ..Default::default()
+        };
         *self.log_shared.lock().unwrap() = "Closed.".to_string();
         self.is_open = false;
+    }
+
+    fn p2p_settings_ui(&mut self, ui: &mut egui::Ui) {
+        let enabled = !self.is_open;
+        let field = |ui: &mut egui::Ui, label: &str, value: &mut String, password: bool| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.add_enabled(
+                    enabled,
+                    egui::TextEdit::singleline(value)
+                        .desired_width(320.0)
+                        .password(password),
+                );
+            });
+        };
+        field(ui, "Identity URL:", &mut self.identity_url, false);
+        field(ui, "Proxy URL:   ", &mut self.proxy_url, false);
+        field(ui, "Auth0 token: ", &mut self.auth0_token, true);
+        field(ui, "Key path:    ", &mut self.key_path, false);
+        field(ui, "Protocol:    ", &mut self.protocol, false);
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(&mut self.register, "Register endpoint on open"),
+        );
+    }
+
+    fn p2p_status_ui(&mut self, ui: &mut egui::Ui) {
+        let (status, info, capability) = {
+            let shared = self.p2p_shared.lock().unwrap();
+            (
+                shared.status.clone(),
+                shared.info.clone(),
+                shared.capability.clone(),
+            )
+        };
+        if !status.is_empty() {
+            ui.label(format!("P2P: {status}"));
+        }
+        let Some(info) = info else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label("Endpoint ID:");
+            ui.monospace(info.endpoint_id.as_str());
+        });
+        ui.horizontal(|ui| {
+            ui.label("Listener ID:");
+            ui.monospace(info.listener_id.as_str());
+        });
+
+        // Step 2 of the exchange: mint a capability for the client's Endpoint ID.
+        ui.horizontal(|ui| {
+            ui.label("Client Endpoint ID:");
+            ui.text_edit_singleline(&mut self.client_endpoint_id);
+        });
+        if ui.button("Issue capability").clicked() {
+            let endpoint = self.client_endpoint_id.trim().to_string();
+            if !endpoint.is_empty() {
+                self.issue_capability(endpoint);
+            }
+        }
+        if let Some(cap) = capability {
+            ui.horizontal(|ui| {
+                ui.label("Capability:");
+                ui.monospace(cap.as_str());
+            });
+        }
+
+        // Step 4: bind the relay once the client reports its connection id.
+        ui.horizontal(|ui| {
+            ui.label("Client Connection ID:");
+            ui.text_edit_singleline(&mut self.client_connection_id);
+        });
+        if ui.button("Bind relay").clicked() {
+            let connection = self.client_connection_id.trim().to_string();
+            if !connection.is_empty() {
+                self.bind_connection(connection);
+            }
+        }
     }
 }
 
@@ -381,23 +633,39 @@ impl eframe::App for MyApp {
 
             ui.separator();
 
+            // ✅ 接続モード
+            ui.horizontal(|ui| {
+                ui.label("Mode:");
+                ui.add_enabled_ui(!self.is_open, |ui| {
+                    ui.selectable_value(&mut self.mode, Mode::Direct, "Direct (legacy)");
+                    ui.selectable_value(&mut self.mode, Mode::P2p, "P2P");
+                });
+            });
+
             // ✅ 接続設定
-            ui.horizontal(|ui| {
-                ui.label("Target:");
-                ui.add_enabled(
-                    !self.is_open,
-                    egui::TextEdit::singleline(&mut self.target).desired_width(300.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("JWT:   ");
-                ui.add_enabled(
-                    !self.is_open,
-                    egui::TextEdit::singleline(&mut self.jwt)
-                        .desired_width(300.0)
-                        .password(true),
-                );
-            });
+            match self.mode {
+                Mode::Direct => {
+                    ui.horizontal(|ui| {
+                        ui.label("Target:");
+                        ui.add_enabled(
+                            !self.is_open,
+                            egui::TextEdit::singleline(&mut self.target).desired_width(300.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("JWT:   ");
+                        ui.add_enabled(
+                            !self.is_open,
+                            egui::TextEdit::singleline(&mut self.jwt)
+                                .desired_width(300.0)
+                                .password(true),
+                        );
+                    });
+                }
+                Mode::P2p => {
+                    self.p2p_settings_ui(ui);
+                }
+            }
 
             // ✅ Open / Closeボタン
             ui.horizontal(|ui| {
@@ -410,9 +678,16 @@ impl eframe::App for MyApp {
                 }
             });
 
-            // ✅ PublicAddress表示
-            if let Some(addr) = self.public_address.lock().unwrap().as_ref() {
-                ui.label(format!("Public Address: {}", addr));
+            // ✅ 接続後の状態表示
+            match self.mode {
+                Mode::Direct => {
+                    if let Some(addr) = self.public_address.lock().unwrap().as_ref() {
+                        ui.label(format!("Public Address: {}", addr));
+                    }
+                }
+                Mode::P2p => {
+                    self.p2p_status_ui(ui);
+                }
             }
 
             ui.separator();

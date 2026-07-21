@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent", "camera-client", "camera-server", "channel-masque", "isekai-p2p", "isekai-p2p-core", "utils", "webrtc-app"]
+members = ["agent", "camera-client", "camera-core", "camera-server", "channel-masque", "isekai-p2p", "isekai-p2p-core", "utils", "webrtc-app"]
 resolver = "3"
 package.edition = "2021"
 
@@ -10,6 +10,7 @@ axum = { version = "0.8", default-features = false }
 axum-h3 = { path = "../submodules/tonic-h3/axum-h3" }
 base64 = "0.22.1"
 channel-masque = { path = "channel-masque" }
+camera-core = { path = "camera-core" }
 isekai-p2p = { path = "isekai-p2p" }
 isekai-p2p-core = { path = "isekai-p2p-core" }
 bytes = "1"
@@ -44,6 +45,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2.0.16"
 time = { version = "0.3", features = ["parsing", "formatting"] }
+rcgen = "0.13"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["full"] }

@@ -223,8 +223,25 @@ The low-level modules (`identity`, `proxy`, `bind`, `transport`, `https`,
 
 ### 3.4 Camera-app integration
 
+The `camera-server` / `camera-client` binaries need OpenCV to build, so their
+transport and P2P wiring is extracted into a new **`camera-core`** crate that is
+free of OpenCV/egui — it builds and is tested on its own (a loopback QUIC
+transport test runs without a proxy). The GUIs do only capture + rendering + UI
+and call into `camera-core`; that keeps the substantive logic verifiable even
+where OpenCV is unavailable.
+
+`camera-core` provides:
+- `video` — the `sample`-ALPN MJPEG-over-QUIC transport (`bind_video_listener`,
+  `serve_frames`, `receive_frames`), usable over any address;
+- `server` — `spawn_p2p_server`: bind the video listener, create a P2P
+  `ListenerSession` relaying to it, and drive `IssueCapability` / `Bind` from the
+  GUI over a command channel;
+- `tls::dev_cert` — the self-signed cert for the video listener (the client dials
+  with validation disabled, dev only).
+
 Both apps gain a **"Connection mode"** UI selector: `Direct (legacy)` vs `P2P`.
-Direct keeps calling `isekai-link-utils` unchanged. P2P uses `isekai-p2p`.
+Direct keeps calling `isekai-link-utils` unchanged. P2P uses `camera-core` (which
+builds on `isekai-p2p`).
 
 **`camera-server` (P2P mode).** New UI fields: identity URL, proxy URL, Auth0
 token, key path, and — after start — a read-only display of `listener_id` and
@@ -290,11 +307,12 @@ Order:
 
 ## 5. Workspace changes
 
-- Add `isekai-p2p` to `rust/Cargo.toml` `members` and as a
-  `workspace.dependencies` path entry.
-- `camera-server` / `camera-client` `Cargo.toml`: add `isekai-p2p` (keep
+- Add `isekai-p2p` and `camera-core` to `rust/Cargo.toml` `members` and as
+  `workspace.dependencies` path entries; add `rcgen` (dev cert for the video
+  listener; already in the lock tree transitively).
+- `camera-server` / `camera-client` `Cargo.toml`: add `camera-core` (keep
   `isekai-link-utils` for the legacy path).
-- No new git dependencies, so `deny.toml` is unaffected.
+- No new git dependencies.
 
 ## 6. Testing
 

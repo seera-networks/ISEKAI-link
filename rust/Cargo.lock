@@ -976,11 +976,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "isekai-link-utils",
+ "isekai-p2p",
+ "msquic-async",
+ "rcgen",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "camera-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "camera-core",
  "channel-masque",
  "eframe",
  "egui",

@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+camera-core = { workspace = true }
 channel-masque = { workspace = true }
 h3-util = { workspace = true }
 http = { workspace = true }

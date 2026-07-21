@@ -1,0 +1,22 @@
+[package]
+name = "camera-core"
+version = "0.1.0"
+edition = "2021"
+
+# The camera apps' video transport and P2P wiring, free of OpenCV / egui so it
+# builds and tests on its own. The GUIs (`camera-server`, `camera-client`) do
+# capture + rendering and call into here.
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+msquic-async = { workspace = true }
+isekai-link-utils = { workspace = true }
+isekai-p2p = { workspace = true }
+# Dev self-signed certificate for the video ("sample" ALPN) QUIC listener.
+rcgen = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
