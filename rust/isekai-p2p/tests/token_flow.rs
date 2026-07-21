@@ -2,7 +2,7 @@
 //! against a mock Identity API, over the default h1/h2 transport.
 //!
 //! The per-request assertions (paths, Auth0 bearer, PoP headers, DER
-//! signatures) live in `isekai-agent`'s `identity_flow` test; this one checks
+//! signatures) live in `isekai-p2p-core`'s `identity_flow` test; this one checks
 //! the `isekai-p2p` config wrapper: that `register` selects register-then-issue
 //! and the Endpoint Token comes back intact.
 

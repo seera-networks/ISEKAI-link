@@ -8,9 +8,9 @@
 use std::net::SocketAddr;
 
 use anyhow::Context as _;
-use isekai_agent::bind::{open_connect_relay, ConnectRelay};
-use isekai_agent::proxy::{Candidate, PeerConnection, ProxyClient};
-use isekai_agent::transport::MasqueH3Transport;
+use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay};
+use isekai_p2p_core::proxy::{Candidate, PeerConnection, ProxyClient};
+use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::config::{issue_endpoint_token, P2pConfig};
 

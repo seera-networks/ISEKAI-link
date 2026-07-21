@@ -2833,35 +2833,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
-name = "isekai-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "bytes",
- "channel-masque",
- "h3-util",
- "http",
- "http-body",
- "http-body-util",
- "p256",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
-]
-
-[[package]]
 name = "isekai-link-utils"
 version = "0.1.0"
 dependencies = [
@@ -2894,13 +2865,42 @@ dependencies = [
  "argh",
  "axum",
  "base64",
- "isekai-agent",
+ "isekai-p2p-core",
  "p256",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "isekai-p2p-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bytes",
+ "channel-masque",
+ "h3-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "p256",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
 ]
 
 [[package]]

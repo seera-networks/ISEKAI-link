@@ -10,7 +10,7 @@ proxy relay** — without the server publishing a reachable public address.
 Scope decisions (agreed up front):
 
 - **New crate.** Add an integration crate (working name **`isekai-p2p`**) that
-  wraps the `isekai-agent` primitives into a high-level session API. The CLI and
+  wraps the `isekai-p2p-core` primitives into a high-level session API. The CLI and
   the camera apps both depend on it.
 - **P2P is an added option, not a replacement.** The camera apps keep their
   current `isekai-link-utils` direct/cert path; P2P becomes a second connection
@@ -92,12 +92,12 @@ Everything between the two loopback sockets is the existing relay data path
 ### 3.2 New crate `isekai-p2p`
 
 A `msquic`-only integration crate — it always needs the relay legs, so unlike
-`isekai-agent` it has no msquic-free build. It re-exports nothing new from the
+`isekai-p2p-core` it has no msquic-free build. It re-exports nothing new from the
 transport layer; it adds two orchestration facades plus a shared config.
 
 ```
 rust/isekai-p2p/
-├── Cargo.toml        # deps: isekai-agent (features=["msquic"]), anyhow, tokio,
+├── Cargo.toml        # deps: isekai-p2p-core (features=["msquic"]), anyhow, tokio,
 │                     #       tracing (+ argh/serde/tracing-subscriber for the bin)
 └── src/
     ├── lib.rs
@@ -190,13 +190,18 @@ These are thin: each is the call sequence the CLI already ran, moved behind a
 struct and returning the session guard instead of blocking on Ctrl-C.
 Errors surface as `anyhow::Error` (the apps only need to display them).
 
-### 3.3 The CLI moves into `isekai-p2p`
+### 3.3 Crate split and the CLI move
 
-The plan first envisioned the CLI staying in `isekai-agent` and depending on
-`isekai-p2p`. That would be a dependency **cycle** (`isekai-agent` →
-`isekai-p2p` → `isekai-agent`), which Cargo forbids. So the CLI binary moves to
-`isekai-p2p` (keeping the `isekai-agent` binary name via `[[bin]]`), and
-`isekai-agent` becomes a primitives-only library. This is the split the plan
+The primitives crate is **renamed `isekai-agent` → `isekai-p2p-core`**: now that
+it is a library of P2P Connect building blocks under `isekai-p2p`, "agent" was
+misleading. (The library rename does not touch the *binary*, which stays
+`isekai-agent` — the user-facing CLI tool.)
+
+The plan first envisioned the CLI staying with the primitives and depending on
+`isekai-p2p`. That would be a dependency **cycle** (`isekai-p2p-core` →
+`isekai-p2p` → `isekai-p2p-core`), which Cargo forbids. So the CLI binary moves
+into `isekai-p2p` (keeping the `isekai-agent` binary name via `[[bin]]`), and
+`isekai-p2p-core` is a primitives-only library. This is the split the plan
 intended — "the CLI depends on `isekai-p2p`" — realized without the cycle.
 
 The CLI's argument surface is unchanged. Internally:
@@ -206,14 +211,14 @@ The CLI's argument surface is unchanged. Internally:
   from `--token` / `--key`, so no Identity round-trip).
 - `connect` without `--relay`, and `create-listener` / `issue-capability` /
   `get-connection` / `report-state` / `bind`: single one-shot control-plane or
-  relay calls, so they keep using the `isekai-agent` primitives directly. The
+  relay calls, so they keep using the `isekai-p2p-core` primitives directly. The
   `ListenerSession` facade (create + capability + bind in one process) doesn't
   fit these separate one-shot invocations, so it isn't used by the CLI — only by
   the camera apps.
 
 The low-level modules (`identity`, `proxy`, `bind`, `transport`, `https`,
-`endpoint`, `pop`) **stay in `isekai-agent`** and keep their current API;
-`isekai-p2p` builds on top. Split: `isekai-agent` = protocol primitives,
+`endpoint`, `pop`) **stay in `isekai-p2p-core`** and keep their current API;
+`isekai-p2p` builds on top. Split: `isekai-p2p-core` = protocol primitives,
 `isekai-p2p` = orchestration + CLI.
 
 ### 3.4 Camera-app integration
@@ -296,10 +301,10 @@ Order:
 Unit / integration (no cameras, no network hardware):
 - `isekai-p2p`: `config::load_or_generate_key` round-trips and enforces `0600`;
   `issue_endpoint_token` against the cleartext axum mock already used by
-  `ISEKAI-agent/tests/identity_flow.rs` (reuse the harness).
-- `ISEKAI-agent`: existing tests must still pass after the orchestration move
+  `isekai-p2p-core/tests/identity_flow.rs` (reuse the harness).
+- `isekai-p2p-core`: existing tests must still pass after the orchestration move
   (the primitives are unchanged).
-- Build both feature configurations: `cargo build -p isekai-agent`
+- Build both feature configurations: `cargo build -p isekai-p2p-core`
   (msquic-free lib still compiles) and `-p isekai-p2p --features …`.
 - CI parity: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 

@@ -19,10 +19,10 @@
 
 use std::net::SocketAddr;
 
-use isekai_agent::bind::{open_bind_session, BindSession};
-use isekai_agent::endpoint::EndpointKey;
-use isekai_agent::proxy::{Capability, ProxyClient};
-use isekai_agent::transport::MasqueH3Transport;
+use isekai_p2p_core::bind::{open_bind_session, BindSession};
+use isekai_p2p_core::endpoint::EndpointKey;
+use isekai_p2p_core::proxy::{Capability, ProxyClient};
+use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::config::{issue_endpoint_token, P2pConfig};
 

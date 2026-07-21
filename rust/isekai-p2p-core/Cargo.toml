@@ -1,12 +1,13 @@
 [package]
-name = "isekai-agent"
+name = "isekai-p2p-core"
 version = "0.1.0"
 edition = "2024"
 
-# Primitives-only library. The CLI that used to live here now ships in the
-# `isekai-p2p` crate, which builds on these primitives.
+# P2P Connect protocol primitives: Endpoint keys + PoP, the Identity API and
+# proxy control-plane clients, and the MASQUE relay legs. The high-level session
+# API and the CLI live in the `isekai-p2p` crate, which builds on these.
 [lib]
-name = "isekai_agent"
+name = "isekai_p2p_core"
 path = "src/lib.rs"
 
 [features]

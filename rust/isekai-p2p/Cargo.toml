@@ -16,7 +16,7 @@ path = "src/bin/isekai-agent.rs"
 # High-level orchestration over the `isekai-agent` primitives. It always needs
 # the relay legs, so — unlike `isekai-agent` — there is no msquic-free build.
 [dependencies]
-isekai-agent = { workspace = true, features = ["msquic"] }
+isekai-p2p-core = { workspace = true, features = ["msquic"] }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

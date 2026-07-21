@@ -9,11 +9,11 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use isekai_agent::endpoint::EndpointKey;
-use isekai_agent::https::HttpsTransport;
-use isekai_agent::identity::{EndpointToken, IdentityClient};
-use isekai_agent::proxy::ControlPlaneTransport;
-use isekai_agent::transport::MasqueH3Transport;
+use isekai_p2p_core::endpoint::EndpointKey;
+use isekai_p2p_core::https::HttpsTransport;
+use isekai_p2p_core::identity::{EndpointToken, IdentityClient};
+use isekai_p2p_core::proxy::ControlPlaneTransport;
+use isekai_p2p_core::transport::MasqueH3Transport;
 
 /// Everything a P2P session needs to reach the services and identify itself.
 pub struct P2pConfig {

@@ -4,7 +4,7 @@
 //! control-plane client and the MASQUE relay legs. Each subcommand performs one
 //! step of the flow so they can be chained. The multi-step in-process flows
 //! (obtaining a token, and connect-then-relay) run through the `isekai-p2p`
-//! session facades; the single control-plane calls use the `isekai-agent`
+//! session facades; the single control-plane calls use the `isekai-p2p-core`
 //! primitives directly.
 
 use std::net::SocketAddr;
@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use argh::FromArgs;
-use isekai_agent::endpoint::EndpointKey;
-use isekai_agent::proxy::{Candidate, CandidateType, ControlPlaneTransport, ProxyClient};
-use isekai_agent::transport::{shutdown_msquic, MasqueH3Transport};
 use isekai_p2p::config::{issue_endpoint_token, P2pConfig};
 use isekai_p2p::initiator::InitiatorSession;
+use isekai_p2p_core::endpoint::EndpointKey;
+use isekai_p2p_core::proxy::{Candidate, CandidateType, ControlPlaneTransport, ProxyClient};
+use isekai_p2p_core::transport::{shutdown_msquic, MasqueH3Transport};
 
 /// ISEKAI P2P Connect agent.
 #[derive(FromArgs)]
@@ -417,7 +417,7 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
 
 async fn run_bind(a: Bind) -> anyhow::Result<()> {
     let key = load_key(&a.key)?;
-    let mut session = isekai_agent::bind::open_bind_session(
+    let mut session = isekai_p2p_core::bind::open_bind_session(
         &a.proxy_url,
         &a.token,
         &key,

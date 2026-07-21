@@ -12,9 +12,9 @@ use axum::response::Json;
 use axum::routing::post;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use isekai_agent::endpoint::EndpointKey;
-use isekai_agent::https::HttpsTransport;
-use isekai_agent::identity::IdentityClient;
+use isekai_p2p_core::endpoint::EndpointKey;
+use isekai_p2p_core::https::HttpsTransport;
+use isekai_p2p_core::identity::IdentityClient;
 use p256::ecdsa::Signature;
 use serde_json::{Value, json};
 
