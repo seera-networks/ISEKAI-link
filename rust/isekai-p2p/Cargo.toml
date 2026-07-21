@@ -1,0 +1,32 @@
+[package]
+name = "isekai-p2p"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "isekai_p2p"
+path = "src/lib.rs"
+
+# The P2P Connect CLI (formerly in the `isekai-agent` crate; binary name kept).
+# It drives the same session facades this crate exposes to the camera apps.
+[[bin]]
+name = "isekai-agent"
+path = "src/bin/isekai-agent.rs"
+
+# High-level orchestration over the `isekai-agent` primitives. It always needs
+# the relay legs, so — unlike `isekai-agent` — there is no msquic-free build.
+[dependencies]
+isekai-agent = { workspace = true, features = ["msquic"] }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# CLI-only.
+argh = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true, features = ["json", "tokio", "http1"] }
+base64 = { workspace = true }
+p256 = { workspace = true }

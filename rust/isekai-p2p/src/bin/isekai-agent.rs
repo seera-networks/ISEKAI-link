@@ -1,22 +1,23 @@
 //! ISEKAI P2P Connect agent CLI.
 //!
 //! Ties together the Endpoint identity, the Identity API client, the proxy
-//! control-plane client (over msquic HTTP/3) and the MASQUE bind session. Each
-//! subcommand performs one step of the flow so they can be chained (like the
-//! server repo's `flow.sh`, but as the real client).
+//! control-plane client and the MASQUE relay legs. Each subcommand performs one
+//! step of the flow so they can be chained. The multi-step in-process flows
+//! (obtaining a token, and connect-then-relay) run through the `isekai-p2p`
+//! session facades; the single control-plane calls use the `isekai-agent`
+//! primitives directly.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use argh::FromArgs;
-use isekai_agent::bind::{open_bind_session, open_connect_relay};
 use isekai_agent::endpoint::EndpointKey;
-use isekai_agent::https::HttpsTransport;
-use isekai_agent::identity::IdentityClient;
 use isekai_agent::proxy::{Candidate, CandidateType, ControlPlaneTransport, ProxyClient};
-use isekai_agent::transport::{MasqueH3Transport, shutdown_msquic};
+use isekai_agent::transport::{shutdown_msquic, MasqueH3Transport};
+use isekai_p2p::config::{issue_endpoint_token, P2pConfig};
+use isekai_p2p::initiator::InitiatorSession;
 
 /// ISEKAI P2P Connect agent.
 #[derive(FromArgs)]
@@ -302,48 +303,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     .await?,
             )
         }
-        Command::Connect(a) => {
-            let client = proxy_client(&a.proxy_url, &a.key, &a.token)?;
-            let candidates = parse_candidates(&a.candidate)?;
-            let conn = client
-                .peer_connect(&a.capability, &a.listener_id, &a.protocol, &candidates)
-                .await?;
-            print_json(&conn)?;
-            // With --relay, open the CONNECT-UDP relay leg to the returned
-            // masque_uri and run it until Ctrl-C.
-            if a.relay {
-                let relay = conn.relay.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("connect response has no relay info; cannot open relay leg")
-                })?;
-                let local_bind: SocketAddr = a
-                    .relay_local_addr
-                    .as_deref()
-                    .unwrap_or("127.0.0.1:0")
-                    .parse()
-                    .context("invalid --relay-local-addr")?;
-                let handle = open_connect_relay(
-                    &a.proxy_url,
-                    &a.token,
-                    &load_key(&a.key)?,
-                    &conn.connection_id,
-                    &relay.masque_uri,
-                    local_bind,
-                )
-                .await?;
-                print_json(&serde_json::json!({
-                    "relay_local_addr": handle.local_addr.to_string(),
-                }))?;
-                tracing::info!(
-                    "relay leg running; send UDP to {} (Ctrl-C to stop)",
-                    handle.local_addr
-                );
-                tokio::signal::ctrl_c()
-                    .await
-                    .context("waiting for Ctrl-C")?;
-                handle.close().await;
-            }
-            Ok(())
-        }
+        Command::Connect(a) => connect(a).await,
         Command::GetConnection(a) => {
             let client = proxy_client(&a.proxy_url, &a.key, &a.token)?;
             print_json(&client.get_connection(&a.connection_id).await?)
@@ -377,17 +337,19 @@ fn keygen(a: Keygen) -> anyhow::Result<()> {
 }
 
 async fn token(a: Token) -> anyhow::Result<()> {
-    let key = load_key(&a.key)?;
-    // The Identity API serves h1/h2 on TCP+TLS and h3 on QUIC at the same port.
-    // Default to the TCP listener; `--identity-http3` picks the QUIC one, which
-    // reuses the msquic H3 stack the proxy control plane already speaks.
-    let token = if a.identity_http3 {
-        let client = IdentityClient::new(MasqueH3Transport::connect(&a.identity_url)?);
-        issue(&client, &a, &key).await?
-    } else {
-        let client = IdentityClient::new(HttpsTransport::connect(&a.identity_url)?);
-        issue(&client, &a, &key).await?
+    let cfg = P2pConfig {
+        identity_url: a.identity_url,
+        identity_http3: a.identity_http3,
+        // Unused by token issuance, but the config is shared with the sessions.
+        proxy_url: String::new(),
+        auth0_token: a.auth0_token,
+        protocol: String::new(),
+        register: a.register,
+        device_name: a.device_name,
+        token_ttl: a.ttl,
+        key: load_key(&a.key)?,
     };
+    let token = issue_endpoint_token(&cfg).await?;
     print_json(&serde_json::json!({
         "endpoint_token": token.endpoint_token,
         "expires_in": token.expires_in,
@@ -397,29 +359,71 @@ async fn token(a: Token) -> anyhow::Result<()> {
     }))
 }
 
-/// Register (when asked) and issue an Endpoint Token, over whichever transport
-/// the caller built.
-async fn issue<T: ControlPlaneTransport>(
-    client: &IdentityClient<T>,
-    a: &Token,
-    key: &EndpointKey,
-) -> anyhow::Result<isekai_agent::identity::EndpointToken> {
-    let token = if a.register {
-        client
-            .register_and_issue(&a.auth0_token, key, a.device_name.as_deref(), a.ttl)
-            .await?
-    } else {
-        client
-            .issue_token(&a.auth0_token, key, None, None, a.ttl)
-            .await?
+async fn connect(a: Connect) -> anyhow::Result<()> {
+    // Without --relay this is a single control-plane call; print and exit.
+    if !a.relay {
+        let client = proxy_client(&a.proxy_url, &a.key, &a.token)?;
+        let candidates = parse_candidates(&a.candidate)?;
+        let conn = client
+            .peer_connect(&a.capability, &a.listener_id, &a.protocol, &candidates)
+            .await?;
+        return print_json(&conn);
+    }
+
+    // With --relay this is peer-connect + open the relay leg, held until Ctrl-C
+    // — exactly an `InitiatorSession`.
+    let local_bind: SocketAddr = a
+        .relay_local_addr
+        .as_deref()
+        .unwrap_or("127.0.0.1:0")
+        .parse()
+        .context("invalid --relay-local-addr")?;
+    let cfg = P2pConfig {
+        identity_url: String::new(),
+        identity_http3: false,
+        proxy_url: a.proxy_url,
+        auth0_token: String::new(),
+        protocol: a.protocol,
+        // The token/key came straight from the caller; no Identity round-trip.
+        register: false,
+        device_name: None,
+        token_ttl: None,
+        key: load_key(&a.key)?,
     };
-    Ok(token)
+    let candidates = parse_candidates(&a.candidate)?;
+    let session = InitiatorSession::connect_with_token(
+        &cfg,
+        &a.token,
+        &a.capability,
+        &a.listener_id,
+        &candidates,
+        local_bind,
+    )
+    .await?;
+    print_json(&session.connection)?;
+    print_json(&serde_json::json!({
+        "relay_local_addr": session.local_addr.to_string(),
+    }))?;
+    tracing::info!(
+        "relay leg running; send UDP to {} (Ctrl-C to stop)",
+        session.local_addr
+    );
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
+    session.close().await;
+    Ok(())
 }
 
 async fn run_bind(a: Bind) -> anyhow::Result<()> {
     let key = load_key(&a.key)?;
-    let mut session =
-        open_bind_session(&a.proxy_url, &a.token, &key, &a.connection_id, a.forward_to)?;
+    let mut session = isekai_agent::bind::open_bind_session(
+        &a.proxy_url,
+        &a.token,
+        &key,
+        &a.connection_id,
+        a.forward_to,
+    )?;
     eprintln!(
         "bind session open for connection {} (forwarding to {}); Ctrl-C to stop",
         a.connection_id, a.forward_to

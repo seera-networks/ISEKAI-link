@@ -3,16 +3,11 @@ name = "isekai-agent"
 version = "0.1.0"
 edition = "2024"
 
+# Primitives-only library. The CLI that used to live here now ships in the
+# `isekai-p2p` crate, which builds on these primitives.
 [lib]
 name = "isekai_agent"
 path = "src/lib.rs"
-
-# The agent CLI. Requires the msquic feature (H3 transport + bind session), so a
-# default `cargo build` builds only the (msquic-free) library.
-[[bin]]
-name = "isekai-agent"
-path = "src/main.rs"
-required-features = ["msquic"]
 
 [features]
 default = []
@@ -29,13 +24,10 @@ msquic = [
     "dep:tower-http",
     "dep:tokio-stream",
     "dep:tokio-util",
-    "dep:argh",
-    "dep:tracing-subscriber",
 ]
 
 [dependencies]
 anyhow = { workspace = true }
-argh = { workspace = true, optional = true }
 base64 = { workspace = true }
 p256 = { workspace = true }
 rand = { workspace = true }
@@ -61,7 +53,6 @@ tower = { workspace = true, optional = true, features = ["util"] }
 tower-http = { workspace = true, optional = true, features = ["auth", "set-header"] }
 tokio-stream = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
