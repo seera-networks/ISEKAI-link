@@ -326,16 +326,25 @@ Unit / integration (no cameras, no network hardware):
   (msquic-free lib still compiles) and `-p isekai-p2p --features …`.
 - CI parity: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
-End-to-end on the msquic host (the setup already used for prior E2E, `minazuki`):
-1. Run the proxy (`bound-udp-server --enable-p2p`) and the HTTPS Identity API
-   (`DEV_CERT=1`).
-2. Drive the **library** directly with a small example bin (or the two camera
-   apps headless): client `InitiatorSession::connect` ↔ server
-   `ListenerSession::start` + `issue_capability`, then push a few synthetic
-   MJPEG frames over the ALPN-`sample` QUIC connection and assert they arrive.
-3. Confirm the proxy logs `bound P2P relay loopback leg` for both legs and that
-   an unauthorized Endpoint is rejected (reuse the negative check from the
-   earlier data-plane test).
+End-to-end on the msquic host (`minazuki`) — **done** via
+`camera-core/examples/relay_e2e.rs`, an OpenCV-free harness that runs both the
+target (`spawn_p2p_server`) and initiator (`InitiatorSession` +
+`receive_frames`) in one process against a live proxy + Identity API, performs
+the four-value exchange, pushes synthetic frames and asserts they arrive.
+
+Result: **PASS** — frames traverse the relay end to end, and the proxy logs
+`bound P2P relay loopback leg` for both legs (initiator ephemeral source +
+target edge). Two bugs surfaced and were fixed:
+
+- `spawn_p2p_server` dropped the video listener's msquic registration on return
+  (a `Listener` only borrows it), blocking in `RegistrationClose`. Now held in
+  `ServerHandle`.
+- video packets nested in the relay (a QUIC Initial pads to 1200) overflowed the
+  tunnel's HTTP datagram at the default MTU (`TooLarge`). The video client MTU is
+  now capped at 1200, matching the listener.
+
+The harness ran against a self-contained mock Auth0 (a minted RS256 JWT + JWKS),
+so it needs no live Auth0 tenant.
 
 ## 7. Rollout order
 
