@@ -52,6 +52,11 @@ pub enum ServerCommand {
 pub struct ServerHandle {
     pub info: ServerInfo,
     pub commands: mpsc::Sender<ServerCommand>,
+    /// The video listener's msquic registration. A `msquic_async::Listener`
+    /// borrows its registration rather than keeping it alive, so this must
+    /// outlive the listener (which runs in the spawned `serve_frames` task);
+    /// holding it here ties its lifetime to the handle.
+    _video_reg: Arc<Registration>,
 }
 
 /// Bind the video listener, create the P2P listener session forwarding to it,
@@ -65,7 +70,7 @@ pub async fn spawn_p2p_server(
     shutdown: CancellationToken,
 ) -> anyhow::Result<ServerHandle> {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
-    let (_reg, listener, video_addr) = bind_video_listener(reg, bind_addr)?;
+    let (video_reg, listener, video_addr) = bind_video_listener(reg, bind_addr)?;
 
     // The relay delivers the initiator's traffic to the video listener address.
     let session = ListenerSession::create(&cfg, video_addr, None).await?;
@@ -83,6 +88,7 @@ pub async fn spawn_p2p_server(
     Ok(ServerHandle {
         info,
         commands: cmd_tx,
+        _video_reg: video_reg,
     })
 }
 

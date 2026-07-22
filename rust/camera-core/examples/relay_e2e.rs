@@ -55,15 +55,22 @@ async fn main() {
     let proxy = env_or("PROXY_URL", "https://127.0.0.1:8443");
     let protocol = env_or("PROTOCOL", "isekai-validator-v1");
 
-    match run(&auth0, &identity, &proxy, &protocol).await {
+    let code = match run(&auth0, &identity, &proxy, &protocol).await {
         Ok(n) => {
             println!("PASS: received {n} frames over the relay");
+            0
         }
         Err(e) => {
             eprintln!("FAIL: {e:#}");
-            std::process::exit(1);
+            1
         }
-    }
+    };
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    // Exit without running the msquic teardown: dropping the relay legs /
+    // registrations calls the blocking `RegistrationClose` (it waits for every
+    // child handle), which would hang this one-shot harness.
+    std::process::exit(code);
 }
 
 async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow::Result<usize> {
@@ -151,10 +158,12 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
         )),
     };
 
+    // Stop the receiver, then leak the relay legs so their blocking msquic
+    // `Drop` (RegistrationClose) never runs — `main` exits the process instead.
     shutdown.cancel();
     let _ = receiver.await;
-    session.close().await;
-    server.commands.closed().await;
+    std::mem::forget(session);
+    std::mem::forget(server);
     result
 }
 
