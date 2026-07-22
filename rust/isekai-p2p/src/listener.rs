@@ -121,7 +121,8 @@ impl ListenerSession {
             &self.key,
             connection_id,
             self.forward_to,
-        )?;
+        )
+        .await?;
         // Own the session in a task that drains its notifications, so an unread
         // events channel can never stall the underlying MASQUE loop. Dropping
         // the task (on close) drops the session, whose Drop cancels the relay.

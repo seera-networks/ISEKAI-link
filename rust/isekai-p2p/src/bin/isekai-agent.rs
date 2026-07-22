@@ -423,7 +423,8 @@ async fn run_bind(a: Bind) -> anyhow::Result<()> {
         &key,
         &a.connection_id,
         a.forward_to,
-    )?;
+    )
+    .await?;
     eprintln!(
         "bind session open for connection {} (forwarding to {}); Ctrl-C to stop",
         a.connection_id, a.forward_to

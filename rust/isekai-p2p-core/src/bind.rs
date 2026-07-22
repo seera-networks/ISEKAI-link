@@ -35,7 +35,7 @@ use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use http_body::Frame;
 use http_body_util::StreamBody;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -93,7 +93,13 @@ impl Drop for BindSession {
 /// `endpoint_token` and `key` must belong to the Endpoint that is a party of
 /// the connection: the proxy authorizes the relay edge against the Endpoint the
 /// PoP signature proves possession of, not against the user.
-pub fn open_bind_session(
+///
+/// Returns only once the CONNECT-UDP bind session is **established** — i.e. the
+/// proxy has bound the relay edge and the leg can carry datagrams. Awaiting
+/// this before the application starts relaying closes a startup race where the
+/// far peer's first packets reached the edge before this leg was ready and were
+/// dropped (the tunneled QUIC handshake then stalled).
+pub async fn open_bind_session(
     target: &str,
     endpoint_token: &str,
     key: &EndpointKey,
@@ -140,6 +146,9 @@ pub fn open_bind_session(
 
     let shutdown = CancellationToken::new();
     let (out_tx, out_rx) = mpsc::channel(32);
+    // Signals that `start` has established the session (or failed to). The
+    // caller awaits this so it only returns once the leg is ready.
+    let (ready_tx, ready_rx) = oneshot::channel();
     let session_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
         let mut client = MasqueClient::new(channel, None);
@@ -148,6 +157,7 @@ pub fn open_bind_session(
             .await
         {
             Ok(mut events) => {
+                let _ = ready_tx.send(Ok(()));
                 // Keep the client alive and forward events until it ends.
                 while let Some(event) = events.recv().await {
                     if out_tx.send(event).await.is_err() {
@@ -155,15 +165,31 @@ pub fn open_bind_session(
                     }
                 }
             }
-            Err(e) => tracing::error!("failed to start MASQUE bind session: {e:?}"),
+            Err(e) => {
+                let _ = ready_tx.send(Err(anyhow::anyhow!(
+                    "failed to start MASQUE bind session: {e:?}"
+                )));
+            }
         }
     });
 
-    Ok(BindSession {
-        events: out_rx,
-        shutdown,
-        task: Some(task),
-    })
+    match ready_rx.await {
+        Ok(Ok(())) => Ok(BindSession {
+            events: out_rx,
+            shutdown,
+            task: Some(task),
+        }),
+        Ok(Err(e)) => {
+            shutdown.cancel();
+            Err(e)
+        }
+        Err(_) => {
+            shutdown.cancel();
+            Err(anyhow::anyhow!(
+                "MASQUE bind session ended before it was established"
+            ))
+        }
+    }
 }
 
 /// A running CONNECT-UDP forward-proxy relay leg (the **initiator** side). Keep
@@ -264,24 +290,45 @@ pub async fn open_connect_relay(
 
     let shutdown = CancellationToken::new();
     let session_shutdown = shutdown.clone();
+    // Signals that `start_connect_udp` has established the leg (or failed to).
+    let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let mut client = MasqueClient::new(channel, None);
-        if let Err(e) = client
+        match client
             .start_connect_udp(&target_path, Vec::new(), socket, session_shutdown.clone())
             .await
         {
-            tracing::error!("failed to start CONNECT-UDP relay leg: {e:?}");
-            return;
+            Ok(()) => {
+                let _ = ready_tx.send(Ok(()));
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(anyhow::anyhow!(
+                    "failed to start CONNECT-UDP relay leg: {e:?}"
+                )));
+                return;
+            }
         }
         // Keep the client (and its H3 connection) alive until shutdown.
         session_shutdown.cancelled().await;
     });
 
-    Ok(ConnectRelay {
-        local_addr,
-        shutdown,
-        task: Some(task),
-    })
+    match ready_rx.await {
+        Ok(Ok(())) => Ok(ConnectRelay {
+            local_addr,
+            shutdown,
+            task: Some(task),
+        }),
+        Ok(Err(e)) => {
+            shutdown.cancel();
+            Err(e)
+        }
+        Err(_) => {
+            shutdown.cancel();
+            Err(anyhow::anyhow!(
+                "CONNECT-UDP relay leg ended before it was established"
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
