@@ -1,0 +1,173 @@
+//! End-to-end check of the camera P2P path over a live proxy: run both a
+//! `spawn_p2p_server` (target) and an `InitiatorSession` + `receive_frames`
+//! (initiator) in one process, perform the four-value exchange, push synthetic
+//! frames through the relay and assert they arrive.
+//!
+//! This is OpenCV-free — it exercises the same `camera-core` transport the GUI
+//! apps use, without a camera or a display. It needs a running proxy
+//! (`bound-udp-server --enable-p2p`) and Identity API.
+//!
+//! ```sh
+//! AUTH0_TOKEN=<jwt> \
+//! IDENTITY_URL=https://127.0.0.1:9443 \
+//! PROXY_URL=https://127.0.0.1:8443 \
+//! cargo run -p camera-core --example relay_e2e
+//! ```
+//! Exits 0 on success, 1 on failure. Honors `ISEKAI_INSECURE_SKIP_VERIFY`
+//! (set here) so dev self-signed certs are accepted.
+
+use std::time::Duration;
+
+use bytes::Bytes;
+use camera_core::{load_or_generate_key, InitiatorSession, P2pConfig, ServerCommand};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+fn config(auth0: &str, identity: &str, proxy: &str, protocol: &str, key_path: &str) -> P2pConfig {
+    P2pConfig {
+        identity_url: identity.to_owned(),
+        identity_http3: false,
+        proxy_url: proxy.to_owned(),
+        auth0_token: auth0.to_owned(),
+        protocol: protocol.to_owned(),
+        register: true,
+        device_name: Some("relay-e2e".to_owned()),
+        token_ttl: None,
+        key: load_or_generate_key(std::path::Path::new(key_path)).expect("load/generate key"),
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_env("SEERA_LOG"))
+        .with_writer(std::io::stderr)
+        .init();
+    // Accept the dev proxy / Identity self-signed certs.
+    std::env::set_var("ISEKAI_INSECURE_SKIP_VERIFY", "1");
+
+    let auth0 = std::env::var("AUTH0_TOKEN").expect("AUTH0_TOKEN is required");
+    let identity = env_or("IDENTITY_URL", "https://127.0.0.1:9443");
+    let proxy = env_or("PROXY_URL", "https://127.0.0.1:8443");
+    let protocol = env_or("PROTOCOL", "isekai-validator-v1");
+
+    match run(&auth0, &identity, &proxy, &protocol).await {
+        Ok(n) => {
+            println!("PASS: received {n} frames over the relay");
+        }
+        Err(e) => {
+            eprintln!("FAIL: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow::Result<usize> {
+    let shutdown = CancellationToken::new();
+
+    // --- Target side: bind the video listener + P2P listener session. ---
+    let server_cfg = config(auth0, identity, proxy, protocol, "e2e-server.pem");
+    let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
+    let server =
+        camera_core::spawn_p2p_server(None, server_cfg, frame_rx, shutdown.clone()).await?;
+    println!(
+        "server ready: listener={} endpoint={} video={}",
+        server.info.listener_id, server.info.endpoint_id, server.info.video_addr
+    );
+
+    // --- Initiator side: its Endpoint id is what the server authorizes. ---
+    let client_cfg = config(auth0, identity, proxy, protocol, "e2e-client.pem");
+    let client_endpoint = client_cfg.endpoint_id();
+
+    // Step 2: server issues a capability for the initiator's Endpoint.
+    let capability = command(&server.commands, |reply| ServerCommand::IssueCapability {
+        allowed_endpoint: client_endpoint.clone(),
+        ttl: None,
+        reply,
+    })
+    .await?;
+    println!("issued capability for {client_endpoint}");
+
+    // Step 3: initiator connects, producing the connection id.
+    let session = InitiatorSession::connect(
+        &client_cfg,
+        &capability,
+        &server.info.listener_id,
+        &[],
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await?;
+    let connection_id = session.connection_id().to_owned();
+    let local_addr = session.local_addr;
+    println!("initiator connected: connection={connection_id} local={local_addr}");
+
+    // Step 4: server binds the relay for that connection id.
+    command(&server.commands, |reply| ServerCommand::Bind {
+        connection_id: connection_id.clone(),
+        reply,
+    })
+    .await?;
+    println!("server bound the relay; streaming");
+
+    // Initiator receives frames from the relay's local address.
+    let (recv_tx, mut recv_rx) = mpsc::channel::<(u64, Bytes)>(16);
+    let recv_shutdown = shutdown.clone();
+    let receiver = tokio::spawn(async move {
+        camera_core::receive_frames(None, local_addr, recv_tx, recv_shutdown).await
+    });
+
+    // Push synthetic frames until enough arrive (the QUIC handshake over the
+    // relay completes shortly after the bind).
+    const TARGET: usize = 5;
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut sent = 0usize;
+        let mut received = Vec::new();
+        loop {
+            sent += 1;
+            let _ = frame_tx.send(Bytes::from(format!("frame-{sent}"))).await;
+            match tokio::time::timeout(Duration::from_millis(300), recv_rx.recv()).await {
+                Ok(Some((_seq, data))) => {
+                    received.push(data);
+                    if received.len() >= TARGET {
+                        return Ok::<usize, anyhow::Error>(received.len());
+                    }
+                }
+                Ok(None) => anyhow::bail!("frame receiver closed"),
+                Err(_) => {} // nothing yet; resend
+            }
+        }
+    })
+    .await;
+
+    let result = match outcome {
+        Ok(Ok(n)) => Ok(n),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(anyhow::anyhow!(
+            "no frames received within the timeout (is the relay bound end to end?)"
+        )),
+    };
+
+    shutdown.cancel();
+    let _ = receiver.await;
+    session.close().await;
+    server.commands.closed().await;
+    result
+}
+
+/// Send a command carrying a oneshot reply and await the result.
+async fn command<T>(
+    commands: &mpsc::Sender<ServerCommand>,
+    make: impl FnOnce(oneshot::Sender<anyhow::Result<T>>) -> ServerCommand,
+) -> anyhow::Result<T> {
+    let (reply, rx) = oneshot::channel();
+    commands
+        .send(make(reply))
+        .await
+        .map_err(|_| anyhow::anyhow!("P2P server command channel closed"))?;
+    rx.await
+        .map_err(|_| anyhow::anyhow!("P2P server dropped the reply"))?
+}

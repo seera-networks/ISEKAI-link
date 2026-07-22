@@ -20,3 +20,5 @@ rcgen = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
