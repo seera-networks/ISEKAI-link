@@ -966,11 +966,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "camera-core",
  "eframe",
  "egui",
  "msquic-async",
  "opencv",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
