@@ -55,7 +55,12 @@ fn frame_context0(payload: &[u8]) -> Bytes {
 /// tunnel until `shutdown` fires.
 ///
 /// - **Uplink:** each datagram read from `socket` records its source and is
-///   framed with context id `0` and sent via `tx`.
+///   framed with context id `0` and sent via `tx`. A send error drops that one
+///   datagram and continues (unreliable-UDP semantics) rather than tearing the
+///   bridge down — a transient failure (e.g. an oversized datagram before path
+///   MTU is confirmed, or momentary flow-control backpressure) must not kill an
+///   otherwise-healthy relay leg. The leg still ends cleanly when `shutdown`
+///   fires, the local socket errors, or the tunnel closes (`inbound` closes).
 /// - **Downlink:** each payload from `inbound` (already context-stripped by the
 ///   transport layer) is `send_to` the most recently recorded source. A
 ///   downlink datagram that arrives before any uplink datagram (no source known
@@ -77,9 +82,12 @@ pub async fn run_bridge(
             r = socket.recv_from(&mut buf) => {
                 let (n, src) = r?;
                 last_src = Some(src);
+                // Drop this datagram and continue on a send error (symmetric
+                // with the downlink `send_to` below), instead of breaking the
+                // bridge — a single transient failure must not tear down the
+                // whole relay leg.
                 if let Err(e) = tx.send(frame_context0(&buf[..n])) {
-                    tracing::error!("connect-udp uplink send failed: {e}");
-                    break;
+                    tracing::warn!("connect-udp uplink send failed, dropping datagram: {e}");
                 }
             }
             payload = inbound.recv() => {
@@ -159,6 +167,44 @@ mod tests {
             .unwrap();
         assert_eq!(&rbuf[..n], b"pong");
         assert_eq!(from, sock_addr, "reply comes from the bridge socket");
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// A `DatagramTx` whose `send` always fails, to exercise the uplink
+    /// error path.
+    struct FailingTx;
+    impl DatagramTx for FailingTx {
+        fn send(&mut self, _d: Bytes) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("simulated transient send failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn uplink_send_error_drops_datagram_but_keeps_bridge_alive() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_addr = sock.local_addr().unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (in_tx, in_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(run_bridge(sock.clone(), FailingTx, in_rx, shutdown.clone()));
+
+        // Uplink whose send fails: it records the source, then the failing send
+        // is dropped — the bridge must NOT tear down.
+        app.send_to(b"ping", sock_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "bridge stays alive after a send error");
+
+        // Proof of life: the recorded source still receives a downlink reply.
+        in_tx.send(Bytes::from_static(b"pong")).await.unwrap();
+        let mut rbuf = [0u8; 16];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(1), app.recv_from(&mut rbuf))
+            .await
+            .expect("downlink within timeout")
+            .unwrap();
+        assert_eq!(&rbuf[..n], b"pong");
 
         shutdown.cancel();
         let _ = handle.await;
