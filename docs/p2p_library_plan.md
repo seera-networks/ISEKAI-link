@@ -237,7 +237,8 @@ where OpenCV is unavailable.
   `ListenerSession` relaying to it, and drive `IssueCapability` / `Bind` from the
   GUI over a command channel;
 - `tls::dev_cert` — the self-signed cert for the video listener (the client dials
-  with validation disabled, dev only).
+  with validation disabled, dev only). This is a dev posture; §8 tracks the
+  planned proxy-issued per-endpoint cert with validation on.
 
 Both apps gain a **"Connection mode"** UI selector: `Direct (legacy)` vs `P2P`.
 Direct keeps calling `isekai-link-utils` unchanged. P2P uses `camera-core` (which
@@ -359,6 +360,30 @@ flow, so the camera work never blocks the library refactor.
 
 ## 8. Out of scope / follow-ups
 
+- **Validated TLS for the video QUIC (proxy-issued per-endpoint cert).** Steps
+  1–4 ship with a dev posture: the listener presents a self-signed cert
+  (`tls::dev_cert`) and the initiator dials with validation disabled
+  (`NO_CERTIFICATE_VALIDATION`, gated by `ISEKAI_INSECURE_SKIP_VERIFY`). The
+  planned replacement removes the blanket skip:
+  - A **loopback FQDN** that resolves to `127.0.0.1` (wildcard DNS
+    `*.<p2p-domain> → 127.0.0.1`), one **per-endpoint** certificate (not a
+    wildcard cert — a shared key would let one compromised listener impersonate
+    every endpoint).
+  - The **listener downloads its FQDN cert + key from the proxy** (a new
+    Endpoint-Token-authenticated endpoint) instead of self-signing.
+  - The **initiator dials the peer's FQDN** (`start(FQDN, C)` — msquic uses the
+    host as SNI; `C` is the relay's local port) with validation **on**.
+  - Caveat: the proxy issues and holds the key, so this does **not** defend
+    against a malicious proxy (already the relay's trust anchor); it removes the
+    blanket skip, prevents wrong-endpoint connections, and limits blast radius on
+    a listener compromise. End-to-end (proxy-untrusted) would require pinning the
+    peer's Endpoint identity — a further step.
+
+  The proxy-side design (FQDN scheme, ACME per-endpoint issuance + caching, the
+  cert-distribution endpoint) is specced in `ISEKAI-link-server`
+  `docs/p2p_connect_implementation_plan.md` phase 7. Camera-side changes:
+  `camera-core` `video`/`server` download and use the cert (drop `tls::dev_cert`
+  for the non-dev path) and enable validation with the peer FQDN as SNI.
 - **Automated capability exchange.** A signaling channel (or reusing the
   server's WebRTC signaling) would remove the manual paste; deferred.
 - **Direct (hole-punched) upgrade.** The plan uses the relay leg only. Candidate
