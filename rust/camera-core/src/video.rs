@@ -141,6 +141,12 @@ fn video_client_config(
         Some(
             &msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
+                // Cap the MTU so a video QUIC packet (a QUIC Initial is padded
+                // to 1200) plus CONNECT-UDP encapsulation fits inside the relay
+                // tunnel's HTTP datagram. Matches the listener (see
+                // `make_msquic_async_listener`). Without it the default 1500-MTU
+                // packets overflow the tunnel and are dropped as `TooLarge`.
+                .set_MaximumMtu(1200)
                 .set_PeerUnidiStreamCount(100)
                 .set_StreamMultiReceiveEnabled(),
         ),

@@ -67,10 +67,18 @@ async fn main() {
     };
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
-    // Exit without running the msquic teardown: dropping the relay legs /
-    // registrations calls the blocking `RegistrationClose` (it waits for every
-    // child handle), which would hang this one-shot harness.
-    std::process::exit(code);
+    let _ = std::io::stderr().flush();
+    // Exit immediately without running msquic's teardown: dropping the relay
+    // legs / registrations calls the blocking `RegistrationClose`, and msquic's
+    // C++ static destructors race the worker threads at process exit and abort.
+    // `_exit(2)` skips both — output is already flushed.
+    unsafe { libc_exit(code) }
+}
+
+// Raw libc `_exit`: terminate now, skipping atexit / static destructors.
+unsafe extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
 }
 
 async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow::Result<usize> {
