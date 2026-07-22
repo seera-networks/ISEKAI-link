@@ -193,6 +193,23 @@ pub(crate) fn make_client_config(
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()
+                // Pin this connection's MTU to the standard ~1500-byte network
+                // path so it can carry a *relayed* inner QUIC packet from the
+                // very first datagram. A tunneled QUIC Initial is padded to 1200
+                // bytes (RFC 9000 §14.1); at msquic's default MinimumMtu (1248)
+                // the outer connection's max-datagram length (~1206) is just
+                // under 1200 + CONNECT-UDP encapsulation, so the first relayed
+                // packet is dropped `TooLarge` before DPLPMTUD probes upward.
+                // (On loopback the MTU is effectively unbounded, so this only
+                // bites off-loopback.) Raising the floor to 1400 clears the
+                // encapsulated Initial immediately while keeping the outer IP
+                // packet within a standard 1500-MTU path. Deliberate trade-off:
+                // the relay data path therefore assumes a normal ~1500-MTU
+                // network and does not support constrained sub-1400 paths
+                // (e.g. a 1280-MTU tunnel), where a nested 1200-byte QUIC
+                // handshake cannot fit a datagram anyway.
+                .set_MinimumMtu(1400)
+                .set_MaximumMtu(1500)
                 .set_StreamMultiReceiveEnabled(),
         ),
     )?;
