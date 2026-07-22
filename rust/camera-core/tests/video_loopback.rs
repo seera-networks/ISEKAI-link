@@ -15,19 +15,27 @@ async fn frames_travel_from_server_to_client() {
     let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default()).unwrap());
     let shutdown = CancellationToken::new();
 
-    // Server: bind the video listener and serve frames pushed into `frame_tx`.
+    // Server: bind the video listener (dev cert) and serve frames pushed into
+    // `frame_tx`.
     let (_reg, listener, addr) =
-        bind_video_listener(Some(reg.clone()), "127.0.0.1:0".parse().unwrap()).unwrap();
+        bind_video_listener(Some(reg.clone()), "127.0.0.1:0".parse().unwrap(), None).unwrap();
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
     let serve = tokio::spawn(serve_frames(listener, frame_rx, shutdown.clone()));
 
-    // Client: dial that address and collect inbound frames.
+    // Client: dial that address (dev cert → skip validation) and collect frames.
     let (recv_tx, mut recv_rx) = mpsc::channel::<(u64, Bytes)>(16);
     let client_shutdown = shutdown.clone();
     let receive = tokio::spawn(async move {
-        receive_frames(None, addr, recv_tx, client_shutdown)
-            .await
-            .unwrap();
+        receive_frames(
+            None,
+            "127.0.0.1",
+            addr.port(),
+            false,
+            recv_tx,
+            client_shutdown,
+        )
+        .await
+        .unwrap();
     });
 
     // The server fans out only to already-connected clients, and the connection

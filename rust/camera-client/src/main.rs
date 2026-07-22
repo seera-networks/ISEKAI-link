@@ -240,7 +240,14 @@ impl MyApp {
                     return;
                 }
             };
-            let local_addr = session.local_addr;
+            let local_port = session.local_addr.port();
+            // Dial the peer's loopback FQDN (which resolves to 127.0.0.1) so the
+            // per-endpoint relay certificate can be validated. When the proxy has
+            // relay certificates disabled, fall back to 127.0.0.1 unvalidated.
+            let (video_host, verify) = match session.video_host() {
+                Some(host) => (host.to_string(), true),
+                None => ("127.0.0.1".to_string(), false),
+            };
             {
                 let mut s = shared.lock().unwrap();
                 s.connection_id = Some(session.connection_id().to_string());
@@ -252,7 +259,10 @@ impl MyApp {
 
             // Receiving establishes once the server binds the relay for this
             // connection id. The `session` stays alive to hold the relay leg.
-            if let Err(e) = camera_core::receive_frames(None, local_addr, tx, shutdown).await {
+            if let Err(e) =
+                camera_core::receive_frames(None, &video_host, local_port, verify, tx, shutdown)
+                    .await
+            {
                 shared.lock().unwrap().status = format!("receive error: {e:#}");
             }
             session.close().await;

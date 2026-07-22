@@ -59,6 +59,22 @@ impl ListenerSession {
         ttl: Option<u64>,
     ) -> anyhow::Result<Self> {
         let endpoint_token = issue_endpoint_token(cfg).await?.endpoint_token;
+        Self::create_with_token(cfg, &endpoint_token, forward_to, ttl).await
+    }
+
+    /// Like [`create`](Self::create) but with an Endpoint Token the caller
+    /// already holds, skipping the Identity API round-trip.
+    ///
+    /// Lets a caller that also downloads the relay certificate (which needs the
+    /// same token) issue the token once. Only `proxy_url`, `protocol`, `key` and
+    /// the Endpoint ID are read from `cfg`.
+    pub async fn create_with_token(
+        cfg: &P2pConfig,
+        endpoint_token: &str,
+        forward_to: SocketAddr,
+        ttl: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        let endpoint_token = endpoint_token.to_owned();
         let proxy = ProxyClient::new(
             MasqueH3Transport::connect(&cfg.proxy_url)?,
             cfg.key.clone(),

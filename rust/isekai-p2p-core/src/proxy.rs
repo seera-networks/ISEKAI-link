@@ -120,6 +120,24 @@ pub struct RelayInfo {
     pub session_id: String,
 }
 
+/// A per-endpoint relay TLS certificate downloaded from the proxy
+/// (`GET /v1/peer/certificate`). The listener presents it on the video QUIC so
+/// the initiator, dialing the matching [`PeerConnection::video_host`] FQDN, can
+/// validate it instead of skipping certificate checks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertBundle {
+    /// The FQDN the certificate is issued for (resolves to loopback).
+    pub hostname: String,
+    /// PEM-encoded certificate chain.
+    pub cert_pem: String,
+    /// PEM-encoded private key.
+    pub key_pem: String,
+    /// Base64 (standard) PKCS#12 bundle, for platforms (Windows/Schannel) that
+    /// load credentials from a PKCS#12 blob rather than PEM. Empty when absent.
+    #[serde(default)]
+    pub pkcs12: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConnection {
     pub connection_id: String,
@@ -132,6 +150,12 @@ pub struct PeerConnection {
     pub relay: Option<RelayInfo>,
     #[serde(default)]
     pub relay_session_id: Option<String>,
+    /// The loopback FQDN the initiator should dial for the video QUIC over the
+    /// relay, so it can validate the per-endpoint certificate the listener
+    /// downloaded. `None` when the proxy has relay certificates disabled — in
+    /// that case the initiator falls back to dialing `127.0.0.1` unvalidated.
+    #[serde(default)]
+    pub video_host: Option<String>,
     #[serde(default)]
     pub candidates: Vec<Candidate>,
     #[serde(default)]
@@ -256,6 +280,20 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             to_vec(&body),
         )
         .await
+    }
+
+    /// `GET /v1/peer/certificate` — download this Endpoint's per-endpoint relay
+    /// TLS certificate. Returns `Ok(None)` when the proxy has relay certificates
+    /// disabled (HTTP 404), so the caller can fall back to a dev certificate.
+    pub async fn get_certificate(&self) -> Result<Option<CertBundle>, ProxyError> {
+        let resp = self.send("GET", "/v1/peer/certificate", Vec::new()).await?;
+        match resp.status {
+            404 => Ok(None),
+            s if (200..300).contains(&s) => serde_json::from_slice(&resp.body)
+                .map(Some)
+                .map_err(ProxyError::Decode),
+            _ => Err(problem_error(&resp)),
+        }
     }
 
     // ---- request plumbing ----
@@ -456,5 +494,32 @@ mod tests {
         let calls = client.transport.calls.lock().unwrap();
         assert_eq!(calls[0].0, "DELETE");
         assert_eq!(calls[0].1, "/v1/peer-listeners/pl_1");
+    }
+
+    #[tokio::test]
+    async fn get_certificate_parses_bundle() {
+        let resp = r#"{"hostname":"e0123.relay.example","cert_pem":"-CERT-",
+            "key_pem":"-KEY-","pkcs12":"AAAA"}"#;
+        let (client, _key) = client(MockTransport::with_response(200, resp));
+        let bundle = client
+            .get_certificate()
+            .await
+            .unwrap()
+            .expect("Some bundle");
+        assert_eq!(bundle.hostname, "e0123.relay.example");
+        assert_eq!(bundle.cert_pem, "-CERT-");
+        assert_eq!(bundle.key_pem, "-KEY-");
+        let calls = client.transport.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "GET");
+        assert_eq!(calls[0].1, "/v1/peer/certificate");
+    }
+
+    #[tokio::test]
+    async fn get_certificate_maps_404_to_none() {
+        let (client, _key) = client(MockTransport::with_response(
+            404,
+            "relay certificates not configured",
+        ));
+        assert!(client.get_certificate().await.unwrap().is_none());
     }
 }

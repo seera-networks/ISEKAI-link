@@ -21,7 +21,7 @@ pub mod config;
 pub mod initiator;
 pub mod listener;
 
-pub use config::{issue_endpoint_token, load_or_generate_key, P2pConfig};
+pub use config::{fetch_relay_certificate, issue_endpoint_token, load_or_generate_key, P2pConfig};
 pub use initiator::InitiatorSession;
 pub use listener::ListenerSession;
 
@@ -29,6 +29,8 @@ pub use listener::ListenerSession;
 pub mod agent {
     pub use isekai_p2p_core::endpoint::EndpointKey;
     pub use isekai_p2p_core::identity::EndpointToken;
-    pub use isekai_p2p_core::proxy::{Candidate, CandidateType, Capability, PeerConnection};
+    pub use isekai_p2p_core::proxy::{
+        Candidate, CandidateType, Capability, CertBundle, PeerConnection,
+    };
     pub use isekai_p2p_core::transport::shutdown_msquic;
 }

@@ -94,6 +94,13 @@ impl InitiatorSession {
         &self.connection.connection_id
     }
 
+    /// The loopback FQDN to dial for the video QUIC so its per-endpoint
+    /// certificate can be validated, or `None` when the proxy has relay
+    /// certificates disabled (dial `127.0.0.1` unvalidated instead).
+    pub fn video_host(&self) -> Option<&str> {
+        self.connection.video_host.as_deref()
+    }
+
     /// Tear down the relay connect leg.
     pub async fn close(self) {
         self.relay.close().await;

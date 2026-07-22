@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use isekai_p2p::{ListenerSession, P2pConfig};
+use isekai_p2p::{fetch_relay_certificate, issue_endpoint_token, ListenerSession, P2pConfig};
 use msquic_async::Registration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -69,11 +69,29 @@ pub async fn spawn_p2p_server(
     frame_rx: mpsc::Receiver<Bytes>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<ServerHandle> {
+    // Issue the Endpoint Token once, then reuse it for both the certificate
+    // download and the listener session.
+    let endpoint_token = issue_endpoint_token(&cfg).await?.endpoint_token;
+
+    // Download this Endpoint's per-endpoint relay certificate so the video
+    // listener can present it and the initiator can validate it. `None` when the
+    // proxy has relay certificates disabled — the listener then uses a dev cert.
+    let cert = fetch_relay_certificate(&cfg, &endpoint_token).await?;
+    if let Some(bundle) = &cert {
+        tracing::info!(
+            "using per-endpoint relay certificate for {}",
+            bundle.hostname
+        );
+    } else {
+        tracing::warn!("proxy has relay certificates disabled; using a dev certificate");
+    }
+
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
-    let (video_reg, listener, video_addr) = bind_video_listener(reg, bind_addr)?;
+    let (video_reg, listener, video_addr) = bind_video_listener(reg, bind_addr, cert.as_ref())?;
 
     // The relay delivers the initiator's traffic to the video listener address.
-    let session = ListenerSession::create(&cfg, video_addr, None).await?;
+    let session =
+        ListenerSession::create_with_token(&cfg, &endpoint_token, video_addr, None).await?;
     let info = ServerInfo {
         listener_id: session.listener_id.clone(),
         endpoint_id: session.endpoint_id.clone(),

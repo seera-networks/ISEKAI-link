@@ -14,26 +14,40 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use isekai_p2p::agent::CertBundle;
+
 use crate::tls::dev_cert;
 
 /// ALPN for the camera video protocol.
 pub const VIDEO_ALPN: &str = "sample";
 
-/// Bind a video QUIC listener on `addr` with a generated dev certificate.
+/// Bind a video QUIC listener on `addr`.
+///
+/// With `cert` (the per-endpoint bundle downloaded from the proxy) the listener
+/// presents that certificate, so the initiator — dialing the matching loopback
+/// FQDN — can validate it. Without one it falls back to a generated dev
+/// certificate (dev only; the initiator then skips validation).
 ///
 /// Returns the registration (created when `reg` is `None`), the listener, and
 /// its bound local address — for P2P, pass that address to the relay bind leg.
 pub fn bind_video_listener(
     reg: Option<Arc<Registration>>,
     addr: SocketAddr,
+    cert: Option<&CertBundle>,
 ) -> anyhow::Result<(Arc<Registration>, Listener, SocketAddr)> {
-    let cert = dev_cert(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
+    let (cert_pem, key_pem) = match cert {
+        Some(bundle) => (bundle.cert_pem.clone(), bundle.key_pem.clone()),
+        None => {
+            let dev = dev_cert(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
+            (dev.cert_pem, dev.key_pem)
+        }
+    };
     let (reg, listener) = isekai_link_utils::make_msquic_async_listener(
         reg,
         VIDEO_ALPN,
         Some(addr),
-        &cert.cert_pem,
-        &cert.key_pem,
+        &cert_pem,
+        &key_pem,
         None,
     )?;
     let local = listener
@@ -97,19 +111,25 @@ async fn push_one(conn: &Connection, frame: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Dial a video QUIC connection at `addr` and deliver inbound frames — tagged
-/// with the stream id as a monotonically increasing sequence — to `frame_tx`.
-/// Runs until `shutdown` fires or the connection ends.
+/// Dial a video QUIC connection at `host:port` and deliver inbound frames —
+/// tagged with the stream id as a monotonically increasing sequence — to
+/// `frame_tx`. Runs until `shutdown` fires or the connection ends.
+///
+/// `host` is used both to resolve the address (a P2P loopback FQDN resolves to
+/// `127.0.0.1`) and as the TLS server name. With `verify` the peer's
+/// certificate is validated against `host`; without it, validation is skipped
+/// (dev only, for the self-signed [`dev_cert`]).
 pub async fn receive_frames(
     reg: Option<Arc<Registration>>,
-    addr: SocketAddr,
+    host: &str,
+    port: u16,
+    verify: bool,
     frame_tx: mpsc::Sender<(u64, Bytes)>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let (reg, config) = video_client_config(reg)?;
+    let (reg, config) = video_client_config(reg, verify)?;
     let conn = Connection::new(&reg)?;
-    conn.start(&config, &addr.ip().to_string(), addr.port())
-        .await?;
+    conn.start(&config, host, port).await?;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -126,10 +146,13 @@ pub async fn receive_frames(
     Ok(())
 }
 
-/// Video client config: ALPN `sample`, certificate validation **disabled** —
-/// dev only, since the peer presents a self-signed cert ([`dev_cert`]).
+/// Video client config: ALPN `sample`. With `verify` the peer's certificate is
+/// validated against the dialed server name (the per-endpoint relay cert);
+/// without it validation is **disabled** — dev only, for the self-signed
+/// [`dev_cert`].
 fn video_client_config(
     reg: Option<Arc<Registration>>,
+    verify: bool,
 ) -> anyhow::Result<(Arc<Registration>, msquic::Configuration)> {
     let reg = match reg {
         Some(reg) => reg,
@@ -151,8 +174,10 @@ fn video_client_config(
                 .set_StreamMultiReceiveEnabled(),
         ),
     )?;
-    let cred = msquic::CredentialConfig::new_client()
-        .set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
+    let mut cred = msquic::CredentialConfig::new_client();
+    if !verify {
+        cred = cred.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
+    }
     config.load_credential(&cred)?;
     Ok((reg, config))
 }

@@ -19,4 +19,5 @@ pub use server::{spawn_p2p_server, ServerCommand, ServerHandle, ServerInfo};
 pub use video::{bind_video_listener, receive_frames, serve_frames, VIDEO_ALPN};
 
 /// Re-exports of the P2P types the camera apps build on.
+pub use isekai_p2p::agent::CertBundle;
 pub use isekai_p2p::{load_or_generate_key, InitiatorSession, P2pConfig};

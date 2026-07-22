@@ -118,7 +118,16 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
     .await?;
     let connection_id = session.connection_id().to_owned();
     let local_addr = session.local_addr;
-    println!("initiator connected: connection={connection_id} local={local_addr}");
+    // Dial the per-endpoint FQDN with validation when the proxy issued a relay
+    // certificate; otherwise fall back to 127.0.0.1 unvalidated (dev).
+    let (video_host, verify) = match session.video_host() {
+        Some(host) => (host.to_string(), true),
+        None => ("127.0.0.1".to_string(), false),
+    };
+    let video_port = local_addr.port();
+    println!(
+        "initiator connected: connection={connection_id} local={local_addr} host={video_host} verify={verify}"
+    );
 
     // Step 4: server binds the relay for that connection id.
     command(&server.commands, |reply| ServerCommand::Bind {
@@ -132,7 +141,15 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
     let (recv_tx, mut recv_rx) = mpsc::channel::<(u64, Bytes)>(16);
     let recv_shutdown = shutdown.clone();
     let receiver = tokio::spawn(async move {
-        camera_core::receive_frames(None, local_addr, recv_tx, recv_shutdown).await
+        camera_core::receive_frames(
+            None,
+            &video_host,
+            video_port,
+            verify,
+            recv_tx,
+            recv_shutdown,
+        )
+        .await
     });
 
     // Push synthetic frames until enough arrive (the QUIC handshake over the
