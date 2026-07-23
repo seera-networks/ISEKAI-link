@@ -4,8 +4,14 @@ use eframe::egui;
 use msquic_async::msquic;
 use opencv::{core::AlgorithmHint, imgcodecs, prelude::*};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_util::sync::CancellationToken;
+
+/// How long to wait for the server to bind its relay leg after we hand over the
+/// connection id. Generous because it spans the human step of pasting the id
+/// into the server GUI.
+const PEER_RELAY_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn make_msquic_async_client_config(
     registration: Option<Arc<msquic_async::Registration>>,
@@ -255,6 +261,17 @@ impl MyApp {
                     "connected; give connection id to the server, then it streams: {}",
                     session.connection_id()
                 );
+            }
+
+            // Readiness barrier: wait until the server has bound its relay leg
+            // before dialing the video QUIC. Dialing earlier hits a half-open
+            // relay edge and stalls the tunneled handshake until its ~10s idle
+            // timeout (CONNECTION_IDLE). The wait spans the human step of pasting
+            // the connection id into the server, so allow generous time.
+            if let Err(e) = session.wait_for_peer_relay(PEER_RELAY_TIMEOUT).await {
+                shared.lock().unwrap().status = format!("relay not ready: {e:#}");
+                session.close().await;
+                return;
             }
 
             // Receiving establishes once the server binds the relay for this
