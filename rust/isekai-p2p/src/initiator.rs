@@ -6,19 +6,13 @@
 //! carries it to the target's bound socket.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use anyhow::Context as _;
 use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay};
-use isekai_p2p_core::proxy::{Candidate, CandidateType, PeerConnection, ProxyClient};
+use isekai_p2p_core::proxy::{Candidate, PeerConnection, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
-use tokio::time::{sleep, Instant};
 
 use crate::config::{issue_endpoint_token, P2pConfig};
-
-/// How often [`InitiatorSession::wait_for_peer_relay`] re-polls the connection
-/// view while waiting for the target to bind its relay leg.
-const PEER_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// An initiator-side P2P session. Holds the relay connect leg open until dropped
 /// or [`close`](InitiatorSession::close)d.
@@ -29,9 +23,6 @@ pub struct InitiatorSession {
     /// target so it can bind) and the relay info.
     pub connection: PeerConnection,
     relay: ConnectRelay,
-    /// The control-plane client, retained so the session can poll the connection
-    /// view for the peer's relay-leg readiness (see [`Self::wait_for_peer_relay`]).
-    proxy: ProxyClient<MasqueH3Transport>,
 }
 
 impl InitiatorSession {
@@ -95,75 +86,12 @@ impl InitiatorSession {
             local_addr: handle.local_addr,
             connection,
             relay: handle,
-            proxy,
         })
     }
 
     /// The connection id, to hand to the target so it can bind its relay leg.
     pub fn connection_id(&self) -> &str {
         &self.connection.connection_id
-    }
-
-    /// Block until the target has bound its relay leg — a readiness barrier the
-    /// local application must clear before it dials the tunneled (video) QUIC.
-    ///
-    /// `connect` returns as soon as *this* side's relay leg is up, but the
-    /// target only binds after it learns the `connection_id` out of band. If the
-    /// application dials the relay before the target's leg exists, its first
-    /// packets reach a half-open relay edge, are dropped, and the tunneled QUIC
-    /// handshake stalls until its ~10 s idle timeout (`CONNECTION_IDLE`). That
-    /// was the dominant remaining cause of P2P relay flakiness.
-    ///
-    /// Readiness is observed on the control plane: once the target's bind leg is
-    /// established, the proxy injects a `relay` candidate for it, which shows up
-    /// in this connection view's `peer_candidates`. We poll
-    /// `GET /v1/peer/connections/{id}` until that candidate appears.
-    ///
-    /// Returns `Ok(())` once the peer relay leg is observed. Returns an error if
-    /// the connection reaches a terminal state first — `failed` (a relay leg was
-    /// rejected by a proxy data-path guardrail, spec §13) or `closed` — or if
-    /// `timeout` elapses.
-    pub async fn wait_for_peer_relay(&self, timeout: Duration) -> anyhow::Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let view = self
-                .proxy
-                .get_connection(&self.connection.connection_id)
-                .await
-                .context("failed to poll the connection view while awaiting the peer relay leg")?;
-
-            if view
-                .peer_candidates
-                .iter()
-                .any(|c| c.r#type == CandidateType::Relay)
-            {
-                return Ok(());
-            }
-
-            // Terminal states never yield a peer relay candidate — fail fast
-            // instead of spinning until the timeout.
-            match view.state.as_str() {
-                "failed" => anyhow::bail!(
-                    "connection {} failed before the peer bound its relay leg \
-                     (a relay leg was rejected by a proxy guardrail)",
-                    self.connection.connection_id
-                ),
-                "closed" => anyhow::bail!(
-                    "connection {} was closed before the peer bound its relay leg",
-                    self.connection.connection_id
-                ),
-                _ => {}
-            }
-
-            if Instant::now() + PEER_RELAY_POLL_INTERVAL >= deadline {
-                anyhow::bail!(
-                    "timed out after {timeout:?} waiting for the peer to bind its relay leg \
-                     for connection {}",
-                    self.connection.connection_id
-                );
-            }
-            sleep(PEER_RELAY_POLL_INTERVAL).await;
-        }
     }
 
     /// The loopback FQDN to dial for the video QUIC so its per-endpoint

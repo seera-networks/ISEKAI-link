@@ -6,12 +6,14 @@
 use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Bytes;
 use msquic_async::{msquic, Connection, Listener, Registration, StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use isekai_p2p::agent::CertBundle;
@@ -20,6 +22,13 @@ use crate::tls::dev_cert;
 
 /// ALPN for the camera video protocol.
 pub const VIDEO_ALPN: &str = "sample";
+
+/// How long to keep retrying the video handshake before giving up. This spans
+/// the gap between the initiator opening its relay leg and the peer binding
+/// *its* leg (e.g. a human pressing "bind relay" on the camera server).
+const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(120);
+/// Delay between video handshake attempts.
+const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Bind a video QUIC listener on `addr`.
 ///
@@ -134,8 +143,7 @@ pub async fn receive_frames(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let (reg, config) = video_client_config(reg, verify)?;
-    let conn = Connection::new(&reg)?;
-    conn.start(&config, host, port).await?;
+    let conn = dial_video(&reg, &config, host, port, &shutdown).await?;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -150,6 +158,57 @@ pub async fn receive_frames(
         }
     }
     Ok(())
+}
+
+/// Dial the video QUIC, retrying the handshake until it completes, the deadline
+/// passes, or `shutdown` fires.
+///
+/// Over the P2P relay the initiator opens its own leg first and only then does
+/// the peer bind *its* leg — it needs the connection id out of band (e.g. a
+/// human pasting it into the camera server). Until both legs are bridged, the
+/// handshake's packets reach a half-open relay edge and the attempt fails with
+/// `CONNECTION_IDLE` after the handshake idle timeout. A completed handshake is
+/// itself the readiness signal (both legs are up), so we simply retry until it
+/// succeeds rather than gating on any control-plane state — the loopback relay
+/// rendezvous injects no reachable candidate to poll for.
+async fn dial_video(
+    reg: &Registration,
+    config: &msquic::Configuration,
+    host: &str,
+    port: u16,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<Connection> {
+    let deadline = Instant::now() + VIDEO_CONNECT_DEADLINE;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let conn = Connection::new(reg)?;
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
+            r = conn.start(config, host, port) => r,
+        };
+        match result {
+            Ok(()) => return Ok(conn),
+            Err(e) => {
+                drop(conn);
+                if Instant::now() >= deadline {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "video QUIC handshake to {host}:{port} did not complete within \
+                         {VIDEO_CONNECT_DEADLINE:?} ({attempt} attempts); the peer may not have \
+                         bound its relay leg"
+                    )));
+                }
+                tracing::debug!(
+                    "video handshake attempt {attempt} failed ({e}); retrying — the peer relay \
+                     leg may not be up yet"
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
+                    _ = sleep(VIDEO_CONNECT_RETRY_DELAY) => {}
+                }
+            }
+        }
+    }
 }
 
 /// Video client config: ALPN `sample`. With `verify` the peer's certificate is
@@ -170,6 +229,10 @@ fn video_client_config(
         Some(
             &msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
+                // Fail an unanswered handshake quickly so `dial_video` can retry
+                // while the peer's relay leg is still being bound, instead of
+                // waiting out the 10s default before each retry.
+                .set_HandshakeIdleTimeoutMs(3_000)
                 // Cap the MTU so a video QUIC packet (a QUIC Initial is padded
                 // to 1200) plus CONNECT-UDP encapsulation fits inside the relay
                 // tunnel's HTTP datagram. Matches the listener (see

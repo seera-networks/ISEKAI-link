@@ -156,11 +156,6 @@ struct Connect {
     /// local UDP address to bind for the relay leg (default 127.0.0.1:0)
     #[argh(option)]
     relay_local_addr: Option<String>,
-    /// with --relay, block after connecting until the peer binds its relay leg
-    /// (a `relay` peer candidate appears), then log readiness before running.
-    /// Avoids sending into a half-open relay edge. Times out after 120s
-    #[argh(switch)]
-    await_peer: bool,
 }
 
 /// Get a peer connection's current state.
@@ -409,13 +404,6 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
     print_json(&serde_json::json!({
         "relay_local_addr": session.local_addr.to_string(),
     }))?;
-    if a.await_peer {
-        tracing::info!("waiting for the peer to bind its relay leg...");
-        session
-            .wait_for_peer_relay(std::time::Duration::from_secs(120))
-            .await?;
-        tracing::info!("peer relay leg established");
-    }
     tracing::info!(
         "relay leg running; send UDP to {} (Ctrl-C to stop)",
         session.local_addr
