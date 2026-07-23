@@ -35,11 +35,17 @@ pub fn bind_video_listener(
     addr: SocketAddr,
     cert: Option<&CertBundle>,
 ) -> anyhow::Result<(Arc<Registration>, Listener, SocketAddr)> {
-    let (cert_pem, key_pem) = match cert {
-        Some(bundle) => (bundle.cert_pem.clone(), bundle.key_pem.clone()),
+    let (cert_pem, key_pem, pkcs12) = match cert {
+        // `pkcs12` is empty when the proxy doesn't ship one; fall back to the
+        // PEM path then instead of importing an empty PKCS#12 blob.
+        Some(bundle) => (
+            bundle.cert_pem.clone(),
+            bundle.key_pem.clone(),
+            (!bundle.pkcs12.is_empty()).then(|| bundle.pkcs12.clone()),
+        ),
         None => {
             let dev = dev_cert(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
-            (dev.cert_pem, dev.key_pem)
+            (dev.cert_pem, dev.key_pem, None)
         }
     };
     let (reg, listener) = isekai_link_utils::make_msquic_async_listener(
@@ -48,7 +54,7 @@ pub fn bind_video_listener(
         Some(addr),
         &cert_pem,
         &key_pem,
-        None,
+        pkcs12.as_deref(),
     )?;
     let local = listener
         .local_addr()
