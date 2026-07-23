@@ -157,8 +157,15 @@ async fn main() -> eframe::Result<()> {
     let reg =
         Arc::new(msquic_async::Registration::new(&msquic::RegistrationConfig::default()).unwrap());
 
-    let (tx, rx) = mpsc::channel();
-    let is_streaming = Arc::new(AtomicBool::new(false));
+    // Bounded: the UI drains this only while the window repaints (egui stops
+    // updating when occluded/minimized), so an unbounded channel accumulates
+    // ~27MB/s of raw frames and freezes the app. Keep at most 2 frames and
+    // drop the rest — the preview only ever needs the latest.
+    let (tx, rx) = mpsc::sync_channel::<([usize; 2], Bytes)>(2);
+    // CAMERA_AUTOSTART=1 starts capture immediately (debug/automation aid).
+    let is_streaming = Arc::new(AtomicBool::new(
+        std::env::var_os("CAMERA_AUTOSTART").is_some(),
+    ));
     let is_streaming_camera = Arc::clone(&is_streaming);
     let is_terminated = Arc::new(AtomicBool::new(false));
     let is_terminated_camera = Arc::clone(&is_terminated);
@@ -187,6 +194,8 @@ async fn main() -> eframe::Result<()> {
             cam.read(&mut frame).unwrap();
 
             if frame.empty() {
+                // Grab failed (e.g. device busy); back off instead of busy-looping.
+                thread::sleep(std::time::Duration::from_millis(33));
                 continue;
             }
 
@@ -204,10 +213,16 @@ async fn main() -> eframe::Result<()> {
             let size = [rgb.cols() as usize, rgb.rows() as usize];
             let data = Bytes::copy_from_slice(rgb.data_bytes().unwrap());
 
-            // ✅ UIへ送信
-            if tx.send((size, data)).is_err() {
-                tracing::error!("failed to send frame to UI");
-                break;
+            // ✅ UIへ送信（満杯なら最新性を優先してドロップ）
+            match tx.try_send((size, data)) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    // UI isn't repainting (e.g. window occluded); drop the frame.
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    tracing::error!("failed to send frame to UI");
+                    break;
+                }
             }
 
             let mut buf = core::Vector::<u8>::new();
@@ -606,7 +621,15 @@ impl MyApp {
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ✅ 新しいフレーム受信（最新のみ使う）
-        while let Ok((size, data)) = self.rx.try_recv() {
+        // Drain first, convert once: converting inside the drain loop livelocks
+        // when one conversion takes longer than the camera period — a new frame
+        // is always ready by the time the previous one is converted, so the
+        // loop (and update()) never returns and the window stops responding.
+        let mut latest = None;
+        while let Ok(frame) = self.rx.try_recv() {
+            latest = Some(frame);
+        }
+        if let Some((size, data)) = latest {
             let image = egui::ColorImage::from_rgb(size, &data);
 
             if let Some(tex) = &mut self.texture {

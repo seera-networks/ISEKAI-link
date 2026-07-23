@@ -364,36 +364,43 @@ impl MyApp {
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 新しいフレーム受信（最新のみ使う）
+        // Drain first, decode once: decoding inside the drain loop livelocks
+        // when one decode takes longer than the frame period — a new frame is
+        // always ready by the time the previous one is decoded, so the loop
+        // (and update()) never returns and the window stops responding.
         if let Some(rx) = &mut self.rx {
             let mut largest_seq = 0u64;
-            let mut new_image: Option<egui::ColorImage> = None;
+            let mut latest: Option<Bytes> = None;
             while let Ok((seq, data)) = rx.try_recv() {
                 if seq > largest_seq || largest_seq == 0 {
                     largest_seq = seq;
-                    let mat = imgcodecs::imdecode(
-                        &opencv::core::Vector::from_slice(&data),
-                        imgcodecs::IMREAD_COLOR,
-                    )
-                    .unwrap();
-
-                    let mut rgb = opencv::core::Mat::default();
-                    opencv::imgproc::cvt_color(
-                        &mat,
-                        &mut rgb,
-                        opencv::imgproc::COLOR_BGR2RGB,
-                        0,
-                        AlgorithmHint::ALGO_HINT_DEFAULT,
-                    )
-                    .unwrap();
-
-                    new_image = Some(egui::ColorImage::from_rgb(
-                        [rgb.cols() as usize, rgb.rows() as usize],
-                        rgb.data_bytes().unwrap(),
-                    ));
+                    latest = Some(data);
                 } else {
                     tracing::debug!("Discarding old frame with seq {seq}");
                 }
             }
+            let new_image = latest.map(|data| {
+                let mat = imgcodecs::imdecode(
+                    &opencv::core::Vector::from_slice(&data),
+                    imgcodecs::IMREAD_COLOR,
+                )
+                .unwrap();
+
+                let mut rgb = opencv::core::Mat::default();
+                opencv::imgproc::cvt_color(
+                    &mat,
+                    &mut rgb,
+                    opencv::imgproc::COLOR_BGR2RGB,
+                    0,
+                    AlgorithmHint::ALGO_HINT_DEFAULT,
+                )
+                .unwrap();
+
+                egui::ColorImage::from_rgb(
+                    [rgb.cols() as usize, rgb.rows() as usize],
+                    rgb.data_bytes().unwrap(),
+                )
+            });
             if let Some(image) = new_image {
                 if let Some(tex) = &mut self.texture {
                     tex.set(image, egui::TextureOptions::default());
