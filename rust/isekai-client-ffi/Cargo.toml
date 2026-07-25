@@ -1,0 +1,28 @@
+[package]
+name = "isekai-client-ffi"
+version = "0.1.0"
+edition = "2021"
+
+# Phase 1 of the iOS camera-client plan (docs/ios_camera_client_plan.md): a thin
+# FFI layer that exposes the P2P Connect *viewer* (initiator) API — connect over
+# the relay and stream received MJPEG frames — to Swift via UniFFI. All the
+# transport/P2P logic is reused from `camera-core`; only decode/UI/keys/login are
+# native on the app side.
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+camera-core = { workspace = true }
+isekai-p2p-core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uniffi = { version = "0.28", features = ["cli"] }

@@ -1,0 +1,86 @@
+name: iOS client FFI
+
+# Phase 1 of docs/ios_camera_client_plan.md: build the `isekai-client-ffi`
+# viewer crate for Apple platforms and generate the Swift bindings. iOS builds
+# need a macOS runner (Xcode + iOS SDK), which we don't have locally.
+#
+# The `apple-native` job proves the whole toolchain (msquic + the Rust core +
+# UniFFI) builds and links on macOS — msquic's build.rs already supports
+# aarch64-apple-darwin. The `ios` job attempts the iOS targets; until the msquic
+# submodule (seera-msquic/scripts/build.rs) learns to cross-compile for
+# *-apple-ios* (a Phase 0 item that lives in the submodule repo), those steps are
+# expected to fail, so they are non-blocking and exist to surface the exact gap.
+
+on:
+  push:
+    paths:
+      - 'rust/isekai-client-ffi/**'
+      - 'rust/camera-core/**'
+      - 'rust/Cargo.toml'
+      - '.github/workflows/ios-ffi.yml'
+  pull_request:
+    paths:
+      - 'rust/isekai-client-ffi/**'
+      - 'rust/camera-core/**'
+      - '.github/workflows/ios-ffi.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  apple-native:
+    name: Build FFI + Swift bindings (macOS native)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build isekai-client-ffi (host macOS)
+        run: cargo build -p isekai-client-ffi
+      - name: Generate Swift bindings from the built library
+        run: |
+          set -euo pipefail
+          LIB=$(ls target/debug/libisekai_client_ffi.dylib)
+          ./target/debug/uniffi-bindgen generate \
+            --library "$LIB" --language swift --out-dir target/swift-bindings
+          ls -l target/swift-bindings
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swift-bindings
+          path: rust/target/swift-bindings/
+
+  ios:
+    name: Build FFI for iOS (expected-fail until msquic iOS support)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Build for aarch64-apple-ios-sim
+        id: sim
+        continue-on-error: true
+        run: cargo build -p isekai-client-ffi --target aarch64-apple-ios-sim
+      - name: Build for aarch64-apple-ios (device)
+        id: device
+        continue-on-error: true
+        run: cargo build -p isekai-client-ffi --target aarch64-apple-ios
+      - name: Report iOS build status
+        run: |
+          echo "sim=${{ steps.sim.outcome }} device=${{ steps.device.outcome }}"
+          if [ "${{ steps.sim.outcome }}" != "success" ] || [ "${{ steps.device.outcome }}" != "success" ]; then
+            echo "::warning::iOS build not yet green — msquic (seera-msquic/scripts/build.rs) needs *-apple-ios cross-compile support (Phase 0, submodule repo)."
+          fi

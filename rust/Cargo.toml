@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent", "camera-client", "camera-core", "camera-server", "channel-masque", "isekai-p2p", "isekai-p2p-core", "utils", "webrtc-app"]
+members = ["agent", "camera-client", "camera-core", "camera-server", "channel-masque", "isekai-client-ffi", "isekai-p2p", "isekai-p2p-core", "utils", "webrtc-app"]
 resolver = "3"
 package.edition = "2021"
 
