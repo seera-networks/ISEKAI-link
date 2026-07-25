@@ -42,8 +42,10 @@ struct ContentView: View {
         }
     }
 
+    // A title string and a footer cannot be combined in one Section
+    // initialiser, so the sections with footers spell their header out.
     private var connectionSection: some View {
-        Section("Connection") {
+        Section {
             LabeledContent("Status", value: model.statusText)
             if !model.statusDetail.isEmpty {
                 Text(model.statusDetail)
@@ -65,16 +67,20 @@ struct ContentView: View {
                 Button("Connect") { model.connect() }
                     .disabled(!model.canConnect)
             }
+        } header: {
+            Text("Connection")
         } footer: {
             Text("Hand the Connection ID to the camera server so it can bind its relay leg.")
         }
     }
 
     private var identitySection: some View {
-        Section("This device") {
+        Section {
             CopyableValue(label: "Endpoint ID", value: model.endpointID)
             Button("Reset Endpoint key", role: .destructive) { model.resetEndpointKey() }
                 .disabled(model.isConnected)
+        } header: {
+            Text("This device")
         } footer: {
             Text("Give the Endpoint ID to the camera server; it issues a capability for it.")
         }
@@ -92,16 +98,20 @@ struct ContentView: View {
     }
 
     private var authSection: some View {
-        Section("Auth0 access token") {
+        Section {
             LabeledField("Token", text: $model.auth0Token, lineLimit: 1 ... 4)
+        } header: {
+            Text("Auth0 access token")
         } footer: {
             Text("Pasted by hand for now. Phase 3 replaces this with a real login.")
         }
     }
 
     private var developmentSection: some View {
-        Section("Development") {
+        Section {
             Toggle("Skip TLS verification", isOn: $model.settings.insecureSkipVerify)
+        } header: {
+            Text("Development")
         } footer: {
             Text("Accepts self-signed proxy and Identity certificates. Never enable this against a real deployment.")
         }
