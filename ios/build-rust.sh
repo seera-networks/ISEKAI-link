@@ -63,10 +63,15 @@ echo "==> building isekai-client-ffi for the host"
 cargo build "${CARGO_FLAGS[@]}"
 
 echo "==> generating Swift bindings"
-"$TARGET_DIR/$PROFILE/uniffi-bindgen" generate \
-    --library "$TARGET_DIR/$PROFILE/libisekai_client_ffi.dylib" \
-    --language swift \
-    --out-dir "$STAGE_DIR/bindings"
+# Library mode shells out to `cargo metadata` to map the library back to its
+# crate, so it has to run from inside the workspace rather than from ios/.
+(
+    cd "$RUST_DIR"
+    "$TARGET_DIR/$PROFILE/uniffi-bindgen" generate \
+        --library "$TARGET_DIR/$PROFILE/libisekai_client_ffi.dylib" \
+        --language swift \
+        --out-dir "$STAGE_DIR/bindings"
+)
 
 # The .swift goes into the app target; the header and its modulemap describe the
 # static library and travel inside the xcframework.
