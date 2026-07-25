@@ -57,8 +57,10 @@ final class ViewerModel: ObservableObject {
         } catch {
             errorMessage = "Endpoint key: \(error.localizedDescription)"
         }
+        // `try?` flattens the throwing call's optional result, so this binds
+        // only when a token was actually stored.
         if let stored = try? KeychainStore.string(for: KeychainStore.auth0TokenAccount) {
-            auth0Token = stored ?? ""
+            auth0Token = stored
         }
     }
 
@@ -100,16 +102,25 @@ final class ViewerModel: ObservableObject {
         // The core blocks for the control-plane exchange and the relay-leg
         // setup before it returns, so this cannot run on the main thread.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            do {
-                let session = try startSession(
+            let result = Result {
+                try startSession(
                     config: config,
                     endpointKeyPem: pem,
                     auth0Token: token,
                     sink: sink
                 )
-                Task { @MainActor in self?.attach(session) }
-            } catch {
-                Task { @MainActor in self?.fail(error.localizedDescription) }
+            }
+            // Bound to a constant after the blocking call: the model is not
+            // retained while connecting, and the hop back to the main actor
+            // captures a `let` rather than the enclosing closure's `self`.
+            guard let model = self else { return }
+            Task { @MainActor in
+                switch result {
+                case .success(let session):
+                    model.attach(session)
+                case .failure(let error):
+                    model.fail(error.localizedDescription)
+                }
             }
         }
     }
