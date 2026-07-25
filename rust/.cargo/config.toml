@@ -1,0 +1,10 @@
+# rustc defaults `*-apple-ios` to a minimum of iOS 10.0, while msquic/quictls
+# are compiled for the 13.0 that seera-msquic's build.rs (and its build.ps1)
+# uses. Linking below the version the objects were built for leaves
+# libSystem-versioned symbols such as `___chkstk_darwin` (iOS 12+) undefined, so
+# pin both sides here: seera-msquic's build.rs reads this same variable.
+#
+# `[env]` does not override a value already present in the environment, so an
+# Xcode-driven build can still choose its own deployment target.
+[env]
+IPHONEOS_DEPLOYMENT_TARGET = "13.0"
