@@ -5,12 +5,11 @@ name: iOS client FFI
 # need a macOS runner (Xcode + iOS SDK), which we don't have locally.
 #
 # The `apple-native` job proves the whole toolchain (msquic + the Rust core +
-# UniFFI) builds and links on macOS — msquic's build.rs already supports
-# aarch64-apple-darwin. The `ios` job builds the iOS targets themselves; the
-# *-apple-ios cross-compile support it needs now lives in the msquic submodule
-# (seera-msquic scripts/build.rs + submodules/CMakeLists.txt). Its steps stay
-# non-blocking until they have actually been observed green here, so a gap
-# surfaces as a warning rather than a red check.
+# UniFFI) builds and links on macOS and publishes the Swift bindings. The `ios`
+# job builds the device and simulator targets; the *-apple-ios cross-compile
+# support they need lives in the msquic submodule (seera-msquic scripts/build.rs
+# + submodules/CMakeLists.txt), and the deployment target both halves link
+# against is pinned in rust/.cargo/config.toml.
 
 on:
   push:
@@ -63,7 +62,7 @@ jobs:
           path: rust/target/swift-bindings/
 
   ios:
-    name: Build FFI for iOS (non-blocking until observed green)
+    name: Build FFI for iOS (device + simulator)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -77,16 +76,6 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - name: Build for aarch64-apple-ios-sim
-        id: sim
-        continue-on-error: true
         run: cargo build -p isekai-client-ffi --target aarch64-apple-ios-sim
       - name: Build for aarch64-apple-ios (device)
-        id: device
-        continue-on-error: true
         run: cargo build -p isekai-client-ffi --target aarch64-apple-ios
-      - name: Report iOS build status
-        run: |
-          echo "sim=${{ steps.sim.outcome }} device=${{ steps.device.outcome }}"
-          if [ "${{ steps.sim.outcome }}" != "success" ] || [ "${{ steps.device.outcome }}" != "success" ]; then
-            echo "::warning::iOS build not yet green — check the msquic submodule's *-apple-ios path (seera-msquic scripts/build.rs, submodules/CMakeLists.txt, src/rs/ffi)."
-          fi
