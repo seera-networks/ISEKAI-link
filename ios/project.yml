@@ -11,6 +11,10 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
+  # XcodeGen defaults to the Xcode 16 file format, which the macos-14 runner's
+  # Xcode 15.4 refuses to open. Newer Xcodes read this one happily, and the
+  # project is regenerated from this spec anyway, so nothing is given up.
+  projectFormat: xcode15_3
 
 settings:
   base:
