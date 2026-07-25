@@ -160,17 +160,25 @@ pub async fn receive_frames(
     Ok(())
 }
 
-/// Dial the video QUIC, retrying the handshake until it completes, the deadline
-/// passes, or `shutdown` fires.
+/// Dial the video QUIC, letting a single handshake ride across the peer's
+/// relay-bind gap; retry only as a fallback, until the deadline or `shutdown`.
 ///
 /// Over the P2P relay the initiator opens its own leg first and only then does
 /// the peer bind *its* leg — it needs the connection id out of band (e.g. a
 /// human pasting it into the camera server). Until both legs are bridged, the
-/// handshake's packets reach a half-open relay edge and the attempt fails with
-/// `CONNECTION_IDLE` after the handshake idle timeout. A completed handshake is
-/// itself the readiness signal (both legs are up), so we simply retry until it
-/// succeeds rather than gating on any control-plane state — the loopback relay
-/// rendezvous injects no reachable candidate to poll for.
+/// handshake's packets reach a half-open relay edge and go unanswered. A
+/// completed handshake is itself the readiness signal (both legs are up), and
+/// there is nothing on the control plane to poll — the loopback relay
+/// rendezvous injects no reachable candidate.
+///
+/// The key is to keep **one** connection retransmitting its Initial for the
+/// whole gap (a long `HandshakeIdleTimeoutMs`) rather than firing many
+/// short-lived attempts. Local relay testing showed rapid short attempts
+/// (a few seconds each) leave the relay path wedged so it never recovers even
+/// after the bind lands, whereas a single persistent handshake completes as
+/// soon as the far leg comes up. The retry loop below is therefore a
+/// last-resort fallback for a genuinely failed handshake, not the mechanism
+/// that bridges the gap.
 async fn dial_video(
     reg: &Registration,
     config: &msquic::Configuration,
@@ -229,10 +237,11 @@ fn video_client_config(
         Some(
             &msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
-                // Fail an unanswered handshake quickly so `dial_video` can retry
-                // while the peer's relay leg is still being bound, instead of
-                // waiting out the 10s default before each retry.
-                .set_HandshakeIdleTimeoutMs(3_000)
+                // Keep a single unanswered handshake alive long enough to span
+                // the peer's relay-bind gap: msquic keeps retransmitting the
+                // Initial on ONE connection until the far leg comes up, rather
+                // than many short-lived attempts (which poison the relay path).
+                .set_HandshakeIdleTimeoutMs(60_000)
                 // Cap the MTU so a video QUIC packet (a QUIC Initial is padded
                 // to 1200) plus CONNECT-UDP encapsulation fits inside the relay
                 // tunnel's HTTP datagram. Matches the listener (see
