@@ -36,10 +36,16 @@ GENERATED_DIR="$APP_DIR/Generated"
 FRAMEWORKS_DIR="$APP_DIR/Frameworks"
 STAGE_DIR="$TARGET_DIR/ios-stage"
 
-CARGO_FLAGS=(-p isekai-client-ffi --manifest-path "$RUST_DIR/Cargo.toml")
+CARGO_FLAGS=(-p isekai-client-ffi)
 if [ "$PROFILE" = release ]; then
     CARGO_FLAGS+=(--release)
 fi
+
+# Everything below addresses absolute paths, so run from the workspace: cargo
+# discovers .cargo/config.toml from the working directory upwards (not from
+# --manifest-path), and uniffi-bindgen's library mode shells out to
+# `cargo metadata`.
+cd "$RUST_DIR"
 
 SIM_TRIPLE=aarch64-apple-ios-sim
 DEVICE_TRIPLE=aarch64-apple-ios
@@ -63,15 +69,10 @@ echo "==> building isekai-client-ffi for the host"
 cargo build "${CARGO_FLAGS[@]}"
 
 echo "==> generating Swift bindings"
-# Library mode shells out to `cargo metadata` to map the library back to its
-# crate, so it has to run from inside the workspace rather than from ios/.
-(
-    cd "$RUST_DIR"
-    "$TARGET_DIR/$PROFILE/uniffi-bindgen" generate \
-        --library "$TARGET_DIR/$PROFILE/libisekai_client_ffi.dylib" \
-        --language swift \
-        --out-dir "$STAGE_DIR/bindings"
-)
+"$TARGET_DIR/$PROFILE/uniffi-bindgen" generate \
+    --library "$TARGET_DIR/$PROFILE/libisekai_client_ffi.dylib" \
+    --language swift \
+    --out-dir "$STAGE_DIR/bindings"
 
 # The .swift goes into the app target; the header and its modulemap describe the
 # static library and travel inside the xcframework.

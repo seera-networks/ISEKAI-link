@@ -11,7 +11,7 @@ name: iOS client FFI
 # for the simulator. The *-apple-ios cross-compile support they rely on lives in
 # the msquic submodule (seera-msquic scripts/build.rs + submodules/CMakeLists.txt),
 # and the deployment target both halves link against is pinned in
-# rust/.cargo/config.toml.
+# .cargo/config.toml.
 
 on:
   push:
@@ -19,7 +19,7 @@ on:
       - 'rust/isekai-client-ffi/**'
       - 'rust/camera-core/**'
       - 'rust/Cargo.toml'
-      - 'rust/.cargo/config.toml'
+      - '.cargo/config.toml'
       - 'ios/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/ios-ffi.yml'
@@ -28,7 +28,7 @@ on:
       - 'rust/isekai-client-ffi/**'
       - 'rust/camera-core/**'
       - 'rust/Cargo.toml'
-      - 'rust/.cargo/config.toml'
+      - '.cargo/config.toml'
       - 'ios/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/ios-ffi.yml'

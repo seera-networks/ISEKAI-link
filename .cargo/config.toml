@@ -6,5 +6,10 @@
 #
 # `[env]` does not override a value already present in the environment, so an
 # Xcode-driven build can still choose its own deployment target.
+#
+# This lives at the repo root rather than next to the workspace in rust/ because
+# cargo discovers config from the *working directory* upwards, not from
+# --manifest-path: ios/build-rust.sh and any future Xcode run-script phase
+# invoke cargo from outside rust/.
 [env]
 IPHONEOS_DEPLOYMENT_TARGET = "13.0"
