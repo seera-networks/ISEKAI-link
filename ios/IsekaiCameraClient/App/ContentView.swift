@@ -1,0 +1,166 @@
+import SwiftUI
+
+/// The whole Phase 2 skeleton: the four values that have to be exchanged with
+/// the camera server by hand, a Connect button, and the stream.
+struct ContentView: View {
+    @StateObject private var model = ViewerModel()
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                streamSection
+                connectionSection
+                identitySection
+                serverSection
+                authSection
+                developmentSection
+            }
+            .navigationTitle("ISEKAI Viewer")
+        }
+        .task { model.prepare() }
+    }
+
+    private var streamSection: some View {
+        Section("Stream") {
+            ZStack {
+                Color.black
+                if let frame = model.frame {
+                    Image(uiImage: frame)
+                        .resizable()
+                        .scaledToFit()
+                } else {
+                    Text("No video")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .aspectRatio(4.0 / 3.0, contentMode: .fit)
+            .frame(maxWidth: .infinity)
+            .listRowInsets(EdgeInsets())
+
+            LabeledContent("Frames", value: "\(model.frameCount)")
+        }
+    }
+
+    private var connectionSection: some View {
+        Section("Connection") {
+            LabeledContent("Status", value: model.statusText)
+            if !model.statusDetail.isEmpty {
+                Text(model.statusDetail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            if !model.connectionID.isEmpty {
+                CopyableValue(label: "Connection ID", value: model.connectionID)
+            }
+            if let error = model.errorMessage {
+                Text(error)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+
+            if model.isConnected {
+                Button("Disconnect", role: .destructive) { model.disconnect() }
+            } else {
+                Button("Connect") { model.connect() }
+                    .disabled(!model.canConnect)
+            }
+        } footer: {
+            Text("Hand the Connection ID to the camera server so it can bind its relay leg.")
+        }
+    }
+
+    private var identitySection: some View {
+        Section("This device") {
+            CopyableValue(label: "Endpoint ID", value: model.endpointID)
+            Button("Reset Endpoint key", role: .destructive) { model.resetEndpointKey() }
+                .disabled(model.isConnected)
+        } footer: {
+            Text("Give the Endpoint ID to the camera server; it issues a capability for it.")
+        }
+    }
+
+    private var serverSection: some View {
+        Section("Camera server") {
+            LabeledField("Capability", text: $model.settings.capability)
+            LabeledField("Listener ID", text: $model.settings.listenerID)
+            LabeledField("Protocol", text: $model.settings.protocolName)
+            LabeledField("Identity URL", text: $model.settings.identityURL, keyboard: .URL)
+            LabeledField("Proxy URL", text: $model.settings.proxyURL, keyboard: .URL)
+            Toggle("Register Endpoint", isOn: $model.settings.register)
+        }
+    }
+
+    private var authSection: some View {
+        Section("Auth0 access token") {
+            LabeledField("Token", text: $model.auth0Token, lineLimit: 1 ... 4)
+        } footer: {
+            Text("Pasted by hand for now. Phase 3 replaces this with a real login.")
+        }
+    }
+
+    private var developmentSection: some View {
+        Section("Development") {
+            Toggle("Skip TLS verification", isOn: $model.settings.insecureSkipVerify)
+        } footer: {
+            Text("Accepts self-signed proxy and Identity certificates. Never enable this against a real deployment.")
+        }
+    }
+}
+
+/// A monospaced, selectable value with a copy button — for the ids that have to
+/// move between this app and the camera server by hand.
+private struct CopyableValue: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(value.isEmpty ? "—" : value)
+                    .font(.system(.footnote, design: .monospaced))
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 8)
+            Button {
+                UIPasteboard.general.string = value
+            } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .disabled(value.isEmpty)
+        }
+    }
+}
+
+/// A labelled text field that does not fight the pasted values it receives.
+private struct LabeledField: View {
+    let label: String
+    @Binding var text: String
+    var keyboard: UIKeyboardType = .default
+    var lineLimit: ClosedRange<Int> = 1 ... 1
+
+    init(_ label: String, text: Binding<String>, keyboard: UIKeyboardType = .default, lineLimit: ClosedRange<Int> = 1 ... 1) {
+        self.label = label
+        self._text = text
+        self.keyboard = keyboard
+        self.lineLimit = lineLimit
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField(label, text: $text, axis: .vertical)
+                .lineLimit(lineLimit)
+                .font(.system(.footnote, design: .monospaced))
+                .keyboardType(keyboard)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+        }
+    }
+}

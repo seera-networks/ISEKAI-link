@@ -6,3 +6,12 @@
 *-endpoint.pem
 e2e-server.pem
 e2e-client.pem
+
+# iOS build outputs. `ios/build-rust.sh` writes the bindings and the
+# xcframework; `xcodegen generate` writes the project and its Info.plist. Only
+# ios/project.yml and ios/IsekaiCameraClient/App are tracked.
+/ios/IsekaiCameraClient.xcodeproj/
+/ios/IsekaiCameraClient/Generated/
+/ios/IsekaiCameraClient/Frameworks/
+/ios/IsekaiCameraClient/Info.plist
+/ios/DerivedData/

@@ -1,0 +1,66 @@
+# XcodeGen spec — this, not the .xcodeproj, is what the repo tracks.
+#
+#   ./build-rust.sh          # bindings + xcframework (must run first)
+#   xcodegen generate        # writes IsekaiCameraClient.xcodeproj
+#
+# See README.md.
+name: IsekaiCameraClient
+
+options:
+  bundleIdPrefix: tools.isekai
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+
+targets:
+  IsekaiCameraClient:
+    type: application
+    platform: iOS
+    sources:
+      - path: IsekaiCameraClient/App
+      # Written by build-rust.sh; absent on a fresh clone.
+      - path: IsekaiCameraClient/Generated
+        optional: true
+    dependencies:
+      # A static library xcframework: linked, never embedded.
+      - framework: IsekaiCameraClient/Frameworks/IsekaiClientFFI.xcframework
+        embed: false
+    settings:
+      base:
+        # Placeholder — set a real identifier before TestFlight (Phase 5).
+        PRODUCT_BUNDLE_IDENTIFIER: tools.isekai.viewer
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # The Rust staticlib brings its own std dependencies, and msquic's
+        # darwin platform layer needs these two frameworks. rustc passes them
+        # automatically when *it* drives the link; here Xcode does.
+        OTHER_LDFLAGS:
+          - -liconv
+          - -framework
+          - CoreFoundation
+          - -framework
+          - Security
+    info:
+      path: IsekaiCameraClient/Info.plist
+      properties:
+        CFBundleDisplayName: ISEKAI Viewer
+        # Standard TLS/ECDSA only; no proprietary cryptography to declare.
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+
+# Declared rather than left to Xcode's autocreation, so `xcodebuild -scheme`
+# works against a freshly generated project.
+schemes:
+  IsekaiCameraClient:
+    build:
+      targets:
+        IsekaiCameraClient: all
+    run:
+      config: Debug

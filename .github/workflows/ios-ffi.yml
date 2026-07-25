@@ -1,15 +1,17 @@
 name: iOS client FFI
 
-# Phase 1 of docs/ios_camera_client_plan.md: build the `isekai-client-ffi`
-# viewer crate for Apple platforms and generate the Swift bindings. iOS builds
-# need a macOS runner (Xcode + iOS SDK), which we don't have locally.
+# docs/ios_camera_client_plan.md, Phases 0-2: build the `isekai-client-ffi`
+# viewer crate for Apple platforms and the SwiftUI app on top of it. Neither can
+# be built locally — they need a macOS runner with Xcode and the iOS SDK.
 #
 # The `apple-native` job proves the whole toolchain (msquic + the Rust core +
-# UniFFI) builds and links on macOS and publishes the Swift bindings. The `ios`
-# job builds the device and simulator targets; the *-apple-ios cross-compile
-# support they need lives in the msquic submodule (seera-msquic scripts/build.rs
-# + submodules/CMakeLists.txt), and the deployment target both halves link
-# against is pinned in rust/.cargo/config.toml.
+# UniFFI) builds and links on macOS and publishes the Swift bindings. The
+# `ios-app` job runs ios/build-rust.sh, which cross-compiles both iOS targets and
+# assembles the xcframework, then generates the Xcode project and builds the app
+# for the simulator. The *-apple-ios cross-compile support they rely on lives in
+# the msquic submodule (seera-msquic scripts/build.rs + submodules/CMakeLists.txt),
+# and the deployment target both halves link against is pinned in
+# rust/.cargo/config.toml.
 
 on:
   push:
@@ -18,6 +20,7 @@ on:
       - 'rust/camera-core/**'
       - 'rust/Cargo.toml'
       - 'rust/.cargo/config.toml'
+      - 'ios/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/ios-ffi.yml'
   pull_request:
@@ -26,18 +29,18 @@ on:
       - 'rust/camera-core/**'
       - 'rust/Cargo.toml'
       - 'rust/.cargo/config.toml'
+      - 'ios/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/ios-ffi.yml'
   workflow_dispatch:
-
-defaults:
-  run:
-    working-directory: rust
 
 jobs:
   apple-native:
     name: Build FFI + Swift bindings (macOS native)
     runs-on: macos-14
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,8 +64,8 @@ jobs:
           name: swift-bindings
           path: rust/target/swift-bindings/
 
-  ios:
-    name: Build FFI for iOS (device + simulator)
+  ios-app:
+    name: Build iOS app (device slices + simulator build)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -75,7 +78,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
-      - name: Build for aarch64-apple-ios-sim
-        run: cargo build -p isekai-client-ffi --target aarch64-apple-ios-sim
-      - name: Build for aarch64-apple-ios (device)
-        run: cargo build -p isekai-client-ffi --target aarch64-apple-ios
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build the Rust bindings and xcframework
+        run: ./build-rust.sh
+        working-directory: ios
+      - name: Generate the Xcode project
+        run: xcodegen generate
+        working-directory: ios
+      # Only the arm64 simulator slice is built, so pin ARCHS rather than let
+      # the generic destination also ask for x86_64.
+      - name: Build the app for the simulator
+        run: |
+          xcodebuild build \
+            -project IsekaiCameraClient.xcodeproj \
+            -scheme IsekaiCameraClient \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath DerivedData \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO
+        working-directory: ios
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IsekaiCameraClient-simulator
+          path: ios/DerivedData/Build/Products/Debug-iphonesimulator/IsekaiCameraClient.app
