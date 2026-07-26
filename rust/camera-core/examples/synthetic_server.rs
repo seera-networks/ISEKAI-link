@@ -46,6 +46,19 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
 
+/// Whether to register the Endpoint before asking for a token.
+///
+/// A key that was already on disk was registered on an earlier run, and the
+/// Identity API answers a repeat registration with 409
+/// `endpoint-already-registered`. So register a freshly generated key and not an
+/// existing one; `REGISTER=1`/`0` forces the issue either way.
+fn should_register(key_path: &std::path::Path) -> bool {
+    match std::env::var("REGISTER") {
+        Ok(value) => matches!(value.trim(), "1" | "true" | "yes" | "on"),
+        Err(_) => !key_path.exists(),
+    }
+}
+
 #[derive(Clone)]
 struct Control {
     listener_id: String,
@@ -206,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
             "-h" | "--help" => {
                 println!("usage: synthetic_server [--control [addr]]");
                 println!("env: AUTH0_TOKEN (required), IDENTITY_URL, PROXY_URL, PROTOCOL,");
+                println!("     REGISTER (default: only for a newly generated key),");
                 println!("     KEY_PATH, FPS, WIDTH, HEIGHT");
                 return Ok(());
             }
@@ -223,16 +237,19 @@ async fn main() -> anyhow::Result<()> {
     let width: u16 = env_or("WIDTH", "640").parse().unwrap_or(640);
     let height: u16 = env_or("HEIGHT", "480").parse().unwrap_or(480);
 
+    let key_path = std::path::Path::new(&key_path);
+    // Read before load_or_generate_key creates the file.
+    let register = should_register(key_path);
     let cfg = P2pConfig {
         identity_url: identity_url.clone(),
         identity_http3: false,
         proxy_url: proxy_url.clone(),
         auth0_token: auth0_token.clone(),
         protocol: protocol.clone(),
-        register: true,
+        register,
         device_name: Some("synthetic-server".to_owned()),
         token_ttl: None,
-        key: load_or_generate_key(std::path::Path::new(&key_path))?,
+        key: load_or_generate_key(key_path)?,
     };
 
     let shutdown = CancellationToken::new();

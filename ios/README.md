@@ -44,6 +44,10 @@ need internet — they do not have to share a LAN, which is the whole point of t
 relay. Point `IDENTITY_URL`/`PROXY_URL` at a local stack instead if you have one
 (and set `ISEKAI_INSECURE_SKIP_VERIFY=1` for its self-signed certificates).
 
+It keeps its Endpoint key in `synthetic-server-endpoint.pem` and registers it
+with the Identity API only when it has just generated one — a repeat
+registration comes back 409. `REGISTER=1`/`0` overrides that.
+
 It prints its `listener=` and `endpoint=` ids and then takes the two halves of
 the exchange on stdin:
 

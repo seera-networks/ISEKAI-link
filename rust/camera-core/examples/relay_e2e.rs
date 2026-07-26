@@ -13,6 +13,10 @@
 //! PROXY_URL=https://127.0.0.1:8443 \
 //! cargo run -p camera-core --example relay_e2e
 //! ```
+//! `REGISTER=1`/`0` overrides whether the Endpoint is registered before a
+//! token is issued; by default only a freshly generated key is registered,
+//! since the Identity API answers a repeat registration with 409.
+//!
 //! Exits 0 on success, 1 on failure. Honors `ISEKAI_INSECURE_SKIP_VERIFY`
 //! (set here) so dev self-signed certs are accepted.
 
@@ -27,17 +31,34 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
 
+
+/// Whether to register the Endpoint before asking for a token.
+///
+/// A key that was already on disk was registered on an earlier run, and the
+/// Identity API answers a repeat registration with 409
+/// `endpoint-already-registered`. So register a freshly generated key and not an
+/// existing one; `REGISTER=1`/`0` forces the issue either way.
+fn should_register(key_path: &std::path::Path) -> bool {
+    match std::env::var("REGISTER") {
+        Ok(value) => matches!(value.trim(), "1" | "true" | "yes" | "on"),
+        Err(_) => !key_path.exists(),
+    }
+}
+
 fn config(auth0: &str, identity: &str, proxy: &str, protocol: &str, key_path: &str) -> P2pConfig {
+    let key_path = std::path::Path::new(key_path);
+    // Read before load_or_generate_key creates the file.
+    let register = should_register(key_path);
     P2pConfig {
         identity_url: identity.to_owned(),
         identity_http3: false,
         proxy_url: proxy.to_owned(),
         auth0_token: auth0.to_owned(),
         protocol: protocol.to_owned(),
-        register: true,
+        register,
         device_name: Some("relay-e2e".to_owned()),
         token_ttl: None,
-        key: load_or_generate_key(std::path::Path::new(key_path)).expect("load/generate key"),
+        key: load_or_generate_key(key_path).expect("load/generate key"),
     }
 }
 
