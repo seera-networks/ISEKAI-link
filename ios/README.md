@@ -71,6 +71,25 @@ xcodebuild test -project ios/IsekaiCameraClient.xcodeproj -scheme IsekaiCameraCl
 With nothing listening on that port the test skips, so a plain build needs no
 setup. CI runs it whenever the `ISEKAI_TEST_AUTH0_TOKEN` secret is present.
 
+## Onto a device, without a Mac
+
+The `ios-ipa` CI job packages an **unsigned** device build. Run it from the
+Actions tab (`iOS client FFI` → Run workflow) on whichever branch you want, or
+take the one from the last push to `main`, and download the
+`IsekaiCameraClient-unsigned-ipa` artifact.
+
+From Windows, [Sideloadly](https://sideloadly.io) or
+[AltStore](https://altstore.io) re-signs that `.ipa` with an Apple ID and
+installs it over USB. Apple's own iTunes and iCloud need to be installed — the
+direct downloads from apple.com, not the Microsoft Store builds — for the device
+drivers.
+
+A free Apple ID is enough: this app needs no entitlement beyond the default
+keychain. The profile it gets expires after **7 days**, so the app stops
+launching until it is installed again; AltStore can refresh it over Wi-Fi if you
+leave AltServer running. A paid Developer Program membership raises that to a
+year and unlocks TestFlight, which would remove the cable entirely.
+
 ## Using it
 
 The four values that identify a session are exchanged by hand for now (QR codes

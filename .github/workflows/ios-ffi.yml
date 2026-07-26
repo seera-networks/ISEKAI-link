@@ -170,3 +170,67 @@ jobs:
         with:
           name: IsekaiCameraClient-simulator
           path: ios/DerivedData/Build/Products/Debug-iphonesimulator/IsekaiCameraClient.app
+
+  # A device build to sideload, since there is no Mac in this loop. Unsigned:
+  # Sideloadly or AltStore re-signs it with whatever Apple ID installs it, and a
+  # free one is enough for testing. Release throughout — a debug Rust core means
+  # unoptimised msquic and crypto, which is not what you want to judge a live
+  # video path on.
+  #
+  # 25 minutes of macOS runner for an artifact nobody needs on every push, so it
+  # is on demand and on main rather than on every branch.
+  ios-ipa:
+    name: Package an unsigned device .ipa
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build the Rust bindings and xcframework (release)
+        run: ./build-rust.sh --release
+        working-directory: ios
+      - name: Generate the Xcode project
+        run: xcodegen generate
+        working-directory: ios
+      - name: Build the app for a device
+        run: |
+          xcodebuild build \
+            -project IsekaiCameraClient.xcodeproj \
+            -scheme IsekaiCameraClient \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedData \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+        working-directory: ios
+      # An .ipa is just a zip with the bundle under Payload/.
+      - name: Package the .ipa
+        run: |
+          set -euo pipefail
+          APP="DerivedData/Build/Products/Release-iphoneos/IsekaiCameraClient.app"
+          test -d "$APP"
+          file "$APP/IsekaiCameraClient"
+          rm -rf Payload IsekaiCameraClient-unsigned.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry IsekaiCameraClient-unsigned.ipa Payload
+          ls -lh IsekaiCameraClient-unsigned.ipa
+        working-directory: ios
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IsekaiCameraClient-unsigned-ipa
+          path: ios/IsekaiCameraClient-unsigned.ipa
