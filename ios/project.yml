@@ -59,6 +59,21 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
 
+  # Drives the FFI directly rather than the UI: connect over the relay and wait
+  # for a frame. Skips unless camera-core's synthetic_server is listening on the
+  # host — see IsekaiCameraClientTests/ViewerConnectTests.swift.
+  IsekaiCameraClientTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: IsekaiCameraClientTests
+    dependencies:
+      - target: IsekaiCameraClient
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tools.isekai.viewer.tests
+        GENERATE_INFOPLIST_FILE: YES
+
 # Declared rather than left to Xcode's autocreation, so `xcodebuild -scheme`
 # works against a freshly generated project.
 schemes:
@@ -66,5 +81,10 @@ schemes:
     build:
       targets:
         IsekaiCameraClient: all
+        IsekaiCameraClientTests: [test]
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - IsekaiCameraClientTests

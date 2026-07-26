@@ -28,6 +28,49 @@ generate` whenever `project.yml` or the set of source files changes.
 Only `project.yml` and `IsekaiCameraClient/App` are tracked. The `.xcodeproj`,
 `Generated/`, `Frameworks/` and `Info.plist` are all build outputs.
 
+## Something to connect to
+
+`camera-server` needs OpenCV and a camera, which is a lot to arrange just to see
+whether the viewer works. `camera-core`'s `synthetic_server` example is the
+server half on its own, streaming generated JPEGs — no OpenCV, so it builds
+wherever the workspace does, Windows included:
+
+```sh
+AUTH0_TOKEN=<jwt> cargo run -p camera-core --example synthetic_server
+```
+
+It defaults to the live Identity and Proxy, so the viewer and the server only
+need internet — they do not have to share a LAN, which is the whole point of the
+relay. Point `IDENTITY_URL`/`PROXY_URL` at a local stack instead if you have one
+(and set `ISEKAI_INSECURE_SKIP_VERIFY=1` for its self-signed certificates).
+
+It prints its `listener=` and `endpoint=` ids and then takes the two halves of
+the exchange on stdin:
+
+```text
+issue <the app's Endpoint ID>      -> ok capability=…
+bind <the app's Connection ID>     -> ok
+```
+
+## Automated check
+
+`IsekaiCameraClientTests` drives the FFI directly — connect over the relay, wait
+for a frame — in the simulator. That is Phase 0's "one frame received" and Phase
+1's "connect → frame from a Swift test", with no device and no GUI.
+
+Run `synthetic_server` with a control socket and the test picks everything up
+from it, credentials included:
+
+```sh
+AUTH0_TOKEN=<jwt> cargo run -p camera-core --example synthetic_server -- \
+  --control 127.0.0.1:57345
+xcodebuild test -project ios/IsekaiCameraClient.xcodeproj -scheme IsekaiCameraClient \
+  -destination 'platform=iOS Simulator,name=iPhone 15'
+```
+
+With nothing listening on that port the test skips, so a plain build needs no
+setup. CI runs it whenever the `ISEKAI_TEST_AUTH0_TOKEN` secret is present.
+
 ## Using it
 
 The four values that identify a session are exchanged by hand for now (QR codes

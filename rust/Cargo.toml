@@ -27,6 +27,9 @@ http-body = "1"
 http-body-util = "0.1.3"
 hyper = { version = "1" , default-features = false}
 isekai-link-utils = { path = "utils" }
+# Pure-Rust JPEG encoder for the synthetic_server example, so generating test
+# frames does not drag in OpenCV.
+jpeg-encoder = "0.6"
 msquic-async = { path = "../submodules/msquic-async-rs/msquic-async", default-features = false, features = ["tokio", "msquic-seera"] }
 opencv = { version = "0.99", default-features = false, features = ["videoio", "imgproc", "imgcodecs"] }
 # ECDSA P-256 / JWK for the P2P Connect Endpoint keypair, PoP and endpoint id.

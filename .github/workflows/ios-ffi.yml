@@ -65,8 +65,14 @@ jobs:
           path: rust/target/swift-bindings/
 
   ios-app:
-    name: Build iOS app (device slices + simulator build)
+    name: Build iOS app + relay integration test
     runs-on: macos-14
+    env:
+      # An Auth0 access token for the live Identity/Proxy. Absent (forks, or
+      # before anyone sets it) the integration test is skipped and the job stays
+      # a build check. Access tokens expire, so this needs periodic refreshing —
+      # minting one from machine-to-machine credentials would be the durable fix.
+      AUTH0_TOKEN: ${{ secrets.ISEKAI_TEST_AUTH0_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,6 +107,65 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO
         working-directory: ios
+
+      # Phases 0 and 1 of the plan: a frame actually crossing the relay into iOS
+      # code. The peer is camera-core's synthetic_server — no camera, no OpenCV
+      # — and the simulator reaches the host's loopback control socket directly.
+      - name: Start the synthetic camera server
+        if: env.AUTH0_TOKEN != ''
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/synthetic-server.log"
+          cargo run -p camera-core --example synthetic_server -- \
+            --control 127.0.0.1:57345 > "$LOG" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/synthetic-server.pid"
+          for _ in $(seq 1 180); do
+            if grep -q '^ready$' "$LOG"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "synthetic_server never reported ready:"
+          cat "$LOG"
+          exit 1
+        working-directory: rust
+
+      - name: Run the viewer integration test in the simulator
+        if: env.AUTH0_TOKEN != ''
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
+          import json, sys
+          runtimes = json.load(sys.stdin)["devices"]
+          for runtime in sorted(runtimes, reverse=True):
+              if "iOS" not in runtime:
+                  continue
+              for device in runtimes[runtime]:
+                  if device.get("isAvailable") and "iPhone" in device["name"]:
+                      print(device["udid"])
+                      sys.exit(0)
+          sys.exit("no available iPhone simulator")')
+          echo "using simulator $UDID"
+          xcodebuild test \
+            -project IsekaiCameraClient.xcodeproj \
+            -scheme IsekaiCameraClient \
+            -configuration Debug \
+            -destination "id=$UDID" \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO
+        working-directory: ios
+
+      - name: Stop the synthetic camera server
+        if: always() && env.AUTH0_TOKEN != ''
+        run: |
+          PID_FILE="$RUNNER_TEMP/synthetic-server.pid"
+          if [ -f "$PID_FILE" ]; then
+            kill "$(cat "$PID_FILE")" 2>/dev/null || true
+          fi
+          # stdout carries the ids and readiness only; the Auth0 token is handed
+          # out over the control socket, never printed.
+          echo '--- synthetic_server ---'
+          cat "$RUNNER_TEMP/synthetic-server.log" || true
       - uses: actions/upload-artifact@v4
         with:
           name: IsekaiCameraClient-simulator

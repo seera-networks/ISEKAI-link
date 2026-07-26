@@ -21,4 +21,7 @@ rcgen = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# Only the synthetic_server example needs it; keeping it a dev-dependency keeps
+# it out of anything that ships.
+jpeg-encoder = { workspace = true }
 tracing-subscriber = { workspace = true }

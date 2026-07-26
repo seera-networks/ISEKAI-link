@@ -198,6 +198,7 @@ pub fn endpoint_id_of(pem: String) -> Result<String, ClientError>;
 `ISEKAI-link-server/docs/p2p_local_testing.md` のローカルスタック（Proxy `:8443` / Identity `:9443` / Endpoint-Token JWKS `:8080`）をそのまま利用できる。
 
 - **Phase 0–1**: ヘッドレス PoC / Swift 単体テストから `connect`→フレーム取得。相手側は `camera-server`（GUI）または `camera-core` の `relay_e2e` / `relay_gap_e2e` 例で合成フレームを配信。
+- **相手役だけが欲しい場合**: `camera-core` の `synthetic_server` 例（OpenCV 不要・Windows 可）がサーバ半分だけを担い、生成した JPEG を流す。stdin で `issue`/`bind`、`--control <addr>` で同じコマンドを TCP から。既定は本番エンドポイント向きなので**同一 LAN である必要はない**（リレー経由のため）。iOS の `IsekaiCameraClientTests` はこれを相手に走る。
 - **Phase 2 以降**: シミュレータは `127.0.0.1` に到達できる（同一 Mac 上のローカルスタック）。実機は同一 LAN 上のホストを指す。dev 期間は `insecure_skip_verify=true`。
 - **ギャップ挙動**: connect 直後にダイヤル→数秒後に相手 bind、の順序でも #47 の 60 秒ハンドシェイクで復旧することを確認済み（iOS でも同経路）。
 
