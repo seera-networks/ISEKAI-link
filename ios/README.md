@@ -69,7 +69,25 @@ xcodebuild test -project ios/IsekaiCameraClient.xcodeproj -scheme IsekaiCameraCl
 ```
 
 With nothing listening on that port the test skips, so a plain build needs no
-setup. CI runs it whenever the `ISEKAI_TEST_AUTH0_TOKEN` secret is present.
+setup.
+
+CI runs it only when **both** of these secrets exist:
+
+| Secret | What it is |
+| --- | --- |
+| `ISEKAI_TEST_AUTH0_TOKEN` | An Auth0 access token for the live Identity/Proxy. Expires, so it needs refreshing. |
+| `ISEKAI_TEST_ENDPOINT_KEY_PEM` | The synthetic server's Endpoint key (PKCS#8 PEM), written to `rust/synthetic-server-endpoint.pem` before the run. |
+
+The key is pinned rather than generated because the proxy issues a per-Endpoint
+relay certificate through ACME and caches it by Endpoint ID: a new key each run
+means a new Let's Encrypt certificate, against a limit of 50 per week for the
+whole `isekai.tools` domain. Reuse a key whose certificate the proxy has already
+cached — running the server once locally leaves one in
+`synthetic-server-endpoint.pem` — and paste that file in whole, `BEGIN`/`END`
+lines included.
+
+Both are required, so a half-configured repository skips the test rather than
+quietly spending that budget.
 
 ## Onto a device, without a Mac
 

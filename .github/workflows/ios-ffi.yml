@@ -73,6 +73,13 @@ jobs:
       # a build check. Access tokens expire, so this needs periodic refreshing —
       # minting one from machine-to-machine credentials would be the durable fix.
       AUTH0_TOKEN: ${{ secrets.ISEKAI_TEST_AUTH0_TOKEN }}
+      # The synthetic server's Endpoint key, pinned rather than generated per
+      # run. The proxy issues a per-Endpoint relay certificate through ACME and
+      # caches it by Endpoint ID, so a fresh key every run means a fresh
+      # Let's Encrypt certificate — against a limit of 50 per week for the whole
+      # isekai.tools domain. Both secrets are required for the test to run, so a
+      # half-configured repository cannot quietly burn that budget.
+      ENDPOINT_KEY_PEM: ${{ secrets.ISEKAI_TEST_ENDPOINT_KEY_PEM }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,8 +118,19 @@ jobs:
       # Phases 0 and 1 of the plan: a frame actually crossing the relay into iOS
       # code. The peer is camera-core's synthetic_server — no camera, no OpenCV
       # — and the simulator reaches the host's loopback control socket directly.
+      - name: Pin the synthetic server's Endpoint key
+        if: env.AUTH0_TOKEN != '' && env.ENDPOINT_KEY_PEM != ''
+        run: |
+          set -euo pipefail
+          # KEY_PATH's default, relative to this working directory. Reusing the
+          # same Endpoint ID every run means the proxy serves its cached relay
+          # certificate instead of ordering a new one.
+          printf '%s\n' "$ENDPOINT_KEY_PEM" > synthetic-server-endpoint.pem
+          chmod 600 synthetic-server-endpoint.pem
+        working-directory: rust
+
       - name: Start the synthetic camera server
-        if: env.AUTH0_TOKEN != ''
+        if: env.AUTH0_TOKEN != '' && env.ENDPOINT_KEY_PEM != ''
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/synthetic-server.log"
@@ -131,7 +149,7 @@ jobs:
         working-directory: rust
 
       - name: Run the viewer integration test in the simulator
-        if: env.AUTH0_TOKEN != ''
+        if: env.AUTH0_TOKEN != '' && env.ENDPOINT_KEY_PEM != ''
         run: |
           set -euo pipefail
           UDID=$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
@@ -156,7 +174,7 @@ jobs:
         working-directory: ios
 
       - name: Stop the synthetic camera server
-        if: always() && env.AUTH0_TOKEN != ''
+        if: always() && env.AUTH0_TOKEN != '' && env.ENDPOINT_KEY_PEM != ''
         run: |
           PID_FILE="$RUNNER_TEMP/synthetic-server.pid"
           if [ -f "$PID_FILE" ]; then
