@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import UIKit
 
@@ -15,8 +16,12 @@ final class ViewerModel: ObservableObject {
 
     @Published var settings = ViewerSettings.load()
     /// Pasted by hand in Phase 2; Phase 3 of the plan replaces this with an
-    /// `ASWebAuthenticationSession` login.
+    /// `ASWebAuthenticationSession` login. Only consulted when no Auth0 session
+    /// is signed in.
     @Published var auth0Token = ""
+
+    /// The signed-in Auth0 session, when there is one.
+    let auth: AuthStore
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var statusDetail = ""
@@ -30,13 +35,24 @@ final class ViewerModel: ObservableObject {
     private var sink: ViewerSink?
     private var lastSeq: UInt64 = 0
 
+    private var authObserver: AnyCancellable?
+
+    init(auth: AuthStore = AuthStore()) {
+        self.auth = auth
+        // SwiftUI observes the object a view was handed, not the ones it owns,
+        // so forward the store's changes or signing in leaves the UI stale.
+        authObserver = auth.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
+
     var isConnected: Bool { session != nil }
 
     var canConnect: Bool {
         session == nil
             && !settings.capability.isBlank
             && !settings.listenerID.isBlank
-            && !auth0Token.isBlank
+            && (auth.isSignedIn || !auth0Token.isBlank)
     }
 
     var statusText: String {
@@ -57,8 +73,9 @@ final class ViewerModel: ObservableObject {
         } catch {
             errorMessage = "Endpoint key: \(error.localizedDescription)"
         }
-        // `try?` flattens the throwing call's optional result, so this binds
-        // only when a token was actually stored.
+        // The hand-pasted fallback, if one was ever used. `try?` flattens the
+        // throwing call's optional result, so this binds only when a token was
+        // actually stored.
         if let stored = try? KeychainStore.string(for: KeychainStore.auth0TokenAccount) {
             auth0Token = stored
         }
@@ -76,7 +93,6 @@ final class ViewerModel: ObservableObject {
         phase = .connecting
 
         settings.save()
-        try? KeychainStore.set(auth0Token, for: KeychainStore.auth0TokenAccount)
 
         let pem: String
         do {
@@ -95,10 +111,40 @@ final class ViewerModel: ObservableObject {
             register: settings.register,
             insecureSkipVerify: settings.insecureSkipVerify
         )
-        let token = auth0Token.trimmed
         let sink = ViewerSink(model: self)
         self.sink = sink
 
+        // Getting a token can mean a round trip to Auth0 to renew it, so the
+        // rest of connect waits on that first.
+        Task {
+            do {
+                let token = try await self.currentToken()
+                self.startConnecting(config: config, endpointKeyPem: pem, token: token, sink: sink)
+            } catch {
+                self.fail(error.localizedDescription)
+            }
+        }
+    }
+
+    /// The signed-in session's access token, renewed if it has gone stale.
+    /// Falls back to a hand-pasted one so the app still works before the Auth0
+    /// application's callback URL is registered.
+    private func currentToken() async throws -> String {
+        if auth.isSignedIn {
+            return try await auth.accessToken()
+        }
+        let manual = auth0Token.trimmed
+        guard !manual.isEmpty else { throw AuthError.notSignedIn }
+        try? KeychainStore.set(manual, for: KeychainStore.auth0TokenAccount)
+        return manual
+    }
+
+    private func startConnecting(
+        config: ClientConfig,
+        endpointKeyPem pem: String,
+        token: String,
+        sink: ViewerSink
+    ) {
         // The core blocks for the control-plane exchange and the relay-leg
         // setup before it returns, so this cannot run on the main thread.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in

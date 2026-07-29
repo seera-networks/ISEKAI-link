@@ -14,6 +14,10 @@ enum KeychainStore {
     }
 
     static let endpointKeyAccount = "endpoint-key-pem"
+    /// The whole `Auth0Tokens` blob from a login, as JSON.
+    static let auth0SessionAccount = "auth0-session"
+    /// A token pasted by hand, kept as a way in while the Auth0 application's
+    /// callback URL is being set up. Remove with the field that feeds it.
     static let auth0TokenAccount = "auth0-access-token"
 
     /// The stored value, or nil if nothing has been stored under `account`.

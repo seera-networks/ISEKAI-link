@@ -4,6 +4,7 @@ import SwiftUI
 /// the camera server by hand, a Connect button, and the stream.
 struct ContentView: View {
     @StateObject private var model = ViewerModel()
+    @State private var signInError: String?
 
     var body: some View {
         NavigationStack {
@@ -13,6 +14,7 @@ struct ContentView: View {
                 identitySection
                 serverSection
                 authSection
+                manualTokenSection
                 developmentSection
             }
             .navigationTitle("ISEKAI Viewer")
@@ -97,13 +99,64 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
     private var authSection: some View {
         Section {
-            LabeledField("Token", text: $model.auth0Token, lineLimit: 1 ... 4)
+            if model.auth.isSignedIn {
+                LabeledContent("Signed in", value: expiryText)
+                Button("Sign out", role: .destructive) { model.auth.signOut() }
+                    .disabled(model.isConnected)
+            } else {
+                Button("Sign in with Auth0") { signIn() }
+                    .disabled(model.auth.isWorking)
+            }
+            if let error = signInError {
+                Text(error)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
         } header: {
-            Text("Auth0 access token")
+            Text("Account")
         } footer: {
-            Text("Pasted by hand for now. Phase 3 replaces this with a real login.")
+            Text(model.auth.isSignedIn
+                ? "The token is renewed automatically while the session lasts."
+                : "Opens Auth0 in Safari. The app never sees your password.")
+        }
+    }
+
+    /// A hand-pasted token, kept as a way in until the Auth0 application's
+    /// callback URL is registered. Ignored once signed in; delete this and
+    /// `ViewerModel.currentToken`'s fallback once the login is proven.
+    @ViewBuilder
+    private var manualTokenSection: some View {
+        if !model.auth.isSignedIn {
+            Section {
+                LabeledField("Token", text: $model.auth0Token, lineLimit: 1 ... 4)
+            } header: {
+                Text("Auth0 access token (fallback)")
+            } footer: {
+                Text("Only used when not signed in.")
+            }
+        }
+    }
+
+    private var expiryText: String {
+        guard let expiresAt = model.auth.expiresAt else { return "—" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return "expires \(formatter.localizedString(for: expiresAt, relativeTo: Date()))"
+    }
+
+    private func signIn() {
+        signInError = nil
+        Task {
+            do {
+                try await model.auth.signIn()
+            } catch let failure as Auth0Client.Failure where failure == .cancelled {
+                // The user backed out; not worth reporting.
+            } catch {
+                signInError = error.localizedDescription
+            }
         }
     }
 

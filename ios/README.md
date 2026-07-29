@@ -120,7 +120,7 @@ are a Phase 5 item):
 1. The app shows its **Endpoint ID** under "This device". Give it to the camera
    server and have it issue a **capability**.
 2. Paste that capability and the server's **Listener ID** into "Camera server",
-   and an Auth0 access token into "Auth0 access token".
+   and **Sign in with Auth0** under "Account".
 3. **Connect**. The app then shows a **Connection ID** — give that back to the
    camera server so it can bind its relay leg, and video starts flowing.
 
@@ -129,10 +129,30 @@ on **Skip TLS verification** and point the URLs at the local Proxy and Identity.
 The simulator reaches `127.0.0.1` on the host Mac directly; a device needs the
 host's LAN address.
 
-## Known gaps
+## Signing in
 
-- The Auth0 token is pasted rather than obtained through a login
-  (`ASWebAuthenticationSession` is Phase 3).
+**Sign in with Auth0** runs the Authorization Code flow with PKCE through
+`ASWebAuthenticationSession`, so credentials stay in Safari and the app only
+ever sees the resulting tokens. They go to the keychain, and the access token is
+renewed from the refresh token as it expires.
+
+The Auth0 side needs, once:
+
+- a **Native** application (no client secret — that is what PKCE replaces),
+  whose client id is in `Auth0Config.swift`
+- `tools.isekai.viewer://seera-networks.jp.auth0.com/ios/tools.isekai.viewer/callback`
+  in its **Allowed Callback URLs**
+- **Allow Offline Access** on the `https://masque.seera-networks.com/` API, or
+  no refresh token is issued and the session ends with the access token
+
+`Auth0Config`'s `issuer` and `audience` have to match the Identity API's
+`AUTH0_ISSUER` / `AUTH0_AUDIENCE` or the token it mints is rejected.
+
+A hand-pasted token still works when not signed in — a way in while the callback
+URL is being registered. Remove that field and `ViewerModel.currentToken`'s
+fallback once the login is proven.
+
+## Known gaps
 - No reconnect and no `scenePhase` handling — iOS suspends UDP sockets in the
   background, so the session dies when the app leaves the foreground (Phase 4).
 - The Endpoint key is a software key in the keychain. Secure Enclave needs the
