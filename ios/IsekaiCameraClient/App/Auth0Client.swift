@@ -135,6 +135,13 @@ final class Auth0Client {
                 }
             }
             session.presentationContextProvider = anchor
+            // Start from a clean cookie jar. Sharing Safari's would buy single
+            // sign-on, but it also carries whatever half-finished login
+            // transaction a previous attempt left behind — which Auth0 reports
+            // as "we couldn't find your session" on the next try, and which the
+            // user can only clear from Settings. A refresh token means signing
+            // in is rare enough that SSO is not worth that.
+            session.prefersEphemeralWebBrowserSession = true
             self.session = session
             // `start()` returning false means the handler will never run, so
             // resuming here cannot race it.

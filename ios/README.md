@@ -136,6 +136,12 @@ host's LAN address.
 ever sees the resulting tokens. They go to the keychain, and the access token is
 renewed from the refresh token as it expires.
 
+The browser session is ephemeral: each sign-in starts with a clean cookie jar.
+That gives up single sign-on with Safari — credentials are entered every time —
+in exchange for never inheriting a half-finished login transaction, which Auth0
+reports as "we couldn't find your session" and which is otherwise only clearable
+from iOS Settings. With a refresh token, signing in is rare.
+
 The Auth0 side needs, once:
 
 - a **Native** application (no client secret — that is what PKCE replaces),
