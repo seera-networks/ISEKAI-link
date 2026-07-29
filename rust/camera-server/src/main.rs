@@ -619,7 +619,8 @@ impl MyApp {
 }
 
 impl eframe::App for MyApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         // ✅ 新しいフレーム受信（最新のみ使う）
         // Drain first, convert once: converting inside the drain loop livelocks
         // when one conversion takes longer than the camera period — a new frame
@@ -651,7 +652,7 @@ impl eframe::App for MyApp {
         let mut open_clicked = false;
         let mut close_clicked = false;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("📷 Camera Stream");
 
             ui.separator();

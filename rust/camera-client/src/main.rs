@@ -394,7 +394,8 @@ impl MyApp {
 }
 
 impl eframe::App for MyApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         // 新しいフレーム受信（最新のみ使う）
         // Drain first, decode once: decoding inside the drain loop livelocks
         // when one decode takes longer than the frame period — a new frame is
@@ -455,7 +456,7 @@ impl eframe::App for MyApp {
         let mut connect_clicked = false;
         let mut disconnect_clicked = false;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("📷 Camera Stream");
 
             ui.horizontal(|ui| {
