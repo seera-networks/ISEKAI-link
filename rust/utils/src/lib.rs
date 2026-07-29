@@ -232,6 +232,12 @@ pub async fn get_certificate(
             tracing::error!("channel call error: {e}");
             anyhow::anyhow!("channel call error: {e}")
         })?;
+    response.status().is_success().then(|| ()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to get certificate: HTTP status {}",
+            response.status()
+        )
+    })?;
     let data = response
         .into_body()
         .collect()
@@ -241,7 +247,8 @@ pub async fn get_certificate(
             anyhow::anyhow!("response body collect error: {e}")
         })?
         .to_bytes();
-    Ok(serde_json::from_slice::<CertificateResponse>(&data)?)
+    Ok(serde_json::from_slice::<CertificateResponse>(&data)
+        .map_err(|e| anyhow::anyhow!("Failed to parse certificate response: {e}"))?)
 }
 
 pub async fn get_public_address(
@@ -275,6 +282,12 @@ pub async fn get_public_address(
             tracing::error!("channel call error: {e}");
             anyhow::anyhow!("channel call error: {e}")
         })?;
+    response.status().is_success().then(|| ()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to get public address: HTTP status {}",
+            response.status()
+        )
+    })?;
     let data = response
         .into_body()
         .collect()
@@ -284,7 +297,10 @@ pub async fn get_public_address(
             anyhow::anyhow!("response body collect error: {e}")
         })?
         .to_bytes();
-    Ok(String::from_utf8(data.to_vec())?.parse()?)
+    Ok(String::from_utf8(data.to_vec())
+        .map_err(|e| anyhow::anyhow!("Failed to convert response body to UTF-8 string: {e}"))?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Failed to parse public address: {e}"))?)
 }
 
 pub async fn create_masque_channel(
