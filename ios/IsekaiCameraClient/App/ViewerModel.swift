@@ -37,7 +37,11 @@ final class ViewerModel: ObservableObject {
 
     private var authObserver: AnyCancellable?
 
-    init(auth: AuthStore = AuthStore()) {
+    /// The store is built in the body rather than as a default argument: Swift
+    /// evaluates default arguments outside the main actor, and `AuthStore` is
+    /// isolated to it. Passing one in stays available for tests.
+    init(auth: AuthStore? = nil) {
+        let auth = auth ?? AuthStore()
         self.auth = auth
         // SwiftUI observes the object a view was handed, not the ones it owns,
         // so forward the store's changes or signing in leaves the UI stale.
