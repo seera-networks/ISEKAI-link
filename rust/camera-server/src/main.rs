@@ -259,7 +259,7 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| Box::new(MyApp::new(reg, rx, is_streaming, mjpeg_tx_holder))),
+        Box::new(|_cc| Ok(Box::new(MyApp::new(reg, rx, is_streaming, mjpeg_tx_holder)))),
     );
     tracing::debug!("eframe exited, stopping camera task");
     is_terminated.store(true, Ordering::Relaxed);

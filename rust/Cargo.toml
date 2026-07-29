@@ -14,8 +14,9 @@ camera-core = { path = "camera-core" }
 isekai-p2p = { path = "isekai-p2p" }
 isekai-p2p-core = { path = "isekai-p2p-core" }
 bytes = "1"
-eframe = "0.27"
-egui = "0.27"
+eframe = "0.34.3"
+egui = "0.34.3"
+egui_plot = "0.35.0"
 futures = "0.3"
 futures-concurrency = "7.6.3"
 h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }

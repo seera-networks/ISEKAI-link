@@ -1,9 +1,13 @@
 use bytes::Bytes;
 use camera_core::P2pConfig;
 use eframe::egui;
+use egui_plot::{Line, Plot, PlotPoints};
 use msquic_async::msquic;
 use opencv::{core::AlgorithmHint, imgcodecs, prelude::*};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -45,12 +49,30 @@ async fn main() -> eframe::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "Camera Client App",
         options,
-        Box::new(|_cc| Box::new(MyApp::new())),
+        Box::new(|_cc| Ok(Box::new(MyApp::new()))),
     )
+}
+
+/// Draw the rolling RTT history as a line plot (values in milliseconds).
+fn show_rtt_plot(ui: &mut egui::Ui, rtt_history: &VecDeque<f64>) {
+    let points: PlotPoints<'_> = rtt_history
+        .iter()
+        .enumerate()
+        .map(|(i, rtt)| [i as f64, *rtt])
+        .collect();
+
+    let line = Line::new("RTT", points);
+
+    Plot::new("rtt_plot").height(200.0).show(ui, |plot_ui| {
+        plot_ui.line(line);
+    });
 }
 
 /// How the client reaches the server.
@@ -93,6 +115,8 @@ struct MyApp {
     conn_task: Option<tokio::task::AbortHandle>,
     shutdown: Option<CancellationToken>,
     texture: Option<egui::TextureHandle>,
+    rtt_rx: Option<mpsc::Receiver<f64>>,
+    rtt_history: VecDeque<f64>,
 }
 
 impl MyApp {
@@ -116,6 +140,8 @@ impl MyApp {
             conn_task: None,
             shutdown: None,
             texture: None,
+            rtt_rx: None,
+            rtt_history: VecDeque::new(),
         }
     }
 
@@ -128,6 +154,8 @@ impl MyApp {
 
     fn connect_direct(&mut self) {
         let (tx, rx) = mpsc::channel::<(u64, Bytes)>(100);
+        let (rtt_tx, rtt_rx) = mpsc::channel::<f64>(100);
+        self.rtt_rx = Some(rtt_rx);
         let addr = self.server_addr.clone();
         let port: u16 = self.server_port.parse().unwrap_or_else(|_| {
             tracing::warn!(
@@ -141,30 +169,47 @@ impl MyApp {
             let (registration, configuration) = make_msquic_async_client_config(None)?;
             let conn = msquic_async::Connection::new(&registration)?;
             conn.start(&configuration, &addr, port).await?;
+            // Sample RTT once a second while draining inbound frames.
+            let mut rtt_interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
-                match conn.accept_inbound_uni_stream().await {
-                    Ok(mut stream) => {
-                        let stream_id = stream.id().unwrap();
-                        tracing::debug!("Inbound stream {stream_id} accepted");
-                        let mut data = Vec::new();
-                        if let Err(e) = stream.read_to_end(&mut data).await {
-                            tracing::error!("Failed to read stream {stream_id}: {:?}", e);
-                            continue;
-                        }
-                        tracing::debug!("Inbound stream {stream_id} read {} bytes", data.len());
-                        match tx.try_send((stream_id, Bytes::copy_from_slice(&data))) {
-                            Ok(_) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                tracing::debug!("Frame channel full, dropping frame {stream_id}");
+                tokio::select! {
+                    _ = rtt_interval.tick() => {
+                        match conn.get_stats() {
+                            // Rtt is reported in microseconds; plot milliseconds.
+                            Ok(stats) => {
+                                let _ = rtt_tx.try_send(stats.Rtt as f64 / 1000.0);
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                break;
+                            Err(e) => {
+                                tracing::error!("Failed to get connection stats: {:?}", e);
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to accept inbound stream: {:?}", e);
-                        break;
+                    res = conn.accept_inbound_uni_stream() => {
+                        match res {
+                            Ok(mut stream) => {
+                                let stream_id = stream.id().unwrap();
+                                tracing::debug!("Inbound stream {stream_id} accepted");
+                                let mut data = Vec::new();
+                                if let Err(e) = stream.read_to_end(&mut data).await {
+                                    tracing::error!("Failed to read stream {stream_id}: {:?}", e);
+                                    continue;
+                                }
+                                tracing::debug!("Inbound stream {stream_id} read {} bytes", data.len());
+                                match tx.try_send((stream_id, Bytes::copy_from_slice(&data))) {
+                                    Ok(_) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::debug!("Frame channel full, dropping frame {stream_id}");
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to accept inbound stream: {:?}", e);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -284,6 +329,7 @@ impl MyApp {
             handle.abort();
         }
         self.rx = None;
+        self.rtt_rx = None;
         self.connected = false;
         self.texture = None;
         *self.p2p_shared.lock().unwrap() = P2pShared::default();
@@ -397,6 +443,15 @@ impl eframe::App for MyApp {
             }
         }
 
+        if let Some(rtt_rx) = &mut self.rtt_rx {
+            while let Ok(rtt) = rtt_rx.try_recv() {
+                self.rtt_history.push_back(rtt);
+                if self.rtt_history.len() > 300 {
+                    self.rtt_history.pop_front();
+                }
+            }
+        }
+
         let mut connect_clicked = false;
         let mut disconnect_clicked = false;
 
@@ -447,13 +502,19 @@ impl eframe::App for MyApp {
 
             ui.separator();
 
-            if let Some(texture) = &self.texture {
-                ui.image(texture);
-            } else if self.connected {
-                ui.label("Waiting for camera feed...");
-            } else {
-                ui.label("Not connected.");
-            }
+            show_rtt_plot(ui, &self.rtt_history);
+
+            ui.separator();
+
+            egui::ScrollArea::both().show(ui, |ui| {
+                if let Some(texture) = &self.texture {
+                    ui.image(texture);
+                } else if self.connected {
+                    ui.label("Waiting for camera feed...");
+                } else {
+                    ui.label("Not connected.");
+                }
+            });
         });
 
         if connect_clicked {

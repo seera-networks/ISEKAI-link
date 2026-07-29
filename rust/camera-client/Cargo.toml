@@ -9,6 +9,7 @@ bytes = { workspace = true }
 camera-core = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+egui_plot = { workspace = true }
 msquic-async = { workspace = true }
 opencv = { workspace = true }
 tokio = { workspace = true }
