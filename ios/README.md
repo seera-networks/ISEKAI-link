@@ -140,8 +140,7 @@ The Auth0 side needs, once:
 
 - a **Native** application (no client secret — that is what PKCE replaces),
   whose client id is in `Auth0Config.swift`
-- `tools.isekai.viewer://seera-networks.jp.auth0.com/ios/tools.isekai.viewer/callback`
-  in its **Allowed Callback URLs**
+- `isekaiviewer://callback` in its **Allowed Callback URLs**
 - **Allow Offline Access** on the `https://masque.seera-networks.com/` API, or
   no refresh token is issued and the session ends with the access token
 

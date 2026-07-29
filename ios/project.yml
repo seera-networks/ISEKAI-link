@@ -54,15 +54,16 @@ targets:
         # Standard TLS/ECDSA only; no proprietary cryptography to declare.
         ITSAppUsesNonExemptEncryption: false
         UILaunchScreen: {}
-        # Auth0 redirects back to this scheme, which is the bundle identifier —
-        # Auth0's documented shape for a native app, and unclaimable by another
-        # app on the device. Keep it in step with Auth0Config.redirectURI and
-        # the Allowed Callback URLs in the Auth0 dashboard.
+        # Auth0 redirects back to this scheme. It is a constant rather than the
+        # bundle identifier because sideloading rewrites the identifier to
+        # append the signing team, which would change the redirect per machine.
+        # Keep it in step with Auth0Config.callbackScheme and the Allowed
+        # Callback URLs in the Auth0 dashboard.
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
             CFBundleURLName: tools.isekai.viewer.auth0
             CFBundleURLSchemes:
-              - tools.isekai.viewer
+              - isekaiviewer
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

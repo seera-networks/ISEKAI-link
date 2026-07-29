@@ -19,20 +19,23 @@ struct Auth0Config: Equatable {
     /// the app simply asks again when the token expires.
     var scope = "openid profile email offline_access"
 
-    /// Auth0's documented callback shape for a native app. The scheme is the
-    /// bundle identifier, which the app registers in its Info.plist, so no other
-    /// app on the device can claim the redirect.
-    var redirectURI: String {
-        "\(Self.bundleID)://\(domain)/ios/\(Self.bundleID)/callback"
-    }
+    /// Where Auth0 sends the browser back to. Must be listed verbatim in the
+    /// Auth0 application's **Allowed Callback URLs**.
+    var redirectURI: String { "\(callbackScheme)://callback" }
 
     /// The scheme half of `redirectURI`, which is all
-    /// `ASWebAuthenticationSession` matches on.
-    var callbackScheme: String { Self.bundleID }
+    /// `ASWebAuthenticationSession` matches on. It must also appear in
+    /// `CFBundleURLSchemes` — see ios/project.yml.
+    ///
+    /// Deliberately a constant rather than the bundle identifier, which is
+    /// Auth0's usual suggestion for a native app: sideloading rewrites the
+    /// bundle identifier to append the signing team (`…viewer.KJ6DNKW8B9`), so
+    /// deriving the scheme from it produces a different redirect on every
+    /// machine that installs the app — and one that no longer matches the
+    /// scheme baked into Info.plist at build time.
+    let callbackScheme = "isekaiviewer"
 
     var isConfigured: Bool {
         !domain.isEmpty && !clientID.isEmpty && !audience.isEmpty
     }
-
-    private static let bundleID = Bundle.main.bundleIdentifier ?? "tools.isekai.viewer"
 }
