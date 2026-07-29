@@ -124,9 +124,8 @@ struct ContentView: View {
         }
     }
 
-    /// A hand-pasted token, kept as a way in until the Auth0 application's
-    /// callback URL is registered. Ignored once signed in; delete this and
-    /// `ViewerModel.currentToken`'s fallback once the login is proven.
+    /// A hand-pasted token, kept as a deliberate way in for when Auth0 is
+    /// unreachable. Ignored once signed in.
     @ViewBuilder
     private var manualTokenSection: some View {
         if !model.auth.isSignedIn {

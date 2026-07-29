@@ -153,11 +153,12 @@ The Auth0 side needs, once:
 `Auth0Config`'s `issuer` and `audience` have to match the Identity API's
 `AUTH0_ISSUER` / `AUTH0_AUDIENCE` or the token it mints is rejected.
 
-A hand-pasted token still works when not signed in — a way in while the callback
-URL is being registered. Remove that field and `ViewerModel.currentToken`'s
-fallback once the login is proven.
+A hand-pasted token still works when not signed in, and stays as a deliberate
+way in: if Auth0 is unreachable, a token obtained some other way still gets a
+session. It is ignored once signed in.
 
 ## Known gaps
+
 - No reconnect and no `scenePhase` handling — iOS suspends UDP sockets in the
   background, so the session dies when the app leaves the foreground (Phase 4).
 - The Endpoint key is a software key in the keychain. Secure Enclave needs the
