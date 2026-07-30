@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         uri.clone(),
         config,
         Some(config_qmux),
+        false,
         reg.clone(),
     );
     // let (conn_sender, mut conn_receiver) = mpsc::channel(1);

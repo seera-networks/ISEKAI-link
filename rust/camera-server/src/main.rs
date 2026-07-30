@@ -47,6 +47,7 @@ async fn run_isekai_connection(
         reg.clone(),
         config.clone(),
         config_qmux.clone(),
+        false,
     )
     .await?;
     let public_addr = get_public_address(uri.clone(), &jwt, normal_channel.clone()).await?;
@@ -83,6 +84,7 @@ async fn run_isekai_connection(
         reg.clone(),
         config,
         config_qmux.clone(),
+        true,
         Some(conn_tx),
     )
     .await

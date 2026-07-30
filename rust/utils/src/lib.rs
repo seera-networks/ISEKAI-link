@@ -198,8 +198,9 @@ pub async fn create_normal_channel(
     reg: Arc<msquic_async::Registration>,
     config: Arc<msquic::Configuration>,
     config_qmux: Arc<msquic::Configuration>,
+    is_unconnected: bool,
 ) -> anyhow::Result<channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>> {
-    let connector = H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), reg);
+    let connector = H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), is_unconnected, reg);
     let channel = channel_masque::H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
     Ok(channel)
 }
@@ -312,6 +313,7 @@ pub async fn create_masque_channel(
     reg: Arc<msquic_async::Registration>,
     config: Arc<msquic::Configuration>,
     config_qmux: Arc<msquic::Configuration>,
+    is_unconnected: bool,
     conn_tx: Option<mpsc::Sender<msquic_async::Connection>>,
 ) -> anyhow::Result<
     channel_masque::H3Channel<
@@ -323,6 +325,7 @@ pub async fn create_masque_channel(
         uri.clone(),
         config,
         Some(config_qmux),
+        is_unconnected,
         reg,
     );
     // Optionally hand the underlying QUIC connection back to the caller so it

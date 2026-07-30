@@ -111,7 +111,7 @@ pub async fn open_bind_session(
     let (registration, config) = make_client_config(None, false)?;
     let (registration, config_qmux) = make_client_config(Some(registration), true)?;
     let connector =
-        H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), registration);
+        H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), false, registration);
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
         connector, uri, None,
     );
@@ -251,7 +251,7 @@ pub async fn open_connect_relay(
     let (registration, config) = make_client_config(None, false)?;
     let (registration, config_qmux) = make_client_config(Some(registration), true)?;
     let connector =
-        H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), registration);
+        H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), false, registration);
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
         connector, uri, None,
     );

@@ -34,7 +34,7 @@ impl MasqueH3Transport {
         let (registration, config) = make_client_config(None, false)?;
         let (registration, config_qmux) = make_client_config(Some(registration), true)?;
         let connector =
-            H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), registration);
+            H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), false, registration);
         let channel = H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
         Ok(Self { channel, uri })
     }
