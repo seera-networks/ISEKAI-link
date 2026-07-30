@@ -88,6 +88,7 @@ video QUIC client (msquic) ── loopback UDP ──▶ tokio UdpSocket (127.0.
 1. **観測アドレスが取れない** — P2P 側のリレーレグは `ReceiveObservedAddressReports` 未設定で、生 `Connection` も外に出ていない。
 2. **公開マッピングを持つバインディングが無い** — `is_unconnected = false` なので、リレーレグの UDP ソケットは接続済みソケットであり共有されない。映像 QUIC 接続がそのバインディングから穴あけパケットを送る手段がない。
 3. **映像 QUIC 接続が loopback に閉じている** — クライアントの初期経路は `127.0.0.1 → 127.0.0.1`。直接経路の候補となる実アドレスを一切知らない。
+   ただし問題なのは **local が loopback であること**だけで、remote が loopback であること自体は支障にならない（§2.2.1）。
 4. **制御の口が無い** — `receive_frames` / `serve_frames` は経路イベントも `activate_path` も外に出していない。
 5. **registration が分かれている** — バインディング共有を確実にするには、リレーレグと映像 QUIC が同一 msquic registration 上にあることが望ましい。
 
@@ -101,22 +102,56 @@ Direct モードの**サーバ側**は、すでに
 「loopback 上の映像接続に、別の実バインディング L_s を `add_bound_addr` で後付けし、その公開マッピング O_s を `add_observed_addr` で広告する」
 という形になっている。これは P2P モードのサーバ側とほぼ同じ構造（映像 listener は loopback、リレーレグは別ソケット）なので、**ほぼそのまま移植できる**。
 
-一方 **クライアント側**は形が違う。Direct モードでは Phase 1 の接続を drop してから Phase 2 が同じローカルアドレスを取り直す前提だが、P2P モードでは **リレーレグ（CONNECT-UDP の H3 接続）を張りっぱなしにする必要がある**（それが映像の搬送路そのもの）。したがってクライアントも、サーバ側と同じ
-**「loopback の初期経路はそのまま、直接経路用に共有バインディングを `add_bound_addr` で後付けする」**
-方式を採る。
+**クライアント側の要点**は、「映像 QUIC の *remote* が loopback（`127.0.0.1:R` = CONNECT-UDP ブリッジソケット）であることと、*local* が loopback であることは無関係」という点にある。
+現状は msquic が dial 先に合わせて loopback にバインドしているだけで、**ローカルアドレスを実インタフェースのアドレス L_c に固定したまま `127.0.0.1:R` へ dial できる**（§2.2.1 で実測確認済み）。
+したがってクライアントは Direct モードの `connect_direct` と**同一の 2 フェーズ構成**をそのまま使える:
+
+1. リレーへ一時接続して自分の `(L_c, O_c)` を得る、
+2. 映像 QUIC 接続のローカルアドレスを L_c に固定して `127.0.0.1:R` へ dial し、`start()` 前に `add_candidate_addr(L_c, O_c)` を呼ぶ。
+
+`add_bound_addr` によるバインディング後付けは**クライアント側では不要**になる。
 
 ### 2.2 採用案と代替案
 
-| | 案A: 追加バインディング方式 **（採用）** | 案B: 単一バインディング方式 |
+| | 案A: 追加バインディング (`add_bound_addr`) | **案B: ローカルアドレス固定 (`set_local_addr`) ← 採用** |
 | --- | --- | --- |
-| 初期（リレー）経路 | loopback のまま | リレーブリッジ socket も実 IP に bind し、映像接続を `set_local_addr(L_c)` で pin |
-| 直接経路 | `add_bound_addr(L)` + `add_candidate_addr(L, O)` で後付け | 同一バインディング上に自然に生える |
-| 証明書検証 | `video_host`（loopback FQDN）をそのまま dial できる → **影響なし** | dial 先が実 IP になり、SNI と解決先を分離する必要があり **破綻しやすい** |
-| リレー Forward 先 | サーバ側 `127.0.0.1:V` のまま → **影響なし** | サーバ側も loopback を外す必要がある |
-| 実績 | Direct モードのサーバ側で実績あり | 無し |
-| リスク | クライアント接続で `add_bound_addr` を使う実績が無い（§7-1 で先に検証） | 大きい |
+| 映像 QUIC の local | `127.0.0.1:x` のまま | **L_c**（実インタフェース） |
+| 映像 QUIC の remote | `127.0.0.1:R` | `127.0.0.1:R`（**変更なし**） |
+| 直接経路の生やし方 | `add_bound_addr(L_c)` + `add_candidate_addr(L_c, O_c)` | `add_candidate_addr(L_c, O_c)` のみ |
+| 証明書検証 / `video_host` | 影響なし | **影響なし**（dial 先は loopback FQDN のまま。変わるのは local だけ） |
+| リレー Forward 先 | 影響なし | **影響なし**（サーバ側 `127.0.0.1:V` のまま） |
+| Direct モードとの実装共有 | 別実装が必要 | **`connect_direct` とほぼ同一** |
+| 未検証点 | クライアント接続での `add_bound_addr` に実績が無い | 実 IP ⇄ loopback の UDP 疎通（**§2.2.1 で実測済み**）と `set_local_addr` の binding 参加 |
 
-→ **案A を採用**。変更は「観測アドレスを配る配線」と「映像接続に候補を足す口」に閉じる。
+→ **案B を採用**。当初 §2.2 で案B を「dial 先が実 IP になり SNI と解決先の分離が必要」として退けていたが、これは誤りだった。変えるのは **local アドレスだけ**で、dial 先（`video_host` → `127.0.0.1`）は一切変わらないため、証明書検証にもリレーの forward 先にも影響しない。
+
+なお **サーバ側は案A のまま**とする。サーバの公開マッピング O_s は bind レグ H3 接続のローカルポートに対して観測されたものなので、映像 listener 自身のバインディングに読み替えるには結局バインディング共有（= `add_bound_addr`）が要る。ここは Direct モードの実装をそのまま移植する。
+
+#### 2.2.1 実測による裏付け（Linux / 2026-07-30）
+
+案B の前提「実インタフェースのアドレスを local に持ったまま loopback の相手と UDP 疎通できる」を、実際のトポロジ（`run_bridge` の `recv_from` → `last_src` → `send_to` 方式）を模したソケットで検証した。
+
+検証手順:
+
+1. UDP ソケットをリレーのエッジアドレスへ `connect()` してローカルアドレス `L_c` を得る（パケットは飛ばない）→ `192.168.1.59:41241`。ソケットは close。
+2. `127.0.0.1:0` にブリッジソケットを bind（= `open_connect_relay` のブリッジ）→ `127.0.0.1:41382`。
+3. 別ソケットを **`L_c` に再 bind**（`SO_REUSEADDR` なし）し、`127.0.0.1:41382` へ `connect()`（msquic 既定の connected ソケット相当）。
+4. 上り／下りの疎通と、第三者からの受信可否を確認。
+
+結果:
+
+| 確認項目 | 結果 |
+| --- | --- |
+| probe を close した後に `L_c` へ再 bind できるか | **可**（`SO_REUSEADDR` 不要） |
+| 上り: src=`192.168.1.59:41241` → dst=`127.0.0.1:41382` | **到達**。ブリッジ側の `recv_from` は src を `192.168.1.59:41241` として観測 |
+| 下り: ブリッジが `last_src`（=実 IP）へ `send_to` | **到達** |
+| connected ソケットが第三者（直接経路の相手）からのパケットを受けるか | **受けない**（タイムアウト） |
+
+- 環境: Linux 6.16、`net.ipv4.conf.all.rp_filter = 2`、`net.ipv4.conf.lo.rp_filter = 0`、`net.ipv4.conf.lo.route_localnet = 0`（いずれも既定値のまま。特別なチューニングは不要）。
+- `run_bridge`（`rust/channel-masque/src/masque/connect_udp.rs:70`）は送信元アドレスを一切検証せず `last_src` にそのまま追従するため、**ブリッジ側の改修は不要**。
+- 4 点目は重要で、**直接経路のパケットを同じソケットで受けるには `set_unconnected_socket(true)` が必須**であることを示す。`msquic-async` のドキュメント上、これは `set_share_binding(true)` が前提。
+
+> 検証は Linux のみ。Windows / macOS / iOS でも同じ挙動かは Phase 0 で確認する（§7-12）。
 
 ### 2.3 経路の定義（両モード共通の語彙）
 
@@ -154,14 +189,21 @@ Direct モードの**サーバ側**は、すでに
 
 1. `git submodule update --init --recursive` で submodule を記録コミットに戻す。
    現在の作業ツリーは `msquic-async-rs` が `0644856-dirty`（記録は `b8a3111`）、`tonic-h3` が `e470be8`（記録は `a68d128`）で**ずれており、`is_unconnected` を含むコードがそもそも入っていない**。
-2. seera-msquic の以下を実機/小さなテストで確認する。
-   - `add_bound_addr` を **クライアント接続**に対して呼べるか（Direct モードでは accept 済みサーバ接続でのみ実績）。
-   - `add_bound_addr` / `add_observed_addr` / `add_candidate_addr` を **`start()` 前**と**ハンドシェイク完了後**のどちらでも呼べるか（P2P はリレー bind が後から来るためレースがある）。
+2. **クライアント側（案B）の未検証点**を小さな msquic テストで確認する。
+   - `set_local_addr(L_c)` を `start()` 前に呼んだ映像 QUIC 接続が、**remote = `127.0.0.1:R`** で正常にハンドシェイクできるか
+     （OS レベルの疎通は §2.2.1 で確認済み。ここで見るのは msquic がその組み合わせを許すか）。
+   - `set_share_binding(true)` + `set_unconnected_socket(true)` + `set_local_addr(L_c)` で、**生存中の**リレーレグ H3 接続のバインディングに
+     **相乗りできるか**（`QuicLibraryGetBinding` が既存の共有バインディングを返すか）。できない場合は §3-Phase 4 の «probe & drop» 方式にフォールバックする（NAT マッピング維持とのトレードオフは §7-13）。
+   - `add_candidate_addr(host, observed)` の `HostAddress` の意味（「host に bind せよ」なのか「既存バインディング host の公開マッピングが observed」なのか）。
+     Direct モードは Phase 1 接続を drop してから同じ `local_address` を渡しており前者寄りに見えるが、案B ではすでに `set_local_addr` で bind 済みなので後者として振る舞う必要がある。
+3. **サーバ側（案A）の未検証点**。
+   - `add_bound_addr` / `add_observed_addr` が **ハンドシェイク完了後**にも呼べるか（P2P はリレー bind が後から来るためレースがある）。
    - loopback バインディングと実バインディングを 1 接続が同時に持てるか、その状態で `activate_path` が両方向に効くか。
-   - `add_candidate_addr(host, observed)` が「host に bind して observed を広告する」意味なのか、「既存バインディング host の公開マッピングが observed」という意味なのか（Direct モードのクライアントは Phase 1 接続を drop してから同じ `local_address` を渡している＝前者寄りの挙動に見える）。
-3. P2P モードで `udp_mode = "dedicated"` 相当の設定が必要かを確認する。P2P の bind レグは `seera-prefer-temporary-public-address: ?1` を送っており、Direct モード（#58）とは別経路。
+   - #59 の caveat「listener 側の NAT traversal / address discovery チューニングが要るかもしれない」の実際の要否。
+4. P2P モードで `udp_mode = "dedicated"` 相当の設定が必要かを確認する。P2P の bind レグは `seera-prefer-temporary-public-address: ?1` を送っており、Direct モード（#58）とは別経路。
+5. §2.2.1 の実測を **Windows / macOS / iOS** でも再現する（§7-12）。
 
-**受け入れ条件**: 上記 4 点の回答がドキュメント化され、案A が成立することが確認できている。成立しない場合は §2.2 の案B か §2.5 の制御プレーン方式へ切り替える判断をここで行う。
+**受け入れ条件**: 上記の回答がドキュメント化され、案B（クライアント）+ 案A（サーバ）が成立することが確認できている。クライアント側が成立しない場合は案A（`add_bound_addr`）へ、サーバ側が成立しない場合は §2.5 の制御プレーン方式へ切り替える判断をここで行う。
 
 ### Phase 1 — `isekai-p2p-core`: 観測アドレスの取得基盤
 
@@ -212,17 +254,27 @@ Direct モードの**サーバ側**は、すでに
 1. `video_client_config(reg, verify, enable_natt)` に拡張。`enable_natt` のとき
    `.set_ReceiveObservedAddressReports()` と `.set_AddAddressMode(AddAddressMode::NatTraversal)` を付ける。
 2. `receive_frames_with(host, port, frame_tx, shutdown, opts: VideoRecvOptions)` を新設（§4.3）。既存 `receive_frames` はデフォルトオプションで委譲。
-3. 内部フロー:
-   - `opts.observed` が指定されていれば、**dial 前に**最大 `OBSERVED_ADDR_WAIT`（既定 3 秒）だけ観測アドレスを待つ。
+3. 内部フロー（**案B**。Direct モードの `connect_direct` と同型）:
+   - `opts.observed` が指定されていれば、**dial 前に**最大 `OBSERVED_ADDR_WAIT`（既定 3 秒）だけ観測アドレス `(L_c, O_c)` を待つ。
      取れなければ警告ログのみでリレー専用として続行（**フォールバック必須**）。
-   - `Connection::new()` 後、`start()` の前に `add_bound_addr(L_c)` + `add_candidate_addr(L_c, O_c)`（Phase 0 の結論次第で順序・タイミングを調整）。
+   - `Connection::new()` 後、`start()` の**前**に:
+     1. `set_share_binding(true)`
+     2. `set_unconnected_socket(true)` — 直接経路のパケットを同じソケットで受けるために必須（§2.2.1 の 4 点目）
+     3. `set_local_addr(L_c)` — ローカルアドレスを実インタフェースに固定。**dial 先は `video_host` → `127.0.0.1:R` のまま**
+     4. `add_candidate_addr(L_c, O_c)`
+   - `add_bound_addr` はクライアント側では**呼ばない**。
    - `dial_video` 成功後、`(get_local_addr, get_remote_addr)` を `PathEvent::Relay` として通知。
+     このとき local は `L_c`、remote は `127.0.0.1:R` になるはず（ログで必ず確認する）。
    - 受信ループを `tokio::select!` に拡張し、Direct モード (`connect_direct`) と同型にする:
      - `conn.poll_event` → `PathValidated` が初期経路と異なれば `PathEvent::DirectValidated` を通知、
      - `opts.migrate` 受信 → `conn.activate_path(local, remote)`、
      - 1 秒周期の `conn.get_stats()` → `opts.rtt` へ RTT(ms) を送出、
      - 既存の `accept_inbound_uni_stream` によるフレーム受信。
-4. `dial_video` の長期ハンドシェイク（`HandshakeIdleTimeoutMs = 60_000`）と NAT traversal の相互作用に注意。リレーレグ確立待ちのリトライ経路では、`Connection` を作り直すたびに候補登録もやり直すこと。
+4. `dial_video` の長期ハンドシェイク（`HandshakeIdleTimeoutMs = 60_000`）と NAT traversal の相互作用に注意。リレーレグ確立待ちのリトライ経路では、`Connection` を作り直すたびに 3 の 1〜4 をやり直すこと。
+5. **L_c を誰が押さえるか**（Phase 0-2 の結論で分岐）:
+   - **推奨（相乗り方式）**: `open_connect_relay` を `unconnected = true` で張り、その H3 接続が L_c を保持し続ける。映像 QUIC は同じ L_c に相乗りする。
+     H3 接続がプロキシへ通信し続けるので **L_c の NAT マッピングが維持される**（P2P では映像トラフィックが全て loopback で、NAT を一切通らないため、これが無いとマッピングが失効しうる。§7-13）。
+   - **フォールバック（probe & drop 方式）**: Direct モードと同じく一時接続で `(L_c, O_c)` を得てから drop し、映像 QUIC が L_c を bind し直す。実装は単純だが NAT マッピング失効のリスクを負う。
 
 **受け入れ条件**: P2P モードで従来どおり受信でき、`PathEvent::Relay` が出る。直接経路が張れる環境では `PathEvent::DirectValidated` が出る。
 
@@ -330,7 +382,8 @@ pub enum PathEvent {
 pub struct VideoRecvOptions {
     pub registration: Option<Arc<Registration>>,
     pub verify: bool,
-    /// 自分のリレーレグが報告した (local, observed)。あれば dial 前に候補登録する。
+    /// 自分のリレーレグが報告した (local, observed) = (L_c, O_c)。あれば dial 前に
+    /// set_local_addr(L_c) + add_candidate_addr(L_c, O_c) を行う（案B, §2.2）。
     pub observed: Option<watch::Receiver<Option<(SocketAddr, SocketAddr)>>>,
     /// 経路イベントの通知先。
     pub path_events: Option<mpsc::Sender<PathEvent>>,
@@ -369,18 +422,20 @@ pub async fn receive_frames_with(
 ## 5. データフロー（変更後・P2P モード）
 
 ```
-[camera-client]                                     [camera-server]
+[camera-client]  … 案B                              [camera-server]  … 案A
  InitiatorSession                                    ListenerSession
-   └ connect leg (H3, unconnected, 共有binding L_c)     └ bind leg (H3, unconnected, 共有binding L_s)
+   └ connect leg (H3, unconnected, binding L_c)        └ bind leg (H3, unconnected, 共有binding L_s)
         │ NotifyObservedAddress → (L_c, O_c)                 │ NotifyObservedAddress → (L_s, O_s)
         ▼ watch                                              ▼ watch
  receive_frames_with                                  serve_frames_with
-   add_bound_addr(L_c)                                  accept ごとに
-   add_candidate_addr(L_c, O_c)                           add_bound_addr(L_s)
-        │                                                   add_observed_addr(L_s, O_s)
+   set_share_binding(true)                              accept ごとに
+   set_unconnected_socket(true)                           add_bound_addr(L_s)
+   set_local_addr(L_c)   ← local だけ固定                  add_observed_addr(L_s, O_s)
+   add_candidate_addr(L_c, O_c)
+        │
         ▼
-  ┌── リレー経路: 127.0.0.1:x → 127.0.0.1:R ─ MASQUE ─ proxy ─ MASQUE ─ 127.0.0.1:F → 127.0.0.1:V
-  │
+  ┌── リレー経路: L_c → 127.0.0.1:R ─ MASQUE ─ proxy ─ MASQUE ─ 127.0.0.1:F → 127.0.0.1:V
+  │              ^^^ 実 IP → loopback（§2.2.1 で疎通確認済み）
   └── 直接経路:   L_c → O_s  /  L_s → O_c        （NAT traversal で穴あけ後 PathValidated）
                      ▲
                      └ UI ボタン → activate_path(local, remote)
@@ -419,8 +474,9 @@ pub async fn receive_frames_with(
 
 | # | 項目 | 影響 | 対策 |
 | --- | --- | --- | --- |
-| 1 | クライアント接続での `add_bound_addr` 実績が無い | 案A が成立しない | **Phase 0 の spike で最優先に検証**。ダメなら案B / 制御プレーン方式へ |
-| 2 | loopback バインディングと実バインディングの混在時の msquic の経路選択 | 予期せぬ経路で送信 | Phase 0 で確認。ログで実際の `(local, remote)` を必ず出す |
+| 1 | 実 IP を local、loopback を remote とする UDP 疎通の可否 | 案B が成立しない | **§2.2.1 で Linux 実測済み（成立）**。他 OS は §7-12 |
+| 1b | `set_local_addr` で**生存中の**共有バインディングに相乗りできるか | 相乗り方式が使えない | Phase 0-2。ダメなら probe & drop 方式（§7-13 とのトレードオフ） |
+| 2 | サーバ側で loopback バインディングと実バインディングの混在時の msquic の経路選択 | 予期せぬ経路で送信 | Phase 0-3 で確認。ログで実際の `(local, remote)` を必ず出す |
 | 3 | 観測アドレスが来ない（プロキシが OBSERVED_ADDRESS を送らない / qmux フォールバックに落ちた） | migrate 不可 | タイムアウト付きで待ち、来なければリレー専用で継続。UI に "no direct path" を表示 |
 | 4 | 対称 NAT では穴あけ不可 | 直接経路が張れない | 仕様上の制約として明示。リレー継続で機能低下なし |
 | 5 | bind タイミングのレース（accept が bind より先に来る） | 広告が漏れる | `watch` + 遅延適用タスク（Phase 3-2） |
@@ -430,6 +486,9 @@ pub async fn receive_frames_with(
 | 9 | submodule のチェックアウトが記録コミットとずれている | そもそもビルドできない | Phase 0-1 で `git submodule update --init --recursive` |
 | 10 | P2P モードで `udp_mode = dedicated` 相当が要るか不明 | 観測アドレスが不安定になる可能性 | Phase 0-3 で確認 |
 | 11 | `dial_video` のリトライで `Connection` を作り直す | 候補登録が消える | Phase 4-4 でリトライごとに再登録 |
+| 12 | §2.2.1 の実測は **Linux のみ**（Windows / macOS / iOS 未確認） | 案B が一部プラットフォームで成立しない | Phase 0-5 で再現確認。特に Windows は `schannel` 依存もあり実機必須 |
+| 13 | P2P では映像トラフィックが全て loopback を通り、**L_c の NAT マッピングが更新されない** | 穴あけ時にマッピングが失効・再割当されている | 相乗り方式でリレーレグ H3 接続に L_c を維持させる（Phase 4-5）。probe & drop 方式を採る場合はキープアライブが別途必要 |
+| 14 | `set_unconnected_socket` は `set_share_binding(true)` が前提（msquic-async のドキュメント） | 呼び順を誤ると `QUIC_STATUS_INVALID_STATE` | Phase 4-3 の順序（share → unconnected → local_addr → candidate）を厳守 |
 
 ---
 
