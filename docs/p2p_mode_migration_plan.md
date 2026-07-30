@@ -151,7 +151,81 @@ Direct モードの**サーバ側**は、すでに
 - `run_bridge`（`rust/channel-masque/src/masque/connect_udp.rs:70`）は送信元アドレスを一切検証せず `last_src` にそのまま追従するため、**ブリッジ側の改修は不要**。
 - 4 点目は重要で、**直接経路のパケットを同じソケットで受けるには `set_unconnected_socket(true)` が必須**であることを示す。`msquic-async` のドキュメント上、これは `set_share_binding(true)` が前提。
 
-> 検証は Linux のみ。Windows / macOS / iOS でも同じ挙動かは Phase 0 で確認する（§7-12）。
+> 上記は開発機（Linux）での手元計測。プラットフォーム差は §2.2.2 で CI により確認した。
+
+#### 2.2.2 Phase 0 の CI 実測結果（2026-07-30）
+
+`rust/camera-core/examples/migration_spike.rs` を `.github/workflows/migration-spike.yml` で
+ubuntu-latest / macos-14 / windows-latest の 3 面に流した結果。スパイクは P2P のリレー経路を
+loopback ソケット 2 個のブリッジで再現し、各側の直接経路アドレスは MASQUE レグに見立てた
+**別の生存中の共有バインディング**から取る（プロキシもリレーも NAT も無し）。
+
+| # | 問い | Linux | macOS 14 | Windows |
+| --- | --- | --- | --- | --- |
+| 1 | 実 IP に **アドレス固定**した socket ⇄ loopback の疎通 | PASS | PASS | **FAIL** |
+| 1b | **wildcard bind**（ポートのみ固定）で 1 ソケットが両経路を捌けるか | PASS | PASS | **PASS** |
+| 2 | `set_local_addr(実IP)` した msquic クライアントが `127.0.0.1` へハンドシェイク | PASS | PASS | SKIP |
+| 3 | 生存中の共有バインディングへの相乗り（リスク #1b） | PASS | PASS | SKIP |
+| 4 | `set_local_addr` + `add_candidate_addr` の併用 | PASS | PASS | SKIP |
+| 5 | サーバ側 `add_bound_addr` / `add_observed_addr` の遅延呼び出し | PASS | FAIL* | SKIP |
+| 6a | 直接経路の `PathValidated` → `activate_path`（listener 現行設定） | PASS | FAIL* | SKIP |
+| 6b | 同上（listener に NAT traversal 設定を追加） | PASS | FAIL* | SKIP |
+
+**確定した答え**
+
+- **リスク #1b は解消**。`set_share_binding(true)` + `set_unconnected_socket(true)` + `set_local_addr(L)` で、
+  **生存中の**共有バインディングに 2 本目の接続が相乗りできる（check 3）。
+  よって Phase 4-5 は «相乗り方式» を採れ、リスク #13（NAT マッピングが更新されない）も
+  リレーレグを L_c 上に生かしておくことで回避できる。
+- **`add_candidate_addr` は `set_local_addr` と併用できる**（check 4）。案B の呼び順が成立する。
+- **サーバ側の遅延広告は可能**（check 5）。accept 後・データ往復後に現れたバインディングでも
+  `add_bound_addr` / `add_observed_addr` とも成功する。P2P の「bind が後から来る」順序に耐える。
+- **#59 の caveat は不要だった**（check 6a/6b）。listener は**現行の設定のまま**で直接経路が
+  `PathValidated` され、`activate_path` 後もアプリケーションデータが流れ続ける。
+  NAT traversal / observed address の設定を listener に足しても結果は変わらない。
+  → Phase 3-3（listener 設定のチューニング）は**不要**。
+- **Linux では案B が端から端まで成立**している（check 6a が実際に経路を切り替えて往復を確認）。
+
+**Windows: アドレス固定は使えない（新規の重大事項）**
+
+check 1 は Windows で **step 3** — `10.1.0.10:58696` から `127.0.0.1:58698` への送信 — が
+`WSAEADDRNOTAVAIL (os error 10049)` で失敗する。Windows では特定の非 loopback アドレスに
+bind した socket から `127.0.0.1` へは送信できない。**案B をそのまま Windows に持ち込むことはできない。**
+
+一方 check 1b は **3 プラットフォームすべてで PASS**した。`0.0.0.0:P` に wildcard bind した
+1 個のソケットが、
+
+- リレー経路（→ `127.0.0.1:R`）ではカーネルが送信元を `127.0.0.1:P` に選び、
+- 直接経路では同じソケットが `<実IP>:P` 宛のデータグラムを受け取る。
+
+つまり **固定すべきはアドレスではなくポート**であり、これが移植可能な形になる（§2.2.3）。
+
+\* macOS の check 5 / 6a / 6b の FAIL は、スパイク側のリレーレグ代役の
+ハンドシェイクが `connection shutdown by transport` で落ちたもの。同じ手順の check 2/3/4 は
+macOS でも PASS しているので、設計そのものの否定ではなく**ハーネスの問題である可能性が高い**。
+未解決の追試項目（§7-15）。
+
+#### 2.2.3 未解決: wildcard bind を msquic でどう表現するか
+
+check 1b は OS レベルの話であり、msquic に「wildcard に bind し、ただしポートは P、
+そして候補としては `<実IP>:P` を広告する」と指示する方法はまだ確認できていない。
+候補となる筋:
+
+- `set_local_addr(0.0.0.0:P)` が受け付けられるか（`QUIC_PARAM_CONN_LOCAL_ADDRESS` にワイルドカードを渡せるか）。
+- `add_candidate_addr(<実IP>:P, <観測アドレス>)` の `HostAddress` が、
+  wildcard バインディング上の送信元として解釈されるか。
+- Windows の msquic が経路ごとに送信元アドレスを選べるか（`set_unconnected_socket` の実装依存）。
+
+**これが Windows 対応の可否を決めるので、Phase 1 に着手する前に片付ける**（Phase 0 の残作業）。
+Windows での msquic チェック（2〜6）は現状スキップされている（理由は下記）ため、
+この追試には Windows で listener を立てられるようにする作業が前提になる。
+
+> Windows で check 2〜6 が SKIP なのは設計とは無関係の理由による。
+> `make_msquic_async_listener` の Windows 分岐は証明書を RSA プロバイダ経由で取り込むが、
+> `camera_core::tls::dev_cert` が生成するのは ECDSA P-256 なので
+> `ASN1 bad tag value met` で失敗する。本番の camera-server はここにプロキシ発行の
+> PKCS#12 を渡すので別分岐に入り、この問題は起きない。
+> スパイクを Windows で完走させるには、dev 証明書を PKCS#12 で用意する必要がある。
 
 ### 2.3 経路の定義（両モード共通の語彙）
 
@@ -183,7 +257,12 @@ Direct モードの**サーバ側**は、すでに
 
 各フェーズは独立して `cargo check --workspace --examples` が通り、既定の挙動を変えない（オプトイン）ことを条件とする。
 
-### Phase 0 — 前提整備と API セマンティクスの検証（spike）
+### Phase 0 — 前提整備と API セマンティクスの検証（spike）  … 一部完了
+
+**状況**: `rust/camera-core/examples/migration_spike.rs` +
+`.github/workflows/migration-spike.yml` で 2〜4 の大半を自動化し、実測済み（結果は §2.2.2）。
+**残作業は §2.2.3（wildcard bind を msquic でどう表現するか）と、Windows でスパイクを
+完走させるための PKCS#12 dev 証明書**。
 
 **作業**
 
@@ -243,7 +322,8 @@ Direct モードの**サーバ側**は、すでに
    - watch に値があれば即 `add_bound_addr(L_s)` / `add_observed_addr(L_s, O_s)`、
    - まだ無ければ小タスクを spawn して `changed().await` 後に適用（**bind が accept より後に来るレースへの対応**）、
    - 失敗はログのみ（Direct モードと同じく致命的にしない）。
-3. `make_msquic_async_listener` 側の設定に `ReceiveObservedAddressReports` / NAT traversal 相当が必要かを Phase 0 の結果に応じて追加（#59 の caveat に「listener 側のチューニングが要るかもしれない」と記載あり）。
+3. ~~`make_msquic_async_listener` 側の設定に NAT traversal 相当を追加~~ — **不要**。
+   §2.2.2 の check 6a/6b で、listener は現行設定のまま直接経路が検証されることを確認した（#59 の caveat は空振り）。
 
 **受け入れ条件**: P2P モードのサーバがリレー経由で従来どおり配信でき、ログに `observed address reported: ...` と `add_observed_addr` の成功が出る。
 
@@ -475,7 +555,7 @@ pub async fn receive_frames_with(
 | # | 項目 | 影響 | 対策 |
 | --- | --- | --- | --- |
 | 1 | 実 IP を local、loopback を remote とする UDP 疎通の可否 | 案B が成立しない | **§2.2.1 で Linux 実測済み（成立）**。他 OS は §7-12 |
-| 1b | `set_local_addr` で**生存中の**共有バインディングに相乗りできるか | 相乗り方式が使えない | Phase 0-2。ダメなら probe & drop 方式（§7-13 とのトレードオフ） |
+| 1b | ~~`set_local_addr` で**生存中の**共有バインディングに相乗りできるか~~ | — | **解消**: §2.2.2 check 3 で Linux / macOS とも相乗り可を確認。«相乗り方式» を採用 |
 | 2 | サーバ側で loopback バインディングと実バインディングの混在時の msquic の経路選択 | 予期せぬ経路で送信 | Phase 0-3 で確認。ログで実際の `(local, remote)` を必ず出す |
 | 3 | 観測アドレスが来ない（プロキシが OBSERVED_ADDRESS を送らない / qmux フォールバックに落ちた） | migrate 不可 | タイムアウト付きで待ち、来なければリレー専用で継続。UI に "no direct path" を表示 |
 | 4 | 対称 NAT では穴あけ不可 | 直接経路が張れない | 仕様上の制約として明示。リレー継続で機能低下なし |
@@ -486,9 +566,10 @@ pub async fn receive_frames_with(
 | 9 | submodule のチェックアウトが記録コミットとずれている | そもそもビルドできない | Phase 0-1 で `git submodule update --init --recursive` |
 | 10 | P2P モードで `udp_mode = dedicated` 相当が要るか不明 | 観測アドレスが不安定になる可能性 | Phase 0-3 で確認 |
 | 11 | `dial_video` のリトライで `Connection` を作り直す | 候補登録が消える | Phase 4-4 でリトライごとに再登録 |
-| 12 | §2.2.1 の実測は **Linux のみ**（Windows / macOS / iOS 未確認） | 案B が一部プラットフォームで成立しない | Phase 0-5 で再現確認。特に Windows は `schannel` 依存もあり実機必須 |
-| 13 | P2P では映像トラフィックが全て loopback を通り、**L_c の NAT マッピングが更新されない** | 穴あけ時にマッピングが失効・再割当されている | 相乗り方式でリレーレグ H3 接続に L_c を維持させる（Phase 4-5）。probe & drop 方式を採る場合はキープアライブが別途必要 |
-| 14 | `set_unconnected_socket` は `set_share_binding(true)` が前提（msquic-async のドキュメント） | 呼び順を誤ると `QUIC_STATUS_INVALID_STATE` | Phase 4-3 の順序（share → unconnected → local_addr → candidate）を厳守 |
+| 12 | **Windows ではアドレス固定が使えない**（`WSAEADDRNOTAVAIL`） | 案B をそのまま Windows に持ち込めない | **確定した問題**（§2.2.2）。移植可能な形は wildcard bind（ポートのみ固定, check 1b は 3 面 PASS）。msquic でどう表現するかが §2.2.3 の残作業 |
+| 13 | P2P では映像トラフィックが全て loopback を通り、**L_c の NAT マッピングが更新されない** | 穴あけ時にマッピングが失効・再割当されている | 相乗り方式でリレーレグ H3 接続に L_c を維持させる（Phase 4-5）。§2.2.2 check 3 でその方式が使えることを確認済み |
+| 14 | `set_unconnected_socket` は `set_share_binding(true)` が前提（msquic-async のドキュメント） | 呼び順を誤ると `QUIC_STATUS_INVALID_STATE` | Phase 4-3 の順序（share → unconnected → local_addr → candidate）を厳守。§2.2.2 check 2/4 でこの順序が通ることを確認済み |
+| 15 | macOS でスパイクの check 5 / 6 がリレーレグ代役のハンドシェイク失敗で落ちる | macOS での端から端までの成立が未確認 | 同手順の check 2/3/4 は macOS でも PASS しており、ハーネス側の問題の可能性が高い。Phase 0 の残作業として切り分ける |
 
 ---
 
