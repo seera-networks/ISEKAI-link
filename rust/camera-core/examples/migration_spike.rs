@@ -106,7 +106,35 @@ async fn spike() -> anyhow::Result<bool> {
         run(check_os_udp()).await,
     );
 
+    report.record(
+        "1b",
+        Required::No,
+        "ローカルアドレスを固定せず wildcard bind にした場合、1 ソケットで両経路を捌けるか",
+        run(check_wildcard_bind()).await,
+    );
+
     let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default())?);
+
+    // Every msquic check needs a listener, and the dev certificate path this
+    // example uses cannot be loaded on every platform (the Windows branch of
+    // `make_msquic_async_listener` imports through an RSA provider, while
+    // `dev_cert` generates ECDSA P-256; production passes the proxy's PKCS#12
+    // instead and takes the other branch). Probe once and skip rather than
+    // report six identical certificate failures as design findings.
+    let listener_probe = spawn_listener(&reg, loopback(0)).await;
+    if let Err(e) = &listener_probe {
+        let reason = format!(
+            "この環境では listener を立てられないためスキップ (設計判断ではない): {e:#}"
+        );
+        for (id, question) in MSQUIC_CHECKS {
+            report.skip(id, question, &reason);
+        }
+        report.print();
+        let failed = report.required_failed();
+        std::mem::forget(reg);
+        return Ok(failed);
+    }
+    drop(listener_probe);
 
     report.record(
         "2",
@@ -156,6 +184,16 @@ async fn spike() -> anyhow::Result<bool> {
     Ok(failed)
 }
 
+/// The msquic-dependent checks, named once so the skip path can list them.
+const MSQUIC_CHECKS: [(&str, &str); 6] = [
+    ("2", "set_local_addr(実IP) を pin した msquic クライアントが 127.0.0.1 へハンドシェイクできるか"),
+    ("3", "生存中の共有バインディングに 2 本目の接続が相乗りできるか (リスク #1b)"),
+    ("4", "set_local_addr で bind 済みの接続に add_candidate_addr を併用できるか"),
+    ("5", "サーバ側 add_bound_addr / add_observed_addr をハンドシェイク前後で呼べるか"),
+    ("6a", "リレー型トポロジで直接経路が PathValidated されるか (listener は現行の設定のまま)"),
+    ("6b", "同上、listener に NAT traversal / observed address 設定を足した場合 (#59 の caveat)"),
+];
+
 // ---------------------------------------------------------------------------
 // Check 1 — the OS-level question, no msquic involved.
 // ---------------------------------------------------------------------------
@@ -172,21 +210,28 @@ async fn check_os_udp() -> anyhow::Result<String> {
         "probe returned a loopback address ({probe}); this host has no usable interface address"
     );
 
-    let bridge = UdpSocket::bind("127.0.0.1:0").await?;
+    let bridge = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .context("step 1: bind the loopback bridge")?;
     let bridge_addr = bridge.local_addr()?;
 
     // Rebind the probe's exact address, as msquic does after `set_local_addr`.
     let video = UdpSocket::bind(probe)
         .await
-        .with_context(|| format!("could not rebind the probe address {probe}"))?;
+        .with_context(|| format!("step 2: rebind the probe address {probe}"))?;
     anyhow::ensure!(video.local_addr()? == probe, "rebind landed on another port");
 
-    // Uplink: real-IP source -> loopback destination.
-    video.send_to(b"uplink", bridge_addr).await?;
+    // Uplink: real-IP source -> loopback destination. This is the step Windows
+    // rejects (WSAEADDRNOTAVAIL / os error 10049): a socket bound to a specific
+    // non-loopback address cannot reach 127.0.0.1 there.
+    video
+        .send_to(b"uplink", bridge_addr)
+        .await
+        .with_context(|| format!("step 3: send from the real address {probe} to {bridge_addr}"))?;
     let mut buf = [0u8; 64];
     let (n, src) = tokio::time::timeout(Duration::from_secs(2), bridge.recv_from(&mut buf))
         .await
-        .context("the bridge never received the uplink datagram (kernel dropped it)")??;
+        .context("step 4: the bridge never received the uplink datagram (kernel dropped it)")??;
     anyhow::ensure!(&buf[..n] == b"uplink", "uplink payload was corrupted");
     anyhow::ensure!(
         src == probe,
@@ -194,10 +239,13 @@ async fn check_os_udp() -> anyhow::Result<String> {
     );
 
     // Downlink: what `run_bridge` does with `last_src`.
-    bridge.send_to(b"downlink", src).await?;
+    bridge
+        .send_to(b"downlink", src)
+        .await
+        .context("step 5: bridge replies to the real address")?;
     let (n, from) = tokio::time::timeout(Duration::from_secs(2), video.recv_from(&mut buf))
         .await
-        .context("the real-IP socket never received the downlink datagram")??;
+        .context("step 6: the real-IP socket never received the downlink datagram")??;
     anyhow::ensure!(&buf[..n] == b"downlink", "downlink payload was corrupted");
     anyhow::ensure!(from == bridge_addr, "downlink came from {from}, expected {bridge_addr}");
 
@@ -219,6 +267,58 @@ async fn check_os_udp() -> anyhow::Result<String> {
 
     Ok(format!(
         "L_c = {probe}, bridge = {bridge_addr}; 上り/下りとも到達; {connected_note}"
+    ))
+}
+
+/// The fallback shape, for platforms where check 1 fails.
+///
+/// Instead of pinning the local address to a specific interface address, bind
+/// the **wildcard** on a chosen port. One socket then serves both paths and the
+/// kernel picks the source per destination: `127.0.0.1` towards the relay
+/// bridge, the interface address towards the direct peer. If this works where
+/// check 1 does not, 案B survives by pinning only the *port*.
+async fn check_wildcard_bind() -> anyhow::Result<String> {
+    let probe = probe_local_addr()?;
+    let bridge = UdpSocket::bind("127.0.0.1:0").await?;
+    let bridge_addr = bridge.local_addr()?;
+
+    let wild = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("step 1: wildcard bind")?;
+    let port = wild.local_addr()?.port();
+    let mut buf = [0u8; 64];
+
+    // Relay path: wildcard socket -> loopback bridge.
+    wild.send_to(b"uplink", bridge_addr)
+        .await
+        .context("step 2: wildcard socket -> loopback bridge")?;
+    let (n, relay_src) = tokio::time::timeout(Duration::from_secs(2), bridge.recv_from(&mut buf))
+        .await
+        .context("step 3: the bridge never received the uplink datagram")??;
+    anyhow::ensure!(&buf[..n] == b"uplink", "uplink payload was corrupted");
+    bridge
+        .send_to(b"downlink", relay_src)
+        .await
+        .context("step 4: bridge replies")?;
+    tokio::time::timeout(Duration::from_secs(2), wild.recv_from(&mut buf))
+        .await
+        .context("step 5: the wildcard socket never received the downlink")??;
+
+    // Direct path: a peer on the interface address reaches the same socket.
+    let peer = UdpSocket::bind((probe.ip(), 0)).await?;
+    let peer_addr = peer.local_addr()?;
+    peer.send_to(b"direct-path", SocketAddr::new(probe.ip(), port))
+        .await
+        .context("step 6: peer -> the wildcard socket's interface address")?;
+    let (n, direct_src) = tokio::time::timeout(Duration::from_secs(2), wild.recv_from(&mut buf))
+        .await
+        .context("step 7: the wildcard socket never received the direct-path datagram")??;
+    anyhow::ensure!(&buf[..n] == b"direct-path", "direct-path payload was corrupted");
+    anyhow::ensure!(direct_src == peer_addr, "direct path source was {direct_src}");
+
+    Ok(format!(
+        "wildcard 0.0.0.0:{port} が両経路を捌ける: リレー側から見た送信元 {relay_src}, \
+         直接経路の相手 {peer_addr} からも同一ソケットで受信"
     ))
 }
 
@@ -780,9 +880,28 @@ enum Required {
     No,
 }
 
+/// PASS / FAIL / SKIP. A skip is "this environment could not ask the question",
+/// which must never read as an answer — and must never fail the build either.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Verdict {
+    Pass,
+    Fail,
+    Skip,
+}
+
+impl Verdict {
+    fn label(self) -> &'static str {
+        match self {
+            Verdict::Pass => "PASS",
+            Verdict::Fail => "FAIL",
+            Verdict::Skip => "SKIP",
+        }
+    }
+}
+
 #[derive(Default)]
 struct Report {
-    rows: Vec<(String, Required, String, anyhow::Result<String>)>,
+    rows: Vec<(String, Required, String, Verdict, String)>,
 }
 
 impl Report {
@@ -793,18 +912,37 @@ impl Report {
         question: &str,
         result: anyhow::Result<String>,
     ) {
-        match &result {
-            Ok(note) => println!("[check {id}] PASS — {question}\n            {note}"),
-            Err(e) => println!("[check {id}] FAIL — {question}\n            {e:#}"),
-        }
+        let (verdict, note) = match result {
+            Ok(note) => (Verdict::Pass, note),
+            Err(e) => (Verdict::Fail, format!("{e:#}")),
+        };
+        self.push(id, required, question, verdict, note);
+    }
+
+    fn skip(&mut self, id: &str, question: &str, reason: &str) {
+        self.push(id, Required::No, question, Verdict::Skip, reason.to_owned());
+    }
+
+    fn push(
+        &mut self,
+        id: &str,
+        required: Required,
+        question: &str,
+        verdict: Verdict,
+        note: String,
+    ) {
+        println!(
+            "[check {id}] {} — {question}\n            {note}",
+            verdict.label()
+        );
         self.rows
-            .push((id.to_owned(), required, question.to_owned(), result));
+            .push((id.to_owned(), required, question.to_owned(), verdict, note));
     }
 
     fn required_failed(&self) -> bool {
         self.rows
             .iter()
-            .any(|(_, req, _, r)| *req == Required::Yes && r.is_err())
+            .any(|(_, req, _, v, _)| *req == Required::Yes && *v == Verdict::Fail)
     }
 
     /// A Markdown table, so CI can paste it straight into the job summary.
@@ -812,14 +950,13 @@ impl Report {
         println!("\n## Phase 0 spike ({} / {})\n", std::env::consts::OS, std::env::consts::ARCH);
         println!("| # | 必須 | 問い | 結果 | 備考 |");
         println!("| --- | --- | --- | --- | --- |");
-        for (id, required, question, result) in &self.rows {
+        for (id, required, question, verdict, note) in &self.rows {
             let required = if *required == Required::Yes { "必須" } else { "参考" };
-            let (verdict, note) = match result {
-                Ok(note) => ("PASS", note.clone()),
-                Err(e) => ("FAIL", format!("{e:#}")),
-            };
             let note = note.replace('|', "\\|").replace('\n', " ");
-            println!("| {id} | {required} | {question} | **{verdict}** | {note} |");
+            println!(
+                "| {id} | {required} | {question} | **{}** | {note} |",
+                verdict.label()
+            );
         }
         println!();
     }
