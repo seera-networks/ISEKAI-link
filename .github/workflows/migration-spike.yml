@@ -1,0 +1,86 @@
+name: P2P migration Phase 0 spike
+
+# docs/p2p_mode_migration_plan.md, Phase 0: answer the open questions that decide
+# whether the adopted design holds — 案B (pin the client's local address to a real
+# interface address, dial loopback, add_candidate_addr) on the client, 案A
+# (add_bound_addr / add_observed_addr on the accepted connection) on the server.
+#
+# `rust/camera-core/examples/migration_spike.rs` reproduces the P2P relay topology
+# on one host with a pair of loopback sockets, so every check runs without a proxy,
+# a relay or a NAT. Checks 1 and 2 are the load-bearing assumptions and fail the
+# job; the rest record an answer either way.
+#
+# The matrix exists for risk #12: the original measurement behind 案B was taken on
+# Linux only, and "a real-IP source can reach a loopback destination" is a kernel
+# behaviour, not a portable guarantee. `fail-fast: false` so one platform's answer
+# never hides another's.
+
+on:
+  push:
+    paths:
+      - 'rust/camera-core/examples/migration_spike.rs'
+      - 'rust/camera-core/Cargo.toml'
+      - 'submodules/msquic-async-rs'
+      - '.github/workflows/migration-spike.yml'
+  pull_request:
+    paths:
+      - 'rust/camera-core/examples/migration_spike.rs'
+      - 'rust/camera-core/Cargo.toml'
+      - 'submodules/msquic-async-rs'
+      - '.github/workflows/migration-spike.yml'
+  workflow_dispatch:
+
+jobs:
+  spike:
+    name: Phase 0 spike (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Same bootstrap the iOS workflow uses; seera-msquic needs its build
+      # dependencies present before cargo drives its CMake build.
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build the spike
+        run: cargo build -p camera-core --example migration_spike
+
+      - name: Run the spike
+        id: spike
+        run: cargo run -q -p camera-core --example migration_spike | tee "$RUNNER_TEMP/spike-report.md"
+        shell: bash
+
+      # The example prints its report as a Markdown table, so it renders as-is.
+      - name: Publish the report to the job summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.os }}"
+            echo
+            sed -n '/^| # |/,$p' "$RUNNER_TEMP/spike-report.md" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spike-report-${{ matrix.os }}
+          path: ${{ runner.temp }}/spike-report.md
+          if-no-files-found: warn

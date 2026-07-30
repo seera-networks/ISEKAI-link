@@ -1066,6 +1066,7 @@ dependencies = [
  "jpeg-encoder",
  "msquic-async",
  "rcgen",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

@@ -25,3 +25,7 @@ anyhow = { workspace = true }
 # it out of anything that ships.
 jpeg-encoder = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio-util = { workspace = true }
+# The migration_spike example writes the dev certificate out for msquic's
+# file-based credential loader.
+tempfile = { workspace = true }
