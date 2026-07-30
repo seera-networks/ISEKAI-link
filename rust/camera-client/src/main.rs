@@ -148,8 +148,8 @@ impl MyApp {
     fn new() -> Self {
         Self {
             mode: Mode::Direct,
-            server_addr: "153.127.33.247".to_string(),
-            server_port: "15640".to_string(),
+            server_addr: "161.33.142.214".to_string(),
+            server_port: "16205".to_string(),
             identity_url: "https://identity.isekai.tools:9443".to_string(),
             proxy_url: "https://link.isekai.tools:8443".to_string(),
             auth0_token: String::new(),
@@ -201,11 +201,11 @@ impl MyApp {
             // Phase 1: reach the relay to discover our observed (public) address.
             let (reg, config_h3) = make_msquic_async_client_config(None, "h3", false, false)?;
             let conn = msquic_async::Connection::new(&reg)?;
-            conn.start(&config_h3, "link2.isekai.tools", 8443)
+            conn.start(&config_h3, "tokyo.link.isekai.tools", 8443)
                 .await
                 .map_err(|e| {
-                    tracing::error!("Failed to connect to link2.isekai.tools:8443: {e:?}");
-                    anyhow::anyhow!("Failed to connect to link2.isekai.tools:8443: {e:?}")
+                    tracing::error!("Failed to connect to tokyo.link.isekai.tools:8443: {e:?}");
+                    anyhow::anyhow!("Failed to connect to tokyo.link.isekai.tools:8443: {e:?}")
                 })?;
             let Ok(msquic_async::ConnectionEvent::NotifyObservedAddress {
                 local_address,

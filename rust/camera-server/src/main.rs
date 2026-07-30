@@ -410,11 +410,11 @@ impl MyApp {
         Self {
             reg,
             mode: Mode::Direct,
-            target: "https://link.isekai.tools:8443".to_string(),
+            target: "https://tokyo.link.isekai.tools:8443".to_string(),
             jwt: String::new(),
             is_open: false,
             identity_url: "https://identity.isekai.tools:9443".to_string(),
-            proxy_url: "https://link.isekai.tools:8443".to_string(),
+            proxy_url: "https://tokyo.link.isekai.tools:8443".to_string(),
             auth0_token: String::new(),
             key_path: "camera-server-endpoint.pem".to_string(),
             protocol: "isekai-validator-v1".to_string(),
