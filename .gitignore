@@ -15,3 +15,8 @@ e2e-client.pem
 /ios/IsekaiCameraClient/Frameworks/
 /ios/IsekaiCameraClient/Info.plist
 /ios/DerivedData/
+
+# QUIC trace artifacts written by msquic (ETW logging) when running the camera
+# apps. Generated on demand; never committed.
+quic.etl
+quic.txt
