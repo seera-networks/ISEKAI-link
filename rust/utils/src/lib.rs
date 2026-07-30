@@ -7,7 +7,7 @@ use http::{Request, Uri};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody};
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
-use tokio::task::JoinSet;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceBuilder, ServiceExt};
@@ -42,7 +42,11 @@ pub fn make_msquic_async_client_config(
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()
-                .set_StreamMultiReceiveEnabled(),
+                .set_StreamMultiReceiveEnabled()
+                // Accept observed-address reports from the peer so the caller
+                // can learn how its address is seen (e.g. the MASQUE relay's
+                // view of this server's public address).
+                .set_ReceiveObservedAddressReports(),
         ),
     )?;
 
@@ -308,6 +312,7 @@ pub async fn create_masque_channel(
     reg: Arc<msquic_async::Registration>,
     config: Arc<msquic::Configuration>,
     config_qmux: Arc<msquic::Configuration>,
+    conn_tx: Option<mpsc::Sender<msquic_async::Connection>>,
 ) -> anyhow::Result<
     channel_masque::H3Channel<
         h3_util::msquic_async::H3MsQuicAsyncConnector,
@@ -320,6 +325,13 @@ pub async fn create_masque_channel(
         Some(config_qmux),
         reg,
     );
+    // Optionally hand the underlying QUIC connection back to the caller so it
+    // can poll connection events (e.g. observed-address reports).
+    let connector = if let Some(conn_tx) = conn_tx {
+        connector.with_channel(conn_tx)
+    } else {
+        connector
+    };
     let channel = channel_masque::H3Channel::<
         _,
         StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>,

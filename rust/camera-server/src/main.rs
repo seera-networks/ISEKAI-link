@@ -77,12 +77,19 @@ async fn run_isekai_connection(
     let listen_addr = listener.local_addr()?;
     tracing::info!("camera server local listening on: {}", listen_addr);
 
-    let channel = create_masque_channel(uri.clone(), reg.clone(), config, config_qmux.clone())
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to create MASQUE channel: {e:?}");
-            anyhow::anyhow!("Failed to create MASQUE channel: {e:?}")
-        })?;
+    let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<msquic_async::Connection>(16);
+    let channel = create_masque_channel(
+        uri.clone(),
+        reg.clone(),
+        config,
+        config_qmux.clone(),
+        Some(conn_tx),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create MASQUE channel: {e:?}");
+        anyhow::anyhow!("Failed to create MASQUE channel: {e:?}")
+    })?;
 
     create_forward_masque_connection(
         &jwt,
@@ -100,6 +107,46 @@ async fn run_isekai_connection(
             _ = shutdown_token.cancelled() => {
                 tracing::debug!("shutdown signal received, exiting ISEKAI connection task");
                 break;
+            }
+            conn = conn_rx.recv() => {
+                match conn {
+                    Some(conn) => {
+                        // The MASQUE relay reports the address it observes for this
+                        // server; poll the connection's events to receive it.
+                        let shutdown_token = shutdown_token.clone();
+                        tasks.spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = shutdown_token.cancelled() => break,
+                                    event = poll_fn(|cx| conn.poll_event(cx)) => {
+                                        match event {
+                                            Ok(msquic_async::ConnectionEvent::NotifyObservedAddress {
+                                                local_address,
+                                                observed_address,
+                                            }) => {
+                                                tracing::info!(
+                                                    "observed address reported: local {local_address}, observed {observed_address}"
+                                                );
+                                            }
+                                            Ok(other) => {
+                                                tracing::debug!("connection event: {other:?}");
+                                            }
+                                            Err(err) => {
+                                                tracing::debug!("connection event stream ended: {err}");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            anyhow::Ok(())
+                        });
+                    }
+                    None => {
+                        tracing::error!("conn_rx closed");
+                        break;
+                    }
+                }
             }
             conn = listener.accept() => {
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(100);
