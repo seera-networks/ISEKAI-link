@@ -109,6 +109,9 @@ async fn run_isekai_connection(
     )
     .await?;
 
+    // Observed address the MASQUE relay reports for this server; applied to
+    // accepted client connections so they can migrate to our direct path.
+    let migrating_addr: Arc<Mutex<Option<(SocketAddr, SocketAddr)>>> = Arc::new(Mutex::new(None));
     let mut txs = Vec::new();
     loop {
         tokio::select! {
@@ -120,8 +123,10 @@ async fn run_isekai_connection(
                 match conn {
                     Some(conn) => {
                         // The MASQUE relay reports the address it observes for this
-                        // server; poll the connection's events to receive it.
+                        // server; poll the connection's events to receive it and
+                        // remember it for migrating accepted client connections.
                         let shutdown_token = shutdown_token.clone();
+                        let migrating_addr = Arc::clone(&migrating_addr);
                         tasks.spawn(async move {
                             loop {
                                 tokio::select! {
@@ -135,6 +140,10 @@ async fn run_isekai_connection(
                                                 tracing::info!(
                                                     "observed address reported: local {local_address}, observed {observed_address}"
                                                 );
+                                                migrating_addr
+                                                    .lock()
+                                                    .unwrap()
+                                                    .replace((local_address, observed_address));
                                             }
                                             Ok(other) => {
                                                 tracing::debug!("connection event: {other:?}");
@@ -161,6 +170,16 @@ async fn run_isekai_connection(
                 txs.push(tx);
                 match conn {
                     Ok(conn) => {
+                        // Advertise our observed (public) address to the client so
+                        // it can validate and migrate to a direct path.
+                        if let Some((local_addr, observed_addr)) = *migrating_addr.lock().unwrap() {
+                            if let Err(e) = conn.add_bound_addr(local_addr) {
+                                tracing::error!("Failed to add bound address: {e}");
+                            }
+                            if let Err(e) = conn.add_observed_addr(local_addr, observed_addr) {
+                                tracing::error!("Failed to add observed address: {e}");
+                            }
+                        }
                         tokio::spawn(async move {
                             while let Some(jpeg_data) = rx.recv().await {
                                 tracing::debug!("sending jpeg data to client, size: {}", jpeg_data.len());
