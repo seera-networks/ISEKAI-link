@@ -4,8 +4,8 @@ use eframe::egui;
 use http::Uri;
 use isekai_link_utils::{
     create_forward_masque_connection, create_masque_channel, create_normal_channel,
-    get_certificate, get_public_address, make_msquic_async_client_config,
-    make_msquic_async_listener,
+    get_certificate, get_public_address, get_udp_mode, make_msquic_async_client_config,
+    make_msquic_async_listener, set_udp_mode,
 };
 use msquic_async::msquic;
 use opencv::{
@@ -51,6 +51,12 @@ async fn run_isekai_connection(
     )
     .await?;
     let public_addr = get_public_address(uri.clone(), &jwt, normal_channel.clone()).await?;
+
+    let udp_mode = get_udp_mode(uri.clone(), &jwt, normal_channel.clone()).await?;
+    tracing::info!("got udp mode: {:?}", udp_mode);
+    if udp_mode.mode != Some("dedicated".to_string()) {
+        set_udp_mode(uri.clone(), &jwt, normal_channel.clone(), "dedicated").await?;
+    }
 
     let cert_info = get_certificate(uri.clone(), &jwt, normal_channel).await?;
     tracing::info!(

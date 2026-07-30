@@ -21,6 +21,21 @@ pub struct CertificateResponse {
     pub pkcs12: String,
 }
 
+/// Body for `PUT /udp_mode`.
+///
+/// `mode` must be `"shared"`, `"dedicated"`, or `null` / omitted to reset
+/// to the server default.
+#[derive(Debug, serde::Serialize)]
+pub struct UdpModeSettingRequest {
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UdpModeSettingResponse {
+    /// `"shared"`, `"dedicated"`, or `null` (server default).
+    pub mode: Option<String>,
+}
+
 pub fn make_msquic_async_client_config(
     registration: Option<Arc<msquic_async::Registration>>,
     alpn: &str,
@@ -200,7 +215,8 @@ pub async fn create_normal_channel(
     config_qmux: Arc<msquic::Configuration>,
     is_unconnected: bool,
 ) -> anyhow::Result<channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>> {
-    let connector = H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), is_unconnected, reg);
+    let connector =
+        H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), is_unconnected, reg);
     let channel = channel_masque::H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
     Ok(channel)
 }
@@ -306,6 +322,109 @@ pub async fn get_public_address(
         .map_err(|e| anyhow::anyhow!("Failed to convert response body to UTF-8 string: {e}"))?
         .parse()
         .map_err(|e| anyhow::anyhow!("Failed to parse public address: {e}"))?)
+}
+
+pub async fn get_udp_mode(
+    uri: Uri,
+    jwt: &str,
+    channel: channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
+) -> anyhow::Result<UdpModeSettingResponse> {
+    let mut channel = ServiceBuilder::new()
+        .option_layer((!jwt.is_empty()).then(|| AddAuthorizationLayer::bearer(jwt)))
+        .service(channel);
+    let uri = Uri::builder()
+        .scheme(uri.scheme().cloned().expect("URI scheme is required"))
+        .authority(uri.authority().cloned().expect("URI authority is required"))
+        .path_and_query("/udp_mode")
+        .build()?;
+    let request = Request::builder()
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let response = channel
+        .ready()
+        .await
+        .map_err(|e| {
+            tracing::error!("channel ready error: {e}");
+            anyhow::anyhow!("channel ready error: {e}")
+        })?
+        .call(request)
+        .await
+        .map_err(|e| {
+            tracing::error!("channel call error: {e}");
+            anyhow::anyhow!("channel call error: {e}")
+        })?;
+
+    response.status().is_success().then(|| ()).ok_or_else(|| {
+        anyhow::anyhow!("Failed to get udp mode: HTTP status {}", response.status())
+    })?;
+    let data = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| {
+            tracing::error!("response body collect error: {e}");
+            anyhow::anyhow!("response body collect error: {e}")
+        })?
+        .to_bytes();
+    Ok(serde_json::from_slice::<UdpModeSettingResponse>(&data)
+        .map_err(|e| anyhow::anyhow!("Failed to parse UDP mode setting response: {e}"))?)
+}
+
+pub async fn set_udp_mode(
+    uri: Uri,
+    jwt: &str,
+    channel: channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
+    mode: &str,
+) -> anyhow::Result<UdpModeSettingResponse> {
+    let mut channel = ServiceBuilder::new()
+        .option_layer((!jwt.is_empty()).then(|| AddAuthorizationLayer::bearer(jwt)))
+        .service(channel);
+    let uri = Uri::builder()
+        .scheme(uri.scheme().cloned().expect("URI scheme is required"))
+        .authority(uri.authority().cloned().expect("URI authority is required"))
+        .path_and_query("/udp_mode")
+        .build()?;
+    let udp_mode_setting_request = UdpModeSettingRequest {
+        mode: Some(mode.to_string()),
+    };
+    let request = Request::builder()
+        .uri(uri)
+        .method("PUT")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(serde_json::to_vec(
+            &udp_mode_setting_request,
+        )?)))
+        .unwrap();
+
+    let response = channel
+        .ready()
+        .await
+        .map_err(|e| {
+            tracing::error!("channel ready error: {e}");
+            anyhow::anyhow!("channel ready error: {e}")
+        })?
+        .call(request)
+        .await
+        .map_err(|e| {
+            tracing::error!("channel call error: {e}");
+            anyhow::anyhow!("channel call error: {e}")
+        })?;
+    response.status().is_success().then(|| ()).ok_or_else(|| {
+        anyhow::anyhow!("Failed to set udp mode: HTTP status {}", response.status())
+    })?;
+    let data = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| {
+            tracing::error!("response body collect error: {e}");
+            anyhow::anyhow!("response body collect error: {e}")
+        })?
+        .to_bytes();
+    Ok(serde_json::from_slice::<UdpModeSettingResponse>(&data)
+        .map_err(|e| anyhow::anyhow!("Failed to parse UDP mode setting response: {e}"))?)
 }
 
 pub async fn create_masque_channel(
