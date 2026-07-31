@@ -238,21 +238,31 @@ fn apply_direct_path(conn: &Connection, address: ObservedAddress) {
 }
 
 async fn push_frames(conn: Connection, mut rx: mpsc::Receiver<Bytes>) {
-    // Roughly once a second at camera rates. The server side of a migration
-    // that goes quiet looks healthy from the application's point of view — it
-    // keeps writing frames — so the counters are the only place the truth shows
-    // up: whether its packets are leaving and whether they are being lost.
-    const STATS_EVERY: usize = 30;
-    let mut pushed = 0usize;
+    // Sample on a timer rather than per frame. Counting frames looks equivalent
+    // and is not: when the peer stops acknowledging, `push_one` blocks on flow
+    // control and the frame counter stops advancing — so the logging goes quiet
+    // exactly when something has gone wrong and the numbers matter most. A
+    // stalled server then leaves no record of which path it was using.
+    let stats = tokio::spawn(log_stats_until_closed(conn.clone()));
     while let Some(frame) = rx.recv().await {
         if let Err(e) = push_one(&conn, &frame).await {
             tracing::debug!("video push ended: {e}");
             break;
         }
-        pushed += 1;
-        if pushed % STATS_EVERY == 0 {
-            if let Ok(stats) = conn.get_stats() {
-                log_connection_stats(&conn, &stats, "serving");
+    }
+    stats.abort();
+}
+
+/// Log a connection's counters once a second for as long as it lives.
+async fn log_stats_until_closed(conn: Connection) {
+    let mut interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
+    loop {
+        interval.tick().await;
+        match conn.get_stats() {
+            Ok(stats) => log_connection_stats(&conn, &stats, "serving"),
+            Err(e) => {
+                tracing::debug!("stopped sampling the video connection: {e}");
+                break;
             }
         }
     }
