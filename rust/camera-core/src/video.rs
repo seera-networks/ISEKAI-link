@@ -35,6 +35,12 @@ const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a migrated path may carry nothing before falling back to the relay.
+///
+/// Generous next to a frame interval, so a stutter never triggers it, and short
+/// enough to be well inside the 30 s idle timeout that would otherwise take the
+/// whole connection down.
+const MIGRATED_PATH_GRACE: Duration = Duration::from_secs(5);
 
 /// Bind a video QUIC listener on `addr`.
 ///
@@ -391,10 +397,16 @@ pub async fn receive_frames_with(
     .await;
 
     let mut rtt_interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
+    // Watchdog state for a migration that silently carries nothing. `None` while
+    // on the relay path; `Some(when)` records when we left it, and is pushed
+    // forward by every frame that arrives afterwards.
+    let mut migrated_since: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = rtt_interval.tick(), if rtt.is_some() => {
+            // The RTT sampler doubles as the watchdog tick, so it runs whether
+            // or not anyone asked for RTT.
+            _ = rtt_interval.tick() => {
                 match conn.get_stats() {
                     // Rtt is reported in microseconds.
                     Ok(stats) => {
@@ -404,6 +416,36 @@ pub async fn receive_frames_with(
                         log_connection_stats(&conn, &stats, "tick");
                     }
                     Err(e) => tracing::debug!("could not read connection stats: {e}"),
+                }
+                // A direct path that validates and then carries nothing takes
+                // the whole connection down with it: the peer never sees our
+                // packets, so it never follows the migration, and both ends sit
+                // there until the idle timeout fires. Go back to the path that
+                // was working rather than let that happen.
+                if let Some(since) = migrated_since {
+                    if since.elapsed() >= MIGRATED_PATH_GRACE {
+                        tracing::warn!(
+                            local = %relay_path.0,
+                            remote = %relay_path.1,
+                            "no frames for {MIGRATED_PATH_GRACE:?} since migrating; \
+                             falling back to the relay path",
+                        );
+                        match conn.activate_path(relay_path.0, relay_path.1) {
+                            Ok(()) => {
+                                migrated_since = None;
+                                report_path(&path_events, PathEvent::Activated {
+                                    local: relay_path.0,
+                                    remote: relay_path.1,
+                                }).await;
+                            }
+                            Err(e) => {
+                                // Nothing else to try; let the idle timeout end
+                                // it rather than spin on a failing call.
+                                tracing::error!("could not fall back to the relay path: {e}");
+                                migrated_since = None;
+                            }
+                        }
+                    }
                 }
             }
             event = poll_fn(|cx| conn.poll_event(cx)) => match event {
@@ -427,6 +469,9 @@ pub async fn receive_frames_with(
                     Some((local, remote)) => match conn.activate_path(local, remote) {
                         Ok(()) => {
                             tracing::info!(%local, %remote, "activated path");
+                            // Watch a move *away* from the relay; a move back to
+                            // it is the recovery, not something to time out.
+                            migrated_since = ((local, remote) != relay_path).then(Instant::now);
                             // A snapshot on each side of the switch is what
                             // tells a stalled migration apart from a broken
                             // one: whether packets still leave, whether any
@@ -444,6 +489,9 @@ pub async fn receive_frames_with(
             }
             stream = conn.accept_inbound_uni_stream() => {
                 let mut stream = stream?;
+                // Traffic is arriving on whatever path is current, so restart
+                // the watchdog rather than count from the migration itself.
+                migrated_since = migrated_since.map(|_| Instant::now());
                 let seq = stream.id().unwrap_or(0);
                 let mut buf = Vec::new();
                 stream.read_to_end(&mut buf).await?;
