@@ -9,6 +9,7 @@ use std::{
     future::poll_fn,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_util::sync::CancellationToken;
@@ -73,11 +74,37 @@ async fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let res = eframe::run_native(
         "Camera Client App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new(reg)))),
-    )
+        Box::new(|_cc| Ok(Box::new(MyApp::new(Arc::clone(&reg))))),
+    );
+
+    // `run_native` has returned, so the app — and with it every connection it
+    // was running — is dropped. Draining msquic before leaving `main` is what
+    // makes the process actually exit: dropping the registration with a handle
+    // still open blocks in `RegistrationClose` forever.
+    if !camera_core::shutdown_msquic_stack(reg, MSQUIC_DRAIN_TIMEOUT).await {
+        // Something is still holding a handle. Returning would drop the tokio
+        // runtime and msquic's statics into that state and hang or abort, so
+        // leave without running destructors — there is nothing left to save.
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe { libc_exit(if res.is_ok() { 0 } else { 1 }) }
+    }
+    res
+}
+
+/// How long to wait for msquic handles to close before exiting hard.
+const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Raw libc `_exit`: terminate now, skipping atexit handlers and C++ static
+// destructors. Only reached when the drain timed out, where running them would
+// race msquic's still-live worker threads.
+unsafe extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
 }
 
 /// Draw the rolling RTT history as a line plot (values in milliseconds).
@@ -620,6 +647,15 @@ impl MyApp {
                 ui.monospace(connection_id.as_str());
             });
         }
+    }
+}
+
+impl Drop for MyApp {
+    fn drop(&mut self) {
+        // Closing the window drops the app, which is the only chance to stop
+        // the connection task. Without this its msquic handles stay open and
+        // the drain in `main` times out.
+        self.disconnect();
     }
 }
 

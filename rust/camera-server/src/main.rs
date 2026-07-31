@@ -23,6 +23,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::Duration,
 };
 use tokio::sync::oneshot;
 use tokio::{io::AsyncWriteExt, task::JoinSet};
@@ -333,15 +334,43 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new(reg, rx, is_streaming, mjpeg_tx_holder)))),
+        Box::new(|_cc| Ok(Box::new(MyApp::new(
+            Arc::clone(&reg),
+            rx,
+            is_streaming,
+            mjpeg_tx_holder,
+        )))),
     );
     tracing::debug!("eframe exited, stopping camera task");
     is_terminated.store(true, Ordering::Relaxed);
     camera_task_handle.await.unwrap().unwrap();
     tracing::debug!("camera task finished");
-    let metrics = tokio::runtime::Handle::current().metrics();
-    tracing::debug!("Tokio runtime alive tasks: {}", metrics.num_alive_tasks());
+
+    // `run_native` has returned, so the app — and with it the listener and any
+    // relay session it was running — is dropped. Draining msquic before leaving
+    // `main` is what makes the process actually exit: dropping the registration
+    // with a handle still open blocks in `RegistrationClose` forever.
+    if !camera_core::shutdown_msquic_stack(reg, MSQUIC_DRAIN_TIMEOUT).await {
+        // Something is still holding a handle. Returning would drop the tokio
+        // runtime and msquic's statics into that state and hang or abort, so
+        // leave without running destructors — there is nothing left to save.
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe { libc_exit(if res.is_ok() { 0 } else { 1 }) }
+    }
     res
+}
+
+/// How long to wait for msquic handles to close before exiting hard.
+const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Raw libc `_exit`: terminate now, skipping atexit handlers and C++ static
+// destructors. Only reached when the drain timed out, where running them would
+// race msquic's still-live worker threads.
+unsafe extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
 }
 
 /// How the camera stream reaches clients.
@@ -706,6 +735,15 @@ impl MyApp {
                 self.bind_connection(connection);
             }
         }
+    }
+}
+
+impl Drop for MyApp {
+    fn drop(&mut self) {
+        // Closing the window drops the app, which is the only chance to stop
+        // whatever it was running. Without this the listener and relay sessions
+        // keep their msquic handles open and the drain in `main` times out.
+        self.close();
     }
 }
 
