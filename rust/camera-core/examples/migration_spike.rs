@@ -166,12 +166,29 @@ async fn spike() -> anyhow::Result<bool> {
         "リレー型トポロジで直接経路が PathValidated されるか (listener は現行の設定のまま)",
         run(check_direct_path_migration(&reg, false)).await,
     );
-    report.record(
-        "6b",
-        Required::No,
-        "同上、listener に NAT traversal / observed address 設定を足した場合 (#59 の caveat)",
-        run(check_direct_path_migration(&reg, true)).await,
-    );
+    // The NAT-traversal listener variant builds its configuration by hand and
+    // loads it from PEM files, which is the Unix credential path; probe it
+    // first so an environment that cannot build it reports SKIP rather than a
+    // PASS whose note says "skipped".
+    let (id, question) = MSQUIC_CHECKS[5];
+    match spawn_listener_variant(&reg, loopback(0), true).await {
+        Ok(Some(l)) => {
+            drop(l);
+            report.record(
+                id,
+                Required::No,
+                question,
+                run(check_direct_path_migration(&reg, true)).await,
+            );
+        }
+        Ok(None) => report.skip(
+            id,
+            question,
+            "このプラットフォームでは listener 設定を差し替えられないためスキップ \
+             (設定を手組みする経路が PEM 読み込み前提のため)",
+        ),
+        Err(e) => report.record(id, Required::No, question, Err(e)),
+    }
 
     report.print();
     let failed = report.required_failed();
@@ -507,9 +524,9 @@ async fn check_direct_path_migration(
     reg: &Arc<Registration>,
     natt_listener: bool,
 ) -> anyhow::Result<String> {
-    let Some(mut listener) = spawn_listener_variant(reg, loopback(0), natt_listener).await? else {
-        return Ok("このプラットフォームでは listener 設定を差し替えられないためスキップ".to_owned());
-    };
+    let mut listener = spawn_listener_variant(reg, loopback(0), natt_listener)
+        .await?
+        .context("this platform cannot build the requested listener variant")?;
     let mut proxy = spawn_listener(reg, loopback(0)).await?;
     let bridge = Bridge::start(listener.addr).await?;
 

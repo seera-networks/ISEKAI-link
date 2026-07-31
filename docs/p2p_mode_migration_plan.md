@@ -169,11 +169,11 @@ loopback ソケット 2 個のブリッジで再現し、各側の直接経路�
 | --- | --- | --- | --- | --- |
 | 1 | 実 IP に **アドレス固定**した socket ⇄ loopback の疎通 | PASS | PASS | **FAIL** |
 | 1b | **wildcard bind**（ポートのみ固定）で 1 ソケットが両経路を捌けるか | PASS | PASS | **PASS** |
-| 2 | `set_local_addr(実IP)` した msquic クライアントが `127.0.0.1` へハンドシェイク | PASS | PASS | SKIP |
-| 3 | 生存中の共有バインディングへの相乗り（リスク #1b） | PASS | PASS | SKIP |
-| 4 | `set_local_addr` + `add_candidate_addr` の併用 | PASS | PASS | SKIP |
-| 5 | サーバ側 `add_bound_addr` / `add_observed_addr` の遅延呼び出し | PASS | FAIL* | SKIP |
-| 6a | 直接経路の `PathValidated` → `activate_path`（listener 現行設定） | PASS | FAIL* | SKIP |
+| 2 | `set_local_addr(実IP)` した msquic クライアントが `127.0.0.1` へハンドシェイク | PASS | PASS | **FAIL** |
+| 3 | 生存中の共有バインディングへの相乗り（リスク #1b） | PASS | PASS | **FAIL** |
+| 4 | `set_local_addr` + `add_candidate_addr` の併用 | PASS | PASS | **FAIL** |
+| 5 | サーバ側 `add_bound_addr` / `add_observed_addr` の遅延呼び出し | PASS | FAIL* | **FAIL** |
+| 6a | 直接経路の `PathValidated` → `activate_path`（listener 現行設定） | PASS | FAIL* | **FAIL** |
 | 6b | 同上（listener に NAT traversal 設定を追加） | PASS | FAIL* | SKIP |
 
 **確定した答え**
@@ -205,6 +205,12 @@ bind した socket から `127.0.0.1` へは送信できない。**案B をそ�
 
 つまり **固定すべきはアドレスではなくポート**であり、これが移植可能な形になる（§2.2.3）。
 
+Windows の check 2〜6a は msquic レベルでも同じ結論を裏づけた。いずれも
+`QUIC_STATUS_CONNECTION_IDLE` でハンドシェイクが成立しない —
+`10.1.0.101:P` に pin したクライアントが `127.0.0.1:R` へ dial しても、
+OS が送信を拒む（check 1 と同じ `WSAEADDRNOTAVAIL`）ため 1 パケットも出ていかないからである。
+**新しい問題ではなく、check 1 の結果が msquic レベルに現れたもの。**
+
 \* macOS の check 5 / 6a / 6b の FAIL は、スパイク側のリレーレグ代役の
 ハンドシェイクが `connection shutdown by transport` で落ちたもの。同じ手順の check 2/3/4 は
 macOS でも PASS しているので、設計そのものの否定ではなく**ハーネスの問題である可能性が高い**。
@@ -225,12 +231,17 @@ check 1b は OS レベルの話であり、msquic に「wildcard に bind し、
 Windows での msquic チェック（2〜6）は現状スキップされている（理由は下記）ため、
 この追試には Windows で listener を立てられるようにする作業が前提になる。
 
-> Windows で check 2〜6 が SKIP なのは設計とは無関係の理由による。
-> `make_msquic_async_listener` の Windows 分岐は証明書を RSA プロバイダ経由で取り込むが、
-> `camera_core::tls::dev_cert` が生成するのは ECDSA P-256 なので
-> `ASN1 bad tag value met` で失敗する。本番の camera-server はここにプロキシ発行の
-> PKCS#12 を渡すので別分岐に入り、この問題は起きない。
-> スパイクを Windows で完走させるには、dev 証明書を PKCS#12 で用意する必要がある。
+> **解決済み**: 初回は Windows で check 2〜6 が丸ごと SKIP になっていた。
+> `make_msquic_async_listener` の Windows 分岐は PKCS#12 が無いと証明書を RSA プロバイダ経由で
+> 取り込もうとするが、`camera_core::tls::dev_cert` が生成するのは ECDSA P-256 なので
+> `ASN1 bad tag value met` で失敗していた（本番の camera-server はここにプロキシ発行の
+> PKCS#12 を渡すので別分岐に入り、この問題は起きない）。
+> `DevCert` に `pkcs12: Option<String>` を追加し、Windows でのみ OpenSSL で bundle を作るようにした
+> （Linux / macOS は PEM 経路で足りるうえ、システム OpenSSL への動的リンクを避けたいので
+> `[target.'cfg(windows)'.dependencies]` に閉じ、非 Windows では `None`）。
+> これにより Windows でも listener が立ち、check 2〜6a が実際に走るようになった。
+> 残る SKIP は 6b のみで、これは NAT traversal 版の listener 設定を手組みする経路が
+> PEM 読み込み前提のため（6b の答え自体は Linux で得られている）。
 
 ### 2.3 経路の定義（両モード共通の語彙）
 
