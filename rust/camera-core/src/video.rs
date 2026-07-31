@@ -360,6 +360,19 @@ pub async fn receive_frames_with(
     // place before `start`, and a handshake here can take a minute (it rides
     // across the peer's relay-bind gap), so there is no useful "add it later".
     let candidate = match observed {
+        // ISEKAI_MIGRATION_NO_CANDIDATE stops this side offering the relay
+        // leg's binding as a candidate, so the connection never shares it.
+        // msquic can still find a direct path on its own from the addresses the
+        // peer advertises — and when it does, it opens a binding of its own for
+        // it. That is the difference under test: whether a path *on the relay
+        // leg's binding* is the thing that carries no data.
+        Some(_) if std::env::var_os("ISEKAI_MIGRATION_NO_CANDIDATE").is_some() => {
+            tracing::warn!(
+                "ISEKAI_MIGRATION_NO_CANDIDATE set: not offering a direct-path candidate; \
+                 any direct path will be one msquic opens for itself",
+            );
+            None
+        }
         Some(watch) => wait_for_observed(watch, &shutdown).await,
         None => None,
     };
