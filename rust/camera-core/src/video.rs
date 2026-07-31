@@ -31,6 +31,10 @@ const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(120);
 const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long to wait for the relay leg's observed address before dialing without
+/// it. The report normally lands within a round trip of the leg coming up; if it
+/// does not, streaming over the relay matters more than a direct path.
+const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
 /// How long a migrated path may carry nothing before falling back to the relay.
 ///
 /// Generous next to a frame interval, so a stutter never triggers it, and short
@@ -297,17 +301,14 @@ pub struct VideoRecvOptions {
     /// Validate the peer's certificate against the dialed name. Off is dev-only
     /// (the self-signed [`dev_cert`]).
     pub verify: bool,
-    /// An address to offer as a direct-path candidate, with the NAT mapping the
-    /// proxy observed for it.
+    /// How the proxy sees this session's relay connect leg
+    /// ([`InitiatorSession::observed_address`](isekai_p2p::InitiatorSession::observed_address)).
     ///
-    /// This must be an address **nothing currently holds** — see
-    /// [`probe_direct_path_address`](isekai_p2p::probe_direct_path_address). A
-    /// path opened on a binding a live MASQUE leg is using validates and then
-    /// carries no data (`docs/p2p_mode_migration_plan.md` §2.2.5), so passing
-    /// the leg's own address here is exactly what not to do.
-    ///
-    /// Without it the connection is relay-only.
-    pub candidate: Option<ObservedAddress>,
+    /// When set, that pair is offered as a direct-path candidate before the
+    /// handshake, and the connection is put on a shared, unconnected socket so
+    /// the path can be opened from the leg's binding. Without it the connection
+    /// is relay-only.
+    pub observed: Option<ObservedAddressWatch>,
     /// Where to report path changes.
     pub path_events: Option<mpsc::Sender<PathEvent>>,
     /// Requests to switch to a `(local, remote)` path — the pair from a
@@ -366,24 +367,18 @@ pub async fn receive_frames_with(
     let VideoRecvOptions {
         registration,
         verify,
-        candidate,
+        observed,
         path_events,
         mut migrate,
         rtt,
     } = opts;
 
-    // ISEKAI_MIGRATION_NO_CANDIDATE drops the candidate entirely, leaving any
-    // direct path to whatever msquic finds from the peer's advertisement alone.
-    // Kept as an escape hatch: it is what first showed that a path on a binding
-    // msquic opens for itself works where one on the relay leg's does not.
-    let candidate = match candidate {
-        Some(_) if std::env::var_os("ISEKAI_MIGRATION_NO_CANDIDATE").is_some() => {
-            tracing::warn!(
-                "ISEKAI_MIGRATION_NO_CANDIDATE set: not offering a direct-path candidate",
-            );
-            None
-        }
-        other => other,
+    // Resolve the candidate before dialing: `add_candidate_addr` has to be in
+    // place before `start`, and a handshake here can take a minute (it rides
+    // across the peer's relay-bind gap), so there is no useful "add it later".
+    let candidate = match observed {
+        Some(watch) => wait_for_observed(watch, &shutdown).await,
+        None => None,
     };
 
     let (reg, config) = video_client_config(registration, verify, candidate.is_some())?;
@@ -599,6 +594,43 @@ async fn dial_video(
     }
 }
 
+/// Wait briefly for the relay leg's observed address.
+///
+/// `None` means carry on relay-only: a missing report costs a direct path, not
+/// the stream, and blocking on it would be the wrong trade.
+async fn wait_for_observed(
+    mut watch: ObservedAddressWatch,
+    shutdown: &CancellationToken,
+) -> Option<ObservedAddress> {
+    if let Some(address) = *watch.borrow_and_update() {
+        return Some(address);
+    }
+    let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return None,
+                changed = watch.changed() => {
+                    changed.ok()?;
+                    if let Some(address) = *watch.borrow_and_update() {
+                        return Some(address);
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    match waited {
+        Ok(address) => address,
+        Err(_) => {
+            tracing::warn!(
+                "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
+                 streaming over the relay without a direct-path candidate",
+            );
+            None
+        }
+    }
+}
+
 /// Put a video connection on a shared, unconnected socket and offer the relay
 /// leg's address as a direct-path candidate. Must run before `start`.
 ///
@@ -611,23 +643,14 @@ async fn dial_video(
 /// yet — msquic opens the path from the relay leg's binding once the peer's
 /// ADD_ADDRESS arrives (`docs/p2p_mode_migration_plan.md` §2.2.3).
 fn prepare_for_migration(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
-    // ISEKAI_MIGRATION_PLAIN offers the candidate without putting this
-    // connection on a shared, unconnected socket.
-    //
-    // Those three calls are what separates the configuration that fails on
-    // Windows from the one that works: with no candidate at all — and so none
-    // of this setup — msquic finds the peer's advertised address on its own and
-    // the path carries data. The knob isolates the setup from the candidate.
-    if std::env::var_os("ISEKAI_MIGRATION_PLAIN").is_none() {
-        conn.set_share_binding(true)
-            .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
-        conn.set_unconnected_socket(true)
-            .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
-        conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
-    } else {
-        tracing::warn!("ISEKAI_MIGRATION_PLAIN set: offering a candidate on a plain socket");
-    }
+    // All three are required for a direct path to be validated at all — without
+    // them msquic never raises `PathValidated`, whatever candidate is offered.
+    conn.set_share_binding(true)
+        .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
+    conn.set_unconnected_socket(true)
+        .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
+    conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
     conn.add_candidate_addr(candidate.local, candidate.observed)
         .map_err(|e| anyhow::anyhow!("could not offer a direct-path candidate: {e}"))?;
     // Also offer the host address itself. A peer on the same LAN can reach it

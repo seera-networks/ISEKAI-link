@@ -23,6 +23,4 @@ pub use video::{
 
 /// Re-exports of the P2P types the camera apps build on.
 pub use isekai_p2p::agent::{CertBundle, ObservedAddressWatch, RelayOptions};
-pub use isekai_p2p::{
-    load_or_generate_key, probe_direct_path_address, InitiatorSession, P2pConfig,
-};
+pub use isekai_p2p::{load_or_generate_key, InitiatorSession, P2pConfig};

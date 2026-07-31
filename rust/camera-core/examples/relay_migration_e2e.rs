@@ -176,14 +176,7 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
     let (path_tx, mut path_rx) = mpsc::channel::<PathEvent>(16);
     let (migrate_tx, migrate_rx) = mpsc::channel::<(SocketAddr, SocketAddr)>(4);
     let recv_shutdown = shutdown.clone();
-    // Probe the proxy for an address and release it, rather than naming the
-    // live relay leg's binding — a direct path opened on that binding validates
-    // and then carries nothing (plan §2.2.5).
-    let candidate = isekai_p2p::probe_direct_path_address(&client_cfg, Some(reg.clone())).await?;
-    println!(
-        "probed direct-path candidate: local={} observed={}",
-        candidate.local, candidate.observed
-    );
+    let observed = session.observed_address();
     let receiver = tokio::spawn(async move {
         camera_core::receive_frames_with(
             &video_host,
@@ -193,7 +186,7 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
             VideoRecvOptions {
                 registration: Some(reg),
                 verify,
-                candidate: Some(candidate),
+                observed: Some(observed),
                 path_events: Some(path_tx),
                 migrate: Some(migrate_rx),
                 ..Default::default()

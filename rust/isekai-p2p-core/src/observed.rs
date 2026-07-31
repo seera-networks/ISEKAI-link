@@ -18,12 +18,6 @@
 
 use std::future::poll_fn;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::Context as _;
-pub use h3_util::msquic_async::h3_msquic_async::msquic_async::Registration;
-use http::Uri;
 
 // Reached through `h3-util` rather than depended on directly, like the rest of
 // this crate's msquic usage (see `crate::transport`).
@@ -164,70 +158,4 @@ mod tests {
             "the watch must not report a value nobody published"
         );
     }
-}
-
-/// How long to wait for the proxy to report the probe's address.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Learn a NAT mapping for a binding that is then left **free**.
-///
-/// Opens a short-lived QUIC connection to the proxy purely so it reports the
-/// address it sees, then closes it. The returned
-/// [`ObservedAddress::local`] therefore names an address nothing holds any more.
-///
-/// This exists because a direct path opened on a binding that a *live* MASQUE
-/// leg is using validates and then carries no data
-/// (`docs/p2p_mode_migration_plan.md` §2.2.5), while one on a binding msquic
-/// opens for itself works. Offering a probed-and-released address gives the
-/// second case a mapping the proxy has actually observed — which is the whole
-/// reason the leg's binding was being named in the first place.
-///
-/// The mapping has to outlive the gap between this returning and the path being
-/// punched. NAT mappings are idle-timed, not closed-timed, and the gap is
-/// milliseconds, so this is safe in practice — but it is the assumption to
-/// revisit if direct paths start failing to validate.
-pub async fn probe_observed_address(
-    proxy_url: &str,
-    registration: Option<Arc<Registration>>,
-) -> anyhow::Result<ObservedAddress> {
-    let uri: Uri = proxy_url.parse().context("invalid proxy URL")?;
-    let host = uri.host().context("proxy URL has no host")?.to_owned();
-    let port = uri.port_u16().unwrap_or(443);
-
-    let (registration, config) = crate::transport::make_client_config(registration, false)?;
-    let conn = Connection::new(&registration)?;
-    conn.start(&config, &host, port)
-        .await
-        .map_err(|e| anyhow::anyhow!("could not reach the proxy to probe our address: {e}"))?;
-
-    let observed = tokio::time::timeout(PROBE_TIMEOUT, async {
-        loop {
-            match poll_fn(|cx| conn.poll_event(cx)).await {
-                Ok(ConnectionEvent::NotifyObservedAddress {
-                    local_address,
-                    observed_address,
-                }) => {
-                    return anyhow::Ok(ObservedAddress {
-                        local: local_address,
-                        observed: observed_address,
-                    })
-                }
-                Ok(other) => tracing::debug!("probe connection event: {other:?}"),
-                Err(e) => anyhow::bail!("probe connection ended before reporting an address: {e}"),
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("the proxy did not report our address within {PROBE_TIMEOUT:?}"))??;
-
-    // Release the address before anyone binds it. `shutdown` asks msquic to
-    // close it; the drop then hands the socket back.
-    let _ = conn.shutdown(0);
-    drop(conn);
-    tracing::info!(
-        local = %observed.local,
-        observed = %observed.observed,
-        "probed a direct-path address and released it",
-    );
-    Ok(observed)
 }

@@ -459,60 +459,15 @@ impl MyApp {
             // that gap (the server may bind seconds later, when a human pastes
             // the connection id), so dialing now is safe. The `session` stays
             // alive to hold the relay leg.
-            // Where the direct-path candidate comes from.
-            //
-            // Naming the relay leg's own binding is the simpler design — no
-            // probe round-trip, and the mapping is one the proxy is actively
-            // refreshing rather than one assumed to outlive a closed socket. It
-            // needs msquic to keep a shared binding's source connection IDs
-            // while other paths still hold it, which seera-msquic 910edff
-            // fixes. ISEKAI_MIGRATION_USE_LEG selects it so the fix can be
-            // confirmed against the probe path it replaces.
-            let candidate = if std::env::var_os("ISEKAI_MIGRATION_USE_LEG").is_some() {
-                let observed = *session.observed_address().borrow();
-                match observed {
-                    Some(candidate) => {
-                        tracing::warn!("ISEKAI_MIGRATION_USE_LEG set: offering the relay leg's own binding");
-                        Some(candidate)
-                    }
-                    None => {
-                        tracing::warn!("the relay leg has not reported yet; staying relay-only");
-                        None
-                    }
-                }
-            } else {
-                match camera_core::probe_direct_path_address(&cfg, Some(Arc::clone(&reg))).await {
-                    Ok(candidate) => Some(candidate),
-                    Err(e) => {
-                        tracing::warn!("no direct-path candidate ({e:#}); staying relay-only");
-                        None
-                    }
-                }
-            };
             if let Err(e) = camera_core::receive_frames_with(
                 &video_host,
                 local_port,
                 tx,
                 shutdown,
                 VideoRecvOptions {
-                    // ISEKAI_MIGRATION_OWN_REGISTRATION gives the video
-                    // connection a registration of its own instead of the one
-                    // the relay leg is on. With a probed (released) candidate
-                    // nothing needs to be shared with the leg, so this isolates
-                    // the two completely — msquic looks bindings up per
-                    // registration, and the leg is the one difference the
-                    // two-process spike cannot reproduce.
-                    registration: if std::env::var_os("ISEKAI_MIGRATION_OWN_REGISTRATION").is_some() {
-                        tracing::warn!(
-                            "ISEKAI_MIGRATION_OWN_REGISTRATION set: the video connection gets \
-                             its own msquic registration",
-                        );
-                        None
-                    } else {
-                        Some(reg)
-                    },
+                    registration: Some(reg),
                     verify,
-                    candidate,
+                    observed: Some(session.observed_address()),
                     path_events: Some(path_tx),
                     migrate: Some(migrate_rx),
                     rtt: Some(rtt_tx),
