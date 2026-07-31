@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use anyhow::Context as _;
-use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay};
+use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay, RelayOptions};
 use isekai_p2p_core::proxy::{Candidate, PeerConnection, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
@@ -80,6 +80,9 @@ impl InitiatorSession {
             &connection.connection_id,
             &relay.masque_uri,
             local_bind,
+            // Phase 2 threads the caller's options through here; until then the
+            // leg keeps the behaviour it has always had.
+            RelayOptions::default(),
         )
         .await?;
         Ok(Self {

@@ -423,6 +423,9 @@ async fn run_bind(a: Bind) -> anyhow::Result<()> {
         &key,
         &a.connection_id,
         a.forward_to,
+        // The CLI does not migrate paths, so the leg keeps its plain connected
+        // socket and its own registration.
+        isekai_p2p_core::bind::RelayOptions::default(),
     )
     .await?;
     eprintln!(

@@ -210,7 +210,14 @@ pub(crate) fn make_client_config(
                 // handshake cannot fit a datagram anyway.
                 .set_MinimumMtu(1400)
                 .set_MaximumMtu(1500)
-                .set_StreamMultiReceiveEnabled(),
+                .set_StreamMultiReceiveEnabled()
+                // Ask the proxy to report the address it observes this
+                // connection at. On a relay leg that report is how the Endpoint
+                // learns its own NAT mapping, which the video connection then
+                // names as a direct-path candidate
+                // (docs/p2p_mode_migration_plan.md §2.2.3). Harmless on the
+                // control-plane connections, which simply never look at it.
+                .set_ReceiveObservedAddressReports(),
         ),
     )?;
     let mut credential = msquic::CredentialConfig::new_client();

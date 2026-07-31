@@ -19,7 +19,7 @@
 
 use std::net::SocketAddr;
 
-use isekai_p2p_core::bind::{open_bind_session, BindSession};
+use isekai_p2p_core::bind::{open_bind_session, BindSession, RelayOptions};
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::proxy::{Capability, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
@@ -121,6 +121,9 @@ impl ListenerSession {
             &self.key,
             connection_id,
             self.forward_to,
+            // Phase 2 threads the caller's options through here; until then the
+            // leg keeps the behaviour it has always had.
+            RelayOptions::default(),
         )
         .await?;
         // Own the session in a task that drains its notifications, so an unread

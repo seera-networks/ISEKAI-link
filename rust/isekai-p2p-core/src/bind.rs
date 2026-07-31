@@ -30,6 +30,7 @@ use bytes::Bytes;
 use channel_masque::{
     CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClientEvent, MasqueClientMode,
 };
+use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use http::Uri;
 use http::header::{HeaderName, HeaderValue};
@@ -44,8 +45,59 @@ use tower_http::auth::AddAuthorizationLayer;
 use tower_http::set_header::SetRequestHeaderLayer;
 
 use crate::endpoint::EndpointKey;
+use crate::observed::{spawn_observed_address_watch, ObservedAddressWatch};
 use crate::pop;
 use crate::transport::make_client_config;
+
+/// How a relay leg's underlying QUIC connection is set up.
+///
+/// The default reproduces the behaviour these legs have always had, so an
+/// existing caller that does not care about path migration keeps working
+/// unchanged.
+#[derive(Clone, Default)]
+pub struct RelayOptions {
+    /// Put the leg on a shared, unconnected socket pinned to a real interface
+    /// address.
+    ///
+    /// Required for connection migration: the direct path is opened *from* this
+    /// leg's binding, and the address the proxy reports for it is what the
+    /// video connection advertises as a candidate
+    /// (`docs/p2p_mode_migration_plan.md` §2.2.3). Without it the leg gets a
+    /// connected socket that no other path can share.
+    pub unconnected: bool,
+    /// The msquic registration to open the leg on.
+    ///
+    /// `None` uses this crate's shared registration. Pass the application's own
+    /// when the video connection has to share a binding with the leg — binding
+    /// lookup is per-registration, so they must match.
+    pub registration: Option<Arc<msquic_async::Registration>>,
+}
+
+/// Build the H3 connector for a relay leg, along with the observed-address
+/// watch fed by whatever connections it opens.
+///
+/// Both legs need exactly this, and getting the pairing wrong (a connector
+/// whose reports nobody drains, or a watch attached to the wrong connection)
+/// is the kind of mistake that only shows up as a direct path that never
+/// materialises — so they are built together.
+fn relay_connector(
+    uri: Uri,
+    opts: &RelayOptions,
+    shutdown: CancellationToken,
+) -> anyhow::Result<(H3MsQuicAsyncConnector, ObservedAddressWatch)> {
+    let (registration, config) = make_client_config(opts.registration.clone(), false)?;
+    let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+    let connector = H3MsQuicAsyncConnector::new(
+        uri,
+        config,
+        Some(config_qmux),
+        opts.unconnected,
+        registration,
+    );
+    let (conn_tx, conn_rx) = mpsc::channel(4);
+    let observed = spawn_observed_address_watch(conn_rx, shutdown);
+    Ok((connector.with_channel(conn_tx), observed))
+}
 
 /// The PoP proof for the single CONNECT-UDP request a session issues: a
 /// signature over `path` with an empty body (spec §8.0, CONNECT-UDP variant).
@@ -67,11 +119,21 @@ pub struct BindSession {
     /// MASQUE client events (e.g. [`MasqueClientEvent::PublicAddresses`] carries
     /// this Endpoint's edge/relay addresses).
     pub events: mpsc::Receiver<MasqueClientEvent>,
+    observed: ObservedAddressWatch,
     shutdown: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
 
 impl BindSession {
+    /// How the proxy sees this leg — `None` until the first report arrives.
+    ///
+    /// The server advertises this pair to the video connection via
+    /// `add_bound_addr` / `add_observed_addr` so the peer can punch a direct
+    /// path to it.
+    pub fn observed(&self) -> ObservedAddressWatch {
+        self.observed.clone()
+    }
+
     /// Cancel the session and wait for it to wind down.
     pub async fn close(mut self) {
         self.shutdown.cancel();
@@ -105,13 +167,12 @@ pub async fn open_bind_session(
     key: &EndpointKey,
     connection_id: &str,
     forward_to: SocketAddr,
+    opts: RelayOptions,
 ) -> anyhow::Result<BindSession> {
     let uri: Uri = target.parse().context("invalid proxy target URI")?;
     let pop = sign_connect_udp(key, CONNECT_UDP_BIND_PATH);
-    let (registration, config) = make_client_config(None, false)?;
-    let (registration, config_qmux) = make_client_config(Some(registration), true)?;
-    let connector =
-        H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), false, registration);
+    let shutdown = CancellationToken::new();
+    let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
         connector, uri, None,
     );
@@ -144,7 +205,6 @@ pub async fn open_bind_session(
         ))
         .service(channel);
 
-    let shutdown = CancellationToken::new();
     let (out_tx, out_rx) = mpsc::channel(32);
     // Signals that `start` has established the session (or failed to). The
     // caller awaits this so it only returns once the leg is ready.
@@ -176,6 +236,7 @@ pub async fn open_bind_session(
     match ready_rx.await {
         Ok(Ok(())) => Ok(BindSession {
             events: out_rx,
+            observed,
             shutdown,
             task: Some(task),
         }),
@@ -198,11 +259,22 @@ pub async fn open_bind_session(
 pub struct ConnectRelay {
     /// The local UDP address the application should send its traffic to.
     pub local_addr: SocketAddr,
+    observed: ObservedAddressWatch,
     shutdown: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
 
 impl ConnectRelay {
+    /// How the proxy sees this leg — `None` until the first report arrives.
+    ///
+    /// Note this is *not* [`local_addr`](ConnectRelay::local_addr), which is the
+    /// loopback socket the application sends to. This is the leg's own binding
+    /// out on the network, and the pair the video connection passes to
+    /// `add_candidate_addr` to offer a direct path.
+    pub fn observed(&self) -> ObservedAddressWatch {
+        self.observed.clone()
+    }
+
     /// Cancel the relay and wait for it to wind down.
     pub async fn close(mut self) {
         self.shutdown.cancel();
@@ -237,6 +309,7 @@ pub async fn open_connect_relay(
     connection_id: &str,
     masque_uri: &str,
     local_bind: SocketAddr,
+    opts: RelayOptions,
 ) -> anyhow::Result<ConnectRelay> {
     let masque: Uri = masque_uri.parse().context("invalid masque_uri")?;
     let target_path = masque
@@ -248,10 +321,8 @@ pub async fn open_connect_relay(
     let pop = sign_connect_udp(key, &target_path);
 
     let uri: Uri = proxy_url.parse().context("invalid proxy target URI")?;
-    let (registration, config) = make_client_config(None, false)?;
-    let (registration, config_qmux) = make_client_config(Some(registration), true)?;
-    let connector =
-        H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), false, registration);
+    let shutdown = CancellationToken::new();
+    let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
         connector, uri, None,
     );
@@ -288,7 +359,6 @@ pub async fn open_connect_relay(
         .local_addr()
         .context("failed to read local relay socket address")?;
 
-    let shutdown = CancellationToken::new();
     let session_shutdown = shutdown.clone();
     // Signals that `start_connect_udp` has established the leg (or failed to).
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -315,6 +385,7 @@ pub async fn open_connect_relay(
     match ready_rx.await {
         Ok(Ok(())) => Ok(ConnectRelay {
             local_addr,
+            observed,
             shutdown,
             task: Some(task),
         }),

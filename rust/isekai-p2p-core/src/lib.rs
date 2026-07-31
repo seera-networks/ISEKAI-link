@@ -33,3 +33,7 @@ pub mod transport;
 /// MASQUE bind session for P2P relay (feature `msquic`).
 #[cfg(feature = "msquic")]
 pub mod bind;
+
+/// Observed-address reports from a relay leg (feature `msquic`).
+#[cfg(feature = "msquic")]
+pub mod observed;
