@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
-use isekai_p2p::agent::CertBundle;
+use isekai_p2p::agent::{CertBundle, ObservedAddress, ObservedAddressWatch};
 
 use crate::tls::dev_cert;
 
@@ -74,13 +74,36 @@ pub fn bind_video_listener(
     Ok((reg, listener, local))
 }
 
+/// How [`serve_frames_with`] serves. Default is the plain relay-only behaviour.
+#[derive(Default)]
+pub struct ServeOptions {
+    /// How the proxy sees this Endpoint's relay bind leg
+    /// ([`ListenerSession::observed_address`](isekai_p2p::ListenerSession::observed_address)).
+    ///
+    /// When set, every accepted connection is told about that address so the
+    /// initiator can validate a direct path to it and migrate off the relay.
+    /// Without it the connection stays relay-only, which is the pre-migration
+    /// behaviour.
+    pub observed: Option<ObservedAddressWatch>,
+}
+
 /// Accept video connections and fan every frame from `frame_rx` out to each
 /// connected client as a unidirectional stream. Runs until `shutdown` fires or
 /// the frame source closes.
 pub async fn serve_frames(
     listener: Listener,
+    frame_rx: mpsc::Receiver<Bytes>,
+    shutdown: CancellationToken,
+) {
+    serve_frames_with(listener, frame_rx, shutdown, ServeOptions::default()).await
+}
+
+/// [`serve_frames`] with the direct-path advertisement wired in.
+pub async fn serve_frames_with(
+    listener: Listener,
     mut frame_rx: mpsc::Receiver<Bytes>,
     shutdown: CancellationToken,
+    opts: ServeOptions,
 ) {
     let mut senders: Vec<mpsc::Sender<Bytes>> = Vec::new();
     loop {
@@ -88,6 +111,9 @@ pub async fn serve_frames(
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok(conn) => {
+                    if let Some(observed) = &opts.observed {
+                        advertise_direct_path(conn.clone(), observed.clone(), shutdown.clone());
+                    }
                     let (tx, rx) = mpsc::channel::<Bytes>(100);
                     senders.push(tx);
                     tokio::spawn(push_frames(conn, rx));
@@ -109,6 +135,86 @@ pub async fn serve_frames(
             },
         }
     }
+}
+
+/// Tell `conn` about the relay leg's binding, so the peer can punch a direct
+/// path to it and migrate off the relay.
+///
+/// The address may not be known yet. In P2P mode the bind leg only comes up
+/// once an operator pastes the connection id, which can happen *after* the
+/// video connection has been accepted — so when the watch is still empty this
+/// keeps a task alive to apply the address when it arrives. It also re-applies
+/// on a genuine change, which is what a rebind onto a new leg produces.
+///
+/// Failures are logged, not fatal: an Endpoint that cannot advertise a direct
+/// path simply keeps streaming over the relay.
+fn advertise_direct_path(
+    conn: Connection,
+    mut observed: ObservedAddressWatch,
+    shutdown: CancellationToken,
+) {
+    let mut applied: Option<ObservedAddress> = None;
+    if let Some(address) = address_to_apply(applied, *observed.borrow_and_update()) {
+        apply_direct_path(&conn, address);
+        applied = Some(address);
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                changed = observed.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    if let Some(address) = address_to_apply(applied, *observed.borrow_and_update()) {
+                        apply_direct_path(&conn, address);
+                        applied = Some(address);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Which address, if any, to hand to the connection given what is already on it.
+///
+/// Applying the *same* address twice fails with `QUIC_STATUS_ADDRESS_IN_USE` —
+/// the binding is already attached — so an unchanged report is a no-op rather
+/// than a logged failure. A watch that goes back to `None` is also a no-op: the
+/// address already on the connection stays valid, and there is nothing better
+/// to replace it with.
+fn address_to_apply(
+    applied: Option<ObservedAddress>,
+    latest: Option<ObservedAddress>,
+) -> Option<ObservedAddress> {
+    match latest {
+        Some(address) if applied != Some(address) => Some(address),
+        _ => None,
+    }
+}
+
+fn apply_direct_path(conn: &Connection, address: ObservedAddress) {
+    if let Err(e) = conn.add_bound_addr(address.local) {
+        tracing::warn!(
+            local = %address.local,
+            "could not add the relay leg's binding to the video connection; \
+             staying relay-only: {e}",
+        );
+        return;
+    }
+    if let Err(e) = conn.add_observed_addr(address.local, address.observed) {
+        tracing::warn!(
+            local = %address.local,
+            observed = %address.observed,
+            "could not advertise the observed address; staying relay-only: {e}",
+        );
+        return;
+    }
+    tracing::info!(
+        local = %address.local,
+        observed = %address.observed,
+        "advertised a direct path to the video client",
+    );
 }
 
 async fn push_frames(conn: Connection, mut rx: mpsc::Receiver<Bytes>) {
@@ -261,4 +367,48 @@ fn video_client_config(
     }
     config.load_credential(&cred)?;
     Ok((reg, config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn observed(port: u16) -> ObservedAddress {
+        ObservedAddress {
+            local: SocketAddr::from(([192, 168, 1, 59], port)),
+            observed: SocketAddr::from(([203, 0, 113, 5], port)),
+        }
+    }
+
+    /// The bind leg usually comes up after the connection was accepted, so the
+    /// first address seen has to be applied whenever it arrives.
+    #[test]
+    fn a_first_address_is_applied() {
+        assert_eq!(address_to_apply(None, Some(observed(1000))), Some(observed(1000)));
+    }
+
+    /// Re-applying the same address fails with ADDRESS_IN_USE, so an unchanged
+    /// report must be a no-op rather than a logged failure.
+    #[test]
+    fn an_unchanged_address_is_not_reapplied() {
+        assert_eq!(address_to_apply(Some(observed(1000)), Some(observed(1000))), None);
+    }
+
+    /// A rebind onto a new leg is a genuine change and has to be advertised.
+    #[test]
+    fn a_changed_address_is_applied() {
+        assert_eq!(
+            address_to_apply(Some(observed(1000)), Some(observed(2000))),
+            Some(observed(2000))
+        );
+    }
+
+    /// A watch that empties leaves the connection as it is: what it already has
+    /// still works, and there is nothing better to offer.
+    #[test]
+    fn an_empty_report_leaves_the_connection_alone() {
+        assert_eq!(address_to_apply(Some(observed(1000)), None), None);
+        assert_eq!(address_to_apply(None, None), None);
+    }
 }

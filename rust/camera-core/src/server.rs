@@ -12,12 +12,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use isekai_p2p::agent::RelayOptions;
 use isekai_p2p::{fetch_relay_certificate, issue_endpoint_token, ListenerSession, P2pConfig};
 use msquic_async::Registration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::video::{bind_video_listener, serve_frames};
+use crate::video::{bind_video_listener, serve_frames_with, ServeOptions};
 
 /// What the operator conveys to the initiator once the server is up.
 #[derive(Clone, Debug)]
@@ -90,15 +91,41 @@ pub async fn spawn_p2p_server(
     let (video_reg, listener, video_addr) = bind_video_listener(reg, bind_addr, cert.as_ref())?;
 
     // The relay delivers the initiator's traffic to the video listener address.
-    let session =
-        ListenerSession::create_with_token(&cfg, &endpoint_token, video_addr, None).await?;
+    //
+    // The bind leg goes on a shared, unconnected socket so a direct path can
+    // later be opened from its binding, and on the *same* registration as the
+    // video listener — msquic looks bindings up per registration, so a leg on
+    // another one could never be shared with the accepted connections
+    // (docs/p2p_mode_migration_plan.md §2.2.3, §2.4).
+    let session = ListenerSession::create_with_token_and_options(
+        &cfg,
+        &endpoint_token,
+        video_addr,
+        None,
+        RelayOptions {
+            unconnected: true,
+            registration: Some(video_reg.clone()),
+        },
+    )
+    .await?;
     let info = ServerInfo {
         listener_id: session.listener_id.clone(),
         endpoint_id: session.endpoint_id.clone(),
         video_addr,
     };
 
-    tokio::spawn(serve_frames(listener, frame_rx, shutdown.clone()));
+    // Taken before any leg is bound — which is the normal order, since binding
+    // waits on a connection id conveyed by hand. The session's watch survives
+    // that gap and any later rebind.
+    let observed = session.observed_address();
+    tokio::spawn(serve_frames_with(
+        listener,
+        frame_rx,
+        shutdown.clone(),
+        ServeOptions {
+            observed: Some(observed),
+        },
+    ));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     tokio::spawn(command_loop(session, cmd_rx, shutdown));
