@@ -164,7 +164,7 @@ async fn spike() -> anyhow::Result<bool> {
         "6a",
         Required::No,
         "リレー型トポロジで直接経路が PathValidated されるか (listener は現行の設定のまま)",
-        run(check_direct_path_migration(&reg, false)).await,
+        run(check_direct_path_migration(&reg, false, ClientBinding::PinnedToLeg)).await,
     );
     // The NAT-traversal listener variant builds its configuration by hand and
     // loads it from PEM files, which is the Unix credential path; probe it
@@ -178,7 +178,7 @@ async fn spike() -> anyhow::Result<bool> {
                 id,
                 Required::No,
                 question,
-                run(check_direct_path_migration(&reg, true)).await,
+                run(check_direct_path_migration(&reg, true, ClientBinding::PinnedToLeg)).await,
             );
         }
         Ok(None) => report.skip(
@@ -189,6 +189,24 @@ async fn spike() -> anyhow::Result<bool> {
         ),
         Err(e) => report.record(id, Required::No, question, Err(e)),
     }
+
+    report.record(
+        "7a",
+        Required::No,
+        "映像接続を pin せず、MASQUE レグの (L_c, O_c) を add_candidate_addr に渡すだけで直接経路が張れるか",
+        run(check_direct_path_migration(&reg, false, ClientBinding::Unpinned)).await,
+    );
+    report.record(
+        "7b",
+        Required::No,
+        "同上 + 映像接続を共有・非接続ソケット (ローカルアドレスは loopback) にした場合",
+        run(check_direct_path_migration(
+            &reg,
+            false,
+            ClientBinding::UnpinnedSharedLoopback,
+        ))
+        .await,
+    );
 
     report.print();
     let failed = report.required_failed();
@@ -520,9 +538,39 @@ async fn check_server_side_advertise(reg: &Arc<Registration>) -> anyhow::Result<
 /// `make_msquic_async_listener` builds today, `true` adds the NAT-traversal and
 /// observed-address knobs. Running both answers #59's open caveat — whether the
 /// listener needs tuning for `add_observed_addr` to take effect.
+/// How the client's *video* connection is bound, which is the whole question
+/// this spike now turns on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientBinding {
+    /// 案B: pin the video connection itself to the relay leg's real address.
+    /// Works on Linux/macOS, impossible on Windows (§2.2.2).
+    PinnedToLeg,
+    /// Leave the video connection where msquic puts it — loopback, facing the
+    /// bridge — and only *name* the relay leg's address as a candidate.
+    /// `add_candidate_addr` does not require the address to be bound yet: the
+    /// path is opened when the peer's ADD_ADDRESS arrives.
+    Unpinned,
+    /// As `Unpinned`, but with the shared/unconnected socket knobs and an
+    /// explicit *loopback* local address — which satisfies the "a specific,
+    /// non-wildcard local address" rule an unconnected socket carries, without
+    /// ever asking a real-IP socket to reach loopback.
+    UnpinnedSharedLoopback,
+}
+
+impl ClientBinding {
+    fn label(self) -> &'static str {
+        match self {
+            ClientBinding::PinnedToLeg => "pinned",
+            ClientBinding::Unpinned => "unpinned",
+            ClientBinding::UnpinnedSharedLoopback => "unpinned+shared(loopback)",
+        }
+    }
+}
+
 async fn check_direct_path_migration(
     reg: &Arc<Registration>,
     natt_listener: bool,
+    binding: ClientBinding,
 ) -> anyhow::Result<String> {
     let mut listener = spawn_listener_variant(reg, loopback(0), natt_listener)
         .await?
@@ -536,8 +584,16 @@ async fn check_direct_path_migration(
     // The client's CONNECT-UDP leg stand-in, for the same reason.
     let client_leg = RelayLeg::start(reg, &mut proxy).await?;
 
-    let conn = shared_binding_conn(reg, client_leg.addr)?;
-    conn.add_candidate_addr(client_leg.addr, client_leg.addr)?;
+    let conn = match binding {
+        ClientBinding::PinnedToLeg => shared_binding_conn(reg, client_leg.addr)?,
+        ClientBinding::Unpinned => Connection::new(reg)?,
+        ClientBinding::UnpinnedSharedLoopback => shared_binding_conn(reg, loopback(0))?,
+    };
+    // No NAT on a CI runner, so the relay leg's observed address is its local
+    // one. The address is not bound *by this connection* in the unpinned
+    // variants — that is the point.
+    conn.add_candidate_addr(client_leg.addr, client_leg.addr)
+        .context("add_candidate_addr with the relay leg's address")?;
     conn.start(&client_config(reg, true)?, "127.0.0.1", bridge.front_addr.port())
         .await
         .context("relay-path handshake")?;
@@ -565,6 +621,17 @@ async fn check_direct_path_migration(
     })
     .await;
 
+    // A run that never validates a direct path is a FAIL, not a PASS carrying
+    // prose that says otherwise — the context below records what was in play.
+    let context = format!(
+        "client={}, listener natt={natt_listener}; relay path {} -> {}; \
+         server leg {} / client leg {}; add_bound_addr {bound} / add_observed_addr {observed}",
+        binding.label(),
+        relay_path.0,
+        relay_path.1,
+        server_leg.addr,
+        client_leg.addr
+    );
     let outcome = match direct {
         Ok(Ok(direct)) => {
             conn.activate_path(direct.0, direct.1)
@@ -577,16 +644,18 @@ async fn check_direct_path_migration(
                 direct.0, direct.1, now.0, now.1
             )
         }
-        Ok(Err(e)) => format!("直接経路の検証に失敗: {e}"),
-        Err(_) => format!("{PATH_VALIDATION_TIMEOUT:?} 以内に PathValidated が来ず"),
+        Ok(Err(e)) => {
+            bridge.stop();
+            return Err(e.context(format!("直接経路の検証に失敗 ({context})")));
+        }
+        Err(_) => {
+            bridge.stop();
+            anyhow::bail!("{PATH_VALIDATION_TIMEOUT:?} 以内に PathValidated が来ず ({context})");
+        }
     };
 
     bridge.stop();
-    Ok(format!(
-        "listener natt={natt_listener}; relay path {} -> {}; server leg {} / client leg {}; \
-         add_bound_addr {bound} / add_observed_addr {observed}; {outcome}",
-        relay_path.0, relay_path.1, server_leg.addr, client_leg.addr
-    ))
+    Ok(format!("{context}; {outcome}"))
 }
 
 /// A live QUIC connection held open purely to own a shared, unconnected binding
