@@ -127,10 +127,13 @@ Direct モードの**サーバ側**は、すでに
 
 なお **サーバ側は案A のまま**とする。サーバの公開マッピング O_s は bind レグ H3 接続のローカルポートに対して観測されたものなので、映像 listener 自身のバインディングに読み替えるには結局バインディング共有（= `add_bound_addr`）が要る。ここは Direct モードの実装をそのまま移植する。
 
-> **重要（Phase 0 の実測を受けて）**: 上表の「ローカルアドレス固定」は **Linux / macOS でのみ成立**する。
+> **重要（Phase 0 の実測を受けて）**: 上表の案B（映像接続を L_c に pin する）は **Linux / macOS でのみ成立**する。
 > Windows は特定の非 loopback アドレスに bind した socket から `127.0.0.1` へ送信できない
-> （`WSAEADDRNOTAVAIL`）。移植可能な形は **アドレスではなくポートだけを固定する wildcard bind** で、
-> こちらは 3 プラットフォームすべてで成立した。詳細と残作業は §2.2.2 / §2.2.3 を参照。
+> （`WSAEADDRNOTAVAIL`, §2.2.2）。
+> **最終的に採用するのは §2.2.3 の案C** — 映像接続は loopback のまま動かさず、
+> `add_candidate_addr` に MASQUE レグの `(L_c, O_c)` を**名指しするだけ**にする。
+> `add_candidate_addr` は未 bind のローカルアドレスを受け付けるので pin が要らず、
+> Windows が拒む「実 IP → loopback」の送信がどこにも現れない。
 
 #### 2.2.1 実測による裏付け（Linux / 2026-07-30）
 
@@ -203,7 +206,10 @@ bind した socket から `127.0.0.1` へは送信できない。**案B をそ�
 - リレー経路（→ `127.0.0.1:R`）ではカーネルが送信元を `127.0.0.1:P` に選び、
 - 直接経路では同じソケットが `<実IP>:P` 宛のデータグラムを受け取る。
 
-つまり **固定すべきはアドレスではなくポート**であり、これが移植可能な形になる（§2.2.3）。
+この時点では「固定すべきはアドレスではなくポート（wildcard bind）」が移植可能な形に見えたが、
+実際にはもっと素直な解があった — **そもそも映像接続を固定しなくてよい**（§2.2.3 の案C）。
+なお wildcard は非接続ソケットが受け付けない（`QUIC_STATUS_INVALID_PARAMETER`）ので、
+check 1b の形をそのまま msquic に持ち込むことはできない。
 
 Windows の check 2〜6a は msquic レベルでも同じ結論を裏づけた。いずれも
 `QUIC_STATUS_CONNECTION_IDLE` でハンドシェイクが成立しない —
@@ -216,56 +222,53 @@ OS が送信を拒む（check 1 と同じ `WSAEADDRNOTAVAIL`）ため 1 パケ�
 macOS でも PASS しているので、設計そのものの否定ではなく**ハーネスの問題である可能性が高い**。
 未解決の追試項目（§7-15）。
 
-#### 2.2.3 未解決: wildcard bind を msquic でどう表現するか
+#### 2.2.3 採用: 映像接続は動かさず、候補アドレスだけを名指しする（案C）
 
-check 1b は OS レベルの話であり、msquic に「wildcard に bind し、ただしポートは P、
-そして候補としては `<実IP>:P` を広告する」と指示する方法はまだ確認できていない。
-候補となる筋:
+§2.2.2 の Windows 問題は、**映像 QUIC 接続を実インタフェースのアドレスに pin したこと**から来ていた。
+だが `add_candidate_addr` は、**その時点で bind されていないローカルアドレスでも受け付ける** —
+相手から ADD_ADDRESS フレームが届いた時点で、そのローカルアドレスのパスを作る。
+したがって映像接続を動かす必要はまったくない:
 
-- `set_local_addr(0.0.0.0:P)` が受け付けられるか（`QUIC_PARAM_CONN_LOCAL_ADDRESS` にワイルドカードを渡せるか）。
-- `add_candidate_addr(<実IP>:P, <観測アドレス>)` の `HostAddress` が、
-  wildcard バインディング上の送信元として解釈されるか。
-- Windows の msquic が経路ごとに送信元アドレスを選べるか（`set_unconnected_socket` の実装依存）。
+1. リレーへの MASQUE 接続を `set_share_binding(true)` + `set_unconnected_socket(true)` +
+   `set_local_addr(L_c)` で張る（`is_unconnected = true` の `H3MsQuicAsyncConnector` が
+   既にやっていること）。そこから `(L_c, O_c)` を得る。
+2. 映像 QUIC 接続は **loopback のまま** `127.0.0.1:R` へ dial する。
+   ただし `set_share_binding(true)` + `set_unconnected_socket(true)` +
+   `set_local_addr(127.0.0.1:0)` は必要（下記 7a/7b）。
+3. `add_candidate_addr(L_c, O_c)` で候補を名指しするだけ。
 
-**これが Windows 対応の可否を決めるので、Phase 1 に着手する前に片付ける**（Phase 0 の残作業）。
-Windows での msquic チェック（2〜6）は現状スキップされている（理由は下記）ため、
-この追試には Windows で listener を立てられるようにする作業が前提になる。
+**これが Windows でも成立する形**である。映像接続自身のソケットは loopback に bind されるので
+ブリッジと会話でき、直接経路は実 IP ⇄ 実 IP になる。
+**実 IP から `127.0.0.1` へ送るという、Windows が拒む操作がどこにも現れない。**
 
-> **解決済み**: 初回は Windows で check 2〜6 が丸ごと SKIP になっていた。
-> `make_msquic_async_listener` の Windows 分岐は PKCS#12 が無いと証明書を RSA プロバイダ経由で
-> 取り込もうとするが、`camera_core::tls::dev_cert` が生成するのは ECDSA P-256 なので
-> `ASN1 bad tag value met` で失敗していた（本番の camera-server はここにプロキシ発行の
-> PKCS#12 を渡すので別分岐に入り、この問題は起きない）。
-> `DevCert` に `pkcs12: Option<String>` を追加し、Windows でのみ OpenSSL で bundle を作るようにした
-> （Linux / macOS は PEM 経路で足りるうえ、システム OpenSSL への動的リンクを避けたいので
-> `[target.'cfg(windows)'.dependencies]` に閉じ、非 Windows では `None`）。
-> これにより Windows でも listener が立ち、check 2〜6a が実際に走るようになった。
-> 残る SKIP は 6b のみで、これは NAT traversal 版の listener 設定を手組みする経路が
-> PEM 読み込み前提のため（6b の答え自体は Linux で得られている）。
+##### 実測（Linux, submodule `0d04ccb` / seera-msquic `ddc9b2c`）
 
-### 2.3 経路の定義（両モード共通の語彙）
+| # | 映像接続の bind | 結果 |
+| --- | --- | --- |
+| 7a | 素の接続（share / unconnected なし）+ `add_candidate_addr(L_c, O_c)` | **FAIL** — 15 秒以内に `PathValidated` が来ない |
+| 7b | `set_share_binding(true)` + `set_unconnected_socket(true)` + `set_local_addr(127.0.0.1:0)` + `add_candidate_addr(L_c, O_c)` | **PASS** — リレー経路は `127.0.0.1 → 127.0.0.1` のまま、直接経路 `L_c → L_s` が検証され `activate_path` 後も往復成立 |
 
-- **リレー経路 (relay path)** = 接続確立直後の `(get_local_addr(), get_remote_addr())`。P2P モードでは `(127.0.0.1:x, 127.0.0.1:R)`。
-- **直接経路 (direct path)** = `PathValidated` で通知された、リレー経路と異なる `(local, remote)`。
-- UI 表記は Direct モードの既存文言を踏襲（"Migrate to P2P" / "Migrate to Isekai Link"）。
+- **共有・非接続ソケットの設定は省略できない**（7a の FAIL）。
+- ローカルアドレスは **loopback を明示指定**する。非接続ソケットは
+  「具体的な（ワイルドカードでない）ローカルアドレス」を要求するため
+  （`0.0.0.0` / `::` は `QUIC_STATUS_INVALID_PARAMETER`）。ポートは 0 でよい。
+- submodule の更新（`0d04ccb`）が前提。seera-msquic `ddc9b2c` の
+  「unconnected socket の要件を追加パスにも適用」が入る前は、
+  `QuicConnOpenNewPath` が後から追加したパスに connected socket を割り当てていた。
 
-### 2.4 registration の統一
+##### 案B からの差分（実装への影響）
 
-バインディング共有を確実にするため、**1 プロセス 1 registration** に寄せる。
+- クライアントは `set_local_addr(L_c)` **しない**。代わりに `set_local_addr(127.0.0.1:0)`。
+- `add_candidate_addr(L_c, O_c)` は変わらず必要。`L_c` は MASQUE レグのアドレス。
+- したがって `open_connect_relay` を `unconnected = true` で張り、
+  そこから `(L_c, O_c)` を取り出す配線（Phase 1 / 2）が**必須**になる。
+  Phase 4-5 の «相乗り方式 vs probe & drop» という選択自体が消え、**相乗り方式一択**になる
+  （リレーレグが L_c を保持し続けるので、リスク #13 の NAT マッピング維持も同時に満たす）。
+- サーバ側は案A のまま（`add_bound_addr` + `add_observed_addr`）で変更なし。
 
-- `camera-client`: `MyApp` に `reg: Arc<msquic_async::Registration>` を持たせ、Direct / P2P 双方に渡す（現状 Direct は関数内で生成、P2P は `receive_frames(None, ...)`）。
-- `isekai-p2p-core::transport::make_client_config` は既に `shared_registration()` を持つが、**外部から registration を注入できる経路**（§4 の `RelayOptions.registration`）を足し、camera 側の registration を使わせる。
-- `camera-server` は既に `main` で 1 個作って `spawn_p2p_server(Some(reg), ...)` に渡しているので、その先（`ListenerSession` → `open_bind_session`）まで貫通させる。
-
-### 2.5 制御プレーン candidates 方式（将来オプション）
-
-`isekai-p2p-core/src/proxy.rs` には既に `Candidate` / `PeerConnection.candidates` / `peer_candidates` / `report_state` があり、**プロキシ経由で候補アドレスを交換する制御プレーンが用意されている**。QUIC レベルの NAT traversal 拡張に頼らず、
-
-1. 双方が自分の観測アドレスを `report_state(connection_id, "connecting", &[candidate])` で通知、
-2. 相手の `peer_candidates` を `get_connection` でポーリング、
-3. `add_path(local, remote)` で明示的に経路を追加、
-
-という実装も可能。**利点**は seera 拡張への依存が減ること、**欠点**はポーリングと状態機械を自前で持つ必要があること。今回は Direct モードとの実装共有を優先して QUIC レベル方式を採るが、対称 NAT 対策や将来の TURN 的フォールバックを入れる際の受け皿として記録しておく。
+> 旧 §2.2.3 は「wildcard bind（ポートのみ固定）で Windows を回避する」案を残作業として挙げていたが、
+> 案C はそれを不要にする。wildcard は非接続ソケットが受け付けない
+> （`QUIC_STATUS_INVALID_PARAMETER`）ので、そもそも採れない筋でもあった。
 
 ---
 
@@ -276,9 +279,11 @@ Windows での msquic チェック（2〜6）は現状スキップされてい�
 ### Phase 0 — 前提整備と API セマンティクスの検証（spike）  … 一部完了
 
 **状況**: `rust/camera-core/examples/migration_spike.rs` +
-`.github/workflows/migration-spike.yml` で 2〜4 の大半を自動化し、実測済み（結果は §2.2.2）。
-**残作業は §2.2.3（wildcard bind を msquic でどう表現するか）と、Windows でスパイクを
-完走させるための PKCS#12 dev 証明書**。
+`.github/workflows/migration-spike.yml` で自動化し、実測済み（結果は §2.2.2 / §2.2.3）。
+Windows でスパイクを完走させるための PKCS#12 dev 証明書は対応済み
+（`camera_core::tls::DevCert::pkcs12`, Windows 限定）。
+**設計上の未解決点は無くなり、採用形は §2.2.3 の案C に確定**。残るのは macOS の
+追試（リスク #15）のみ。
 
 **作業**
 
@@ -582,7 +587,7 @@ pub async fn receive_frames_with(
 | 9 | submodule のチェックアウトが記録コミットとずれている | そもそもビルドできない | Phase 0-1 で `git submodule update --init --recursive` |
 | 10 | P2P モードで `udp_mode = dedicated` 相当が要るか不明 | 観測アドレスが不安定になる可能性 | Phase 0-3 で確認 |
 | 11 | `dial_video` のリトライで `Connection` を作り直す | 候補登録が消える | Phase 4-4 でリトライごとに再登録 |
-| 12 | **Windows ではアドレス固定が使えない**（`WSAEADDRNOTAVAIL`） | 案B をそのまま Windows に持ち込めない | **確定した問題**（§2.2.2）。移植可能な形は wildcard bind（ポートのみ固定, check 1b は 3 面 PASS）。msquic でどう表現するかが §2.2.3 の残作業 |
+| 12 | **Windows ではアドレス固定が使えない**（`WSAEADDRNOTAVAIL`） | 案B をそのまま Windows に持ち込めない | **解消**: §2.2.3 の案C（映像接続を pin せず候補を名指しするだけ）に切り替え。実 IP → loopback の送信が発生しなくなる |
 | 13 | P2P では映像トラフィックが全て loopback を通り、**L_c の NAT マッピングが更新されない** | 穴あけ時にマッピングが失効・再割当されている | 相乗り方式でリレーレグ H3 接続に L_c を維持させる（Phase 4-5）。§2.2.2 check 3 でその方式が使えることを確認済み |
 | 14 | `set_unconnected_socket` は `set_share_binding(true)` が前提（msquic-async のドキュメント） | 呼び順を誤ると `QUIC_STATUS_INVALID_STATE` | Phase 4-3 の順序（share → unconnected → local_addr → candidate）を厳守。§2.2.2 check 2/4 でこの順序が通ることを確認済み |
 | 15 | macOS でスパイクの check 5 / 6 がリレーレグ代役のハンドシェイク失敗で落ちる | macOS での端から端までの成立が未確認 | 同手順の check 2/3/4 は macOS でも PASS しており、ハーネス側の問題の可能性が高い。Phase 0 の残作業として切り分ける |
