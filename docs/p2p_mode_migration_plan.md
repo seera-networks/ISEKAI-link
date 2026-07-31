@@ -175,9 +175,10 @@ loopback ソケット 2 個のブリッジで再現し、各側の直接経路�
 | 2 | `set_local_addr(実IP)` した msquic クライアントが `127.0.0.1` へハンドシェイク | PASS | PASS | **FAIL** |
 | 3 | 生存中の共有バインディングへの相乗り（リスク #1b） | PASS | PASS | **FAIL** |
 | 4 | `set_local_addr` + `add_candidate_addr` の併用 | PASS | PASS | **FAIL** |
-| 5 | サーバ側 `add_bound_addr` / `add_observed_addr` の遅延呼び出し | PASS | FAIL* | **FAIL** |
-| 6a | 直接経路の `PathValidated` → `activate_path`（listener 現行設定） | PASS | FAIL* | **FAIL** |
-| 6b | 同上（listener に NAT traversal 設定を追加） | PASS | FAIL* | SKIP |
+| 5 | サーバ側 `add_bound_addr` / `add_observed_addr` の遅延呼び出し | PASS | PASS | FAIL† |
+| 6a | 直接経路の `PathValidated` → `activate_path`（listener 現行設定） | PASS | PASS | FAIL† |
+| 6b | 同上（listener に NAT traversal 設定を追加） | PASS | PASS | SKIP |
+| **7b** | **[採用] 映像接続を pin せず候補を名指しするだけ**（§2.2.3） | **PASS** | **PASS** | **PASS** |
 
 **確定した答え**
 
@@ -217,10 +218,15 @@ Windows の check 2〜6a は msquic レベルでも同じ結論を裏づけた�
 OS が送信を拒む（check 1 と同じ `WSAEADDRNOTAVAIL`）ため 1 パケットも出ていかないからである。
 **新しい問題ではなく、check 1 の結果が msquic レベルに現れたもの。**
 
-\* macOS の check 5 / 6a / 6b の FAIL は、スパイク側のリレーレグ代役の
-ハンドシェイクが `connection shutdown by transport` で落ちたもの。同じ手順の check 2/3/4 は
-macOS でも PASS しているので、設計そのものの否定ではなく**ハーネスの問題である可能性が高い**。
-未解決の追試項目（§7-15）。
+† Windows の check 2〜6a の FAIL は、いずれも check 1 の結果が msquic レベルに現れたもの
+（実 IP に pin したクライアントが `127.0.0.1` へ dial しても 1 パケットも出ていかない）。
+**採用形の 7b は Windows でも PASS しており**、これらは不採用となった案B の記録として残してある。
+
+> 当初 macOS の check 5 / 6a / 6b も FAIL していたが、原因は**スパイク側のハーネス**だった。
+> リレーレグ代役が実 IP に pin したまま *loopback* のプロキシ代役へ dial していた
+> （本番の MASQUE レグは実プロキシへネットワーク越しに繋ぐので両端とも実 IP）。
+> プロキシ代役を実インタフェースアドレスに移したところ macOS は全項目 PASS になった。
+> リスク #15 はこれで解消。
 
 #### 2.2.3 採用: 映像接続は動かさず、候補アドレスだけを名指しする（案C）
 
@@ -241,12 +247,19 @@ macOS でも PASS しているので、設計そのものの否定ではなく**
 ブリッジと会話でき、直接経路は実 IP ⇄ 実 IP になる。
 **実 IP から `127.0.0.1` へ送るという、Windows が拒む操作がどこにも現れない。**
 
-##### 実測（Linux, submodule `0d04ccb` / seera-msquic `ddc9b2c`）
+##### 実測（submodule `0d04ccb` / seera-msquic `ddc9b2c`）
 
-| # | 映像接続の bind | 結果 |
-| --- | --- | --- |
-| 7a | 素の接続（share / unconnected なし）+ `add_candidate_addr(L_c, O_c)` | **FAIL** — 15 秒以内に `PathValidated` が来ない |
-| 7b | `set_share_binding(true)` + `set_unconnected_socket(true)` + `set_local_addr(127.0.0.1:0)` + `add_candidate_addr(L_c, O_c)` | **PASS** — リレー経路は `127.0.0.1 → 127.0.0.1` のまま、直接経路 `L_c → L_s` が検証され `activate_path` 後も往復成立 |
+| # | 映像接続の bind | Linux | macOS 14 | Windows |
+| --- | --- | --- | --- | --- |
+| 7a | 素の接続（share / unconnected なし）+ `add_candidate_addr(L_c, O_c)` | FAIL | FAIL | FAIL |
+| 7b | `set_share_binding(true)` + `set_unconnected_socket(true)` + `set_local_addr(127.0.0.1:0)` + `add_candidate_addr(L_c, O_c)` | **PASS** | **PASS** | **PASS** |
+
+7a はいずれのプラットフォームでも 15 秒以内に `PathValidated` が来ない。
+7b はいずれでも、リレー経路が `127.0.0.1 → 127.0.0.1` のまま直接経路 `L_c → L_s` が検証され、
+`activate_path` 後もアプリケーションデータの往復が成立する。
+**3 プラットフォームで揃って成立した唯一の形**であり、CI はこの 7b を必須チェックとして
+ゲートするようにしてある（案B の前提だった check 1 / 2 は、不採用の記録として残すが
+ビルドを落とさない）。
 
 - **共有・非接続ソケットの設定は省略できない**（7a の FAIL）。
 - ローカルアドレスは **loopback を明示指定**する。非接続ソケットは
@@ -276,14 +289,14 @@ macOS でも PASS しているので、設計そのものの否定ではなく**
 
 各フェーズは独立して `cargo check --workspace --examples` が通り、既定の挙動を変えない（オプトイン）ことを条件とする。
 
-### Phase 0 — 前提整備と API セマンティクスの検証（spike）  … 一部完了
+### Phase 0 — 前提整備と API セマンティクスの検証（spike）  … **完了**
 
 **状況**: `rust/camera-core/examples/migration_spike.rs` +
 `.github/workflows/migration-spike.yml` で自動化し、実測済み（結果は §2.2.2 / §2.2.3）。
 Windows でスパイクを完走させるための PKCS#12 dev 証明書は対応済み
 （`camera_core::tls::DevCert::pkcs12`, Windows 限定）。
-**設計上の未解決点は無くなり、採用形は §2.2.3 の案C に確定**。残るのは macOS の
-追試（リスク #15）のみ。
+**設計上の未解決点は無くなり、採用形は §2.2.3 の案C に確定**（3 プラットフォームで実測 PASS）。
+リスク #15 も解消済み。**Phase 0 は完了**で、Phase 1 に進める。
 
 **作業**
 
@@ -590,7 +603,7 @@ pub async fn receive_frames_with(
 | 12 | **Windows ではアドレス固定が使えない**（`WSAEADDRNOTAVAIL`） | 案B をそのまま Windows に持ち込めない | **解消**: §2.2.3 の案C（映像接続を pin せず候補を名指しするだけ）に切り替え。実 IP → loopback の送信が発生しなくなる |
 | 13 | P2P では映像トラフィックが全て loopback を通り、**L_c の NAT マッピングが更新されない** | 穴あけ時にマッピングが失効・再割当されている | 相乗り方式でリレーレグ H3 接続に L_c を維持させる（Phase 4-5）。§2.2.2 check 3 でその方式が使えることを確認済み |
 | 14 | `set_unconnected_socket` は `set_share_binding(true)` が前提（msquic-async のドキュメント） | 呼び順を誤ると `QUIC_STATUS_INVALID_STATE` | Phase 4-3 の順序（share → unconnected → local_addr → candidate）を厳守。§2.2.2 check 2/4 でこの順序が通ることを確認済み |
-| 15 | macOS でスパイクの check 5 / 6 がリレーレグ代役のハンドシェイク失敗で落ちる | macOS での端から端までの成立が未確認 | 同手順の check 2/3/4 は macOS でも PASS しており、ハーネス側の問題の可能性が高い。Phase 0 の残作業として切り分ける |
+| 15 | ~~macOS でスパイクの check 5 / 6 がリレーレグ代役のハンドシェイク失敗で落ちる~~ | — | **解消**: 原因はハーネスだった（リレーレグ代役が実 IP に pin したまま loopback のプロキシ代役へ dial していた）。プロキシ代役を実アドレスに移し、macOS は全項目 PASS |
 
 ---
 

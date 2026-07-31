@@ -19,10 +19,11 @@
 //! `is_unconnected` mode obtains it: `connect()` a throwaway UDP socket at the
 //! target (which sends nothing) and read its local address.
 //!
-//! Each check prints PASS / FAIL plus a note. Checks marked *required* are the
-//! load-bearing assumptions of 案B; if one fails the process exits non-zero,
-//! because the plan itself has to change. The rest are exploratory: they record
-//! an answer either way and never fail the build.
+//! Each check prints PASS / FAIL / SKIP plus a note. The one marked *required*
+//! is the adopted design (案C, check 7b): if it fails the process exits
+//! non-zero, because the plan itself has to change. The rest are exploratory —
+//! several record why an *earlier* design was abandoned and are expected to
+//! fail on some platforms, so they never fail the build.
 //!
 //! Run with `cargo run -p camera-core --example migration_spike`.
 
@@ -99,10 +100,13 @@ async fn spike() -> anyhow::Result<bool> {
 
     // Check 1 needs no msquic at all, so it still answers even if the QUIC
     // stack fails to initialise on this platform.
+    // Not required: 案B (pinning the video connection to a real address) was
+    // abandoned precisely because this fails on Windows. Kept as the record of
+    // why.
     report.record(
         "1",
-        Required::Yes,
-        "実 IP を local、loopback を remote とする UDP が双方向に疎通するか (§2.2.1)",
+        Required::No,
+        "[案B の前提・不採用] 実 IP を local、loopback を remote とする UDP が双方向に疎通するか (§2.2.1)",
         run(check_os_udp()).await,
     );
 
@@ -138,8 +142,8 @@ async fn spike() -> anyhow::Result<bool> {
 
     report.record(
         "2",
-        Required::Yes,
-        "set_local_addr(実IP) を pin した msquic クライアントが 127.0.0.1 へハンドシェイクできるか",
+        Required::No,
+        "[案B の前提・不採用] set_local_addr(実IP) を pin した msquic クライアントが 127.0.0.1 へハンドシェイクできるか",
         run(check_pinned_local_dial_loopback(&reg)).await,
     );
     report.record(
@@ -196,10 +200,11 @@ async fn spike() -> anyhow::Result<bool> {
         "映像接続を pin せず、MASQUE レグの (L_c, O_c) を add_candidate_addr に渡すだけで直接経路が張れるか",
         run(check_direct_path_migration(&reg, false, ClientBinding::Unpinned)).await,
     );
+    // The adopted design (案C). This is the check that gates the build.
     report.record(
         "7b",
-        Required::No,
-        "同上 + 映像接続を共有・非接続ソケット (ローカルアドレスは loopback) にした場合",
+        Required::Yes,
+        "[採用] 同上 + 映像接続を共有・非接続ソケット (ローカルアドレスは loopback) にした場合",
         run(check_direct_path_migration(
             &reg,
             false,
@@ -211,7 +216,7 @@ async fn spike() -> anyhow::Result<bool> {
     report.print();
     let failed = report.required_failed();
     if failed {
-        eprintln!("a required Phase 0 assumption does not hold; the plan needs revising");
+        eprintln!("the adopted design (案C) does not hold here; the plan needs revising");
     }
 
     // Deliberately leaked: see the note in `main`.
@@ -221,7 +226,7 @@ async fn spike() -> anyhow::Result<bool> {
 
 /// The msquic-dependent checks, named once so the skip path can list them.
 const MSQUIC_CHECKS: [(&str, &str); 6] = [
-    ("2", "set_local_addr(実IP) を pin した msquic クライアントが 127.0.0.1 へハンドシェイクできるか"),
+    ("2", "[案B の前提・不採用] set_local_addr(実IP) を pin した msquic クライアントが 127.0.0.1 へハンドシェイクできるか"),
     ("3", "生存中の共有バインディングに 2 本目の接続が相乗りできるか (リスク #1b)"),
     ("4", "set_local_addr で bind 済みの接続に add_candidate_addr を併用できるか"),
     ("5", "サーバ側 add_bound_addr / add_observed_addr をハンドシェイク前後で呼べるか"),
