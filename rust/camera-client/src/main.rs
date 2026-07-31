@@ -459,17 +459,34 @@ impl MyApp {
             // that gap (the server may bind seconds later, when a human pastes
             // the connection id), so dialing now is safe. The `session` stays
             // alive to hold the relay leg.
-            // Probe the proxy for an address and release it, rather than
-            // naming the live relay leg's binding: a direct path opened on that
-            // binding validates and then carries nothing. Failing to probe only
-            // costs the direct path, so keep streaming over the relay.
-            let candidate = match camera_core::probe_direct_path_address(&cfg, Some(Arc::clone(&reg)))
-                .await
-            {
-                Ok(candidate) => Some(candidate),
-                Err(e) => {
-                    tracing::warn!("no direct-path candidate ({e:#}); staying relay-only");
-                    None
+            // Where the direct-path candidate comes from.
+            //
+            // Naming the relay leg's own binding is the simpler design — no
+            // probe round-trip, and the mapping is one the proxy is actively
+            // refreshing rather than one assumed to outlive a closed socket. It
+            // needs msquic to keep a shared binding's source connection IDs
+            // while other paths still hold it, which seera-msquic 910edff
+            // fixes. ISEKAI_MIGRATION_USE_LEG selects it so the fix can be
+            // confirmed against the probe path it replaces.
+            let candidate = if std::env::var_os("ISEKAI_MIGRATION_USE_LEG").is_some() {
+                let observed = *session.observed_address().borrow();
+                match observed {
+                    Some(candidate) => {
+                        tracing::warn!("ISEKAI_MIGRATION_USE_LEG set: offering the relay leg's own binding");
+                        Some(candidate)
+                    }
+                    None => {
+                        tracing::warn!("the relay leg has not reported yet; staying relay-only");
+                        None
+                    }
+                }
+            } else {
+                match camera_core::probe_direct_path_address(&cfg, Some(Arc::clone(&reg))).await {
+                    Ok(candidate) => Some(candidate),
+                    Err(e) => {
+                        tracing::warn!("no direct-path candidate ({e:#}); staying relay-only");
+                        None
+                    }
                 }
             };
             if let Err(e) = camera_core::receive_frames_with(

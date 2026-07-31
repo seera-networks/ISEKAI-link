@@ -456,7 +456,28 @@ Windows 実機（クライアント・サーバを同一マシンで実行、同
 - ETW の `No matching client connection` は事実だが、
   「レグのバインディングだから起きる」という限定は**裏付けられていない**
 
-##### Windows 実機で確かめられていること（2026-08-01 時点）
+##### seera-msquic 側の修正（2026-08-01）
+
+submodule を `msquic-async-rs` `9797d17`（seera-msquic `910edff`）へ更新した。
+「Keep source connection IDs while a shared binding is still in use」が入り、
+ETW で観測した症状の原因がそのまま修正されている。
+
+> 非接続バインディングはローカルポートだけで一致するため、
+> 一つの接続が持つ複数のパスが同じバインディングを共有する。
+> そのバインディングに登録された source connection ID が
+> パケットを接続へ届ける仕組みであり、これはパス単位ではなく接続単位のものである。
+> `QuicConnProcessPathValidationTimerOperation` はパスを破棄するたびに
+> `QuicBindingRemoveAllSourceConnectionIDs` を呼んでおり、
+> 他のパスが同じバインディングを保持しているかを見ていなかった。
+> 結果、生きているパスが黙って受信できなくなっていた。
+
+`No matching client connection` の直接の説明になっている。
+これにより、**リレーレグのバインディングを直接名指しする元の案C が使えるはず**である
+（プローブ 1 往復が不要になり、NAT マッピングが閉じたソケットより長生きするという
+仮定も外せるので、そちらのほうが望ましい）。
+`ISEKAI_MIGRATION_USE_LEG=1` で切り替えて確認する。
+
+##### Windows 実機で確かめられていること（修正適用前）
 
 | 構成 | `DirectValidated` | 切替後の通信 |
 | --- | --- | --- |
