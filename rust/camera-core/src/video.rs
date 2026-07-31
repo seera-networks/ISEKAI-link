@@ -232,10 +232,22 @@ fn apply_direct_path(conn: &Connection, address: ObservedAddress) {
 }
 
 async fn push_frames(conn: Connection, mut rx: mpsc::Receiver<Bytes>) {
+    // Roughly once a second at camera rates. The server side of a migration
+    // that goes quiet looks healthy from the application's point of view — it
+    // keeps writing frames — so the counters are the only place the truth shows
+    // up: whether its packets are leaving and whether they are being lost.
+    const STATS_EVERY: usize = 30;
+    let mut pushed = 0usize;
     while let Some(frame) = rx.recv().await {
         if let Err(e) = push_one(&conn, &frame).await {
             tracing::debug!("video push ended: {e}");
             break;
+        }
+        pushed += 1;
+        if pushed % STATS_EVERY == 0 {
+            if let Ok(stats) = conn.get_stats() {
+                log_connection_stats(&conn, &stats, "serving");
+            }
         }
     }
 }
@@ -376,6 +388,7 @@ pub async fn receive_frames_with(
                         if let Some(rtt) = &rtt {
                             let _ = rtt.try_send(stats.Rtt as f64 / 1000.0);
                         }
+                        log_connection_stats(&conn, &stats, "tick");
                     }
                     Err(e) => tracing::debug!("could not read connection stats: {e}"),
                 }
@@ -401,6 +414,13 @@ pub async fn receive_frames_with(
                     Some((local, remote)) => match conn.activate_path(local, remote) {
                         Ok(()) => {
                             tracing::info!(%local, %remote, "activated path");
+                            // A snapshot on each side of the switch is what
+                            // tells a stalled migration apart from a broken
+                            // one: whether packets still leave, whether any
+                            // arrive, and what MTU the new path settled on.
+                            if let Ok(stats) = conn.get_stats() {
+                                log_connection_stats(&conn, &stats, "after activate_path");
+                            }
                             report_path(&path_events, PathEvent::Activated { local, remote }).await;
                         }
                         Err(e) => tracing::warn!(%local, %remote, "could not activate path: {e}"),
@@ -420,6 +440,27 @@ pub async fn receive_frames_with(
         }
     }
     Ok(())
+}
+
+/// Log what the connection is actually doing, which is the difference between
+/// "the migration stalled" and "the migration broke the connection".
+///
+/// `Send.PathMtu` is worth watching in particular: a newly opened path has to
+/// size itself, and this connection is configured with a `MaximumMtu` below
+/// msquic's default `MinimumMtu`.
+fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATISTICS, when: &str) {
+    tracing::debug!(
+        when,
+        local = ?conn.get_local_addr().ok(),
+        remote = ?conn.get_remote_addr().ok(),
+        rtt_us = stats.Rtt,
+        send_path_mtu = stats.Send.PathMtu,
+        send_packets = stats.Send.TotalPackets,
+        send_lost = stats.Send.SuspectedLostPackets,
+        recv_packets = stats.Recv.TotalPackets,
+        recv_dropped = stats.Recv.DroppedPackets,
+        "video connection stats",
+    );
 }
 
 async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent) {

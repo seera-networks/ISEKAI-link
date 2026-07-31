@@ -42,6 +42,10 @@ use tokio_util::sync::CancellationToken;
 const DIRECT_PATH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Frames to see before and again after the switch.
 const FRAMES_PER_LEG: usize = 5;
+/// Frame size, in bytes. A camera JPEG at 640x480/q80 is tens of kilobytes, so
+/// a payload that fits in a single QUIC packet proves nothing about the path
+/// that actually has to carry video. Override with FRAME_BYTES.
+const DEFAULT_FRAME_BYTES: usize = 30_000;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
@@ -248,7 +252,7 @@ async fn pump_until(
         let mut received = 0usize;
         loop {
             sent += 1;
-            let _ = frame_tx.send(Bytes::from(format!("{leg}-frame-{sent}"))).await;
+            let _ = frame_tx.send(frame(leg, sent)).await;
             match tokio::time::timeout(Duration::from_millis(300), recv_rx.recv()).await {
                 Ok(Some(_)) => {
                     received += 1;
@@ -263,6 +267,17 @@ async fn pump_until(
     })
     .await
     .map_err(|_| anyhow::anyhow!("no frames arrived on the {leg} path within the timeout"))?
+}
+
+/// A frame of realistic size, tagged so it is identifiable in a capture.
+fn frame(leg: &str, seq: usize) -> Bytes {
+    let size = std::env::var("FRAME_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_FRAME_BYTES);
+    let mut body = format!("{leg}-frame-{seq}:").into_bytes();
+    body.resize(size.max(body.len()), b'.');
+    Bytes::from(body)
 }
 
 /// Read path events until both the relay path and a validated direct path are

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use isekai_p2p::agent::ObservedAddress;
 use msquic_async::{msquic, Connection, Listener, Registration, StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -60,7 +61,23 @@ unsafe extern "C" {
 
 fn main() -> ! {
     let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
-    let failed = runtime.block_on(run_all());
+    // `server` / `client` split the same topology across two processes, which is
+    // the one difference left between this spike passing everywhere and the
+    // camera apps failing in the field. Without a role, run the checks in one
+    // process as before.
+    let role = std::env::args().nth(1);
+    let failed = match role.as_deref() {
+        Some("server") => runtime.block_on(run_role(Role::Server)),
+        Some("client") => runtime.block_on(run_role(Role::Client)),
+        // The same two processes, but driven through camera-core's own
+        // `serve_frames_with` / `receive_frames_with` instead of this file's
+        // hand-rolled equivalents. Everything the hand-rolled roles cover has
+        // passed everywhere, so what is left to suspect is the production code
+        // itself — and, beyond it, the real MASQUE leg.
+        Some("server-prod") => runtime.block_on(run_role(Role::ServerProd)),
+        Some("client-prod") => runtime.block_on(run_role(Role::ClientProd)),
+        _ => runtime.block_on(run_all()),
+    };
 
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
@@ -77,6 +94,358 @@ fn main() -> ! {
     // times out. The report on stdout is the only output that matters and is
     // already flushed.
     unsafe { libc_exit(if failed { 1 } else { 0 }) }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Server,
+    Client,
+    ServerProd,
+    ClientProd,
+}
+
+/// What to report as the leg's *observed* address.
+///
+/// Production sees a public address here, unreachable from inside a NAT that
+/// does not hairpin, and offers it as a candidate before the host address.
+/// `SPIKE_UNREACHABLE_FIRST` reproduces that; otherwise observed == local and
+/// production skips the second candidate entirely.
+fn observed_for(leg: SocketAddr) -> anyhow::Result<ObservedAddress> {
+    let observed = if std::env::var("SPIKE_UNREACHABLE_FIRST").is_ok() {
+        format!("{UNREACHABLE}:{}", leg.port()).parse()?
+    } else {
+        leg
+    };
+    Ok(ObservedAddress {
+        local: leg,
+        observed,
+    })
+}
+
+/// The loopback TCP rendezvous the two processes use to exchange the addresses
+/// they cannot learn from each other any other way (the proxy stand-in's
+/// address and the video listener's port). Override with SPIKE_CONTROL.
+fn control_addr() -> SocketAddr {
+    std::env::var("SPIKE_CONTROL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| loopback(57346))
+}
+
+async fn run_role(role: Role) -> bool {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+    let reg = match Registration::new(&msquic::RegistrationConfig::default()) {
+        Ok(reg) => Arc::new(reg),
+        Err(e) => {
+            eprintln!("could not open the msquic registration: {e}");
+            return true;
+        }
+    };
+    let result = match role {
+        Role::Server => role_server(&reg).await,
+        Role::Client => role_client(&reg).await,
+        Role::ServerProd => role_server_prod(&reg).await,
+        Role::ClientProd => role_client_prod(&reg).await,
+    };
+    match result {
+        Ok(report) => {
+            println!("PASS: {report}");
+            std::mem::forget(reg);
+            false
+        }
+        Err(e) => {
+            println!("FAIL: {e:#}");
+            std::mem::forget(reg);
+            true
+        }
+    }
+}
+
+/// The target half: video listener on loopback, relay leg on a real address,
+/// advertised to whatever connects.
+async fn role_server(reg: &Arc<Registration>) -> anyhow::Result<String> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut proxy = spawn_proxy_stand_in(reg).await?;
+    let mut video = spawn_listener(reg, loopback(0)).await?;
+    let server_leg = RelayLeg::start(reg, &mut proxy).await?;
+
+    let control = tokio::net::TcpListener::bind(control_addr()).await?;
+    println!(
+        "server: proxy={} video={} leg={} — waiting for the client",
+        proxy.addr, video.addr, server_leg.addr
+    );
+    let (mut sock, _) = control.accept().await?;
+    sock.write_all(format!("{} {}\n", proxy.addr, video.addr.port()).as_bytes())
+        .await?;
+    sock.flush().await?;
+
+    let accepted = video.accept_one().await?;
+    let bound = describe(accepted.add_bound_addr(server_leg.addr));
+    // Same ordering question as on the client: `apply_direct_path` advertises
+    // the observed address first and the host one second.
+    let unreachable = if std::env::var("SPIKE_UNREACHABLE_FIRST").is_ok() {
+        let dead: SocketAddr = format!("{UNREACHABLE}:{}", server_leg.addr.port()).parse()?;
+        describe(accepted.add_observed_addr(server_leg.addr, dead))
+    } else {
+        "n/a".to_owned()
+    };
+    let observed = describe(accepted.add_observed_addr(server_leg.addr, server_leg.addr));
+    println!(
+        "server: accepted the video connection; advertised {} \
+         (add_bound_addr {bound} / unreachable-first {unreachable} / add_observed_addr {observed})",
+        server_leg.addr
+    );
+
+    // Push video-sized frames until the client goes away. The client decides
+    // when it has seen enough on each path.
+    let mut pushed = 0usize;
+    loop {
+        match push_frame(&accepted, VIDEO_SIZED_PAYLOAD).await {
+            Ok(()) => pushed += 1,
+            Err(e) => {
+                return Ok(format!("pushed {pushed} frames before the connection ended: {e}"));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The initiator half: bridge to the peer's video listener over loopback, offer
+/// this side's relay leg as a candidate, migrate, and check frames survive it.
+async fn role_client(reg: &Arc<Registration>) -> anyhow::Result<String> {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let sock = tokio::net::TcpStream::connect(control_addr())
+        .await
+        .context("could not reach the server process; start it with `... migration_spike server`")?;
+    let mut lines = tokio::io::BufReader::new(sock).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .context("the server closed the control channel")?;
+    let mut parts = line.split_whitespace();
+    let proxy_addr: SocketAddr = parts.next().context("no proxy address")?.parse()?;
+    let video_port: u16 = parts.next().context("no video port")?.parse()?;
+    println!("client: proxy={proxy_addr} video port={video_port}");
+
+    let client_leg = RelayLeg::start_dialing(reg, proxy_addr).await?;
+    let bridge = Bridge::start(loopback(video_port)).await?;
+
+    let conn = shared_binding_conn(reg, loopback(0))?;
+    // SPIKE_UNREACHABLE_FIRST reproduces `prepare_for_migration`'s ordering:
+    // the *observed* address goes first and the host address second. Behind a
+    // NAT that does not hairpin, that first candidate is unreachable from here —
+    // and the spike has always offered the good one first, so the order itself
+    // was never under test.
+    if std::env::var("SPIKE_UNREACHABLE_FIRST").is_ok() {
+        let dead: SocketAddr = format!("{UNREACHABLE}:{}", client_leg.addr.port()).parse()?;
+        conn.add_candidate_addr(client_leg.addr, dead)
+            .context("add_candidate_addr with an unreachable observed address")?;
+    }
+    conn.add_candidate_addr(client_leg.addr, client_leg.addr)?;
+    conn.start(&client_config(reg, true)?, "127.0.0.1", bridge.front_addr.port())
+        .await
+        .context("relay-path handshake")?;
+    let relay_path = (conn.get_local_addr()?, conn.get_remote_addr()?);
+    println!("client: relay path {} -> {}", relay_path.0, relay_path.1);
+
+    let relay_frames = read_frames(&conn, 3).await.context("no frames over the relay")?;
+
+    let direct = tokio::time::timeout(PATH_VALIDATION_TIMEOUT, async {
+        loop {
+            match poll_fn(|cx| conn.poll_event(cx)).await {
+                Ok(msquic_async::ConnectionEvent::PathValidated {
+                    local_address,
+                    remote_address,
+                }) if (local_address, remote_address) != relay_path => {
+                    return anyhow::Ok((local_address, remote_address));
+                }
+                Ok(other) => tracing::info!("client event: {other:?}"),
+                Err(e) => anyhow::bail!("connection ended while waiting for a direct path: {e}"),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("{PATH_VALIDATION_TIMEOUT:?} 以内に PathValidated が来ず"))??;
+    println!("client: direct path {} -> {}", direct.0, direct.1);
+
+    conn.activate_path(direct.0, direct.1)
+        .context("activate_path onto the validated direct path")?;
+    let direct_frames = read_frames(&conn, 3)
+        .await
+        .context("the migrated path carried no frames — this is the field symptom")?;
+
+    bridge.stop();
+    Ok(format!(
+        "{relay_frames} frames over the relay ({} -> {}), then {direct_frames} more after \
+         migrating to the direct path ({} -> {})",
+        relay_path.0, relay_path.1, direct.0, direct.1
+    ))
+}
+
+/// The target half, run through camera-core's own serving path.
+async fn role_server_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut proxy = spawn_proxy_stand_in(reg).await?;
+    let (_video_reg, listener, video_addr) =
+        camera_core::bind_video_listener(Some(reg.clone()), loopback(0), None)?;
+    let server_leg = RelayLeg::start(reg, &mut proxy).await?;
+
+    // Stand in for the bind leg's observed-address watch. Held for the whole
+    // run: dropping the sender would close the watch and stop the advertisement
+    // for the wrong reason.
+    let (_observed_tx, observed_rx) = tokio::sync::watch::channel(Some(observed_for(server_leg.addr)?));
+
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+    let shutdown = CancellationToken::new();
+    tokio::spawn(camera_core::serve_frames_with(
+        listener,
+        frame_rx,
+        shutdown.clone(),
+        camera_core::ServeOptions {
+            observed: Some(observed_rx),
+        },
+    ));
+
+    let control = tokio::net::TcpListener::bind(control_addr()).await?;
+    println!(
+        "server-prod: proxy={} video={} leg={} — waiting for the client",
+        proxy.addr, video_addr, server_leg.addr
+    );
+    let (mut sock, _) = control.accept().await?;
+    sock.write_all(format!("{} {}\n", proxy.addr, video_addr.port()).as_bytes())
+        .await?;
+    sock.flush().await?;
+
+    let payload = bytes::Bytes::from(vec![b'.'; VIDEO_SIZED_PAYLOAD]);
+    let mut pushed = 0usize;
+    loop {
+        if frame_tx.send(payload.clone()).await.is_err() {
+            return Ok(format!("pushed {pushed} frames before the frame sink closed"));
+        }
+        pushed += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The initiator half, run through camera-core's own receiving path.
+async fn role_client_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let sock = tokio::net::TcpStream::connect(control_addr()).await.context(
+        "could not reach the server process; start it with `... migration_spike server-prod`",
+    )?;
+    let mut lines = tokio::io::BufReader::new(sock).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .context("the server closed the control channel")?;
+    let mut parts = line.split_whitespace();
+    let proxy_addr: SocketAddr = parts.next().context("no proxy address")?.parse()?;
+    let video_port: u16 = parts.next().context("no video port")?.parse()?;
+    println!("client-prod: proxy={proxy_addr} video port={video_port}");
+
+    let client_leg = RelayLeg::start_dialing(reg, proxy_addr).await?;
+    let bridge = Bridge::start(loopback(video_port)).await?;
+    let (_observed_tx, observed_rx) = tokio::sync::watch::channel(Some(observed_for(client_leg.addr)?));
+
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(16);
+    let (path_tx, mut path_rx) = tokio::sync::mpsc::channel::<camera_core::PathEvent>(16);
+    let (migrate_tx, migrate_rx) = tokio::sync::mpsc::channel::<(SocketAddr, SocketAddr)>(4);
+    let shutdown = CancellationToken::new();
+    let port = bridge.front_addr.port();
+    let recv_reg = reg.clone();
+    let recv_shutdown = shutdown.clone();
+    let receiver = tokio::spawn(async move {
+        camera_core::receive_frames_with(
+            "127.0.0.1",
+            port,
+            frame_tx,
+            recv_shutdown,
+            camera_core::VideoRecvOptions {
+                registration: Some(recv_reg),
+                verify: false,
+                observed: Some(observed_rx),
+                path_events: Some(path_tx),
+                migrate: Some(migrate_rx),
+                rtt: None,
+            },
+        )
+        .await
+    });
+
+    let relay_frames = read_reported_frames(&mut frame_rx, 3)
+        .await
+        .context("no frames over the relay")?;
+
+    let mut relay_path = None;
+    let direct = tokio::time::timeout(PATH_VALIDATION_TIMEOUT, async {
+        while let Some(event) = path_rx.recv().await {
+            match event {
+                camera_core::PathEvent::Relay { local, remote } => relay_path = Some((local, remote)),
+                camera_core::PathEvent::DirectValidated { local, remote } => {
+                    return Some((local, remote))
+                }
+                camera_core::PathEvent::Activated { .. } => {}
+            }
+        }
+        None
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("{PATH_VALIDATION_TIMEOUT:?} 以内に DirectValidated が来ず"))?
+    .context("the path event channel closed before a direct path appeared")?;
+    println!("client-prod: direct path {} -> {}", direct.0, direct.1);
+
+    migrate_tx
+        .send(direct)
+        .await
+        .map_err(|_| anyhow::anyhow!("the receive task stopped before the switch"))?;
+    let direct_frames = read_reported_frames(&mut frame_rx, 3)
+        .await
+        .context("the migrated path carried no frames — this is the field symptom")?;
+
+    shutdown.cancel();
+    let _ = receiver.await;
+    bridge.stop();
+    Ok(format!(
+        "{relay_frames} frames over the relay ({:?}), then {direct_frames} more after \
+         migrating to the direct path ({} -> {})",
+        relay_path, direct.0, direct.1
+    ))
+}
+
+/// Take `count` frames off the channel `receive_frames_with` fills.
+async fn read_reported_frames(
+    rx: &mut tokio::sync::mpsc::Receiver<(u64, bytes::Bytes)>,
+    count: usize,
+) -> anyhow::Result<usize> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for _ in 0..count {
+            rx.recv().await.context("the frame channel closed")?;
+        }
+        anyhow::Ok(count)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for {count} frames"))?
+}
+
+/// Read `count` inbound frames, or give up.
+async fn read_frames(conn: &Connection, count: usize) -> anyhow::Result<usize> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for _ in 0..count {
+            let mut stream = conn.accept_inbound_uni_stream().await?;
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).await?;
+        }
+        anyhow::Ok(count)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for {count} frames"))?
 }
 
 /// Every check. Returns whether a required one failed.
@@ -168,7 +537,7 @@ async fn spike() -> anyhow::Result<bool> {
         "6a",
         Required::No,
         "リレー型トポロジで直接経路が PathValidated されるか (listener は現行の設定のまま)",
-        run(check_direct_path_migration(&reg, false, ClientBinding::PinnedToLeg)).await,
+        run(check_direct_path_migration(&reg, false, ClientBinding::PinnedToLeg, false, false)).await,
     );
     // The NAT-traversal listener variant builds its configuration by hand and
     // loads it from PEM files, which is the Unix credential path; probe it
@@ -182,7 +551,7 @@ async fn spike() -> anyhow::Result<bool> {
                 id,
                 Required::No,
                 question,
-                run(check_direct_path_migration(&reg, true, ClientBinding::PinnedToLeg)).await,
+                run(check_direct_path_migration(&reg, true, ClientBinding::PinnedToLeg, false, false)).await,
             );
         }
         Ok(None) => report.skip(
@@ -198,7 +567,7 @@ async fn spike() -> anyhow::Result<bool> {
         "7a",
         Required::No,
         "映像接続を pin せず、MASQUE レグの (L_c, O_c) を add_candidate_addr に渡すだけで直接経路が張れるか",
-        run(check_direct_path_migration(&reg, false, ClientBinding::Unpinned)).await,
+        run(check_direct_path_migration(&reg, false, ClientBinding::Unpinned, false, false)).await,
     );
     // The adopted design (案C). This is the check that gates the build.
     report.record(
@@ -209,6 +578,34 @@ async fn spike() -> anyhow::Result<bool> {
             &reg,
             false,
             ClientBinding::UnpinnedSharedLoopback,
+            false,
+            false,
+        ))
+        .await,
+    );
+    report.record(
+        "7c",
+        Required::No,
+        "同上 + 到達不能な観測アドレスも候補として広告した場合 (実アプリと同じ 2 候補構成)",
+        run(check_direct_path_migration(
+            &reg,
+            false,
+            ClientBinding::UnpinnedSharedLoopback,
+            true,
+            false,
+        ))
+        .await,
+    );
+    report.record(
+        "7d",
+        Required::No,
+        "検証済みの直接経路の相手が消えた後 (サーバのリレーレグ張り替え) に切り替えるとどうなるか",
+        run(check_direct_path_migration(
+            &reg,
+            false,
+            ClientBinding::UnpinnedSharedLoopback,
+            false,
+            true,
         ))
         .await,
     );
@@ -572,10 +969,20 @@ impl ClientBinding {
     }
 }
 
+/// A candidate that can never be reached (TEST-NET-3, RFC 5737).
+///
+/// Stands in for the *observed* address of a peer behind a NAT that does not
+/// hairpin: advertised, probed, and permanently dead. The real apps always
+/// advertise one of these alongside the host address, which the single-candidate
+/// checks above never reproduced.
+const UNREACHABLE: &str = "203.0.113.5";
+
 async fn check_direct_path_migration(
     reg: &Arc<Registration>,
     natt_listener: bool,
     binding: ClientBinding,
+    with_unreachable_candidate: bool,
+    drop_server_leg_before_activating: bool,
 ) -> anyhow::Result<String> {
     let mut listener = spawn_listener_variant(reg, loopback(0), natt_listener)
         .await?
@@ -599,6 +1006,11 @@ async fn check_direct_path_migration(
     // variants — that is the point.
     conn.add_candidate_addr(client_leg.addr, client_leg.addr)
         .context("add_candidate_addr with the relay leg's address")?;
+    if with_unreachable_candidate {
+        let dead: SocketAddr = format!("{UNREACHABLE}:{}", client_leg.addr.port()).parse()?;
+        conn.add_candidate_addr(client_leg.addr, dead)
+            .context("add_candidate_addr with an unreachable observed address")?;
+    }
     conn.start(&client_config(reg, true)?, "127.0.0.1", bridge.front_addr.port())
         .await
         .context("relay-path handshake")?;
@@ -608,6 +1020,12 @@ async fn check_direct_path_migration(
     // The server half of 案A: advertise the address the client should punch to.
     let bound = describe(accepted.add_bound_addr(server_leg.addr));
     let observed = describe(accepted.add_observed_addr(server_leg.addr, server_leg.addr));
+    let unreachable = if with_unreachable_candidate {
+        let dead: SocketAddr = format!("{UNREACHABLE}:{}", server_leg.addr.port()).parse()?;
+        describe(accepted.add_observed_addr(server_leg.addr, dead))
+    } else {
+        "n/a".to_owned()
+    };
 
     // Wait for NAT-traversal probing to validate anything but the relay path.
     let direct = tokio::time::timeout(PATH_VALIDATION_TIMEOUT, async {
@@ -628,24 +1046,41 @@ async fn check_direct_path_migration(
 
     // A run that never validates a direct path is a FAIL, not a PASS carrying
     // prose that says otherwise — the context below records what was in play.
+    let server_leg_addr = server_leg.addr;
     let context = format!(
-        "client={}, listener natt={natt_listener}; relay path {} -> {}; \
-         server leg {} / client leg {}; add_bound_addr {bound} / add_observed_addr {observed}",
+        "client={}, listener natt={natt_listener}, unreachable-candidate={with_unreachable_candidate}; \
+         relay path {} -> {}; server leg {} / client leg {}; \
+         add_bound_addr {bound} / add_observed_addr {observed} / unreachable {unreachable}",
         binding.label(),
         relay_path.0,
         relay_path.1,
-        server_leg.addr,
+        server_leg_addr,
         client_leg.addr
     );
+    // Reproduce a rebind: the server's relay leg is replaced, so the binding
+    // the client just validated a path to stops existing — while the client's
+    // notion of "the direct path" still points at it.
+    if drop_server_leg_before_activating {
+        drop(server_leg);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     let outcome = match direct {
         Ok(Ok(direct)) => {
             conn.activate_path(direct.0, direct.1)
                 .context("activate_path onto the validated direct path")?;
-            // Application data must keep flowing across the switch.
+            // Application data must keep flowing across the switch — a small
+            // frame first, then a video-sized one. A migrated path that carries
+            // the former but not the latter is exactly the failure reported
+            // from a Windows field test.
             round_trip(&accepted, &conn).await?;
+            let big = round_trip_sized(&accepted, &conn, VIDEO_SIZED_PAYLOAD)
+                .await
+                .context("the migrated path did not carry a video-sized frame")?;
             let now = (conn.get_local_addr()?, conn.get_remote_addr()?);
             format!(
-                "直接経路 {} -> {} が検証され、activate_path 後も往復成立 (現在の経路 {} -> {})",
+                "直接経路 {} -> {} が検証され、activate_path 後も往復成立 \
+                 (小フレーム + {big} バイト; 現在の経路 {} -> {})",
                 direct.0, direct.1, now.0, now.1
             )
         }
@@ -680,10 +1115,33 @@ async fn spawn_proxy_stand_in(reg: &Arc<Registration>) -> anyhow::Result<SpikeLi
 struct RelayLeg {
     addr: SocketAddr,
     _conn: Connection,
-    _peer: Connection,
+    /// The accepted side, when this process owns the peer listener.
+    _peer: Option<Connection>,
 }
 
 impl RelayLeg {
+    /// Like [`start`](Self::start) but dialing an address rather than a
+    /// listener this process owns — the two-process roles cannot accept on each
+    /// other's behalf. msquic completes the handshake without the peer calling
+    /// `accept`, so the leg comes up either way.
+    async fn start_dialing(reg: &Arc<Registration>, peer: SocketAddr) -> anyhow::Result<Self> {
+        let addr = probe_local_addr()?;
+        let conn = shared_binding_conn(reg, addr)?;
+        let peer_ip = peer.ip().to_string();
+        conn.start(&client_config(reg, false)?, &peer_ip, peer.port())
+            .await
+            .with_context(|| format!("relay-leg stand-in could not reach {peer} from {addr}"))?;
+        anyhow::ensure!(
+            conn.get_local_addr()? == addr,
+            "relay-leg stand-in landed on another address"
+        );
+        Ok(Self {
+            addr,
+            _conn: conn,
+            _peer: None,
+        })
+    }
+
     /// Bind a fresh real address and keep a connection to `peer` alive on it.
     async fn start(reg: &Arc<Registration>, peer: &mut SpikeListener) -> anyhow::Result<Self> {
         let addr = probe_local_addr()?;
@@ -704,7 +1162,7 @@ impl RelayLeg {
         Ok(Self {
             addr,
             _conn: conn,
-            _peer: accepted,
+            _peer: Some(accepted),
         })
     }
 }
@@ -746,10 +1204,28 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
     let alpn = [msquic::BufferRef::from(ALPN)];
     let settings = msquic::Settings::new()
         .set_IdleTimeoutMs(30_000)
-        .set_DestCidUpdateIdleTimeoutMs(0)
         .set_PeerUnidiStreamCount(100)
         .set_StreamMultiReceiveEnabled()
         .set_ReceiveObservedAddressReports();
+    // Two settings differ between this spike (which migrates everywhere) and
+    // camera-core's `video_client_config` (which does not, in the field). Knobs
+    // rather than a guess, so each can be ruled in or out on its own.
+    //
+    // SPIKE_MAX_MTU: the real config pins MaximumMtu to 1200 to fit inside the
+    // relay tunnel. msquic's default MinimumMtu is 1248, so that leaves the
+    // range inverted — and a freshly opened path has to size itself.
+    let settings = match std::env::var("SPIKE_MAX_MTU").ok().and_then(|v| v.parse().ok()) {
+        Some(mtu) => settings.set_MaximumMtu(mtu),
+        None => settings,
+    };
+    // SPIKE_PIN_DCID=0 drops it. Every other client config in this repo sets it,
+    // including Direct mode's; `video_client_config` is the one that does not.
+    // Migrating to a new path needs a spare destination connection ID.
+    let settings = if std::env::var("SPIKE_PIN_DCID").as_deref() == Ok("0") {
+        settings
+    } else {
+        settings.set_DestCidUpdateIdleTimeoutMs(0)
+    };
     let settings = if enable_natt {
         settings.set_AddAddressMode(msquic::AddAddressMode::NatTraversal)
     } else {
@@ -938,14 +1414,39 @@ impl Bridge {
     }
 }
 
+/// A camera JPEG at 640x480/q80 is tens of kilobytes, so a payload that fits in
+/// one QUIC packet proves nothing about a path that has to carry video. Checks
+/// that matter push this much instead.
+const VIDEO_SIZED_PAYLOAD: usize = 30_000;
+
 /// Push one unidirectional stream server -> client and read it back, proving
 /// the path carries application data. Returns the byte count.
 async fn round_trip(server: &Connection, client: &Connection) -> anyhow::Result<usize> {
-    const PAYLOAD: &[u8] = b"isekai-spike-frame";
+    round_trip_sized(server, client, b"isekai-spike-frame".len()).await
+}
+
+/// Send one frame of `size` bytes as a unidirectional stream.
+async fn push_frame(conn: &Connection, size: usize) -> anyhow::Result<()> {
+    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let mut out = conn
+        .open_outbound_stream(StreamType::Unidirectional, false)
+        .await?;
+    out.write_all(&payload).await?;
+    poll_fn(|cx| out.poll_finish_write(cx)).await?;
+    Ok(())
+}
+
+/// [`round_trip`] with an explicit payload size.
+async fn round_trip_sized(
+    server: &Connection,
+    client: &Connection,
+    size: usize,
+) -> anyhow::Result<usize> {
+    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
     let mut out = server
         .open_outbound_stream(StreamType::Unidirectional, false)
         .await?;
-    out.write_all(PAYLOAD).await?;
+    out.write_all(&payload).await?;
     poll_fn(|cx| out.poll_finish_write(cx)).await?;
 
     let mut inbound = tokio::time::timeout(
@@ -953,10 +1454,14 @@ async fn round_trip(server: &Connection, client: &Connection) -> anyhow::Result<
         client.accept_inbound_uni_stream(),
     )
     .await
-    .context("no inbound stream arrived on the active path")??;
+    .with_context(|| format!("no inbound stream of {size} bytes arrived on the active path"))??;
     let mut got = Vec::new();
     inbound.read_to_end(&mut got).await?;
-    anyhow::ensure!(got == PAYLOAD, "payload mismatch across the path");
+    anyhow::ensure!(
+        got == payload,
+        "payload mismatch across the path ({} of {size} bytes)",
+        got.len()
+    );
     Ok(got.len())
 }
 

@@ -73,6 +73,40 @@ jobs:
         run: cargo run -q -p camera-core --example migration_spike | tee "$RUNNER_TEMP/spike-report.md"
         shell: bash
 
+      # Two processes, and across the two settings that differ between this
+      # spike and camera-core's video_client_config. The field failure survives
+      # everything the single-process checks cover, so these are what is left.
+      - name: Run the two-process spike
+        run: |
+          set -uo pipefail
+          fail=0
+          run_case() {
+            local label="$1"; shift
+            local port="$1"; shift
+            local srv="$RUNNER_TEMP/spike-server-$port.log"
+            env "$@" SPIKE_CONTROL=127.0.0.1:$port \
+              cargo run -q -p camera-core --example migration_spike -- server > "$srv" 2>&1 &
+            for _ in $(seq 1 60); do
+              if grep -q 'waiting for the client' "$srv"; then break; fi
+              sleep 1
+            done
+            local out
+            out=$(env "$@" SPIKE_CONTROL=127.0.0.1:$port \
+              cargo run -q -p camera-core --example migration_spike -- client 2>/dev/null \
+              | grep -E '^(PASS|FAIL)' | head -1)
+            if [ -z "$out" ]; then
+              out="<no client output; server tail: $(tail -1 "$srv")>"
+            fi
+            echo "$label -> $out"
+            case "$out" in PASS*) ;; *) fail=1 ;; esac
+          }
+          run_case 'two-process baseline            ' 57701 DUMMY=1
+          run_case 'two-process MaximumMtu=1200     ' 57702 SPIKE_MAX_MTU=1200
+          run_case 'two-process no DestCidUpdate    ' 57703 SPIKE_PIN_DCID=0
+          run_case 'two-process = video_client_config' 57704 SPIKE_MAX_MTU=1200 SPIKE_PIN_DCID=0
+          exit $fail
+        shell: bash
+
       # The example prints its report as a Markdown table, so it renders as-is.
       - name: Publish the report to the job summary
         if: always()
