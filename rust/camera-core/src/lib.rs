@@ -17,7 +17,8 @@ pub mod video;
 
 pub use server::{spawn_p2p_server, ServerCommand, ServerHandle, ServerInfo};
 pub use video::{
-    bind_video_listener, receive_frames, serve_frames, serve_frames_with, ServeOptions, VIDEO_ALPN,
+    bind_video_listener, receive_frames, receive_frames_with, serve_frames, serve_frames_with,
+    PathEvent, ServeOptions, VideoRecvOptions, VIDEO_ALPN,
 };
 
 /// Re-exports of the P2P types the camera apps build on.

@@ -4,13 +4,13 @@
 //! one (legacy) or the P2P relay's loopback address.
 
 use std::future::poll_fn;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Bytes;
-use msquic_async::{msquic, Connection, Listener, Registration, StreamType};
+use msquic_async::{msquic, Connection, ConnectionEvent, Listener, Registration, StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
@@ -29,6 +29,12 @@ pub const VIDEO_ALPN: &str = "sample";
 const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(120);
 /// Delay between video handshake attempts.
 const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// How long to wait for the relay leg's observed address before dialing without
+/// it. The report normally lands within a round trip of the leg coming up; if
+/// it does not, streaming over the relay matters more than a direct path.
+const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
+/// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
+const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Bind a video QUIC listener on `addr`.
 ///
@@ -210,6 +216,14 @@ fn apply_direct_path(conn: &Connection, address: ObservedAddress) {
         );
         return;
     }
+    // Advertise the host address too — see the note in `prepare_for_migration`:
+    // a peer on the same LAN can only reach us there, because a NAT that does
+    // not hairpin drops packets sent from inside to its own public address.
+    if address.local != address.observed {
+        if let Err(e) = conn.add_observed_addr(address.local, address.local) {
+            tracing::debug!("could not advertise the host address: {e}");
+        }
+    }
     tracing::info!(
         local = %address.local,
         observed = %address.observed,
@@ -235,6 +249,46 @@ async fn push_one(conn: &Connection, frame: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What happened to the video connection's path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathEvent {
+    /// The path the connection established on — over the relay.
+    Relay { local: SocketAddr, remote: SocketAddr },
+    /// A path other than the relay one has been validated: the peers punched a
+    /// direct route and [`migrate`](VideoRecvOptions::migrate) can switch to it.
+    DirectValidated { local: SocketAddr, remote: SocketAddr },
+    /// `activate_path` succeeded and this is now the active path.
+    Activated { local: SocketAddr, remote: SocketAddr },
+}
+
+/// How [`receive_frames_with`] connects and what it reports back. Default is
+/// the plain relay-only behaviour [`receive_frames`] has always had.
+#[derive(Default)]
+pub struct VideoRecvOptions {
+    /// Reuse an existing msquic registration instead of opening one.
+    ///
+    /// Must be the same registration as the relay leg's when migration is
+    /// wanted: msquic looks bindings up per registration.
+    pub registration: Option<Arc<Registration>>,
+    /// Validate the peer's certificate against the dialed name. Off is dev-only
+    /// (the self-signed [`dev_cert`]).
+    pub verify: bool,
+    /// How the proxy sees this session's relay connect leg
+    /// ([`InitiatorSession::observed_address`](isekai_p2p::InitiatorSession::observed_address)).
+    ///
+    /// When set, that pair is offered as a direct-path candidate before the
+    /// handshake, and the connection is put on a shared, unconnected socket so
+    /// the path can actually be opened. Without it the connection is relay-only.
+    pub observed: Option<ObservedAddressWatch>,
+    /// Where to report path changes.
+    pub path_events: Option<mpsc::Sender<PathEvent>>,
+    /// Requests to switch to a `(local, remote)` path — the pair from a
+    /// [`PathEvent`].
+    pub migrate: Option<mpsc::Receiver<(SocketAddr, SocketAddr)>>,
+    /// Where to report RTT samples, in milliseconds, once a second.
+    pub rtt: Option<mpsc::Sender<f64>>,
+}
+
 /// Dial a video QUIC connection at `host:port` and deliver inbound frames —
 /// tagged with the stream id as a monotonically increasing sequence — to
 /// `frame_tx`. Runs until `shutdown` fires or the connection ends.
@@ -251,11 +305,110 @@ pub async fn receive_frames(
     frame_tx: mpsc::Sender<(u64, Bytes)>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let (reg, config) = video_client_config(reg, verify)?;
-    let conn = dial_video(&reg, &config, host, port, &shutdown).await?;
+    receive_frames_with(
+        host,
+        port,
+        frame_tx,
+        shutdown,
+        VideoRecvOptions {
+            registration: reg,
+            verify,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// [`receive_frames`] with path migration wired in.
+///
+/// With [`VideoRecvOptions::observed`] set, the connection is put on a shared,
+/// unconnected socket pinned to *loopback* and the relay leg's address is
+/// offered as a candidate before the handshake. The connection therefore keeps
+/// talking to the loopback relay bridge as it always did, while the peers punch
+/// a direct path between their two relay legs' real addresses — which is what
+/// makes this work on Windows, where a socket bound to a real interface address
+/// cannot reach `127.0.0.1` at all (`docs/p2p_mode_migration_plan.md` §2.2.3).
+pub async fn receive_frames_with(
+    host: &str,
+    port: u16,
+    frame_tx: mpsc::Sender<(u64, Bytes)>,
+    shutdown: CancellationToken,
+    opts: VideoRecvOptions,
+) -> anyhow::Result<()> {
+    let VideoRecvOptions {
+        registration,
+        verify,
+        observed,
+        path_events,
+        mut migrate,
+        rtt,
+    } = opts;
+
+    // Wait for the candidate before dialing: `add_candidate_addr` has to be in
+    // place before `start`, and a handshake here can take a minute (it rides
+    // across the peer's relay-bind gap), so there is no useful "add it later".
+    let candidate = match observed {
+        Some(watch) => wait_for_observed(watch, &shutdown).await,
+        None => None,
+    };
+
+    let (reg, config) = video_client_config(registration, verify, candidate.is_some())?;
+    let conn = dial_video(&reg, &config, host, port, candidate, &shutdown).await?;
+
+    let relay_path = (conn.get_local_addr()?, conn.get_remote_addr()?);
+    report_path(
+        &path_events,
+        PathEvent::Relay {
+            local: relay_path.0,
+            remote: relay_path.1,
+        },
+    )
+    .await;
+
+    let mut rtt_interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = rtt_interval.tick(), if rtt.is_some() => {
+                match conn.get_stats() {
+                    // Rtt is reported in microseconds.
+                    Ok(stats) => {
+                        if let Some(rtt) = &rtt {
+                            let _ = rtt.try_send(stats.Rtt as f64 / 1000.0);
+                        }
+                    }
+                    Err(e) => tracing::debug!("could not read connection stats: {e}"),
+                }
+            }
+            event = poll_fn(|cx| conn.poll_event(cx)) => match event {
+                Ok(ConnectionEvent::PathValidated { local_address, remote_address }) => {
+                    // Anything but the path we started on is the direct one.
+                    if (local_address, remote_address) != relay_path {
+                        report_path(&path_events, PathEvent::DirectValidated {
+                            local: local_address,
+                            remote: remote_address,
+                        }).await;
+                    }
+                }
+                Ok(other) => tracing::debug!("video connection event: {other:?}"),
+                Err(e) => {
+                    tracing::debug!("video connection event stream ended: {e}");
+                    break;
+                }
+            },
+            request = async { migrate.as_mut().unwrap().recv().await }, if migrate.is_some() => {
+                match request {
+                    Some((local, remote)) => match conn.activate_path(local, remote) {
+                        Ok(()) => {
+                            tracing::info!(%local, %remote, "activated path");
+                            report_path(&path_events, PathEvent::Activated { local, remote }).await;
+                        }
+                        Err(e) => tracing::warn!(%local, %remote, "could not activate path: {e}"),
+                    },
+                    // The requester is gone; stop polling but keep streaming.
+                    None => migrate = None,
+                }
+            }
             stream = conn.accept_inbound_uni_stream() => {
                 let mut stream = stream?;
                 let seq = stream.id().unwrap_or(0);
@@ -267,6 +420,53 @@ pub async fn receive_frames(
         }
     }
     Ok(())
+}
+
+async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent) {
+    tracing::info!("video path: {event:?}");
+    if let Some(events) = events {
+        let _ = events.send(event).await;
+    }
+}
+
+/// Wait briefly for the relay leg's observed address.
+///
+/// `None` means carry on relay-only: a missing report is a lost optimisation,
+/// not a failure, and blocking the stream on it would be the wrong trade.
+async fn wait_for_observed(
+    mut watch: ObservedAddressWatch,
+    shutdown: &CancellationToken,
+) -> Option<ObservedAddress> {
+    if let Some(address) = *watch.borrow_and_update() {
+        return Some(address);
+    }
+    let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return None,
+                changed = watch.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    if let Some(address) = *watch.borrow_and_update() {
+                        return Some(address);
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    match waited {
+        Ok(Some(address)) => Some(address),
+        Ok(None) => None,
+        Err(_) => {
+            tracing::warn!(
+                "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
+                 streaming over the relay without a direct-path candidate",
+            );
+            None
+        }
+    }
 }
 
 /// Dial the video QUIC, letting a single handshake ride across the peer's
@@ -293,6 +493,7 @@ async fn dial_video(
     config: &msquic::Configuration,
     host: &str,
     port: u16,
+    candidate: Option<ObservedAddress>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Connection> {
     let deadline = Instant::now() + VIDEO_CONNECT_DEADLINE;
@@ -300,6 +501,11 @@ async fn dial_video(
     loop {
         attempt += 1;
         let conn = Connection::new(reg)?;
+        // Every attempt builds a fresh connection, so the migration setup has
+        // to be redone on each one.
+        if let Some(candidate) = candidate {
+            prepare_for_migration(&conn, candidate)?;
+        }
         let result = tokio::select! {
             _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
             r = conn.start(config, host, port) => r,
@@ -328,6 +534,45 @@ async fn dial_video(
     }
 }
 
+/// Put a video connection on a shared, unconnected socket and offer the relay
+/// leg's address as a direct-path candidate. Must run before `start`.
+///
+/// The order is fixed: `set_unconnected_socket` requires a shared binding, and
+/// an unconnected socket requires a specific — non-wildcard — local address.
+/// That address is deliberately **loopback**: this connection's own traffic
+/// goes to the relay bridge on `127.0.0.1`, and pinning it to a real interface
+/// address instead cannot work on Windows at all. The direct path does not need
+/// it, because `add_candidate_addr` accepts an address that is not bound here
+/// yet — msquic opens the path from the relay leg's binding once the peer's
+/// ADD_ADDRESS arrives (`docs/p2p_mode_migration_plan.md` §2.2.3).
+fn prepare_for_migration(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
+    conn.set_share_binding(true)
+        .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
+    conn.set_unconnected_socket(true)
+        .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
+    conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
+    conn.add_candidate_addr(candidate.local, candidate.observed)
+        .map_err(|e| anyhow::anyhow!("could not offer a direct-path candidate: {e}"))?;
+    // Also offer the host address itself. A peer on the same LAN can reach it
+    // directly, while the observed one is only reachable from outside the NAT —
+    // and a NAT that does not hairpin (most of them) drops a packet sent from
+    // inside to its own public address, so without this two peers behind the
+    // same NAT can never find each other. Across the internet this candidate
+    // simply fails to validate and the observed one wins.
+    if candidate.local != candidate.observed {
+        if let Err(e) = conn.add_candidate_addr(candidate.local, candidate.local) {
+            tracing::debug!("could not offer the host candidate: {e}");
+        }
+    }
+    tracing::info!(
+        local = %candidate.local,
+        observed = %candidate.observed,
+        "offered direct-path candidates to the video server",
+    );
+    Ok(())
+}
+
 /// Video client config: ALPN `sample`. With `verify` the peer's certificate is
 /// validated against the dialed server name (the per-endpoint relay cert);
 /// without it validation is **disabled** — dev only, for the self-signed
@@ -335,16 +580,14 @@ async fn dial_video(
 fn video_client_config(
     reg: Option<Arc<Registration>>,
     verify: bool,
+    enable_migration: bool,
 ) -> anyhow::Result<(Arc<Registration>, msquic::Configuration)> {
     let reg = match reg {
         Some(reg) => reg,
         None => Arc::new(Registration::new(&msquic::RegistrationConfig::default())?),
     };
     let alpn = [msquic::BufferRef::from(VIDEO_ALPN)];
-    let config = reg.open_configuration(
-        &alpn,
-        Some(
-            &msquic::Settings::new()
+    let settings = msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
                 // Keep a single unanswered handshake alive long enough to span
                 // the peer's relay-bind gap: msquic keeps retransmitting the
@@ -358,9 +601,18 @@ fn video_client_config(
                 // packets overflow the tunnel and are dropped as `TooLarge`.
                 .set_MaximumMtu(1200)
                 .set_PeerUnidiStreamCount(100)
-                .set_StreamMultiReceiveEnabled(),
-        ),
-    )?;
+                .set_StreamMultiReceiveEnabled();
+    // NAT-traversal mode is what makes the peer probe our candidate address and
+    // report a `PathValidated` for the direct path; the observed-address reports
+    // are the other half of the exchange.
+    let settings = if enable_migration {
+        settings
+            .set_ReceiveObservedAddressReports()
+            .set_AddAddressMode(msquic::AddAddressMode::NatTraversal)
+    } else {
+        settings
+    };
+    let config = reg.open_configuration(&alpn, Some(&settings))?;
     let mut cred = msquic::CredentialConfig::new_client();
     if !verify {
         cred = cred.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
