@@ -352,7 +352,7 @@ async fn role_client_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
 
     let client_leg = RelayLeg::start_dialing(reg, proxy_addr).await?;
     let bridge = Bridge::start(loopback(video_port)).await?;
-    let (_observed_tx, observed_rx) = tokio::sync::watch::channel(Some(observed_for(client_leg.addr)?));
+    let candidate = observed_for(client_leg.addr)?;
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(16);
     let (path_tx, mut path_rx) = tokio::sync::mpsc::channel::<camera_core::PathEvent>(16);
@@ -370,7 +370,7 @@ async fn role_client_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
             camera_core::VideoRecvOptions {
                 registration: Some(recv_reg),
                 verify: false,
-                observed: Some(observed_rx),
+                candidate: Some(candidate),
                 path_events: Some(path_tx),
                 migrate: Some(migrate_rx),
                 rtt: None,

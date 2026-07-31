@@ -22,6 +22,7 @@ pub mod initiator;
 pub mod listener;
 
 pub use config::{fetch_relay_certificate, issue_endpoint_token, load_or_generate_key, P2pConfig};
+pub use config::probe_direct_path_address;
 pub use initiator::InitiatorSession;
 pub use listener::ListenerSession;
 

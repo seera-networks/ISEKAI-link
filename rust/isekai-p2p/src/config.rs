@@ -98,6 +98,20 @@ pub async fn fetch_relay_certificate(
     Ok(proxy.get_certificate().await?)
 }
 
+/// Learn a NAT mapping for a binding that is then left free, for use as a
+/// direct-path candidate.
+///
+/// See [`isekai_p2p_core::observed::probe_observed_address`]: the point is that
+/// the returned address belongs to nothing once this returns, so msquic can
+/// open the direct path on a binding of its own rather than share the live
+/// relay leg's — which does not work.
+pub async fn probe_direct_path_address(
+    cfg: &P2pConfig,
+    registration: Option<std::sync::Arc<isekai_p2p_core::observed::Registration>>,
+) -> anyhow::Result<isekai_p2p_core::observed::ObservedAddress> {
+    isekai_p2p_core::observed::probe_observed_address(&cfg.proxy_url, registration).await
+}
+
 async fn issue<T: ControlPlaneTransport>(
     client: &IdentityClient<T>,
     cfg: &P2pConfig,

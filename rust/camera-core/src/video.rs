@@ -29,10 +29,6 @@ pub const VIDEO_ALPN: &str = "sample";
 const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(120);
 /// Delay between video handshake attempts.
 const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
-/// How long to wait for the relay leg's observed address before dialing without
-/// it. The report normally lands within a round trip of the leg coming up; if
-/// it does not, streaming over the relay matters more than a direct path.
-const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a migrated path may carry nothing before falling back to the relay.
@@ -301,13 +297,17 @@ pub struct VideoRecvOptions {
     /// Validate the peer's certificate against the dialed name. Off is dev-only
     /// (the self-signed [`dev_cert`]).
     pub verify: bool,
-    /// How the proxy sees this session's relay connect leg
-    /// ([`InitiatorSession::observed_address`](isekai_p2p::InitiatorSession::observed_address)).
+    /// An address to offer as a direct-path candidate, with the NAT mapping the
+    /// proxy observed for it.
     ///
-    /// When set, that pair is offered as a direct-path candidate before the
-    /// handshake, and the connection is put on a shared, unconnected socket so
-    /// the path can actually be opened. Without it the connection is relay-only.
-    pub observed: Option<ObservedAddressWatch>,
+    /// This must be an address **nothing currently holds** — see
+    /// [`probe_direct_path_address`](isekai_p2p::probe_direct_path_address). A
+    /// path opened on a binding a live MASQUE leg is using validates and then
+    /// carries no data (`docs/p2p_mode_migration_plan.md` §2.2.5), so passing
+    /// the leg's own address here is exactly what not to do.
+    ///
+    /// Without it the connection is relay-only.
+    pub candidate: Option<ObservedAddress>,
     /// Where to report path changes.
     pub path_events: Option<mpsc::Sender<PathEvent>>,
     /// Requests to switch to a `(local, remote)` path — the pair from a
@@ -366,31 +366,24 @@ pub async fn receive_frames_with(
     let VideoRecvOptions {
         registration,
         verify,
-        observed,
+        candidate,
         path_events,
         mut migrate,
         rtt,
     } = opts;
 
-    // Wait for the candidate before dialing: `add_candidate_addr` has to be in
-    // place before `start`, and a handshake here can take a minute (it rides
-    // across the peer's relay-bind gap), so there is no useful "add it later".
-    let candidate = match observed {
-        // ISEKAI_MIGRATION_NO_CANDIDATE stops this side offering the relay
-        // leg's binding as a candidate, so the connection never shares it.
-        // msquic can still find a direct path on its own from the addresses the
-        // peer advertises — and when it does, it opens a binding of its own for
-        // it. That is the difference under test: whether a path *on the relay
-        // leg's binding* is the thing that carries no data.
+    // ISEKAI_MIGRATION_NO_CANDIDATE drops the candidate entirely, leaving any
+    // direct path to whatever msquic finds from the peer's advertisement alone.
+    // Kept as an escape hatch: it is what first showed that a path on a binding
+    // msquic opens for itself works where one on the relay leg's does not.
+    let candidate = match candidate {
         Some(_) if std::env::var_os("ISEKAI_MIGRATION_NO_CANDIDATE").is_some() => {
             tracing::warn!(
-                "ISEKAI_MIGRATION_NO_CANDIDATE set: not offering a direct-path candidate; \
-                 any direct path will be one msquic opens for itself",
+                "ISEKAI_MIGRATION_NO_CANDIDATE set: not offering a direct-path candidate",
             );
             None
         }
-        Some(watch) => wait_for_observed(watch, &shutdown).await,
-        None => None,
+        other => other,
     };
 
     let (reg, config) = video_client_config(registration, verify, candidate.is_some())?;
@@ -538,46 +531,6 @@ async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent)
     tracing::info!("video path: {event:?}");
     if let Some(events) = events {
         let _ = events.send(event).await;
-    }
-}
-
-/// Wait briefly for the relay leg's observed address.
-///
-/// `None` means carry on relay-only: a missing report is a lost optimisation,
-/// not a failure, and blocking the stream on it would be the wrong trade.
-async fn wait_for_observed(
-    mut watch: ObservedAddressWatch,
-    shutdown: &CancellationToken,
-) -> Option<ObservedAddress> {
-    if let Some(address) = *watch.borrow_and_update() {
-        return Some(address);
-    }
-    let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return None,
-                changed = watch.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                    if let Some(address) = *watch.borrow_and_update() {
-                        return Some(address);
-                    }
-                }
-            }
-        }
-    })
-    .await;
-    match waited {
-        Ok(Some(address)) => Some(address),
-        Ok(None) => None,
-        Err(_) => {
-            tracing::warn!(
-                "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
-                 streaming over the relay without a direct-path candidate",
-            );
-            None
-        }
     }
 }
 

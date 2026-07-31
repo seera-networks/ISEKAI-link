@@ -459,7 +459,19 @@ impl MyApp {
             // that gap (the server may bind seconds later, when a human pastes
             // the connection id), so dialing now is safe. The `session` stays
             // alive to hold the relay leg.
-            let observed = session.observed_address();
+            // Probe the proxy for an address and release it, rather than
+            // naming the live relay leg's binding: a direct path opened on that
+            // binding validates and then carries nothing. Failing to probe only
+            // costs the direct path, so keep streaming over the relay.
+            let candidate = match camera_core::probe_direct_path_address(&cfg, Some(Arc::clone(&reg)))
+                .await
+            {
+                Ok(candidate) => Some(candidate),
+                Err(e) => {
+                    tracing::warn!("no direct-path candidate ({e:#}); staying relay-only");
+                    None
+                }
+            };
             if let Err(e) = camera_core::receive_frames_with(
                 &video_host,
                 local_port,
@@ -468,7 +480,7 @@ impl MyApp {
                 VideoRecvOptions {
                     registration: Some(reg),
                     verify,
-                    observed: Some(observed),
+                    candidate,
                     path_events: Some(path_tx),
                     migrate: Some(migrate_rx),
                     rtt: Some(rtt_tx),
