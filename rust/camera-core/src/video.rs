@@ -611,12 +611,23 @@ async fn dial_video(
 /// yet — msquic opens the path from the relay leg's binding once the peer's
 /// ADD_ADDRESS arrives (`docs/p2p_mode_migration_plan.md` §2.2.3).
 fn prepare_for_migration(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
-    conn.set_share_binding(true)
-        .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
-    conn.set_unconnected_socket(true)
-        .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
-    conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
+    // ISEKAI_MIGRATION_PLAIN offers the candidate without putting this
+    // connection on a shared, unconnected socket.
+    //
+    // Those three calls are what separates the configuration that fails on
+    // Windows from the one that works: with no candidate at all — and so none
+    // of this setup — msquic finds the peer's advertised address on its own and
+    // the path carries data. The knob isolates the setup from the candidate.
+    if std::env::var_os("ISEKAI_MIGRATION_PLAIN").is_none() {
+        conn.set_share_binding(true)
+            .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
+        conn.set_unconnected_socket(true)
+            .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
+        conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
+    } else {
+        tracing::warn!("ISEKAI_MIGRATION_PLAIN set: offering a candidate on a plain socket");
+    }
     conn.add_candidate_addr(candidate.local, candidate.observed)
         .map_err(|e| anyhow::anyhow!("could not offer a direct-path candidate: {e}"))?;
     // Also offer the host address itself. A peer on the same LAN can reach it
