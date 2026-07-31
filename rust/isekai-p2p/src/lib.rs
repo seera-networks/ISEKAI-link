@@ -34,5 +34,5 @@ pub mod agent {
     pub use isekai_p2p_core::proxy::{
         Candidate, CandidateType, Capability, CertBundle, PeerConnection,
     };
-    pub use isekai_p2p_core::transport::shutdown_msquic;
+    pub use isekai_p2p_core::transport::{drain_msquic, shutdown_msquic};
 }

@@ -17,7 +17,7 @@ pub mod tls;
 pub mod video;
 
 pub use server::{spawn_p2p_server, ServerCommand, ServerHandle, ServerInfo};
-pub use shutdown::{drain_registration, shutdown_msquic_stack};
+pub use shutdown::{drain_registration, shutdown_and_exit};
 pub use video::{
     bind_video_listener, receive_frames, receive_frames_with, serve_frames, serve_frames_with,
     PathEvent, ServeOptions, VideoRecvOptions, VIDEO_ALPN,

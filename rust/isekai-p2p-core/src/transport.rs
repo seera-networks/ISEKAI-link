@@ -135,6 +135,37 @@ fn shared_registration() -> anyhow::Result<Arc<msquic_async::Registration>> {
 /// On timeout the registration is deliberately **leaked** rather than dropped:
 /// something still holds a handle, so `RegistrationClose` would block forever,
 /// and the caller is expected to fall back to a hard exit.
+/// Drain the registration without closing it, for a caller that is about to
+/// leave the process without running destructors.
+///
+/// [`shutdown_msquic`] drops the registration once it drains, which runs
+/// `RegistrationClose`. That is still a *blocking* call, and `wait_idle()` does
+/// not cover application-owned client `Configuration`s — one outstanding
+/// anywhere and the close waits on its rundown reference, uninterruptibly and
+/// after the timeout has already been satisfied. On an exit path there is
+/// nothing to gain from closing, so this never does.
+///
+/// Returns whether every connection and listener closed within `timeout`.
+pub async fn drain_msquic(timeout: Duration) -> bool {
+    let registration = REGISTRATION
+        .lock()
+        .expect("registration mutex poisoned")
+        .take();
+    let Some(registration) = registration else {
+        // No msquic work happened this run.
+        return true;
+    };
+    registration.shutdown();
+    let drained = tokio::time::timeout(timeout, registration.wait_idle())
+        .await
+        .is_ok();
+    if !drained {
+        tracing::warn!(?timeout, "msquic registration still has live handles");
+    }
+    std::mem::forget(registration);
+    drained
+}
+
 pub async fn shutdown_msquic(timeout: Duration) -> bool {
     let registration = REGISTRATION
         .lock()

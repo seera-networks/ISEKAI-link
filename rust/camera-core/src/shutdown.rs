@@ -14,54 +14,69 @@
 //! See `docs/registration-wait-idle-design.md` in the `msquic-async-rs`
 //! submodule for the full contract.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use msquic_async::Registration;
 
-/// Ask `reg` to shut down, wait until nothing holds it, and drop it.
+/// Ask `reg` to shut down and wait until no connection or listener holds it.
 ///
-/// Returns whether it drained within `timeout`. On timeout the registration is
-/// deliberately **leaked** rather than dropped: something still holds a handle,
-/// so dropping it would hang, and the caller is expected to leave the process
-/// without running destructors.
+/// Takes a reference and never touches ownership: **closing the registration is
+/// the caller's problem, and on an exit path the answer is not to.** `wait_idle`
+/// does not cover application-owned client `Configuration`s (see §7 of the
+/// design) — one outstanding anywhere and `RegistrationClose` waits on its
+/// rundown reference, uninterruptibly, after the timeout has already been
+/// satisfied. That is a hang no timeout can save you from, and there is nothing
+/// to gain from closing a registration in a process that is about to exit.
+///
+/// The wait is still worth doing: it gives msquic time to send
+/// CONNECTION_CLOSE, so peers learn immediately instead of timing out.
 ///
 /// Cancel whatever owns the connections and listeners *before* calling this —
 /// `wait_idle()` waits for them to be dropped, it does not cause it.
-pub async fn drain_registration(reg: Arc<Registration>, timeout: Duration) -> bool {
+///
+/// Returns whether everything closed within `timeout`.
+pub async fn drain_registration(reg: &Registration, timeout: Duration) -> bool {
     reg.shutdown();
-    match tokio::time::timeout(timeout, reg.wait_idle()).await {
-        Ok(()) => {
-            // Last reference (the caller's tasks are gone by now), so this
-            // runs RegistrationClose with nothing left for it to wait on.
-            drop(reg);
-            true
-        }
-        Err(_) => {
-            tracing::warn!(
-                ?timeout,
-                "msquic registration still has live handles; leaking it rather than blocking",
-            );
-            std::mem::forget(reg);
-            false
-        }
+    let drained = tokio::time::timeout(timeout, reg.wait_idle()).await.is_ok();
+    if !drained {
+        tracing::warn!(?timeout, "msquic registration still has live handles");
     }
+    drained
 }
 
-/// Wind down both registrations a camera app runs on.
+/// Wind down both registrations a camera app runs on, then leave the process.
 ///
 /// There are two: the application's own, which carries the video listener or
 /// connection and the relay legs, and `isekai-p2p-core`'s shared one, which the
 /// P2P control-plane transports open for themselves. Draining one and not the
-/// other still hangs.
+/// other still leaves handles open.
 ///
-/// Returns whether both drained. A `false` means the caller should exit without
-/// running destructors.
-pub async fn shutdown_msquic_stack(app: Arc<Registration>, timeout: Duration) -> bool {
-    // Order does not matter — they are independent — but both must happen.
-    let core = isekai_p2p::agent::shutdown_msquic(timeout).await;
-    let app = drain_registration(app, timeout).await;
-    core && app
+/// **Never returns.** Exits via `_exit(2)`, skipping atexit handlers and C++
+/// static destructors — which is the point: returning would drop the tokio
+/// runtime and then the registrations, and `RegistrationClose` blocks on any
+/// `Configuration` still outstanding no matter how long the drain waited. That
+/// is the hang this exists to remove, and nothing after this point needs to
+/// run. `stdout` and `stderr` are flushed first.
+pub async fn shutdown_and_exit(app: &Registration, timeout: Duration, code: i32) -> ! {
+    // Independent of each other, but both must happen. Logged step by step:
+    // if a future version ever stops here, the last line printed says which
+    // registration it stopped on.
+    tracing::debug!("draining msquic before exit");
+    let core = isekai_p2p::agent::drain_msquic(timeout).await;
+    tracing::debug!(drained = core, "control-plane registration done");
+    let own = drain_registration(app, timeout).await;
+    tracing::debug!(drained = own, "application registration done");
+
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe { libc_exit(code) }
+}
+
+// Raw libc `_exit`: terminate now, running nothing on the way out.
+unsafe extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
 }
 
 #[cfg(test)]
@@ -69,8 +84,8 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
-    fn registration() -> Arc<Registration> {
-        Arc::new(
+    fn registration() -> std::sync::Arc<Registration> {
+        std::sync::Arc::new(
             Registration::new(&msquic_async::msquic::RegistrationConfig::default())
                 .expect("open a registration"),
         )
@@ -79,7 +94,7 @@ mod tests {
     /// Nothing was ever opened, so there is nothing to wait for.
     #[tokio::test]
     async fn an_idle_registration_drains_immediately() {
-        assert!(drain_registration(registration(), Duration::from_secs(5)).await);
+        assert!(drain_registration(&registration(), Duration::from_secs(5)).await);
     }
 
     // The timeout branch is deliberately not tested: exercising it means
@@ -97,7 +112,7 @@ mod tests {
         let (reg, listener, _bound) = crate::bind_video_listener(Some(reg), addr, None)
             .expect("bind the video listener");
         drop(listener);
-        assert!(drain_registration(reg, Duration::from_secs(5)).await);
+        assert!(drain_registration(&reg, Duration::from_secs(5)).await);
     }
 
 }

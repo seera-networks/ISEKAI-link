@@ -347,31 +347,18 @@ async fn main() -> eframe::Result<()> {
     tracing::debug!("camera task finished");
 
     // `run_native` has returned, so the app — and with it the listener and any
-    // relay session it was running — is dropped. Draining msquic before leaving
-    // `main` is what makes the process actually exit: dropping the registration
-    // with a handle still open blocks in `RegistrationClose` forever.
-    if !camera_core::shutdown_msquic_stack(reg, MSQUIC_DRAIN_TIMEOUT).await {
-        // Something is still holding a handle. Returning would drop the tokio
-        // runtime and msquic's statics into that state and hang or abort, so
-        // leave without running destructors — there is nothing left to save.
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-        unsafe { libc_exit(if res.is_ok() { 0 } else { 1 }) }
+    // relay session it was running — is dropped. Give msquic a moment to close
+    // what those tasks held, then leave without running destructors: returning
+    // would drop the registration, and `RegistrationClose` blocks on anything
+    // still open.
+    if let Err(e) = &res {
+        tracing::error!("camera server exited with an error: {e}");
     }
-    res
+    camera_core::shutdown_and_exit(&reg, MSQUIC_DRAIN_TIMEOUT, i32::from(res.is_err())).await
 }
 
-/// How long to wait for msquic handles to close before exiting hard.
+/// How long to wait for msquic handles to close before leaving anyway.
 const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-// Raw libc `_exit`: terminate now, skipping atexit handlers and C++ static
-// destructors. Only reached when the drain timed out, where running them would
-// race msquic's still-live worker threads.
-unsafe extern "C" {
-    #[link_name = "_exit"]
-    fn libc_exit(code: i32) -> !;
-}
 
 /// How the camera stream reaches clients.
 #[derive(PartialEq, Eq, Clone, Copy)]
