@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use camera_core::{P2pConfig, ServerCommand, ServerInfo};
+use camera_core::{ObservedAddressWatch, P2pConfig, ServerCommand, ServerInfo};
 use eframe::egui;
 use http::Uri;
 use isekai_link_utils::{
@@ -360,6 +360,10 @@ struct P2pShared {
     info: Option<ServerInfo>,
     capability: Option<String>,
     status: String,
+    /// How the proxy sees our relay bind leg. This is the address advertised to
+    /// each video client as a direct path, so showing it makes a migration that
+    /// never happens diagnosable: empty means the leg has not reported yet.
+    observed: Option<ObservedAddressWatch>,
 }
 
 struct MyApp {
@@ -529,6 +533,7 @@ impl MyApp {
                             server.info.listener_id, server.info.endpoint_id
                         );
                         s.info = Some(server.info);
+                        s.observed = Some(server.observed);
                     }
                     *cmd_holder.lock().unwrap() = Some(server.commands);
                 }
@@ -637,17 +642,29 @@ impl MyApp {
     }
 
     fn p2p_status_ui(&mut self, ui: &mut egui::Ui) {
-        let (status, info, capability) = {
+        let (status, info, capability, observed) = {
             let shared = self.p2p_shared.lock().unwrap();
             (
                 shared.status.clone(),
                 shared.info.clone(),
                 shared.capability.clone(),
+                // Read through the watch while the lock is held; the value is a
+                // pair of addresses, so copying it out is cheap.
+                shared.observed.as_ref().and_then(|w| *w.borrow()),
             )
         };
         if !status.is_empty() {
             ui.label(format!("P2P: {status}"));
         }
+        ui.horizontal(|ui| {
+            ui.label("Direct path offered:");
+            match observed {
+                Some(address) => ui.monospace(format!("{} (as {})", address.local, address.observed)),
+                // Until a leg is bound and the proxy reports, clients are told
+                // nothing and stay on the relay.
+                None => ui.label("not yet — bind a relay first"),
+            };
+        });
         let Some(info) = info else {
             return;
         };

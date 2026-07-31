@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use isekai_p2p::agent::RelayOptions;
+use isekai_p2p::agent::{ObservedAddressWatch, RelayOptions};
 use isekai_p2p::{fetch_relay_certificate, issue_endpoint_token, ListenerSession, P2pConfig};
 use msquic_async::Registration;
 use tokio::sync::{mpsc, oneshot};
@@ -53,6 +53,11 @@ pub enum ServerCommand {
 pub struct ServerHandle {
     pub info: ServerInfo,
     pub commands: mpsc::Sender<ServerCommand>,
+    /// How the proxy sees this Endpoint's relay bind leg — `None` until a leg
+    /// is bound and reports. This is the address advertised to each video
+    /// client as a direct path; surfacing it makes a stuck migration
+    /// diagnosable from the UI.
+    pub observed: ObservedAddressWatch,
     /// The video listener's msquic registration. A `msquic_async::Listener`
     /// borrows its registration rather than keeping it alive, so this must
     /// outlive the listener (which runs in the spawned `serve_frames` task);
@@ -118,6 +123,7 @@ pub async fn spawn_p2p_server(
     // waits on a connection id conveyed by hand. The session's watch survives
     // that gap and any later rebind.
     let observed = session.observed_address();
+    let observed_for_handle = observed.clone();
     tokio::spawn(serve_frames_with(
         listener,
         frame_rx,
@@ -133,6 +139,7 @@ pub async fn spawn_p2p_server(
     Ok(ServerHandle {
         info,
         commands: cmd_tx,
+        observed: observed_for_handle,
         _video_reg: video_reg,
     })
 }
