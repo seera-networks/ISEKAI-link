@@ -504,9 +504,16 @@ pub async fn receive_frames_with(
 /// Log what the connection is actually doing, which is the difference between
 /// "the migration stalled" and "the migration broke the connection".
 ///
-/// `Send.PathMtu` is worth watching in particular: a newly opened path has to
-/// size itself, and this connection is configured with a `MaximumMtu` below
-/// msquic's default `MinimumMtu`.
+/// `Send.PathMtu` is worth watching when a path has just been opened, since it
+/// has to size itself.
+///
+/// For loss, `send_lost` alone says very little: it counts packets the loss
+/// detector *declared* lost, and `send_spurious_lost` is how many of those
+/// turned out to have arrived after all. A high first number with a high second
+/// is an over-eager loss detector, not a lossy path, and the two want opposite
+/// fixes. `send_congestion` and the byte counters give the other half — whether
+/// the congestion controller is actually backing off, and what throughput that
+/// leaves.
 fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATISTICS, when: &str) {
     tracing::debug!(
         when,
@@ -516,8 +523,13 @@ fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATISTICS,
         send_path_mtu = stats.Send.PathMtu,
         send_packets = stats.Send.TotalPackets,
         send_lost = stats.Send.SuspectedLostPackets,
+        send_spurious_lost = stats.Send.SpuriousLostPackets,
+        send_congestion = stats.Send.CongestionCount,
+        send_persistent_congestion = stats.Send.PersistentCongestionCount,
+        send_bytes = stats.Send.TotalBytes,
         recv_packets = stats.Recv.TotalPackets,
         recv_dropped = stats.Recv.DroppedPackets,
+        recv_bytes = stats.Recv.TotalBytes,
         "video connection stats",
     );
 }
