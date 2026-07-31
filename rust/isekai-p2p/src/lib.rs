@@ -27,7 +27,9 @@ pub use listener::ListenerSession;
 
 /// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.
 pub mod agent {
+    pub use isekai_p2p_core::bind::RelayOptions;
     pub use isekai_p2p_core::endpoint::EndpointKey;
+    pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::identity::EndpointToken;
     pub use isekai_p2p_core::proxy::{
         Candidate, CandidateType, Capability, CertBundle, PeerConnection,

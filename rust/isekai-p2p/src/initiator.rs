@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use anyhow::Context as _;
 use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay, RelayOptions};
+use isekai_p2p_core::observed::ObservedAddressWatch;
 use isekai_p2p_core::proxy::{Candidate, PeerConnection, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
@@ -50,6 +51,34 @@ impl InitiatorSession {
         .await
     }
 
+    /// Like [`connect`](Self::connect) but choosing how the relay connect leg is
+    /// opened.
+    ///
+    /// Pass `RelayOptions { unconnected: true, registration: Some(..) }` to make
+    /// the leg usable for path migration: the direct path is opened from its
+    /// binding, and [`observed_address`](Self::observed_address) then reports
+    /// the pair to hand to `add_candidate_addr`.
+    pub async fn connect_with_options(
+        cfg: &P2pConfig,
+        capability: &str,
+        listener_id: &str,
+        candidates: &[Candidate],
+        local_bind: SocketAddr,
+        opts: RelayOptions,
+    ) -> anyhow::Result<Self> {
+        let endpoint_token = issue_endpoint_token(cfg).await?.endpoint_token;
+        Self::connect_with_token_and_options(
+            cfg,
+            &endpoint_token,
+            capability,
+            listener_id,
+            candidates,
+            local_bind,
+            opts,
+        )
+        .await
+    }
+
     /// Like [`connect`](Self::connect) but with an Endpoint Token the caller
     /// already holds, skipping the Identity API round-trip.
     ///
@@ -61,6 +90,29 @@ impl InitiatorSession {
         listener_id: &str,
         candidates: &[Candidate],
         local_bind: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_token_and_options(
+            cfg,
+            endpoint_token,
+            capability,
+            listener_id,
+            candidates,
+            local_bind,
+            RelayOptions::default(),
+        )
+        .await
+    }
+
+    /// [`connect_with_token`](Self::connect_with_token) plus the relay-leg
+    /// options — the form the other three delegate to.
+    pub async fn connect_with_token_and_options(
+        cfg: &P2pConfig,
+        endpoint_token: &str,
+        capability: &str,
+        listener_id: &str,
+        candidates: &[Candidate],
+        local_bind: SocketAddr,
+        opts: RelayOptions,
     ) -> anyhow::Result<Self> {
         let proxy = ProxyClient::new(
             MasqueH3Transport::connect(&cfg.proxy_url)?,
@@ -80,9 +132,7 @@ impl InitiatorSession {
             &connection.connection_id,
             &relay.masque_uri,
             local_bind,
-            // Phase 2 threads the caller's options through here; until then the
-            // leg keeps the behaviour it has always had.
-            RelayOptions::default(),
+            opts,
         )
         .await?;
         Ok(Self {
@@ -95,6 +145,22 @@ impl InitiatorSession {
     /// The connection id, to hand to the target so it can bind its relay leg.
     pub fn connection_id(&self) -> &str {
         &self.connection.connection_id
+    }
+
+    /// How the proxy sees this session's relay connect leg — `None` until the
+    /// first report arrives.
+    ///
+    /// This is the pair the video connection names via `add_candidate_addr` to
+    /// offer a direct path. Note it is **not**
+    /// [`local_addr`](InitiatorSession::local_addr): that is the loopback socket
+    /// the application sends to, whereas this is the leg's own binding out on
+    /// the network.
+    ///
+    /// Only meaningful when the session was created with
+    /// `RelayOptions { unconnected: true, .. }`; a leg on a plain connected
+    /// socket has no binding a direct path could use.
+    pub fn observed_address(&self) -> ObservedAddressWatch {
+        self.relay.observed()
     }
 
     /// The loopback FQDN to dial for the video QUIC so its per-endpoint
