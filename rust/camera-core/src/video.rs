@@ -53,8 +53,11 @@ pub fn bind_video_listener(
             (!bundle.pkcs12.is_empty()).then(|| bundle.pkcs12.clone()),
         ),
         None => {
+            // On Windows the bundle is what makes the dev certificate usable at
+            // all; elsewhere it is `None` and the PEM path is taken. See
+            // `crate::tls`.
             let dev = dev_cert(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
-            (dev.cert_pem, dev.key_pem, None)
+            (dev.cert_pem, dev.key_pem, dev.pkcs12)
         }
     };
     let (reg, listener) = isekai_link_utils::make_msquic_async_listener(

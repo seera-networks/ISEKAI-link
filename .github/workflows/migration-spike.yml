@@ -62,6 +62,12 @@ jobs:
       - name: Build the spike
         run: cargo build -p camera-core --example migration_spike
 
+      # On Windows the dev certificate is only usable through a PKCS#12 bundle;
+      # check the bundle itself here so a failure is attributable to packaging
+      # rather than showing up as six skipped msquic checks.
+      - name: Check the dev certificate packaging
+        run: cargo test -p camera-core --lib
+
       - name: Run the spike
         id: spike
         run: cargo run -q -p camera-core --example migration_spike | tee "$RUNNER_TEMP/spike-report.md"

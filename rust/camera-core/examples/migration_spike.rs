@@ -687,7 +687,7 @@ async fn spawn_listener(reg: &Arc<Registration>, addr: SocketAddr) -> anyhow::Re
             Some(addr),
             &cert.cert_pem,
             &cert.key_pem,
-            None,
+            cert.pkcs12.as_deref(),
         )?;
     Ok(wrap_listener(reg, listener)?)
 }
