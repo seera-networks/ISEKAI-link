@@ -72,6 +72,7 @@ ISEKAI Link combines modern networking technologies:
 
 - Direct peer-to-peer connections
 - Automatic NAT traversal (hole punching)
+- Live migration from a relayed path to a direct one, without dropping the connection
 - QUIC-based encrypted transport
 - Built-in WebRTC signaling
 

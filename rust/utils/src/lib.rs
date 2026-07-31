@@ -91,7 +91,12 @@ pub fn make_msquic_async_listener(
         Some(
             &&&msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
-                .set_MaximumMtu(1200)
+                // 1248 is msquic's floor (QUIC_DPLPMTUD_MIN_MTU); a smaller
+                // request is silently clamped up to it. Stated explicitly so
+                // the cap the listener applies is the one it appears to apply.
+                // Matches the video client (see `camera_core::video`), so the
+                // relay tunnel carries the same packet size in both directions.
+                .set_MaximumMtu(1248)
                 .set_KeepAliveIntervalMs(10_000)
                 .set_DestCidUpdateIdleTimeoutMs(0)
                 .set_PeerBidiStreamCount(100)

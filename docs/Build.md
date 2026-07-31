@@ -11,6 +11,7 @@ This document describes how to build ISEKAI Link from source.
 - [3. Install OpenCV / libclang (for camera-server & camera-client)](#3-install-opencv--libclang-for-camera-server--camera-client)
 - [4. Build](#4-build)
 - [5. Run](#5-run)
+- [6. P2P mode and path migration](#6-p2p-mode-and-path-migration)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -268,6 +269,91 @@ cargo run -p camera-server -- --help
 
 ---
 
+## 6. P2P mode and path migration
+
+`camera-server` and `camera-client` each offer two modes:
+
+- **Direct (legacy)** — the server publishes a public address through the relay and the
+  client dials it.
+- **P2P** — the two sides are introduced through the proxy's P2P Connect control plane
+  and the video rides a MASQUE relay. Neither side needs a reachable public address.
+
+In P2P mode the connection can then **migrate off the relay onto a direct path** between
+the two endpoints, which is lower latency and takes the proxy out of the data path. The
+relay path stays available and the connection can move back to it at any time.
+
+### 6-1. Bringing a P2P connection up
+
+Four values are exchanged by hand, in this order. Both apps need the Identity URL, proxy
+URL and an Auth0 access token filled in first.
+
+| # | Where | What |
+| --- | --- | --- |
+| 1 | client | **Show my Endpoint ID** → give the `ep:…` value to the server operator |
+| 2 | server | paste it into **Client Endpoint ID** → **Issue capability** → give the capability *and* the **Listener ID** to the client operator |
+| 3 | client | paste both → **Connect** → a **Connection ID** appears; give it to the server operator |
+| 4 | server | paste it into **Client Connection ID** → **Bind relay** |
+
+Video starts flowing over the relay once step 4 completes. The client's video handshake
+waits across the gap between steps 3 and 4, so taking a minute over the exchange is fine.
+
+### 6-2. Migrating to the direct path
+
+Once the connection is up, the client shows both paths and marks the active one with `▶`:
+
+```
+▶ Isekai Link path: 127.0.0.1:51067 -> 127.0.0.1:51065
+   Direct path     : 192.168.1.223:51066 -> 192.168.1.223:49639
+```
+
+- **Migrate to P2P** becomes available once a direct path has been validated. Press it to
+  switch; the button then reads **Migrate to Isekai Link** and switches back.
+- The RTT graph is the quickest confirmation: the direct path should be visibly lower.
+- The server shows the address it is offering clients under **Direct path offered**. Until
+  a relay is bound it reads *not yet — bind a relay first*, and no client can find a direct
+  path.
+
+If the button stays greyed out, no direct path was validated — see
+[Troubleshooting](#troubleshooting).
+
+**If a migrated path turns out to carry nothing, the client returns to the relay by itself**
+after five seconds without a frame. Streaming continues; only the direct path is lost.
+
+### 6-3. What has to be true for a direct path
+
+- Both endpoints must have reached the proxy, so it can report the address it observes for
+  each of them. That address is what the peer punches to.
+- The two NATs must let the punch through. Endpoint-independent ("cone") NATs work;
+  **a symmetric NAT will not**, and the connection simply stays on the relay.
+- Both endpoints on one machine or one LAN work, and take the LAN path rather than the
+  public one.
+
+Note that TLS is negotiated once, when the connection is established, and is **not**
+re-validated when the path changes — which is how QUIC is designed. The certificate is the
+one presented over the relay.
+
+### 6-4. Seeing what is happening
+
+```sh
+RUST_LOG=camera_core=debug,isekai_p2p_core=debug cargo run -p camera-server
+RUST_LOG=camera_core=debug,isekai_p2p_core=debug cargo run -p camera-client
+```
+
+Both sides then log, once a second: the connection's current local/remote addresses, RTT,
+path MTU, and packet counters for sent, lost, received and dropped. The lines worth
+knowing:
+
+| Log line | Meaning |
+| --- | --- |
+| `relay leg observed-address report` | the proxy told this endpoint how it looks from outside |
+| `offered direct-path candidates` (client) | the client named where it can be punched |
+| `advertised a direct path to the video client` (server) | the server named where it can be punched |
+| `video path: DirectValidated` | a direct path passed validation — the button is now live |
+| `video path: Activated` | the switch took effect |
+| `falling back to the relay path` | the migrated path carried nothing for five seconds |
+
+---
+
 ## Troubleshooting
 
 - **`msquic`-related link/build errors**
@@ -293,6 +379,19 @@ cargo run -p camera-server -- --help
 
 - **`camera-*.exe` fails to start with a missing `opencv_*.dll` error**
   The OpenCV DLLs must be on `PATH` at runtime. Add `C:\vcpkg\installed\x64-windows\bin` to `PATH` (or copy the DLLs next to the executable).
+
+- **The Migrate button stays greyed out (P2P mode)**
+  No direct path has been validated. Check, in order: the server logged `advertised a
+  direct path to the video client` (if not, no relay is bound, or the proxy has not
+  reported its address yet); the client logged `offered direct-path candidates`; and then
+  whether `video path: DirectValidated` ever appears. A symmetric NAT on either side will
+  stop it here, and the connection stays on the relay — which is working as intended.
+
+- **Video stops right after migrating, then comes back**
+  The direct path validated but carried nothing, and the five-second fallback returned the
+  connection to the relay. Make sure the `msquic-async-rs` submodule is at the commit this
+  repository records: a binding shared by several paths used to lose its source connection
+  IDs, which drops every packet arriving on it. `git submodule update --init --recursive`.
 
 - **When you only need the non-camera apps**
   Skip installing OpenCV / libclang and build only the target crate with `cargo build -p <crate>`.

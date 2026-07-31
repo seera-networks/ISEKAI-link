@@ -693,12 +693,18 @@ fn video_client_config(
                 // Initial on ONE connection until the far leg comes up, rather
                 // than many short-lived attempts (which poison the relay path).
                 .set_HandshakeIdleTimeoutMs(60_000)
-                // Cap the MTU so a video QUIC packet (a QUIC Initial is padded
-                // to 1200) plus CONNECT-UDP encapsulation fits inside the relay
-                // tunnel's HTTP datagram. Matches the listener (see
-                // `make_msquic_async_listener`). Without it the default 1500-MTU
-                // packets overflow the tunnel and are dropped as `TooLarge`.
-                .set_MaximumMtu(1200)
+                // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
+                // (1248), so asking for less is silently ignored — 1248 is what
+                // this connection actually uses, and stating it keeps the code
+                // honest about the cap it is applying.
+                //
+                // The cap exists so a video QUIC packet plus CONNECT-UDP
+                // encapsulation fits inside the relay tunnel's HTTP datagram.
+                // Without it the default 1500 overflows the tunnel and packets
+                // are dropped as `TooLarge`. The outer connection's
+                // MinimumMtu(1400) (see `isekai_p2p_core::transport`) is sized
+                // to carry 1248 plus that encapsulation.
+                .set_MaximumMtu(1248)
                 .set_PeerUnidiStreamCount(100)
                 .set_StreamMultiReceiveEnabled();
     // NAT-traversal mode is what makes the peer probe our candidate address and
