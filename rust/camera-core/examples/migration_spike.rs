@@ -492,7 +492,7 @@ async fn check_candidate_with_pinned_local(reg: &Arc<Registration>) -> anyhow::R
 /// `ADDRESS_IN_USE` for reasons that have nothing to do with timing, so each
 /// call here uses its own address.
 async fn check_server_side_advertise(reg: &Arc<Registration>) -> anyhow::Result<String> {
-    let mut proxy = spawn_listener(reg, loopback(0)).await?;
+    let mut proxy = spawn_proxy_stand_in(reg).await?;
     let mut listener = spawn_listener(reg, loopback(0)).await?;
     let bridge = Bridge::start(listener.addr).await?;
 
@@ -575,7 +575,7 @@ async fn check_direct_path_migration(
     let mut listener = spawn_listener_variant(reg, loopback(0), natt_listener)
         .await?
         .context("this platform cannot build the requested listener variant")?;
-    let mut proxy = spawn_listener(reg, loopback(0)).await?;
+    let mut proxy = spawn_proxy_stand_in(reg).await?;
     let bridge = Bridge::start(listener.addr).await?;
 
     // The server's MASQUE bind leg stand-in: a live shared binding on a real
@@ -658,6 +658,18 @@ async fn check_direct_path_migration(
     Ok(format!("{context}; {outcome}"))
 }
 
+/// The proxy a relay leg connects to, on a **real interface address**.
+///
+/// The real MASQUE leg dials the proxy over the network, so both ends of that
+/// connection are interface addresses. A loopback stand-in would instead force
+/// the leg to send from a real address to `127.0.0.1` — the one operation
+/// Windows refuses (§2.2.2) — and the harness would fail where production would
+/// not.
+async fn spawn_proxy_stand_in(reg: &Arc<Registration>) -> anyhow::Result<SpikeListener> {
+    let addr = SocketAddr::new(probe_local_addr()?.ip(), 0);
+    spawn_listener(reg, addr).await
+}
+
 /// A live QUIC connection held open purely to own a shared, unconnected binding
 /// at a real interface address — the spike's stand-in for a MASQUE relay leg.
 struct RelayLeg {
@@ -671,9 +683,14 @@ impl RelayLeg {
     async fn start(reg: &Arc<Registration>, peer: &mut SpikeListener) -> anyhow::Result<Self> {
         let addr = probe_local_addr()?;
         let conn = shared_binding_conn(reg, addr)?;
-        conn.start(&client_config(reg, false)?, "127.0.0.1", peer.addr.port())
+        // Dial the proxy stand-in at its interface address, as the real leg
+        // dials the real proxy — never loopback (see `spawn_proxy_stand_in`).
+        let peer_ip = peer.addr.ip().to_string();
+        conn.start(&client_config(reg, false)?, &peer_ip, peer.addr.port())
             .await
-            .with_context(|| format!("relay-leg stand-in could not bind {addr}"))?;
+            .with_context(|| {
+                format!("relay-leg stand-in could not reach the proxy stand-in from {addr}")
+            })?;
         let accepted = peer.accept_one().await?;
         anyhow::ensure!(
             conn.get_local_addr()? == addr,
