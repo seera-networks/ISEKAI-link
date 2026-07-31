@@ -478,7 +478,22 @@ impl MyApp {
                 tx,
                 shutdown,
                 VideoRecvOptions {
-                    registration: Some(reg),
+                    // ISEKAI_MIGRATION_OWN_REGISTRATION gives the video
+                    // connection a registration of its own instead of the one
+                    // the relay leg is on. With a probed (released) candidate
+                    // nothing needs to be shared with the leg, so this isolates
+                    // the two completely — msquic looks bindings up per
+                    // registration, and the leg is the one difference the
+                    // two-process spike cannot reproduce.
+                    registration: if std::env::var_os("ISEKAI_MIGRATION_OWN_REGISTRATION").is_some() {
+                        tracing::warn!(
+                            "ISEKAI_MIGRATION_OWN_REGISTRATION set: the video connection gets \
+                             its own msquic registration",
+                        );
+                        None
+                    } else {
+                        Some(reg)
+                    },
                     verify,
                     candidate,
                     path_events: Some(path_tx),
