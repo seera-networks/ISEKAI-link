@@ -80,9 +80,29 @@ async fn watch_connection(
     tx: &watch::Sender<Option<ObservedAddress>>,
     shutdown: &CancellationToken,
 ) {
+    // The video connection opens its direct path *on this leg's binding*. If
+    // that ever stops the leg receiving — because msquic opened a second socket
+    // on the same address rather than sharing the binding, say — the counters
+    // here are where it shows: the leg would keep sending to the proxy and stop
+    // hearing back, at the same moment the video connection goes quiet.
+    let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = stats_interval.tick() => {
+                if let Ok(stats) = conn.get_stats() {
+                    tracing::debug!(
+                        local = ?conn.get_local_addr().ok(),
+                        remote = ?conn.get_remote_addr().ok(),
+                        rtt_us = stats.Rtt,
+                        send_packets = stats.Send.TotalPackets,
+                        send_lost = stats.Send.SuspectedLostPackets,
+                        recv_packets = stats.Recv.TotalPackets,
+                        recv_dropped = stats.Recv.DroppedPackets,
+                        "relay leg stats",
+                    );
+                }
+            }
             event = poll_fn(|cx| conn.poll_event(cx)) => match event {
                 Ok(ConnectionEvent::NotifyObservedAddress { local_address, observed_address }) => {
                     tracing::info!(
