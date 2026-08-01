@@ -688,10 +688,10 @@ async fn dial_video(
                          bound its relay leg"
                     )));
                 }
-                tracing::debug!(
-                    "video handshake attempt {attempt} failed ({e}); retrying — the peer relay \
-                     leg may not be up yet"
-                );
+                // Debug, not Display: the transport status is what names the
+                // cause — an untrusted certificate and an unanswered handshake
+                // both read as "connection lost" otherwise.
+                tracing::debug!("video handshake attempt {attempt} failed: {e:?}");
                 tokio::select! {
                     _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
                     _ = sleep(VIDEO_CONNECT_RETRY_DELAY) => {}
@@ -826,7 +826,19 @@ fn video_client_config(
     };
     let config = reg.open_configuration(&alpn, Some(&settings))?;
     let mut cred = msquic::CredentialConfig::new_client();
-    if !verify {
+    // The same dev-only opt-in the proxy and Identity connections honour
+    // (`isekai_p2p_core::transport`). This one has to honour it too, because
+    // validation here can be impossible rather than merely strict: msquic is
+    // built against OpenSSL on Apple platforms, and on iOS there is no CA bundle
+    // on disk for it to consult, so a client there cannot complete this
+    // handshake however good the certificate is. Never set in production.
+    let skip_verify = std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some();
+    if verify && skip_verify {
+        tracing::warn!(
+            "ISEKAI_INSECURE_SKIP_VERIFY set: skipping video TLS certificate validation"
+        );
+    }
+    if !verify || skip_verify {
         cred = cred.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
     }
     config.load_credential(&cred)?;
