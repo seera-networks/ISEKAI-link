@@ -48,6 +48,12 @@ final class ViewerSink: FrameSink {
         }
     }
 
+    func onLog(line: String) {
+        Task { @MainActor [weak model] in
+            model?.append(log: line)
+        }
+    }
+
     private func drain() {
         while true {
             lock.lock()

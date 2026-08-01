@@ -67,6 +67,20 @@ pub struct ClientConfig {
     /// **Dev only** — accept self-signed proxy/Identity certificates. Never true
     /// in production; leave the proxy's real certificate validation on.
     pub insecure_skip_verify: bool,
+    /// Offer a direct path and allow migrating off the relay.
+    ///
+    /// Turning this off makes the session relay-only: the leg goes on an
+    /// ordinary connected socket, no candidate is offered, and
+    /// [`ViewerSession::migrate`] has nothing to do. Useful when a network
+    /// cannot support a direct path, and as a way to tell a migration problem
+    /// apart from a relay one.
+    pub enable_migration: bool,
+    /// Log filter for the Rust core, in `RUST_LOG` syntax — e.g.
+    /// `camera_core=debug,isekai_p2p_core=debug`. Empty disables logging.
+    ///
+    /// Records go to [`FrameSink::on_log`]. A phone has no console to read
+    /// `RUST_LOG` on, so this is the only way to see what the core is doing.
+    pub log_filter: String,
 }
 
 /// One end-to-end route the video can take.
@@ -160,6 +174,11 @@ pub trait FrameSink: Send + Sync {
     fn on_path(&self, status: PathStatus);
     /// A round-trip time sample, in milliseconds, about once a second.
     fn on_rtt(&self, rtt_ms: f64);
+    /// One formatted log line from the Rust core.
+    ///
+    /// Only called when [`ClientConfig::log_filter`] is non-empty. Arrives on
+    /// core threads and can be frequent — buffer it, do not block.
+    fn on_log(&self, line: String);
 }
 
 /// A live viewer session. Hold it for the duration of viewing; drop or
@@ -219,6 +238,8 @@ impl ViewerSession {
     /// Tear down the session (idempotent).
     pub fn disconnect(&self) {
         self.shutdown.cancel();
+        // Stop logging into a sink whose session is gone.
+        *LOG_SINK.lock().expect("log sink mutex poisoned") = None;
     }
 }
 
@@ -226,6 +247,62 @@ impl Drop for ViewerSession {
     fn drop(&mut self) {
         self.shutdown.cancel();
     }
+}
+
+/// The sink the tracing bridge currently writes to.
+///
+/// A global because `tracing`'s subscriber is process-wide and can only be
+/// installed once, while sinks come and go with sessions. Cleared on
+/// disconnect so a dead session stops receiving.
+static LOG_SINK: Mutex<Option<Arc<dyn FrameSink>>> = Mutex::new(None);
+/// Guards the one-time subscriber installation.
+static LOG_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Writes formatted log lines to whichever sink is current.
+struct SinkWriter;
+
+impl std::io::Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(sink) = LOG_SINK.lock().expect("log sink mutex poisoned").clone() {
+            sink.on_log(String::from_utf8_lossy(buf).trim_end().to_owned());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SinkWriter {
+    type Writer = SinkWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        SinkWriter
+    }
+}
+
+/// Point the core's logging at `sink`, installing the subscriber on first use.
+///
+/// The filter cannot be changed afterwards — `tracing` allows one global
+/// subscriber per process — so the first session's `log_filter` is the one that
+/// applies for the life of the app.
+fn install_logging(filter: &str, sink: &Arc<dyn FrameSink>) {
+    if filter.is_empty() {
+        return;
+    }
+    *LOG_SINK.lock().expect("log sink mutex poisoned") = Some(Arc::clone(sink));
+    LOG_INIT.call_once(|| {
+        let env = tracing_subscriber::EnvFilter::new(filter);
+        if let Err(e) = tracing_subscriber::fmt()
+            .with_env_filter(env)
+            .with_writer(SinkWriter)
+            .with_ansi(false)
+            .try_init()
+        {
+            // Something else already installed one; logging simply goes there.
+            sink.on_log(format!("could not install the log bridge: {e}"));
+        }
+    });
 }
 
 /// Generate a fresh Endpoint key, returned as a PKCS#8 PEM string.
@@ -265,6 +342,7 @@ pub fn connect(
     sink: Box<dyn FrameSink>,
 ) -> Result<Arc<ViewerSession>, ClientError> {
     let sink: Arc<dyn FrameSink> = Arc::from(sink);
+    install_logging(&config.log_filter, &sink);
 
     // Dev-only self-signed acceptance is read from this env var by the transport
     // layer. Production leaves it unset so real certificates are validated.
@@ -310,6 +388,14 @@ pub fn connect(
     // before video flows.
     // The leg goes on a shared, unconnected socket so a direct path can be
     // opened from its binding, and reports the address to offer as a candidate.
+    //
+    // `unconnected` and the candidate below are a pair: the candidate names this
+    // leg's binding, so without the shared, unconnected socket there is nothing
+    // for a direct path to be opened from. They are switched together.
+    let relay_options = RelayOptions {
+        unconnected: config.enable_migration,
+        registration: Some(Arc::clone(&registration)),
+    };
     let session = runtime
         .block_on(InitiatorSession::connect_with_options(
             &cfg,
@@ -317,10 +403,7 @@ pub fn connect(
             &config.listener_id,
             &[],
             local_bind,
-            RelayOptions {
-                unconnected: true,
-                registration: Some(Arc::clone(&registration)),
-            },
+            relay_options,
         ))
         .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
 
@@ -341,7 +424,7 @@ pub fn connect(
     let (rtt_tx, mut rtt_rx) = mpsc::channel::<f64>(16);
     let (migrate_tx, migrate_rx) = mpsc::channel::<(SocketAddr, SocketAddr)>(4);
     let paths = Arc::new(Mutex::new(Paths::default()));
-    let observed = session.observed_address();
+    let observed = config.enable_migration.then(|| session.observed_address());
 
     // Receiver: dials the video QUIC over the relay and delivers frames.
     let recv_shutdown = shutdown.clone();
@@ -356,7 +439,7 @@ pub fn connect(
             VideoRecvOptions {
                 registration: Some(recv_registration),
                 verify,
-                observed: Some(observed),
+                observed,
                 path_events: Some(path_tx),
                 migrate: Some(migrate_rx),
                 rtt: Some(rtt_tx),

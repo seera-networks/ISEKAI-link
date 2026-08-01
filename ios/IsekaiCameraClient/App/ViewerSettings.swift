@@ -16,6 +16,14 @@ struct ViewerSettings: Codable, Equatable {
     /// **Dev only.** Accepts self-signed proxy/Identity certificates; Phase 4 of
     /// the plan turns real validation back on.
     var insecureSkipVerify = false
+    /// Offer a direct path and allow migrating off the relay. Off makes the
+    /// session relay-only, which is also how to tell a migration problem apart
+    /// from a relay one.
+    var enableMigration = true
+    /// `RUST_LOG`-style filter for the core's logging. Empty disables it.
+    /// There is no console on a phone, so this is the only way to see what the
+    /// core is doing.
+    var logFilter = ""
 }
 
 extension ViewerSettings {

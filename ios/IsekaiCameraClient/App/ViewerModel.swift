@@ -33,6 +33,9 @@ final class ViewerModel: ObservableObject {
     @Published private(set) var paths: PathStatus?
     /// Latest round-trip time in milliseconds, sampled about once a second.
     @Published private(set) var rttMs: Double?
+    /// Recent log lines from the core, newest last. Bounded — this is a
+    /// diagnostic view, not a record.
+    @Published private(set) var logLines: [String] = []
     @Published private(set) var errorMessage: String?
 
     private var session: ViewerSession?
@@ -117,7 +120,9 @@ final class ViewerModel: ObservableObject {
             capability: settings.capability.trimmed,
             listenerId: settings.listenerID.trimmed,
             register: settings.register,
-            insecureSkipVerify: settings.insecureSkipVerify
+            insecureSkipVerify: settings.insecureSkipVerify,
+            enableMigration: settings.enableMigration,
+            logFilter: settings.logFilter.trimmed
         )
         let sink = ViewerSink(model: self)
         self.sink = sink
@@ -234,6 +239,16 @@ final class ViewerModel: ObservableObject {
     func apply(rtt ms: Double) {
         rttMs = ms
     }
+
+    func append(log line: String) {
+        logLines.append(line)
+        if logLines.count > 500 {
+            logLines.removeFirst(logLines.count - 500)
+        }
+    }
+
+    /// The log as one blob, for sharing out of the app.
+    var logText: String { logLines.joined(separator: "\n") }
 
     /// Switch between the Isekai Link relay and a direct path.
     ///

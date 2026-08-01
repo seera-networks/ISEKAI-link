@@ -42,7 +42,12 @@ final class ViewerConnectTests: XCTestCase {
             register: true,
             // Follow whatever the peer is talking to: a local stack needs this,
             // the live deployment must not have it.
-            insecureSkipVerify: peer["insecure"] == "1"
+            insecureSkipVerify: peer["insecure"] == "1",
+            // Both peers run on the CI host, so a direct path is between
+            // loopback-adjacent addresses and proves nothing the relay does
+            // not. Keep the test on the relay it is there to exercise.
+            enableMigration: false,
+            logFilter: ""
         )
 
         let sink = RecordingSink()
@@ -128,4 +133,6 @@ private final class RecordingSink: FrameSink {
     }
 
     func onRtt(rttMs: Double) {}
+
+    func onLog(line: String) {}
 }

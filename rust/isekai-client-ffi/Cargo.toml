@@ -28,4 +28,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+# Routes the core's tracing output to the Swift sink. A phone has no console to
+# read RUST_LOG on, so without this the client is unobservable in the field.
+tracing-subscriber = { workspace = true }
 uniffi = { version = "0.28", features = ["cli"] }

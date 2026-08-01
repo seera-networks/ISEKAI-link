@@ -16,6 +16,7 @@ struct ContentView: View {
                 authSection
                 manualTokenSection
                 developmentSection
+                logSection
             }
             .navigationTitle("ISEKAI Viewer")
         }
@@ -181,10 +182,36 @@ struct ContentView: View {
     private var developmentSection: some View {
         Section {
             Toggle("Skip TLS verification", isOn: $model.settings.insecureSkipVerify)
+            Toggle("Direct path", isOn: $model.settings.enableMigration)
+                .disabled(model.isConnected)
+            TextField("Log filter", text: $model.settings.logFilter)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.caption.monospaced())
         } header: {
             Text("Development")
         } footer: {
-            Text("Accepts self-signed proxy and Identity certificates. Never enable this against a real deployment.")
+            Text("Skip TLS verification accepts self-signed proxy and Identity certificates; never enable it against a real deployment. Turning off Direct path makes the session relay-only. The log filter takes RUST_LOG syntax, e.g. camera_core=debug,isekai_p2p_core=debug — leave it empty for no logging.")
+        }
+    }
+
+    @ViewBuilder
+    private var logSection: some View {
+        if !model.logLines.isEmpty {
+            Section {
+                ScrollView {
+                    Text(model.logText)
+                        .font(.caption2.monospaced())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 220)
+                ShareLink(item: model.logText) {
+                    Label("Share log", systemImage: "square.and.arrow.up")
+                }
+            } header: {
+                Text("Log")
+            }
         }
     }
 }
