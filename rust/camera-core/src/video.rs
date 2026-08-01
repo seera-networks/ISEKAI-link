@@ -587,6 +587,18 @@ async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent)
 /// soon as the far leg comes up. The retry loop below is therefore a
 /// last-resort fallback for a genuinely failed handshake, not the mechanism
 /// that bridges the gap.
+///
+/// `host` is a *name*, never an address to look up. Every caller dials the relay
+/// bridge on loopback, and the name is the per-endpoint FQDN the listener's relay
+/// certificate is issued for — it exists so the certificate can be validated, and
+/// its only DNS record points back at `127.0.0.1`. Pinning the remote address
+/// below says that outright, and keeps msquic from resolving the name: msquic
+/// resolves with a blocking `getaddrinfo` on the connection's worker thread, and
+/// that worker also drives the relay leg, so a slow resolver takes the leg down
+/// with it. A loopback-only name is exactly what mobile resolvers are slowest
+/// about — DNS64 will not synthesise an AAAA for `127.0.0.0/8`, and resolvers
+/// with rebinding protection refuse to return it at all — which is why this
+/// showed up on iOS long before it would have anywhere else.
 async fn dial_video(
     reg: &Registration,
     config: &msquic::Configuration,
@@ -600,8 +612,10 @@ async fn dial_video(
     loop {
         attempt += 1;
         let conn = Connection::new(reg)?;
-        // Every attempt builds a fresh connection, so the migration setup has
-        // to be redone on each one.
+        // Every attempt builds a fresh connection, so the setup below has to be
+        // redone on each one.
+        conn.set_remote_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .map_err(|e| anyhow::anyhow!("could not pin the relay bridge address: {e}"))?;
         if let Some(candidate) = candidate {
             prepare_for_migration(&conn, candidate)?;
         }
