@@ -31,6 +31,10 @@ const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(120);
 const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// How often to report what the handshake is doing while it is still unanswered.
+const HANDSHAKE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the heartbeat ticks. See [`spawn_heartbeat`].
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long to wait for the relay leg's observed address before dialing without
 /// it. The report normally lands within a round trip of the leg coming up; if it
 /// does not, streaming over the relay matters more than a direct path.
@@ -400,6 +404,12 @@ pub async fn receive_frames_with(
         rtt,
     } = opts;
 
+    // Runs for as long as this receive does, and ends with it: the guard cancels
+    // the child token on every exit path, including the `?`s below.
+    let heartbeat = shutdown.child_token();
+    let _heartbeat = heartbeat.clone().drop_guard();
+    spawn_heartbeat(heartbeat);
+
     // Resolve the candidate before dialing: `add_candidate_addr` has to be in
     // place before `start`, and a handshake here can take a minute (it rides
     // across the peer's relay-bind gap), so there is no useful "add it later".
@@ -561,6 +571,35 @@ fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATISTICS,
     );
 }
 
+/// Tick once a second, touching nothing but the clock.
+///
+/// Every other sampler here calls `get_stats`, which msquic serves by queueing
+/// an operation to the connection's worker and blocking until the worker runs
+/// it. So when those samplers go quiet, a wedged msquic worker and a stalled
+/// runtime look exactly the same from the log, and they are not the same bug.
+/// This task has no such dependency, and `tokio::time::interval` bursts its
+/// missed ticks on the way out, so the gap it leaves also measures itself:
+///
+/// - ticks continue while the samplers stop → the runtime is fine, the block is
+///   inside msquic
+/// - ticks stop too, then burst → the runtime itself was not scheduling this
+///   task, so the block is upstream of msquic
+fn spawn_heartbeat(shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut ticks = 0u64;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    ticks += 1;
+                    tracing::debug!(ticks, "heartbeat");
+                }
+            }
+        }
+    });
+}
+
 async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent) {
     tracing::info!("video path: {event:?}");
     if let Some(events) = events {
@@ -619,9 +658,24 @@ async fn dial_video(
         if let Some(candidate) = candidate {
             prepare_for_migration(&conn, candidate)?;
         }
-        let result = tokio::select! {
-            _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
-            r = conn.start(config, host, port) => r,
+        // The handshake can stay unanswered for a minute by design, and until it
+        // is answered there is nothing else to go on. Report what it is doing
+        // while it waits: whether our packets are still leaving tells a peer
+        // that has not bound its leg apart from a path that has stopped
+        // carrying anything, and those want opposite fixes.
+        let start = conn.start(config, host, port);
+        tokio::pin!(start);
+        let mut probe = tokio::time::interval(HANDSHAKE_PROBE_INTERVAL);
+        probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let result = loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
+                r = &mut start => break r,
+                _ = probe.tick() => match conn.get_stats() {
+                    Ok(stats) => log_connection_stats(&conn, &stats, "handshake"),
+                    Err(e) => tracing::debug!("could not read handshake stats: {e}"),
+                },
+            }
         };
         match result {
             Ok(()) => return Ok(conn),
