@@ -29,6 +29,10 @@ final class ViewerModel: ObservableObject {
     @Published private(set) var endpointID = ""
     @Published private(set) var frame: UIImage?
     @Published private(set) var frameCount = 0
+    /// Which route the video is taking, and whether it could take another.
+    @Published private(set) var paths: PathStatus?
+    /// Latest round-trip time in milliseconds, sampled about once a second.
+    @Published private(set) var rttMs: Double?
     @Published private(set) var errorMessage: String?
 
     private var session: ViewerSession?
@@ -180,6 +184,8 @@ final class ViewerModel: ObservableObject {
         session = nil
         sink = nil
         phase = .closed
+        paths = nil
+        rttMs = nil
     }
 
     /// Forget the Endpoint key and mint a new identity. Any capability the
@@ -221,6 +227,26 @@ final class ViewerModel: ObservableObject {
         }
     }
 
+    func apply(paths status: PathStatus) {
+        paths = status
+    }
+
+    func apply(rtt ms: Double) {
+        rttMs = ms
+    }
+
+    /// Switch between the Isekai Link relay and a direct path.
+    ///
+    /// The switch is asynchronous — `paths` updates when the connection reports
+    /// it, not here — and if the new path turns out to carry nothing the core
+    /// returns to the relay by itself after a few seconds.
+    func migrate() {
+        guard let session else { return }
+        if !session.migrate() {
+            errorMessage = "No direct path is available yet."
+        }
+    }
+
     func present(_ image: UIImage?, seq: UInt64) {
         guard let image else { return }
         // Frames decode concurrently and hop back independently; drop one that
@@ -246,6 +272,8 @@ final class ViewerModel: ObservableObject {
         phase = .failed
         session = nil
         sink = nil
+        paths = nil
+        rttMs = nil
     }
 }
 

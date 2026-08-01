@@ -65,10 +65,7 @@ async fn main() -> eframe::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let reg = Arc::new(
-        msquic_async::Registration::new(&msquic::RegistrationConfig::default())
-            .expect("open the msquic registration"),
-    );
+    let reg = camera_core::new_registration().expect("open the msquic registration");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]),

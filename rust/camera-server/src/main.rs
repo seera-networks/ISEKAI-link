@@ -229,8 +229,7 @@ async fn main() -> eframe::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let reg =
-        Arc::new(msquic_async::Registration::new(&msquic::RegistrationConfig::default()).unwrap());
+    let reg = camera_core::new_registration().expect("open the msquic registration");
 
     // Bounded: the UI drains this only while the window repaints (egui stops
     // updating when occluded/minimized), so an unbounded channel accumulates

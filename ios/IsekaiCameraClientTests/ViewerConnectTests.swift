@@ -81,6 +81,13 @@ private final class RecordingSink: FrameSink {
     private var magic: [UInt8] = []
     private var state = "none"
     private var seenFrame = false
+    private var paths: PathStatus?
+
+    var lastPaths: PathStatus? {
+        lock.lock()
+        defer { lock.unlock() }
+        return paths
+    }
 
     var firstFrameMagic: [UInt8] {
         lock.lock()
@@ -111,4 +118,14 @@ private final class RecordingSink: FrameSink {
         self.state = detail.isEmpty ? "\(state)" : "\(state) (\(detail))"
         lock.unlock()
     }
+
+    /// Both peers are the same host here, so whether a direct path shows up is
+    /// not something this test asserts on — it only has to accept the callback.
+    func onPath(status: PathStatus) {
+        lock.lock()
+        paths = status
+        lock.unlock()
+    }
+
+    func onRtt(rttMs: Double) {}
 }

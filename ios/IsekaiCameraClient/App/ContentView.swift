@@ -41,6 +41,25 @@ struct ContentView: View {
             .listRowInsets(EdgeInsets())
 
             LabeledContent("Frames", value: "\(model.frameCount)")
+            if let rtt = model.rttMs {
+                LabeledContent("RTT", value: String(format: "%.0f ms", rtt))
+            }
+            if let paths = model.paths {
+                PathRow(
+                    label: "Isekai Link",
+                    path: paths.relay,
+                    active: paths.onRelay
+                )
+                PathRow(
+                    label: "Direct",
+                    path: paths.direct,
+                    active: !paths.onRelay
+                )
+                Button(paths.onRelay ? "Switch to direct path" : "Switch to Isekai Link") {
+                    model.migrate()
+                }
+                .disabled(!paths.canMigrate)
+            }
         }
     }
 
@@ -223,6 +242,27 @@ private struct LabeledField: View {
                 .keyboardType(keyboard)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+        }
+    }
+}
+
+/// One route the video can take, marked when it is the one in use.
+private struct PathRow: View {
+    let label: String
+    let path: PathInfo?
+    let active: Bool
+
+    var body: some View {
+        LabeledContent(active ? "▶ \(label)" : label) {
+            if let path {
+                Text("\(path.local) → \(path.remote)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("not available")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

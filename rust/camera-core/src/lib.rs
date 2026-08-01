@@ -26,3 +26,20 @@ pub use video::{
 /// Re-exports of the P2P types the camera apps build on.
 pub use isekai_p2p::agent::{CertBundle, ObservedAddressWatch, RelayOptions};
 pub use isekai_p2p::{load_or_generate_key, InitiatorSession, P2pConfig};
+
+/// Open the msquic registration an application should run everything on.
+///
+/// One per process, shared by the relay leg and the video listener or
+/// connection. msquic looks bindings up per registration, so a direct path
+/// opened from the leg's binding is not reachable from a connection on a
+/// different one — that mismatch produces a path that validates and then
+/// carries nothing, which is a hard failure to read from the outside.
+///
+/// Pair it with [`shutdown::shutdown_and_exit`] on the way out.
+pub fn new_registration() -> anyhow::Result<std::sync::Arc<msquic_async::Registration>> {
+    use anyhow::Context as _;
+    Ok(std::sync::Arc::new(
+        msquic_async::Registration::new(&msquic_async::msquic::RegistrationConfig::default())
+            .context("could not open the msquic registration")?,
+    ))
+}

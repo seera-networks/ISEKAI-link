@@ -20,6 +20,9 @@ path = "src/bin/uniffi-bindgen.rs"
 anyhow = { workspace = true }
 bytes = { workspace = true }
 camera-core = { workspace = true }
+# Only for the `Registration` type in the session struct; it is opened through
+# `camera_core::new_registration`.
+msquic-async = { workspace = true }
 isekai-p2p-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
