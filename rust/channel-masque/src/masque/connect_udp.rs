@@ -67,6 +67,14 @@ fn frame_context0(payload: &[u8]) -> Bytes {
 ///   yet) is dropped, mirroring stateless UDP.
 ///
 /// Uplink and downlink share one task, so the recorded source needs no locking.
+///
+/// Both directions are counted and reported once a second while they move. The
+/// three ways this bridge can fail look identical from the application's side —
+/// it has sent packets and heard nothing back — and they want entirely different
+/// fixes, so the counters name which one it is: no uplink means the application's
+/// packets are not reaching this socket, uplink dropped means the tunnel refused
+/// to carry them (an oversized datagram is the usual reason), and uplink without
+/// downlink means the far end is not answering.
 pub async fn run_bridge(
     socket: Arc<UdpSocket>,
     mut tx: impl DatagramTx,
@@ -76,9 +84,22 @@ pub async fn run_bridge(
     let mut last_src: Option<SocketAddr> = None;
     // Max UDP payload; oversized datagrams are truncated by the OS on recv.
     let mut buf = vec![0u8; 65_535];
+    let mut up = 0u64;
+    let mut up_dropped = 0u64;
+    let mut down = 0u64;
+    let mut reported = (0u64, 0u64, 0u64);
+    let mut report = tokio::time::interval(std::time::Duration::from_secs(1));
+    report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = report.tick() => {
+                // Only when something moved, so an idle leg stays quiet.
+                if (up, up_dropped, down) != reported {
+                    reported = (up, up_dropped, down);
+                    tracing::debug!(up, up_dropped, down, "connect-udp bridge");
+                }
+            }
             r = socket.recv_from(&mut buf) => {
                 let (n, src) = r?;
                 last_src = Some(src);
@@ -86,8 +107,17 @@ pub async fn run_bridge(
                 // with the downlink `send_to` below), instead of breaking the
                 // bridge — a single transient failure must not tear down the
                 // whole relay leg.
-                if let Err(e) = tx.send(frame_context0(&buf[..n])) {
-                    tracing::warn!("connect-udp uplink send failed, dropping datagram: {e}");
+                match tx.send(frame_context0(&buf[..n])) {
+                    Ok(()) => up += 1,
+                    Err(e) => {
+                        up_dropped += 1;
+                        // The size is the point: the usual cause is a datagram
+                        // larger than the leg's current path MTU allows.
+                        tracing::warn!(
+                            bytes = n,
+                            "connect-udp uplink send failed, dropping datagram: {e}"
+                        );
+                    }
                 }
             }
             payload = inbound.recv() => {
@@ -96,11 +126,10 @@ pub async fn run_bridge(
                     break;
                 };
                 match last_src {
-                    Some(dst) => {
-                        if let Err(e) = socket.send_to(&payload, dst).await {
-                            tracing::warn!("connect-udp downlink send_to {dst} failed: {e}");
-                        }
-                    }
+                    Some(dst) => match socket.send_to(&payload, dst).await {
+                        Ok(_) => down += 1,
+                        Err(e) => tracing::warn!("connect-udp downlink send_to {dst} failed: {e}"),
+                    },
                     None => tracing::debug!(
                         "connect-udp downlink datagram dropped: no local source recorded yet"
                     ),

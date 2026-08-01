@@ -257,6 +257,15 @@ impl Drop for ViewerSession {
 static LOG_SINK: Mutex<Option<Arc<dyn FrameSink>>> = Mutex::new(None);
 /// Guards the one-time subscriber installation.
 static LOG_INIT: std::sync::Once = std::sync::Once::new();
+/// Applies a new filter to the installed subscriber.
+///
+/// A subscriber can only be installed once per process, but the filter is the
+/// setting being adjusted — narrowing it down is how a field problem gets found,
+/// and on a phone the only way to try another one is to reconnect. Without this
+/// every filter after the first would be silently ignored, which is worse than
+/// not offering the setting at all.
+#[allow(clippy::type_complexity)]
+static LOG_FILTER: Mutex<Option<Box<dyn Fn(&str) + Send>>> = Mutex::new(None);
 
 /// Writes formatted log lines to whichever sink is current.
 struct SinkWriter;
@@ -292,17 +301,35 @@ fn install_logging(filter: &str, sink: &Arc<dyn FrameSink>) {
     }
     *LOG_SINK.lock().expect("log sink mutex poisoned") = Some(Arc::clone(sink));
     LOG_INIT.call_once(|| {
-        let env = tracing_subscriber::EnvFilter::new(filter);
-        if let Err(e) = tracing_subscriber::fmt()
-            .with_env_filter(env)
-            .with_writer(SinkWriter)
-            .with_ansi(false)
-            .try_init()
-        {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let (layer, handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new(filter));
+        let installed = tracing_subscriber::registry()
+            .with(layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(SinkWriter)
+                    .with_ansi(false),
+            )
+            .try_init();
+        match installed {
+            Ok(()) => {
+                *LOG_FILTER.lock().expect("log filter mutex poisoned") =
+                    Some(Box::new(move |filter: &str| {
+                        let _ = handle.reload(tracing_subscriber::EnvFilter::new(filter));
+                    }));
+            }
             // Something else already installed one; logging simply goes there.
-            sink.on_log(format!("could not install the log bridge: {e}"));
+            Err(e) => sink.on_log(format!("could not install the log bridge: {e}")),
         }
     });
+    // Runs on every connect, so a filter changed in the app takes effect on the
+    // next one rather than needing the app restarted.
+    if let Some(reload) = LOG_FILTER.lock().expect("log filter mutex poisoned").as_ref() {
+        reload(filter);
+    }
 }
 
 /// Generate a fresh Endpoint key, returned as a PKCS#8 PEM string.

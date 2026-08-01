@@ -191,7 +191,7 @@ struct ContentView: View {
         } header: {
             Text("Development")
         } footer: {
-            Text("Skip TLS verification accepts self-signed proxy and Identity certificates; never enable it against a real deployment. Turning off Direct path makes the session relay-only. The log filter takes RUST_LOG syntax, e.g. camera_core=debug,isekai_p2p_core=debug — leave it empty for no logging.")
+            Text("Skip TLS verification accepts self-signed proxy and Identity certificates; never enable it against a real deployment. Turning off Direct path makes the session relay-only. The log filter takes RUST_LOG syntax — camera_core=debug,isekai_p2p_core=debug,channel_masque=debug covers the whole relay path; leave it empty for no logging. It applies from the next connect.")
         }
     }
 
