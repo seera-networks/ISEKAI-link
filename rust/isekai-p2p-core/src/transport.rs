@@ -224,22 +224,28 @@ pub(crate) fn make_client_config(
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()
-                // Pin this connection's MTU to the standard ~1500-byte network
-                // path so it can carry a *relayed* inner QUIC packet from the
-                // very first datagram. A tunneled QUIC Initial is padded to 1200
-                // bytes (RFC 9000 §14.1); at msquic's default MinimumMtu (1248)
-                // the outer connection's max-datagram length (~1206) is just
-                // under 1200 + CONNECT-UDP encapsulation, so the first relayed
-                // packet is dropped `TooLarge` before DPLPMTUD probes upward.
-                // (On loopback the MTU is effectively unbounded, so this only
-                // bites off-loopback.) Raising the floor to 1400 clears the
-                // encapsulated Initial immediately while keeping the outer IP
-                // packet within a standard 1500-MTU path. Deliberate trade-off:
-                // the relay data path therefore assumes a normal ~1500-MTU
-                // network and does not support constrained sub-1400 paths
-                // (e.g. a 1280-MTU tunnel), where a nested 1200-byte QUIC
-                // handshake cannot fit a datagram anyway.
-                .set_MinimumMtu(1400)
+                // Floor this connection's MTU high enough to carry a *relayed*
+                // inner QUIC packet in one datagram, from the very first one.
+                //
+                // The arithmetic, because the number matters and the failure is
+                // silent. The inner video connection cannot go below 1248:
+                // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
+                // (`core/settings.c`), so a full inner packet is 1248 bytes and
+                // there is no way to ask for less. As a CONNECT-UDP payload
+                // that is 1248 + 1 context-id byte, and this connection's
+                // max-datagram length runs about 42 bytes under its MTU. So the
+                // floor has to be at least ~1291; anything lower and **every**
+                // full-size inner packet fails to send and is dropped, while
+                // ACKs and control packets still fit — which looks like a lossy
+                // path rather than a misconfigured one.
+                //
+                // 1350 clears that with room for a longer connection ID, and is
+                // as low as it can usefully go. It was 1400, which is more than
+                // needed and excludes networks that carry 1360 but not 1400 —
+                // one such network is what turned this up. Paths below ~1300
+                // remain unsupported: the inner connection has a hard 1248-byte
+                // floor, so there is nothing left to give.
+                .set_MinimumMtu(1350)
                 .set_MaximumMtu(1500)
                 .set_StreamMultiReceiveEnabled()
                 // Ask the proxy to report the address it observes this
