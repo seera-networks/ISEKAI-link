@@ -12,7 +12,7 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use msquic_async::{msquic, Connection, ConnectionEvent, Listener, Registration, StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -99,9 +99,15 @@ pub struct ServeOptions {
     pub observed: Option<ObservedAddressWatch>,
 }
 
-/// Accept video connections and fan every frame from `frame_rx` out to each
+/// Accept video connections and fan frames from `frame_rx` out to each
 /// connected client as a unidirectional stream. Runs until `shutdown` fires or
 /// the frame source closes.
+///
+/// **Latest wins.** A client that cannot keep up does not accumulate a backlog:
+/// frames it missed are dropped and it gets the newest one as soon as it is
+/// ready. For a live camera that is the only sensible policy — a queued frame
+/// is just latency, and one slow client must not hold up the others or the
+/// accept loop.
 pub async fn serve_frames(
     listener: Listener,
     frame_rx: mpsc::Receiver<Bytes>,
@@ -117,7 +123,12 @@ pub async fn serve_frames_with(
     shutdown: CancellationToken,
     opts: ServeOptions,
 ) {
-    let mut senders: Vec<mpsc::Sender<Bytes>> = Vec::new();
+    // One slot, not a queue: publishing replaces whatever the slowest client had
+    // not picked up yet. Each client subscribes and always reads the newest
+    // frame, so a client that falls behind skips ahead instead of working
+    // through stale ones — and publishing never blocks, so a slow client cannot
+    // stall this loop and with it `accept` and shutdown.
+    let (frames, _) = watch::channel::<Option<Bytes>>(None);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -126,9 +137,7 @@ pub async fn serve_frames_with(
                     if let Some(observed) = &opts.observed {
                         advertise_direct_path(conn.clone(), observed.clone(), shutdown.clone());
                     }
-                    let (tx, rx) = mpsc::channel::<Bytes>(100);
-                    senders.push(tx);
-                    tokio::spawn(push_frames(conn, rx));
+                    tokio::spawn(push_frames(conn, frames.subscribe()));
                 }
                 Err(e) => {
                     tracing::error!("video accept failed: {e}");
@@ -137,11 +146,7 @@ pub async fn serve_frames_with(
             },
             frame = frame_rx.recv() => match frame {
                 Some(frame) => {
-                    // Drop connections whose push task has ended.
-                    senders.retain(|s| !s.is_closed());
-                    for s in &senders {
-                        let _ = s.send(frame.clone()).await;
-                    }
+                    frames.send_replace(Some(frame));
                 }
                 None => break,
             },
@@ -237,20 +242,42 @@ fn apply_direct_path(conn: &Connection, address: ObservedAddress) {
     );
 }
 
-async fn push_frames(conn: Connection, mut rx: mpsc::Receiver<Bytes>) {
+/// Push the newest frame to one client, for as long as it keeps up with itself.
+///
+/// Whatever arrives while `push_one` is in flight replaces the pending frame
+/// rather than queueing behind it, so this always sends what the camera has
+/// *now*.
+async fn push_frames(conn: Connection, mut frames: watch::Receiver<Option<Bytes>>) {
     // Sample on a timer rather than per frame. Counting frames looks equivalent
     // and is not: when the peer stops acknowledging, `push_one` blocks on flow
     // control and the frame counter stops advancing — so the logging goes quiet
     // exactly when something has gone wrong and the numbers matter most. A
     // stalled server then leaves no record of which path it was using.
     let stats = tokio::spawn(log_stats_until_closed(conn.clone()));
-    while let Some(frame) = rx.recv().await {
+    while let Some(frame) = next_frame(&mut frames).await {
         if let Err(e) = push_one(&conn, &frame).await {
             tracing::debug!("video push ended: {e}");
             break;
         }
     }
     stats.abort();
+}
+
+/// The next frame to send, skipping any superseded while the last one was in
+/// flight. `None` once the server stops publishing.
+///
+/// This is where "latest wins" actually happens: several frames may have been
+/// published while `push_one` was awaiting, and only the last of them is worth
+/// sending.
+async fn next_frame(frames: &mut watch::Receiver<Option<Bytes>>) -> Option<Bytes> {
+    loop {
+        frames.changed().await.ok()?;
+        // A published `None` cannot happen today, but skipping rather than
+        // stopping keeps this honest if an empty slot is ever published.
+        if let Some(frame) = frames.borrow_and_update().clone() {
+            return Some(frame);
+        }
+    }
 }
 
 /// Log a connection's counters once a second for as long as it lives.
@@ -742,6 +769,43 @@ fn video_client_config(
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    /// Frames published while a send is in flight are superseded, not queued:
+    /// the next send takes the newest and skips the rest. Without this a slow
+    /// client works through a backlog, and every frame in it is latency.
+    #[tokio::test]
+    async fn only_the_newest_frame_survives_a_slow_send() {
+        let (tx, mut rx) = watch::channel::<Option<Bytes>>(None);
+        for i in 1..=3u8 {
+            tx.send_replace(Some(Bytes::from(vec![i])));
+        }
+        assert_eq!(next_frame(&mut rx).await, Some(Bytes::from(vec![3u8])));
+    }
+
+    /// And it waits rather than spinning when nothing new has been published.
+    #[tokio::test]
+    async fn waits_for_a_frame_that_has_not_arrived_yet() {
+        let (tx, mut rx) = watch::channel::<Option<Bytes>>(None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next_frame(&mut rx))
+                .await
+                .is_err(),
+            "there is nothing to send yet",
+        );
+        tx.send_replace(Some(Bytes::from_static(b"frame")));
+        assert_eq!(
+            next_frame(&mut rx).await,
+            Some(Bytes::from_static(b"frame"))
+        );
+    }
+
+    /// The server going away ends the push loop instead of leaving it parked.
+    #[tokio::test]
+    async fn stops_when_the_server_stops_publishing() {
+        let (tx, mut rx) = watch::channel::<Option<Bytes>>(None);
+        drop(tx);
+        assert_eq!(next_frame(&mut rx).await, None);
+    }
 
     fn observed(port: u16) -> ObservedAddress {
         ObservedAddress {
