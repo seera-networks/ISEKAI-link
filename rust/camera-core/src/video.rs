@@ -23,10 +23,20 @@ use crate::tls::dev_cert;
 /// ALPN for the camera video protocol.
 pub const VIDEO_ALPN: &str = "sample";
 
-/// How long to keep retrying the video handshake before giving up. This spans
-/// the gap between the initiator opening its relay leg and the peer binding
-/// *its* leg (e.g. a human pressing "bind relay" on the camera server).
-const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(120);
+/// How long to keep retrying the video handshake before giving up.
+///
+/// This spans an entirely manual gap: the initiator opens its relay leg, and the
+/// peer can only bind *its* leg once a human has carried the connection id
+/// across — reading it off a phone, typing it into the camera server, starting
+/// the camera, pressing bind. Two minutes looked generous and was not: every
+/// field failure we chased for a day ended at exactly this deadline, with the
+/// relay leg still healthy and the operator still typing.
+///
+/// So it is set to a span no operator will lose a race against. Waiting costs
+/// nothing here — the connection retransmits an Initial every few seconds — and
+/// the caller can stop it at any time by cancelling `shutdown`, which is what
+/// the disconnect button does.
+const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(900);
 /// Delay between video handshake attempts.
 const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
@@ -658,8 +668,8 @@ async fn dial_video(
         if let Some(candidate) = candidate {
             prepare_for_migration(&conn, candidate)?;
         }
-        // The handshake can stay unanswered for a minute by design, and until it
-        // is answered there is nothing else to go on. Report what it is doing
+        // The handshake can stay unanswered for a long time by design, and until
+        // it is answered there is nothing else to go on. Report what it is doing
         // while it waits: whether our packets are still leaving tells a peer
         // that has not bound its leg apart from a path that has stopped
         // carrying anything, and those want opposite fixes.
@@ -667,12 +677,18 @@ async fn dial_video(
         tokio::pin!(start);
         let mut probe = tokio::time::interval(HANDSHAKE_PROBE_INTERVAL);
         probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Carried out of the loop because the failure below has to describe a
+        // connection it has already had to drop.
+        let mut last: Option<(u64, u64)> = None;
         let result = loop {
             tokio::select! {
                 _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
                 r = &mut start => break r,
                 _ = probe.tick() => match conn.get_stats() {
-                    Ok(stats) => log_connection_stats(&conn, &stats, "handshake"),
+                    Ok(stats) => {
+                        last = Some((stats.Send.TotalPackets, stats.Recv.TotalPackets));
+                        log_connection_stats(&conn, &stats, "handshake");
+                    }
                     Err(e) => tracing::debug!("could not read handshake stats: {e}"),
                 },
             }
@@ -680,12 +696,29 @@ async fn dial_video(
         match result {
             Ok(()) => return Ok(conn),
             Err(e) => {
+                let observed = conn
+                    .get_stats()
+                    .ok()
+                    .map(|s| (s.Send.TotalPackets, s.Recv.TotalPackets))
+                    .or(last);
                 drop(conn);
                 if Instant::now() >= deadline {
+                    // Say what was seen, not what it might mean. The old wording
+                    // asserted the peer had not bound its leg, and a day went
+                    // into chasing that assertion while it was wrong; the packet
+                    // counts distinguish the cases without guessing. Nothing
+                    // received at all is the peer never answering — a leg not
+                    // bridged yet, or an operator who has not finished carrying
+                    // the connection id across.
+                    let seen = match observed {
+                        Some((sent, received)) => {
+                            format!("{sent} packets sent, {received} received")
+                        }
+                        None => "no packet counts available".to_owned(),
+                    };
                     return Err(anyhow::Error::new(e).context(format!(
                         "video QUIC handshake to {host}:{port} did not complete within \
-                         {VIDEO_CONNECT_DEADLINE:?} ({attempt} attempts); the peer may not have \
-                         bound its relay leg"
+                         {VIDEO_CONNECT_DEADLINE:?} ({attempt} attempts, {seen})"
                     )));
                 }
                 // Debug, not Display: the transport status is what names the
@@ -827,11 +860,11 @@ fn video_client_config(
     let config = reg.open_configuration(&alpn, Some(&settings))?;
     let mut cred = msquic::CredentialConfig::new_client();
     // The same dev-only opt-in the proxy and Identity connections honour
-    // (`isekai_p2p_core::transport`). This one has to honour it too, because
-    // validation here can be impossible rather than merely strict: msquic is
-    // built against OpenSSL on Apple platforms, and on iOS there is no CA bundle
-    // on disk for it to consult, so a client there cannot complete this
-    // handshake however good the certificate is. Never set in production.
+    // (`isekai_p2p_core::transport`), which this one ignored — so the one switch
+    // an operator has did not cover the one connection that carries the video.
+    // It is only an escape hatch: iOS validates this certificate fine, contrary
+    // to what an earlier version of this comment claimed. Never set in
+    // production.
     let skip_verify = std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some();
     if verify && skip_verify {
         tracing::warn!(
