@@ -437,12 +437,12 @@ const ACTIVITY_LINES: usize = 20;
 /// One line of binding activity, in the terms an operator thinks in.
 fn describe(event: &SignalingEvent) -> String {
     match event {
-        SignalingEvent::Bound {
-            peer_endpoint,
-            replaced: Some(previous),
-            ..
-        } => format!("{peer_endpoint} connected (took over from {previous})"),
         SignalingEvent::Bound { peer_endpoint, .. } => format!("{peer_endpoint} connected"),
+        SignalingEvent::Unbound { connection_id } => format!("{connection_id} disconnected"),
+        SignalingEvent::AtCapacity { peer_endpoint, .. } => format!(
+            "{peer_endpoint} is waiting — already serving {} peers",
+            camera_core::MAX_CONCURRENT_PEERS
+        ),
         SignalingEvent::Waiting { peer_endpoint, .. } => format!("{peer_endpoint} is waiting"),
         SignalingEvent::BindFailed { error, .. } => format!("could not connect a peer: {error}"),
         SignalingEvent::Truncated => "more peers are waiting than the proxy will list".to_string(),

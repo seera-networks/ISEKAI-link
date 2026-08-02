@@ -19,7 +19,7 @@ pub mod video;
 pub use isekai_p2p::agent::{
     pairing_code_from_input, pairing_uri, Grant, PairingCode, ReachableListener,
 };
-pub use isekai_p2p::{AcceptPolicy, PeerDirectory, SignalingEvent};
+pub use isekai_p2p::{AcceptPolicy, PeerDirectory, SignalingEvent, MAX_CONCURRENT_PEERS};
 pub use server::{spawn_p2p_server, ServerCommand, ServerHandle, ServerInfo};
 pub use shutdown::{drain_registration, shutdown_and_exit};
 pub use video::{
