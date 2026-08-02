@@ -146,7 +146,7 @@ pub struct CertBundle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grant {
     pub grant_id: String,
-    pub listener_id: String,
+    /// The Endpoint being reached. Not a listener — see [`ProxyClient::create_grant`].
     pub owner_endpoint: String,
     pub allowed_endpoint: String,
     pub protocol: String,
@@ -170,7 +170,8 @@ struct GrantList {
 pub struct PairingCode {
     /// Eight characters, shown as `XXXX-XXXX`.
     pub code: String,
-    pub listener_id: String,
+    /// The Endpoint whoever redeems this will be let in to.
+    pub owner_endpoint: String,
     pub protocol: String,
     pub expires_at: String,
 }
@@ -243,6 +244,9 @@ impl ConnectionStateFilter {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReachableListener {
     pub listener_id: String,
+    /// The Endpoint running it. Unlike `listener_id` this survives a restart,
+    /// so it is what identifies the device a grant was made against.
+    pub owner_endpoint: String,
     pub protocol: String,
     /// Whatever the owner put there — typically a display name.
     #[serde(default)]
@@ -451,13 +455,17 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         .await
     }
 
-    /// `POST /v1/peer-listeners/{id}/grants` (spec §8.8.1).
+    /// `POST /v1/peer/grants` (spec §8.8.1).
+    ///
+    /// The caller is the owner, and no listener is named: a grant authorizes
+    /// reaching **this Endpoint** over one protocol, through whichever listener
+    /// it happens to be running. That is what lets an app be restarted without
+    /// everyone it let in having to pair again.
     ///
     /// `ttl` omitted means the grant stands until revoked, which is the usual
     /// case — a dated grant is closer to a capability.
     pub async fn create_grant(
         &self,
-        listener_id: &str,
         allowed_endpoint: &str,
         protocol: &str,
         ttl: Option<u64>,
@@ -469,55 +477,41 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             "ttl": ttl,
             "label": label,
         });
-        self.request_json(
-            "POST",
-            &format!("/v1/peer-listeners/{listener_id}/grants"),
-            to_vec(&body),
-        )
-        .await
+        self.request_json("POST", "/v1/peer/grants", to_vec(&body))
+            .await
     }
 
-    /// `GET /v1/peer-listeners/{id}/grants` (spec §8.8.2).
-    pub async fn list_grants(&self, listener_id: &str) -> Result<Vec<Grant>, ProxyError> {
+    /// `GET /v1/peer/grants` (spec §8.8.2) — everyone this Endpoint has let in.
+    pub async fn list_grants(&self) -> Result<Vec<Grant>, ProxyError> {
         let list: GrantList = self
-            .request_json(
-                "GET",
-                &format!("/v1/peer-listeners/{listener_id}/grants"),
-                Vec::new(),
-            )
+            .request_json("GET", "/v1/peer/grants", Vec::new())
             .await?;
         Ok(list.grants)
     }
 
-    /// `DELETE /v1/peer-listeners/{id}/grants/{grant_id}` (spec §8.8.3).
+    /// `DELETE /v1/peer/grants/{grant_id}` (spec §8.8.3).
     ///
     /// Takes effect on the peer's next connect; anything already established
     /// stays up.
-    pub async fn revoke_grant(&self, listener_id: &str, grant_id: &str) -> Result<(), ProxyError> {
-        self.request_empty(
-            "DELETE",
-            &format!("/v1/peer-listeners/{listener_id}/grants/{grant_id}"),
-            Vec::new(),
-        )
-        .await
+    pub async fn revoke_grant(&self, grant_id: &str) -> Result<(), ProxyError> {
+        self.request_empty("DELETE", &format!("/v1/peer/grants/{grant_id}"), Vec::new())
+            .await
     }
 
-    /// `POST /v1/peer-listeners/{id}/pairing-codes` (spec §8.9.1).
+    /// `POST /v1/peer/pairing-codes` (spec §8.9.1).
     ///
-    /// Issuing one invalidates the listener's previous code — there is only
-    /// ever one, because the owner is showing it on one screen.
+    /// Issuing one invalidates this Endpoint's previous code for the same
+    /// protocol — there is only ever one, because the owner is showing it on
+    /// one screen. No listener is needed: someone can pair with a camera that
+    /// is switched off and connect when it comes back.
     pub async fn create_pairing_code(
         &self,
-        listener_id: &str,
+        protocol: &str,
         ttl: Option<u64>,
     ) -> Result<PairingCode, ProxyError> {
-        let body = serde_json::json!({ "ttl": ttl });
-        self.request_json(
-            "POST",
-            &format!("/v1/peer-listeners/{listener_id}/pairing-codes"),
-            to_vec(&body),
-        )
-        .await
+        let body = serde_json::json!({ "protocol": protocol, "ttl": ttl });
+        self.request_json("POST", "/v1/peer/pairing-codes", to_vec(&body))
+            .await
     }
 
     /// `GET /v1/peer-listeners/{id}/connections` (spec §8.5.3).
@@ -796,7 +790,7 @@ mod tests {
     /// side is otherwise only found on a device.
     #[tokio::test]
     async fn pairing_sends_the_two_shapes_the_proxy_distinguishes() {
-        let body = r#"{"grant_id":"gr_1","listener_id":"pl_1","owner_endpoint":"ep:B",
+        let body = r#"{"grant_id":"gr_1","owner_endpoint":"ep:B",
             "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"pairing",
             "created_at":"2026-08-02T09:00:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
@@ -805,6 +799,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grant.origin, "pairing");
+        assert_eq!(
+            grant.owner_endpoint, "ep:B",
+            "the grant names the Endpoint let in to, not a listener"
+        );
         assert_eq!(
             grant.expires_at, None,
             "a paired grant stands until revoked"
@@ -823,7 +821,7 @@ mod tests {
     /// than as the string "null" or omitted.
     #[tokio::test]
     async fn enrolling_names_the_listener_and_sends_a_null_label() {
-        let body = r#"{"grant_id":"gr_2","listener_id":"pl_1","owner_endpoint":"ep:B",
+        let body = r#"{"grant_id":"gr_2","owner_endpoint":"ep:B",
             "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"owner_match",
             "created_at":"2026-08-02T09:00:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
@@ -834,6 +832,86 @@ mod tests {
         assert_eq!(sent["listener_id"], "pl_1");
         assert!(sent["label"].is_null());
         assert!(sent["code"].is_null());
+    }
+
+    /// Grants are the owner's, not a listener's, and the route says so. A
+    /// rename on either side is otherwise only found on a device, which is what
+    /// this whole change was fixing.
+    #[tokio::test]
+    async fn granting_names_no_listener() {
+        let body = r#"{"grant_id":"gr_1","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
+            "created_at":"2026-08-02T09:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let grant = client
+            .create_grant("ep:A", "mjpeg", None, Some("phone"))
+            .await
+            .unwrap();
+        assert_eq!(grant.owner_endpoint, "ep:B");
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, body) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/peer/grants")
+        );
+        let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(sent["allowed_endpoint"], "ep:A");
+        assert_eq!(sent["protocol"], "mjpeg");
+        assert!(sent["ttl"].is_null(), "no ttl means until revoked");
+    }
+
+    /// Revocation addresses the grant by id alone; the proxy scopes it to the
+    /// caller, so there is no listener to name here either.
+    #[tokio::test]
+    async fn revoking_addresses_the_grant_by_id_alone() {
+        let (client, _key) = client(MockTransport::with_response(204, ""));
+        client.revoke_grant("gr_1").await.unwrap();
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, ..) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("DELETE", "/v1/peer/grants/gr_1")
+        );
+    }
+
+    /// A code is minted against the Endpoint and a protocol, with no listener
+    /// in the path or the body.
+    #[tokio::test]
+    async fn a_pairing_code_is_minted_against_the_endpoint() {
+        let body = r#"{"code":"K7M2-QX4P","owner_endpoint":"ep:B","protocol":"mjpeg",
+            "expires_at":"2026-08-02T09:05:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let issued = client
+            .create_pairing_code("mjpeg", Some(120))
+            .await
+            .unwrap();
+        assert_eq!(issued.code, "K7M2-QX4P");
+        assert_eq!(issued.owner_endpoint, "ep:B");
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, body) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/peer/pairing-codes")
+        );
+        let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(sent["protocol"], "mjpeg");
+        assert_eq!(sent["ttl"], 120);
+    }
+
+    /// A listing has to carry the owner Endpoint: it is what stays the same
+    /// when the camera restarts and the listener id does not.
+    #[tokio::test]
+    async fn a_reachable_listener_names_the_endpoint_running_it() {
+        let body = r#"{"listeners":[{"listener_id":"pl_new","owner_endpoint":"ep:B",
+            "protocol":"mjpeg","metadata":{"label":"居間のカメラ"},
+            "expires_at":"2026-08-02T10:00:00Z"}]}"#;
+        let (client, _key) = client(MockTransport::with_response(200, body));
+        let found = client.list_reachable_listeners().await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].listener_id, "pl_new");
+        assert_eq!(found[0].owner_endpoint, "ep:B");
     }
 
     /// The filter goes in the query string, and a truncated answer has to
