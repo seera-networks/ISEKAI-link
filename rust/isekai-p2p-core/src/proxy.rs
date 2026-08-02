@@ -175,6 +175,44 @@ pub struct PairingCode {
     pub expires_at: String,
 }
 
+/// The URI scheme a pairing QR carries.
+///
+/// A QR holding the bare code scans to eight characters and nothing happens —
+/// the phone shows the text and the person still has to find the app and type
+/// it. A URI is what lets the scan land somewhere. This is settled here rather
+/// than at each display site so the desktop apps and the mobile ones agree on
+/// it before the mobile QR capture exists to disagree.
+const PAIRING_SCHEME: &str = "isekai://pair?code=";
+
+/// What to put in a pairing QR for [`code`](PairingCode::code).
+pub fn pairing_uri(code: &str) -> String {
+    // The code alphabet is digits and uppercase letters plus the display dash,
+    // so there is nothing here that needs escaping.
+    format!("{PAIRING_SCHEME}{code}")
+}
+
+/// Recover a pairing code from whatever was scanned, pasted or typed.
+///
+/// Accepts both the URI and the bare code, because those are the two things
+/// that end up in the field: one from a scanner, one from someone reading the
+/// screen. Neither is validated beyond the shape — the proxy decides whether a
+/// code is real, and this only has to stop the scheme prefix from being sent as
+/// part of it.
+pub fn pairing_code_from_input(input: &str) -> String {
+    let trimmed = input.trim();
+    match trimmed.strip_prefix(PAIRING_SCHEME) {
+        // A scanner may append a fragment or further parameters; the code runs
+        // to the first thing that could not be part of one.
+        Some(rest) => rest
+            .split(['&', '#'])
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .to_owned(),
+        None => trimmed.to_owned(),
+    }
+}
+
 /// A connection state to filter a listing by (spec §8.5.2).
 ///
 /// Typed rather than a string because the proxy answers `400` to anything it
@@ -915,5 +953,34 @@ mod tests {
             "relay certificates not configured",
         ));
         assert!(client.get_certificate().await.unwrap().is_none());
+    }
+
+    /// What a QR holds has to come back out of the field it is scanned into,
+    /// and so does what someone reads off the screen instead.
+    #[test]
+    fn a_pairing_code_survives_the_uri_it_is_scanned_from() {
+        let uri = pairing_uri("K7M2-QX4P");
+        assert_eq!(uri, "isekai://pair?code=K7M2-QX4P");
+        for input in [
+            uri.as_str(),
+            " isekai://pair?code=K7M2-QX4P ",
+            "isekai://pair?code=K7M2-QX4P&v=1",
+            "isekai://pair?code=K7M2-QX4P#x",
+            "K7M2-QX4P",
+            "  K7M2-QX4P  ",
+        ] {
+            assert_eq!(pairing_code_from_input(input), "K7M2-QX4P", "{input:?}");
+        }
+    }
+
+    /// Anything else is passed through for the proxy to reject, rather than
+    /// guessed at here.
+    #[test]
+    fn input_that_is_not_a_pairing_uri_is_left_alone() {
+        assert_eq!(pairing_code_from_input("nonsense"), "nonsense");
+        assert_eq!(
+            pairing_code_from_input("https://example.test/pair?code=K7M2-QX4P"),
+            "https://example.test/pair?code=K7M2-QX4P"
+        );
     }
 }

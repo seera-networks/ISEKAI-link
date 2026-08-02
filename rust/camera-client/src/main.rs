@@ -9,7 +9,7 @@ use std::{
     future::poll_fn,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_util::sync::CancellationToken;
@@ -114,6 +114,54 @@ enum Mode {
     P2p,
 }
 
+/// What to call a camera on screen: the name its owner gave it, falling back to
+/// the listener id, which is at least unambiguous.
+fn display_name(camera: &camera_core::ReachableListener) -> Option<&str> {
+    camera
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("label"))
+        .and_then(|l| l.as_str())
+}
+
+/// The proxy control plane, kept open between the actions that use it.
+///
+/// [`PeerDirectory::open`](camera_core::PeerDirectory::open) issues an Endpoint
+/// Token from the Identity API and opens a QUIC connection to the proxy. Doing
+/// that per button press means a token and a connection per press, and the
+/// connect that follows a listing would make a second one — which is what the
+/// directory exists to avoid. One is kept here and handed to whichever of
+/// listing, pairing and connecting runs next.
+struct ControlPlane {
+    directory: camera_core::PeerDirectory,
+    /// When to stop using it. Short of the token's real expiry, so a call does
+    /// not start on a token that runs out partway through.
+    good_until: Instant,
+}
+
+/// How far ahead of a token's expiry to replace it.
+const TOKEN_MARGIN: Duration = Duration::from_secs(30);
+
+/// The open control plane, opening one first if there is none or the token it
+/// holds is nearly out.
+async fn control_plane<'a>(
+    slot: &'a mut Option<ControlPlane>,
+    cfg: &P2pConfig,
+) -> anyhow::Result<&'a camera_core::PeerDirectory> {
+    if slot
+        .as_ref()
+        .is_none_or(|held| held.good_until <= Instant::now())
+    {
+        let token = camera_core::issue_endpoint_token(cfg).await?;
+        let life = Duration::from_secs(token.expires_in.max(0) as u64);
+        *slot = Some(ControlPlane {
+            directory: camera_core::PeerDirectory::open_with_token(cfg, &token.endpoint_token)?,
+            good_until: Instant::now() + life.saturating_sub(TOKEN_MARGIN),
+        });
+    }
+    Ok(&slot.as_ref().expect("just filled").directory)
+}
+
 /// Shared runtime state of a P2P connection, updated by the async task and read
 /// by the UI.
 #[derive(Default)]
@@ -141,11 +189,19 @@ struct MyApp {
     register: bool,
     capability: String,
     listener_id: String,
-    /// Cameras this Endpoint may connect to, as of the last refresh.
-    cameras: Arc<Mutex<Vec<camera_core::ReachableListener>>>,
-    /// A pairing code being typed in, and what the last attempt said.
+    /// Cameras this Endpoint may connect to, or `None` before the proxy has
+    /// been asked. "no cameras" and "not asked yet" have to look different on
+    /// screen: someone who paired a camera yesterday should not be shown a bare
+    /// "none" and conclude it has been lost.
+    cameras: Arc<Mutex<Option<Vec<camera_core::ReachableListener>>>>,
+    /// Whether the automatic first listing has been asked for, so it happens
+    /// once rather than every frame.
+    cameras_requested: bool,
+    /// A pairing code being typed or pasted in, and what the last attempt said.
     pairing_code: String,
     pairing_status: Arc<Mutex<Option<String>>>,
+    /// The control plane, held open across button presses. See [`ControlPlane`].
+    control_plane: Arc<tokio::sync::Mutex<Option<ControlPlane>>>,
     my_endpoint_id: Option<String>,
     p2p_shared: Arc<Mutex<P2pShared>>,
 
@@ -188,9 +244,11 @@ impl MyApp {
             register: true,
             capability: String::new(),
             listener_id: String::new(),
-            cameras: Arc::new(Mutex::new(Vec::new())),
+            cameras: Arc::new(Mutex::new(None)),
+            cameras_requested: false,
             pairing_code: String::new(),
             pairing_status: Arc::new(Mutex::new(None)),
+            control_plane: Arc::new(tokio::sync::Mutex::new(None)),
             my_endpoint_id: None,
             p2p_shared: Arc::new(Mutex::new(P2pShared::default())),
             connected: false,
@@ -413,6 +471,7 @@ impl MyApp {
         };
 
         let shared = Arc::clone(&self.p2p_shared);
+        let plane = Arc::clone(&self.control_plane);
         let capability = self.capability.trim().to_string();
         let listener_id = self.listener_id.trim().to_string();
 
@@ -430,14 +489,18 @@ impl MyApp {
             // so only the listener's id is needed. Leaving the field filled
             // still uses the capability, so the old flow is unchanged.
             let connect = if capability.is_empty() {
-                camera_core::InitiatorSession::connect_with_grant(
-                    &cfg,
-                    &listener_id,
-                    &[],
-                    local_bind,
-                    relay_options,
-                )
-                .await
+                // Over the control plane that listed this camera, so acting on
+                // the answer does not cost a second Endpoint Token and a second
+                // QUIC connection to the proxy. The lock is held only for as
+                // long as the connect takes to set up.
+                let mut slot = plane.lock().await;
+                match control_plane(&mut slot, &cfg).await {
+                    Ok(dir) => {
+                        dir.connect(&cfg, &listener_id, &[], local_bind, relay_options)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
             } else {
                 camera_core::InitiatorSession::connect_with_options(
                     &cfg,
@@ -591,20 +654,24 @@ impl MyApp {
                 return;
             }
         };
+        let plane = Arc::clone(&self.control_plane);
         let cameras = Arc::clone(&self.cameras);
         let status = Arc::clone(&self.pairing_status);
         tokio::spawn(async move {
-            match camera_core::PeerDirectory::open(&cfg).await {
-                Ok(dir) => match dir.reachable().await {
-                    Ok(found) => {
-                        let empty = found.is_empty();
-                        *cameras.lock().unwrap() = found;
-                        *status.lock().unwrap() =
-                            empty.then(|| "no cameras yet — pair with one below".to_string());
-                    }
-                    Err(e) => *status.lock().unwrap() = Some(format!("list failed: {e:#}")),
-                },
-                Err(e) => *status.lock().unwrap() = Some(format!("control plane: {e:#}")),
+            let mut slot = plane.lock().await;
+            let dir = match control_plane(&mut slot, &cfg).await {
+                Ok(dir) => dir,
+                Err(e) => {
+                    *status.lock().unwrap() = Some(format!("control plane: {e:#}"));
+                    return;
+                }
+            };
+            match dir.reachable().await {
+                Ok(found) => {
+                    *cameras.lock().unwrap() = Some(found);
+                    *status.lock().unwrap() = None;
+                }
+                Err(e) => *status.lock().unwrap() = Some(format!("list failed: {e:#}")),
             }
         });
     }
@@ -618,10 +685,12 @@ impl MyApp {
                 return;
             }
         };
+        let plane = Arc::clone(&self.control_plane);
         let cameras = Arc::clone(&self.cameras);
         let status = Arc::clone(&self.pairing_status);
         tokio::spawn(async move {
-            let dir = match camera_core::PeerDirectory::open(&cfg).await {
+            let mut slot = plane.lock().await;
+            let dir = match control_plane(&mut slot, &cfg).await {
                 Ok(dir) => dir,
                 Err(e) => {
                     *status.lock().unwrap() = Some(format!("control plane: {e:#}"));
@@ -630,12 +699,21 @@ impl MyApp {
             };
             match dir.pair(&code, Some("camera-client")).await {
                 Ok(grant) => {
-                    *status.lock().unwrap() = Some(format!("paired with {}", grant.listener_id));
-                    // Show it straight away rather than making the operator
-                    // work out that a refresh is now needed.
+                    // Read the list back straight away rather than making the
+                    // operator work out that a refresh is now needed — and it
+                    // is also where the camera's own name comes from, which is
+                    // what they will recognise it by.
+                    let mut named = None;
                     if let Ok(found) = dir.reachable().await {
-                        *cameras.lock().unwrap() = found;
+                        named = found
+                            .iter()
+                            .find(|c| c.listener_id == grant.listener_id)
+                            .and_then(display_name)
+                            .map(str::to_owned);
+                        *cameras.lock().unwrap() = Some(found);
                     }
+                    let name = named.unwrap_or(grant.listener_id);
+                    *status.lock().unwrap() = Some(format!("paired with {name}"));
                 }
                 // The proxy answers every pairing failure the same way, so
                 // there is nothing more specific to report than this.
@@ -648,17 +726,20 @@ impl MyApp {
     fn cameras_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Cameras");
         let cameras = self.cameras.lock().unwrap().clone();
-        if cameras.is_empty() {
-            ui.label("none — pair with a camera, or refresh");
-        }
-        for camera in &cameras {
+        let cameras = match &cameras {
+            None => {
+                ui.label("not read yet");
+                &[][..]
+            }
+            Some(cameras) if cameras.is_empty() => {
+                ui.label("none — pair with a camera below");
+                &[][..]
+            }
+            Some(cameras) => cameras.as_slice(),
+        };
+        for camera in cameras {
             ui.horizontal(|ui| {
-                let name = camera
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("label"))
-                    .and_then(|l| l.as_str())
-                    .unwrap_or(&camera.listener_id);
+                let name = display_name(camera).unwrap_or(&camera.listener_id);
                 let selected = self.listener_id == camera.listener_id;
                 if ui.selectable_label(selected, name).clicked() {
                     // Selecting a camera is all the connect needs: a grant is
@@ -675,7 +756,9 @@ impl MyApp {
             ui.label("Pairing code:");
             ui.text_edit_singleline(&mut self.pairing_code);
             if ui.button("Pair").clicked() {
-                let code = self.pairing_code.trim().to_string();
+                // Whatever a scanner put in the field, or what someone read off
+                // the camera's screen — both arrive here.
+                let code = camera_core::pairing_code_from_input(&self.pairing_code);
                 if !code.is_empty() {
                     self.pair(code);
                     self.pairing_code.clear();
@@ -697,18 +780,30 @@ impl MyApp {
                     egui::TextEdit::singleline(value)
                         .desired_width(320.0)
                         .password(password),
-                );
-            });
+                )
+            })
+            .inner
         };
         field(ui, "Identity URL:", &mut self.identity_url, false);
         field(ui, "Proxy URL:   ", &mut self.proxy_url, false);
-        field(ui, "Auth0 token: ", &mut self.auth0_token, true);
+        let token_field = field(ui, "Auth0 token: ", &mut self.auth0_token, true);
         field(ui, "Key path:    ", &mut self.key_path, false);
         field(ui, "Protocol:    ", &mut self.protocol, false);
         ui.add_enabled(
             enabled,
             egui::Checkbox::new(&mut self.register, "Register endpoint on connect"),
         );
+        // As soon as there is a credential to ask with — and not while it is
+        // still being typed — find out what this device can reach. Waiting for
+        // someone to press Refresh means the list below reads "none" to a
+        // person who paired a camera yesterday.
+        if !self.cameras_requested
+            && !self.auth0_token.trim().is_empty()
+            && !token_field.has_focus()
+        {
+            self.cameras_requested = true;
+            self.refresh_cameras();
+        }
         ui.add_enabled_ui(enabled, |ui| self.cameras_ui(ui));
         ui.separator();
         // The values a camera used to have to read out. Still here for a proxy

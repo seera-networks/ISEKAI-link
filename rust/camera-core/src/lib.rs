@@ -16,7 +16,9 @@ pub mod shutdown;
 pub mod tls;
 pub mod video;
 
-pub use isekai_p2p::agent::{Grant, PairingCode, ReachableListener};
+pub use isekai_p2p::agent::{
+    pairing_code_from_input, pairing_uri, Grant, PairingCode, ReachableListener,
+};
 pub use isekai_p2p::{AcceptPolicy, PeerDirectory, SignalingEvent};
 pub use server::{spawn_p2p_server, ServerCommand, ServerHandle, ServerInfo};
 pub use shutdown::{drain_registration, shutdown_and_exit};
@@ -26,8 +28,8 @@ pub use video::{
 };
 
 /// Re-exports of the P2P types the camera apps build on.
-pub use isekai_p2p::agent::{CertBundle, ObservedAddressWatch, RelayOptions};
-pub use isekai_p2p::{load_or_generate_key, InitiatorSession, P2pConfig};
+pub use isekai_p2p::agent::{CertBundle, EndpointToken, ObservedAddressWatch, RelayOptions};
+pub use isekai_p2p::{issue_endpoint_token, load_or_generate_key, InitiatorSession, P2pConfig};
 
 /// Open the msquic registration an application should run everything on.
 ///

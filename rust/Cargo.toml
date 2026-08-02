@@ -17,8 +17,6 @@ bytes = "1"
 eframe = "0.34.3"
 egui = "0.34.3"
 egui_plot = "0.35.0"
-# Renders the pairing code as a QR for a phone to scan (camera-server UI).
-qrcode = { version = "0.14", default-features = false }
 futures = "0.3"
 futures-concurrency = "7.6.3"
 h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
@@ -38,6 +36,8 @@ opencv = { version = "0.99", default-features = false, features = ["videoio", "i
 # ECDSA P-256 / JWK for the P2P Connect Endpoint keypair, PoP and endpoint id.
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "jwk", "pem", "pkcs8", "std"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+# Renders the pairing code as a QR for a phone to scan (camera-server UI).
+qrcode = { version = "0.14", default-features = false }
 rand = "0.8.4"
 # HTTP(S) client for the Identity API (registration + Endpoint Token, plain HTTPS).
 # `http2` so ALPN can negotiate h2 with the Identity API, which serves h1/h2 on
