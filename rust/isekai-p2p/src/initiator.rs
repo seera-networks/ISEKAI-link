@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use anyhow::Context as _;
 use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay, RelayOptions};
 use isekai_p2p_core::observed::ObservedAddressWatch;
-use isekai_p2p_core::proxy::{Candidate, PeerConnection, ProxyClient};
+use isekai_p2p_core::proxy::{Candidate, Grant, PeerConnection, ProxyClient, ReachableListener};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::config::{issue_endpoint_token, P2pConfig};
@@ -24,6 +24,76 @@ pub struct InitiatorSession {
     /// target so it can bind) and the relay info.
     pub connection: PeerConnection,
     relay: ConnectRelay,
+}
+
+/// What lets an initiator open a connection.
+///
+/// The proxy accepts either; which one a caller holds says how it was let in,
+/// not what it may do afterwards (spec §8.4).
+enum Authorization<'a> {
+    /// A one-shot token the listener's owner minted and handed over.
+    Capability(&'a str),
+    /// A standing grant the proxy already holds. Nothing was carried.
+    Grant,
+}
+
+/// The initiator's view of the control plane, before any relay leg exists.
+///
+/// Everything an app needs to answer "what can I reach, and how do I get let
+/// in" — the questions that used to be answered by a person reading a listener
+/// id and a capability off someone else's screen.
+pub struct PeerDirectory {
+    proxy: ProxyClient<MasqueH3Transport>,
+    endpoint_token: String,
+}
+
+impl PeerDirectory {
+    /// Obtain an Endpoint Token and open the control plane.
+    pub async fn open(cfg: &P2pConfig) -> anyhow::Result<Self> {
+        let token = issue_endpoint_token(cfg).await?;
+        Self::open_with_token(cfg, &token.endpoint_token)
+    }
+
+    /// Open with a token already in hand.
+    pub fn open_with_token(cfg: &P2pConfig, endpoint_token: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            proxy: ProxyClient::new(
+                MasqueH3Transport::connect(&cfg.proxy_url)?,
+                cfg.key.clone(),
+                endpoint_token,
+            ),
+            endpoint_token: endpoint_token.to_owned(),
+        })
+    }
+
+    /// The token this was opened with, to pass to a connect so the app does not
+    /// issue a second one.
+    pub fn endpoint_token(&self) -> &str {
+        &self.endpoint_token
+    }
+
+    /// Listeners this Endpoint may connect to now (spec §8.10).
+    pub async fn reachable(&self) -> anyhow::Result<Vec<ReachableListener>> {
+        Ok(self.proxy.list_reachable_listeners().await?)
+    }
+
+    /// Listeners of this Endpoint's own account that accept self-enrolment.
+    ///
+    /// Appearing here is **not** permission to connect — [`Self::enrol`] turns
+    /// one into the grant that is (spec §8.9.3).
+    pub async fn enrollable(&self) -> anyhow::Result<Vec<ReachableListener>> {
+        Ok(self.proxy.list_enrollable_listeners().await?)
+    }
+
+    /// Redeem a pairing code the listener's owner displayed (spec §8.9.2).
+    pub async fn pair(&self, code: &str, label: Option<&str>) -> anyhow::Result<Grant> {
+        Ok(self.proxy.pair_with_code(code, label).await?)
+    }
+
+    /// Enrol on a listener of this Endpoint's own account (spec §8.9.3).
+    pub async fn enrol(&self, listener_id: &str, label: Option<&str>) -> anyhow::Result<Grant> {
+        Ok(self.proxy.pair_with_listener(listener_id, label).await?)
+    }
 }
 
 impl InitiatorSession {
@@ -114,14 +184,95 @@ impl InitiatorSession {
         local_bind: SocketAddr,
         opts: RelayOptions,
     ) -> anyhow::Result<Self> {
+        Self::connect_inner(
+            cfg,
+            endpoint_token,
+            Authorization::Capability(capability),
+            listener_id,
+            candidates,
+            local_bind,
+            opts,
+        )
+        .await
+    }
+
+    /// Connect on a standing grant instead of a capability (spec §8.8).
+    ///
+    /// The difference is what the caller had to be given: a capability is a
+    /// token the listener's owner minted and handed over for this one
+    /// connection, and a grant is a record the proxy already holds. With a
+    /// grant there is nothing to carry, so this needs only the listener's id —
+    /// which [`PeerDirectory::reachable`] supplies.
+    pub async fn connect_with_grant(
+        cfg: &P2pConfig,
+        listener_id: &str,
+        candidates: &[Candidate],
+        local_bind: SocketAddr,
+        opts: RelayOptions,
+    ) -> anyhow::Result<Self> {
+        let token = issue_endpoint_token(cfg).await?;
+        Self::connect_with_grant_and_token(
+            cfg,
+            &token.endpoint_token,
+            listener_id,
+            candidates,
+            local_bind,
+            opts,
+        )
+        .await
+    }
+
+    /// [`connect_with_grant`](Self::connect_with_grant) with a token already in
+    /// hand, so an app that has just listed what it can reach does not issue a
+    /// second one to connect.
+    pub async fn connect_with_grant_and_token(
+        cfg: &P2pConfig,
+        endpoint_token: &str,
+        listener_id: &str,
+        candidates: &[Candidate],
+        local_bind: SocketAddr,
+        opts: RelayOptions,
+    ) -> anyhow::Result<Self> {
+        Self::connect_inner(
+            cfg,
+            endpoint_token,
+            Authorization::Grant,
+            listener_id,
+            candidates,
+            local_bind,
+            opts,
+        )
+        .await
+    }
+
+    /// What the two connect paths share. Only the authorization differs; the
+    /// relay leg that follows does not care which one got it here.
+    async fn connect_inner(
+        cfg: &P2pConfig,
+        endpoint_token: &str,
+        auth: Authorization<'_>,
+        listener_id: &str,
+        candidates: &[Candidate],
+        local_bind: SocketAddr,
+        opts: RelayOptions,
+    ) -> anyhow::Result<Self> {
         let proxy = ProxyClient::new(
             MasqueH3Transport::connect(&cfg.proxy_url)?,
             cfg.key.clone(),
             endpoint_token,
         );
-        let connection = proxy
-            .peer_connect(capability, listener_id, &cfg.protocol, candidates)
-            .await?;
+        let connection = match auth {
+            Authorization::Capability(capability) => {
+                proxy
+                    .peer_connect(capability, listener_id, &cfg.protocol, candidates)
+                    .await?
+            }
+            Authorization::Grant => {
+                proxy
+                    .peer_connect_with_grant(listener_id, &cfg.protocol, candidates)
+                    .await?
+            }
+        };
         let relay = connection.relay.as_ref().context(
             "connect response has no relay info; the proxy did not allocate a relay edge",
         )?;

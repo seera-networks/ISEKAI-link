@@ -30,8 +30,8 @@ use bytes::Bytes;
 use channel_masque::{
     CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClientEvent, MasqueClientMode,
 };
-use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
+use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use http_body::Frame;
@@ -45,7 +45,7 @@ use tower_http::auth::AddAuthorizationLayer;
 use tower_http::set_header::SetRequestHeaderLayer;
 
 use crate::endpoint::EndpointKey;
-use crate::observed::{spawn_observed_address_watch, ObservedAddressWatch};
+use crate::observed::{ObservedAddressWatch, spawn_observed_address_watch};
 use crate::pop;
 use crate::transport::make_client_config;
 

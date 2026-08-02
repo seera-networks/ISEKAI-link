@@ -333,12 +333,14 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new(
-            Arc::clone(&reg),
-            rx,
-            is_streaming,
-            mjpeg_tx_holder,
-        )))),
+        Box::new(|_cc| {
+            Ok(Box::new(MyApp::new(
+                Arc::clone(&reg),
+                rx,
+                is_streaming,
+                mjpeg_tx_holder,
+            )))
+        }),
     );
     tracing::debug!("eframe exited, stopping camera task");
     is_terminated.store(true, Ordering::Relaxed);
@@ -685,7 +687,9 @@ impl MyApp {
         ui.horizontal(|ui| {
             ui.label("Direct path offered:");
             match observed {
-                Some(address) => ui.monospace(format!("{} (as {})", address.local, address.observed)),
+                Some(address) => {
+                    ui.monospace(format!("{} (as {})", address.local, address.observed))
+                }
                 // Until a leg is bound and the proxy reports, clients are told
                 // nothing and stay on the relay.
                 None => ui.label("not yet — bind a relay first"),

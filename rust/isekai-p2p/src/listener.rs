@@ -24,7 +24,7 @@ use isekai_p2p_core::bind::{open_bind_session, BindSession, RelayOptions};
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
 use isekai_p2p_core::proxy::{
-    Capability, ConnectionStateFilter, PeerConnection, ProxyClient,
+    Capability, ConnectionStateFilter, Grant, PairingCode, PeerConnection, ProxyClient,
 };
 use isekai_p2p_core::transport::MasqueH3Transport;
 use tokio::sync::watch;
@@ -272,6 +272,28 @@ impl ListenerSession {
         Ok(())
     }
 
+    /// Mint a pairing code for the owner to display (spec §8.9.1).
+    ///
+    /// Issuing one invalidates this listener's previous code: there is only
+    /// ever one, because the owner is showing it on one screen.
+    pub async fn show_pairing_code(&self, ttl: Option<u64>) -> anyhow::Result<PairingCode> {
+        Ok(self
+            .proxy
+            .create_pairing_code(&self.listener_id, ttl)
+            .await?)
+    }
+
+    /// Who is currently allowed to connect to this listener (spec §8.8.2).
+    pub async fn list_grants(&self) -> anyhow::Result<Vec<Grant>> {
+        Ok(self.proxy.list_grants(&self.listener_id).await?)
+    }
+
+    /// Withdraw a grant (spec §8.8.3). Takes effect on that peer's next
+    /// connect; anything already established stays up.
+    pub async fn revoke_grant(&self, grant_id: &str) -> anyhow::Result<()> {
+        Ok(self.proxy.revoke_grant(&self.listener_id, grant_id).await?)
+    }
+
     /// Look for connections waiting on this listener and bind one, once.
     ///
     /// This is a single pass rather than a loop because binding needs `&mut
@@ -411,7 +433,11 @@ fn forget_gone(state: &mut SignalingState, connections: &[PeerConnection]) {
         .map(|c| c.connection_id.as_str())
         .collect();
     state.bound.retain(|id| live.contains(id.as_str()));
-    if state.current.as_deref().is_some_and(|id| !live.contains(id)) {
+    if state
+        .current
+        .as_deref()
+        .is_some_and(|id| !live.contains(id))
+    {
         state.current = None;
     }
 }

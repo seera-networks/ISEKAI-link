@@ -119,9 +119,14 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
     // --- Target side ---
     let server_cfg = config(auth0, identity, proxy, protocol, "e2e-server.pem");
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
-    let server =
-        camera_core::spawn_p2p_server(Some(reg.clone()), server_cfg, frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone())
-            .await?;
+    let server = camera_core::spawn_p2p_server(
+        Some(reg.clone()),
+        server_cfg,
+        frame_rx,
+        camera_core::AcceptPolicy::Manual,
+        shutdown.clone(),
+    )
+    .await?;
     println!(
         "server ready: listener={} endpoint={} video={}",
         server.info.listener_id, server.info.endpoint_id, server.info.video_addr

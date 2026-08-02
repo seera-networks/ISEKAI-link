@@ -22,18 +22,18 @@ pub mod initiator;
 pub mod listener;
 
 pub use config::{fetch_relay_certificate, issue_endpoint_token, load_or_generate_key, P2pConfig};
-pub use initiator::InitiatorSession;
+pub use initiator::{InitiatorSession, PeerDirectory};
 pub use listener::{AcceptPolicy, ListenerSession, SignalingEvent, SignalingState};
 
 /// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.
 pub mod agent {
     pub use isekai_p2p_core::bind::RelayOptions;
     pub use isekai_p2p_core::endpoint::EndpointKey;
-    pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::identity::EndpointToken;
+    pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::proxy::{
-        Candidate, CandidateType, Capability, CertBundle, Grant, ListenerConnections, PairingCode,
-        PeerConnection, ReachableListener,
+        Candidate, CandidateType, Capability, CertBundle, ConnectionStateFilter, Grant,
+        ListenerConnections, PairingCode, PeerConnection, ReachableListener,
     };
     pub use isekai_p2p_core::transport::{drain_msquic, shutdown_msquic};
 }

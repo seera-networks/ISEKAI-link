@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use isekai_p2p::agent::{ObservedAddressWatch, RelayOptions};
+use isekai_p2p::agent::{Grant, ObservedAddressWatch, PairingCode, RelayOptions};
 use isekai_p2p::{
     fetch_relay_certificate, issue_endpoint_token, AcceptPolicy, ListenerSession, P2pConfig,
     SignalingEvent, SignalingState,
@@ -44,8 +44,25 @@ pub enum ServerCommand {
         reply: oneshot::Sender<anyhow::Result<String>>,
     },
     /// Attach the relay bind leg for the initiator's connection id.
+    ///
+    /// Only needed under [`AcceptPolicy::Manual`]; otherwise the session binds
+    /// what the proxy says is waiting, without anyone carrying an id across.
     Bind {
         connection_id: String,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Mint a pairing code to display. Replaces whatever code this listener had.
+    ShowPairingCode {
+        ttl: Option<u64>,
+        reply: oneshot::Sender<anyhow::Result<PairingCode>>,
+    },
+    /// Who is currently allowed to connect.
+    ListGrants {
+        reply: oneshot::Sender<anyhow::Result<Vec<Grant>>>,
+    },
+    /// Withdraw one. Takes effect on that peer's next connect.
+    RevokeGrant {
+        grant_id: String,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
 }
@@ -213,6 +230,15 @@ async fn command_loop(
                 Some(ServerCommand::Bind { connection_id, reply }) => {
                     let result = session.bind(&connection_id).await;
                     let _ = reply.send(result);
+                }
+                Some(ServerCommand::ShowPairingCode { ttl, reply }) => {
+                    let _ = reply.send(session.show_pairing_code(ttl).await);
+                }
+                Some(ServerCommand::ListGrants { reply }) => {
+                    let _ = reply.send(session.list_grants().await);
+                }
+                Some(ServerCommand::RevokeGrant { grant_id, reply }) => {
+                    let _ = reply.send(session.revoke_grant(&grant_id).await);
                 }
                 None => break,
             },

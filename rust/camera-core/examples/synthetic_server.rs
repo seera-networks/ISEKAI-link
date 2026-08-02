@@ -214,7 +214,10 @@ async fn main() -> anyhow::Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--control" => {
-                control_addr = Some(args.next().unwrap_or_else(|| DEFAULT_CONTROL_ADDR.to_owned()))
+                control_addr = Some(
+                    args.next()
+                        .unwrap_or_else(|| DEFAULT_CONTROL_ADDR.to_owned()),
+                )
             }
             "-h" | "--help" => {
                 println!("usage: synthetic_server [--control [addr]]");
@@ -227,8 +230,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let auth0_token = std::env::var("AUTH0_TOKEN")
-        .map_err(|_| anyhow::anyhow!("AUTH0_TOKEN is required"))?;
+    let auth0_token =
+        std::env::var("AUTH0_TOKEN").map_err(|_| anyhow::anyhow!("AUTH0_TOKEN is required"))?;
     let identity_url = env_or("IDENTITY_URL", "https://identity.isekai.tools:9443");
     let proxy_url = env_or("PROXY_URL", "https://link.isekai.tools:8443");
     let protocol = env_or("PROTOCOL", "isekai-validator-v1");
@@ -254,7 +257,14 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(4);
-    let server = camera_core::spawn_p2p_server(None, cfg, frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
+    let server = camera_core::spawn_p2p_server(
+        None,
+        cfg,
+        frame_rx,
+        camera_core::AcceptPolicy::Manual,
+        shutdown.clone(),
+    )
+    .await?;
 
     println!(
         "listener={} endpoint={} video={}",

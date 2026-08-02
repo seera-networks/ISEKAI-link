@@ -428,19 +428,35 @@ impl MyApp {
             // path can be opened from its binding, and on the app's
             // registration so the video connection can share it.
             let local_bind = "127.0.0.1:0".parse().expect("valid loopback addr");
-            let session = match camera_core::InitiatorSession::connect_with_options(
-                &cfg,
-                &capability,
-                &listener_id,
-                &[],
-                local_bind,
-                RelayOptions {
-                    unconnected: true,
-                    registration: Some(Arc::clone(&reg)),
-                },
-            )
-            .await
-            {
+            let relay_options = RelayOptions {
+                unconnected: true,
+                registration: Some(Arc::clone(&reg)),
+            };
+            // An empty capability means there is nothing to present, which is
+            // the point of a grant: the proxy already holds the authorization,
+            // so only the listener's id is needed. Leaving the field filled
+            // still uses the capability, so the old flow is unchanged.
+            let connect = if capability.is_empty() {
+                camera_core::InitiatorSession::connect_with_grant(
+                    &cfg,
+                    &listener_id,
+                    &[],
+                    local_bind,
+                    relay_options,
+                )
+                .await
+            } else {
+                camera_core::InitiatorSession::connect_with_options(
+                    &cfg,
+                    &capability,
+                    &listener_id,
+                    &[],
+                    local_bind,
+                    relay_options,
+                )
+                .await
+            };
+            let session = match connect {
                 Ok(session) => session,
                 Err(e) => {
                     shared.lock().unwrap().status = format!("connect error: {e:#}");
@@ -545,9 +561,7 @@ impl MyApp {
         };
         while let Ok(event) = path_rx.try_recv() {
             match event {
-                PathEvent::Relay { local, remote } => {
-                    self.isekai_link_path = Some((local, remote))
-                }
+                PathEvent::Relay { local, remote } => self.isekai_link_path = Some((local, remote)),
                 PathEvent::DirectValidated { local, remote } => {
                     self.p2p_path = Some((local, remote))
                 }
@@ -582,6 +596,14 @@ impl MyApp {
         );
         field(ui, "Capability:  ", &mut self.capability, false);
         field(ui, "Listener ID: ", &mut self.listener_id, false);
+        ui.label(
+            egui::RichText::new(
+                "Leave Capability empty to connect on a standing grant \
+                 (pair with the camera once, then only the Listener ID is needed).",
+            )
+            .small()
+            .weak(),
+        );
 
         // Step 1 of the exchange: reveal this Endpoint's id for the server.
         if ui
@@ -601,17 +623,29 @@ impl MyApp {
     /// Which path the traffic is on, and what it could move to. Mode-agnostic:
     /// both Direct and P2P report the same events.
     fn path_status_ui(&self, ui: &mut egui::Ui) {
-        let show = |ui: &mut egui::Ui, label: &str, path: Option<(SocketAddr, SocketAddr)>, active: bool| {
+        let show = |ui: &mut egui::Ui,
+                    label: &str,
+                    path: Option<(SocketAddr, SocketAddr)>,
+                    active: bool| {
             let text = match path {
                 Some((local, remote)) => format!("{local} -> {remote}"),
                 None => "not available".to_owned(),
             };
             ui.horizontal(|ui| {
-                ui.label(if active { format!("▶ {label}:") } else { format!("   {label}:") });
+                ui.label(if active {
+                    format!("▶ {label}:")
+                } else {
+                    format!("   {label}:")
+                });
                 ui.monospace(text);
             });
         };
-        show(ui, "Isekai Link path", self.isekai_link_path, self.is_isekai_link);
+        show(
+            ui,
+            "Isekai Link path",
+            self.isekai_link_path,
+            self.is_isekai_link,
+        );
         show(ui, "Direct path     ", self.p2p_path, !self.is_isekai_link);
     }
 

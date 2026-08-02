@@ -413,7 +413,6 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         .await
     }
 
-
     /// `POST /v1/peer-listeners/{id}/grants` (spec §8.8.1).
     ///
     /// `ttl` omitted means the grant stands until revoked, which is the usual
@@ -456,11 +455,7 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     ///
     /// Takes effect on the peer's next connect; anything already established
     /// stays up.
-    pub async fn revoke_grant(
-        &self,
-        listener_id: &str,
-        grant_id: &str,
-    ) -> Result<(), ProxyError> {
+    pub async fn revoke_grant(&self, listener_id: &str, grant_id: &str) -> Result<(), ProxyError> {
         self.request_empty(
             "DELETE",
             &format!("/v1/peer-listeners/{listener_id}/grants/{grant_id}"),
@@ -518,7 +513,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         label: Option<&str>,
     ) -> Result<Grant, ProxyError> {
         let body = serde_json::json!({ "code": code, "label": label });
-        self.request_json("POST", "/v1/peer/pair", to_vec(&body)).await
+        self.request_json("POST", "/v1/peer/pair", to_vec(&body))
+            .await
     }
 
     /// `POST /v1/peer/pair` on a listener of this Endpoint's own account
@@ -530,7 +526,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         label: Option<&str>,
     ) -> Result<Grant, ProxyError> {
         let body = serde_json::json!({ "listener_id": listener_id, "label": label });
-        self.request_json("POST", "/v1/peer/pair", to_vec(&body)).await
+        self.request_json("POST", "/v1/peer/pair", to_vec(&body))
+            .await
     }
 
     /// `GET /v1/peer/listeners` — what this Endpoint may connect to now.

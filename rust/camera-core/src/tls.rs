@@ -104,7 +104,9 @@ mod tests {
             .expect("bundle is standard base64");
         let parsed = openssl::pkcs12::Pkcs12::from_der(&der).expect("bundle is PKCS#12");
         // Empty password, as `PFXImportCertStore` is called with a null one.
-        let parsed = parsed.parse2("").expect("bundle opens with an empty password");
+        let parsed = parsed
+            .parse2("")
+            .expect("bundle opens with an empty password");
         assert!(parsed.cert.is_some(), "bundle carries the certificate");
         assert!(parsed.pkey.is_some(), "bundle carries the private key");
     }
