@@ -6,6 +6,7 @@
 //! carries it to the target's bound socket.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay, RelayOptions};
@@ -24,7 +25,17 @@ pub struct InitiatorSession {
     /// target so it can bind) and the relay info.
     pub connection: PeerConnection,
     relay: ConnectRelay,
+    /// Kept so [`close`](Self::close) can tell the proxy the connection is
+    /// over. Nothing else here needs the control plane once the leg is up.
+    proxy: ProxyClient<MasqueH3Transport>,
 }
+
+/// How long [`InitiatorSession::close`] waits to report the connection closed.
+///
+/// Short: this runs while an application is disconnecting or exiting, and what
+/// is lost by giving up is that the listener holds its relay leg for this
+/// connection until the proxy expires it.
+const REPORT_CLOSED_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What lets an initiator open a connection.
 ///
@@ -347,6 +358,7 @@ impl InitiatorSession {
             local_addr: handle.local_addr,
             connection,
             relay: handle,
+            proxy: proxy.clone(),
         })
     }
 
@@ -379,7 +391,42 @@ impl InitiatorSession {
     }
 
     /// Tear down the relay connect leg.
+    /// Report the connection closed and take the relay connect leg down.
+    ///
+    /// The report is the important half, and it is easy to miss why. The
+    /// listener finds out who is waiting for it by listing its connections in
+    /// state `relay`, and binds its single leg to one of them. A connection
+    /// nobody reports stays in that listing until the proxy expires it — so a
+    /// peer that disconnects goes on occupying the listener's leg for minutes,
+    /// and another peer already waiting is not picked up in the meantime. What
+    /// looks like "the camera stopped accepting anyone" is this.
+    ///
+    /// Bounded by [`REPORT_CLOSED_TIMEOUT`] and never fails the caller: this
+    /// runs on the way out, the connection expires on its own either way, and
+    /// there is nothing a disconnecting application could do with the error.
     pub async fn close(self) {
+        let reported = tokio::time::timeout(
+            REPORT_CLOSED_TIMEOUT,
+            self.proxy
+                .report_state(&self.connection.connection_id, "closed", &[]),
+        )
+        .await;
+        match reported {
+            Ok(Ok(_)) => tracing::debug!(
+                connection_id = %self.connection.connection_id,
+                "reported the peer connection closed"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                connection_id = %self.connection.connection_id,
+                "could not report the peer connection closed; the listener's leg \
+                 stays reserved until the proxy expires it: {e}"
+            ),
+            Err(_) => tracing::warn!(
+                connection_id = %self.connection.connection_id,
+                "timed out reporting the peer connection closed; the listener's leg \
+                 stays reserved until the proxy expires it"
+            ),
+        }
         self.relay.close().await;
     }
 }

@@ -344,6 +344,7 @@ pub struct PeerConnection {
 }
 
 /// The P2P control-plane client.
+#[derive(Clone)]
 pub struct ProxyClient<T> {
     transport: T,
     key: EndpointKey,

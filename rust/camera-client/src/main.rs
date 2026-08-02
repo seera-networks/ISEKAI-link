@@ -197,6 +197,10 @@ async fn control_plane<'a>(
     Ok(&slot.as_ref().expect("just filled").directory)
 }
 
+/// How long a disconnect waits for the connection task to report itself closed
+/// before killing it.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// Shared runtime state of a P2P connection, updated by the async task and read
 /// by the UI.
 #[derive(Default)]
@@ -243,6 +247,9 @@ struct MyApp {
     connected: bool,
     rx: Option<mpsc::Receiver<(u64, Bytes)>>,
     conn_task: Option<tokio::task::AbortHandle>,
+    /// The P2P connection task, kept as a join handle rather than an abort
+    /// handle so disconnecting can let it report the connection closed first.
+    p2p_task: Option<tokio::task::JoinHandle<()>>,
     shutdown: Option<CancellationToken>,
     texture: Option<egui::TextureHandle>,
     rtt_rx: Option<mpsc::Receiver<f64>>,
@@ -289,6 +296,7 @@ impl MyApp {
             connected: false,
             rx: None,
             conn_task: None,
+            p2p_task: None,
             shutdown: None,
             texture: None,
             rtt_rx: None,
@@ -597,7 +605,7 @@ impl MyApp {
             session.close().await;
         });
 
-        self.conn_task = Some(handle.abort_handle());
+        self.p2p_task = Some(handle);
         self.rx = Some(rx);
         self.connected = true;
     }
@@ -608,6 +616,25 @@ impl MyApp {
         }
         if let Some(handle) = self.conn_task.take() {
             handle.abort();
+        }
+        if let Some(mut handle) = self.p2p_task.take() {
+            // Let this one wind down rather than killing it. The last thing it
+            // does is close the session, and the first thing closing does is
+            // tell the proxy the connection is over — without which the camera
+            // goes on holding its relay leg for us, and does not pick up
+            // whoever else is waiting, until the proxy expires the connection.
+            // Aborted only if winding down does not finish.
+            tokio::spawn(async move {
+                if tokio::time::timeout(DISCONNECT_TIMEOUT, &mut handle)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "P2P connection task did not stop within {DISCONNECT_TIMEOUT:?}; aborting"
+                    );
+                    handle.abort();
+                }
+            });
         }
         self.rx = None;
         self.rtt_rx = None;

@@ -127,6 +127,15 @@ pub enum SignalingEvent {
 pub struct SignalingState {
     bound: HashSet<String>,
     current: Option<String>,
+    /// Connections whose leg has already ended here.
+    ///
+    /// Separate from `bound` because they mean different things. `bound` is
+    /// "already served, do not churn the leg for it while the leg is busy";
+    /// this is "serving it did not last, and the listing has not caught up".
+    /// Without it, a peer that vanished without reporting would be picked
+    /// again the moment its leg died, and again after that, for as long as the
+    /// proxy kept listing it.
+    spent: HashSet<String>,
 }
 
 impl SignalingState {
@@ -336,6 +345,17 @@ impl ListenerSession {
         if listing.truncated {
             events.push(SignalingEvent::Truncated);
         }
+        // A leg that has ended is not holding anything, whatever the listing
+        // still says. The peer usually reports itself closed and drops out of
+        // the listing, and `forget_gone` covers that; this is the peer that
+        // went away without reporting — killed, crashed, or off the network —
+        // whose connection the proxy will keep listing until it expires.
+        if self.bind.as_ref().is_some_and(|g| g.handle.is_finished()) {
+            self.bind = None;
+            if let Some(ended) = state.current.take() {
+                state.spent.insert(ended);
+            }
+        }
         forget_gone(state, &listing.connections);
         let Some(next) = next_to_bind(&listing.connections, state) else {
             return Ok(events);
@@ -484,6 +504,7 @@ fn forget_gone(state: &mut SignalingState, connections: &[PeerConnection]) {
         .map(|c| c.connection_id.as_str())
         .collect();
     state.bound.retain(|id| live.contains(id.as_str()));
+    state.spent.retain(|id| live.contains(id.as_str()));
     if state
         .current
         .as_deref()
@@ -505,15 +526,22 @@ fn forget_gone(state: &mut SignalingState, connections: &[PeerConnection]) {
 ///   there until its TTL ran out while the leg was free. Whoever is newest gets
 ///   it, which is the same rule as always; having been bound once before is
 ///   not a reason to be passed over now.
+///
+/// A connection whose leg has already ended here is skipped either way. It is
+/// still listed — a peer that vanished without reporting stays listed until the
+/// proxy expires it — and binding it again would only produce a leg that ends
+/// the same way, every poll, for minutes.
 fn next_to_bind<'a>(
     connections: &'a [PeerConnection],
     state: &SignalingState,
 ) -> Option<&'a PeerConnection> {
+    let usable = |c: &&PeerConnection| !state.spent.contains(&c.connection_id);
     if state.current.is_none() {
-        return connections.first();
+        return connections.iter().find(usable);
     }
     connections
         .iter()
+        .filter(usable)
         .find(|c| !state.bound.contains(&c.connection_id))
 }
 
@@ -623,6 +651,11 @@ mod tests {
     /// A peer displaced by a newer one is still waiting and still listed. Once
     /// the leg is free it has to be picked up again, or it sits there until its
     /// TTL runs out while the camera serves nobody.
+    ///
+    /// On hardware this did not happen, and the reason was not here: B stayed
+    /// in the listing after disconnecting because nothing told the proxy it had
+    /// gone, so the leg never came free at all. `InitiatorSession::close` now
+    /// reports it, which is what makes `forget_gone` below run for real.
     #[test]
     fn a_displaced_connection_is_picked_up_once_the_leg_is_free() {
         let mut state = SignalingState::default();
@@ -718,5 +751,29 @@ mod tests {
         leg_tx.send_replace(None);
         republish_observed(&mut leg_rx, &session, true);
         assert_eq!(*held.borrow(), Some(observed(1000)));
+    }
+
+    /// A peer that vanished without reporting stays listed until the proxy
+    /// expires it. Its leg has ended here, so it must not be chosen again —
+    /// otherwise every poll rebuilds a leg that dies immediately, and the peer
+    /// actually waiting never gets the leg.
+    #[test]
+    fn a_peer_whose_leg_died_is_not_chosen_again() {
+        let listing = vec![conn("conn_b"), conn("conn_a")];
+        let mut state = SignalingState::default();
+        state.bound.insert("conn_b".to_owned());
+        // What `poll_signaling` does when it finds the leg finished.
+        state.spent.insert("conn_b".to_owned());
+        state.current = None;
+
+        assert_eq!(
+            next_to_bind(&listing, &state).map(|c| c.connection_id.as_str()),
+            Some("conn_a"),
+            "the newest is B, but B's leg already died here"
+        );
+
+        // And once the proxy stops listing B, it is forgotten entirely.
+        forget_gone(&mut state, &[conn("conn_a")]);
+        assert!(state.spent.is_empty());
     }
 }
