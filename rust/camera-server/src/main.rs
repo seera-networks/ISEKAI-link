@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use camera_core::{ObservedAddressWatch, P2pConfig, ServerCommand, ServerInfo};
+use camera_core::{
+    Grant, ObservedAddressWatch, P2pConfig, PairingCode, ServerCommand, ServerInfo, SignalingEvent,
+};
 use eframe::egui;
 use http::Uri;
 use isekai_link_utils::{
@@ -15,6 +17,7 @@ use opencv::{
     videoio,
 };
 use std::{
+    collections::VecDeque,
     future::poll_fn,
     net::SocketAddr,
     sync::{
@@ -23,9 +26,9 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -333,12 +336,14 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new(
-            Arc::clone(&reg),
-            rx,
-            is_streaming,
-            mjpeg_tx_holder,
-        )))),
+        Box::new(|_cc| {
+            Ok(Box::new(MyApp::new(
+                Arc::clone(&reg),
+                rx,
+                is_streaming,
+                mjpeg_tx_holder,
+            )))
+        }),
     );
     tracing::debug!("eframe exited, stopping camera task");
     is_terminated.store(true, Ordering::Relaxed);
@@ -379,6 +384,73 @@ struct P2pShared {
     /// each video client as a direct path, so showing it makes a migration that
     /// never happens diagnosable: empty means the leg has not reported yet.
     observed: Option<ObservedAddressWatch>,
+    /// The code currently on screen, and when it stops working. Shown until it
+    /// expires so the operator can see it running out rather than find out by
+    /// having someone fail to pair.
+    pairing_code: Option<(PairingCode, Instant)>,
+    /// Who is allowed to connect. Only what the last refresh said — the proxy
+    /// decides, and this is a view of it.
+    grants: Vec<Grant>,
+    /// What the session's automatic binding did, newest last. Bounded, because
+    /// it is a log on a screen and nobody scrolls back an hour.
+    activity: VecDeque<String>,
+    /// Last error from a control-plane action, shown until the next one.
+    error: Option<String>,
+}
+
+/// How many lines of binding activity the UI keeps.
+const ACTIVITY_LINES: usize = 20;
+
+/// One line of binding activity, in the terms an operator thinks in.
+fn describe(event: &SignalingEvent) -> String {
+    match event {
+        SignalingEvent::Bound {
+            peer_endpoint,
+            replaced: Some(previous),
+            ..
+        } => format!("{peer_endpoint} connected (took over from {previous})"),
+        SignalingEvent::Bound { peer_endpoint, .. } => format!("{peer_endpoint} connected"),
+        SignalingEvent::Waiting { peer_endpoint, .. } => format!("{peer_endpoint} is waiting"),
+        SignalingEvent::BindFailed { error, .. } => format!("could not connect a peer: {error}"),
+        SignalingEvent::Truncated => "more peers are waiting than the proxy will list".to_string(),
+    }
+}
+
+/// How long a pairing code has left, or `None` once it has run out.
+fn code_remaining(shown_at: Instant, ttl: Duration) -> Option<Duration> {
+    ttl.checked_sub(shown_at.elapsed())
+}
+
+/// Render a pairing code as a QR image.
+///
+/// Scanning beats typing eight characters into a phone, and the code is short
+/// enough that the smallest QR carries it. The quiet zone matters: without a
+/// border, scanners frequently will not see it at all.
+fn qr_image(text: &str) -> Option<egui::ColorImage> {
+    const SCALE: usize = 6;
+    const QUIET: usize = 4;
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let modules = code.to_colors();
+    let width = (modules.len() as f64).sqrt() as usize;
+    let side = (width + QUIET * 2) * SCALE;
+    let mut pixels = vec![egui::Color32::WHITE; side * side];
+    for (i, module) in modules.iter().enumerate() {
+        if *module != qrcode::Color::Dark {
+            continue;
+        }
+        let (mx, my) = (i % width + QUIET, i / width + QUIET);
+        for dy in 0..SCALE {
+            for dx in 0..SCALE {
+                let (x, y) = (mx * SCALE + dx, my * SCALE + dy);
+                pixels[y * side + x] = egui::Color32::BLACK;
+            }
+        }
+    }
+    Some(egui::ColorImage {
+        size: [side, side],
+        pixels,
+        source_size: egui::vec2(side as f32, side as f32),
+    })
 }
 
 struct MyApp {
@@ -408,6 +480,10 @@ struct MyApp {
 
     // P2P 実行時の共有状態
     p2p_shared: Arc<Mutex<P2pShared>>,
+    /// The current pairing code's QR, uploaded once and dropped when the code
+    /// changes or lapses — a stale image would invite someone to scan a code
+    /// that no longer works.
+    qr_texture: Option<egui::TextureHandle>,
     p2p_commands: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ServerCommand>>>>,
 
     // カメラ表示
@@ -446,6 +522,7 @@ impl MyApp {
             public_address: Arc::new(Mutex::new(None)),
             log_shared: Arc::new(Mutex::new("Ready.".to_string())),
             p2p_shared: Arc::new(Mutex::new(P2pShared::default())),
+            qr_texture: None,
             p2p_commands: Arc::new(Mutex::new(None)),
             rx,
             texture: None,
@@ -561,6 +638,30 @@ impl MyApp {
                         s.info = Some(server.info);
                         s.observed = Some(server.observed);
                     }
+                    // Follow what the automatic binding does, so the operator
+                    // can see who connected without having done anything.
+                    let activity_shared = Arc::clone(&shared);
+                    let mut events = server.signaling.subscribe();
+                    tokio::spawn(async move {
+                        loop {
+                            match events.recv().await {
+                                Ok(event) => {
+                                    let mut s = activity_shared.lock().unwrap();
+                                    s.activity.push_back(describe(&event));
+                                    while s.activity.len() > ACTIVITY_LINES {
+                                        s.activity.pop_front();
+                                    }
+                                }
+                                // Falling behind loses the oldest lines, which
+                                // is the right trade for a log on a screen.
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    let mut s = activity_shared.lock().unwrap();
+                                    s.activity.push_back(format!("({n} events missed)"));
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
                     *cmd_holder.lock().unwrap() = Some(server.commands);
                 }
                 Err(e) => {
@@ -570,6 +671,97 @@ impl MyApp {
         });
         self.open_task = Some(handle.abort_handle());
         self.is_open = true;
+    }
+
+    /// Ask the session for a pairing code and put it on screen.
+    fn show_pairing_code(&self) {
+        let Some(cmd_tx) = self.p2p_commands.lock().unwrap().clone() else {
+            self.p2p_shared.lock().unwrap().status = "P2P server not ready".to_string();
+            return;
+        };
+        let shared = Arc::clone(&self.p2p_shared);
+        tokio::spawn(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ServerCommand::ShowPairingCode { ttl: None, reply })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            match rx.await {
+                Ok(Ok(code)) => {
+                    let mut s = shared.lock().unwrap();
+                    s.pairing_code = Some((code, Instant::now()));
+                    s.error = None;
+                }
+                Ok(Err(e)) => shared.lock().unwrap().error = Some(format!("pairing code: {e:#}")),
+                Err(_) => {}
+            }
+        });
+    }
+
+    /// Refresh the list of who may connect.
+    fn refresh_grants(&self) {
+        let Some(cmd_tx) = self.p2p_commands.lock().unwrap().clone() else {
+            return;
+        };
+        let shared = Arc::clone(&self.p2p_shared);
+        tokio::spawn(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ServerCommand::ListGrants { reply })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            match rx.await {
+                Ok(Ok(grants)) => {
+                    let mut s = shared.lock().unwrap();
+                    s.grants = grants;
+                    s.error = None;
+                }
+                Ok(Err(e)) => shared.lock().unwrap().error = Some(format!("grants: {e:#}")),
+                Err(_) => {}
+            }
+        });
+    }
+
+    /// Withdraw one. Takes effect on that peer's next connect; what is
+    /// streaming now keeps streaming.
+    fn revoke_grant(&self, grant_id: String) {
+        let Some(cmd_tx) = self.p2p_commands.lock().unwrap().clone() else {
+            return;
+        };
+        let shared = Arc::clone(&self.p2p_shared);
+        tokio::spawn(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ServerCommand::RevokeGrant { grant_id, reply })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            match rx.await {
+                Ok(Ok(())) => {
+                    // Ask again rather than editing the local copy: the proxy
+                    // is what decides, and this keeps the screen its view.
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    if cmd_tx
+                        .send(ServerCommand::ListGrants { reply })
+                        .await
+                        .is_ok()
+                        && let Ok(Ok(grants)) = rx.await
+                    {
+                        shared.lock().unwrap().grants = grants;
+                    }
+                }
+                Ok(Err(e)) => shared.lock().unwrap().error = Some(format!("revoke: {e:#}")),
+                Err(_) => {}
+            }
+        });
     }
 
     /// Ask the running P2P server for a capability for `allowed_endpoint`, then
@@ -668,6 +860,7 @@ impl MyApp {
     }
 
     fn p2p_status_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let (status, info, capability, observed) = {
             let shared = self.p2p_shared.lock().unwrap();
             (
@@ -685,7 +878,9 @@ impl MyApp {
         ui.horizontal(|ui| {
             ui.label("Direct path offered:");
             match observed {
-                Some(address) => ui.monospace(format!("{} (as {})", address.local, address.observed)),
+                Some(address) => {
+                    ui.monospace(format!("{} (as {})", address.local, address.observed))
+                }
                 // Until a leg is bound and the proxy reports, clients are told
                 // nothing and stay on the relay.
                 None => ui.label("not yet — bind a relay first"),
@@ -703,34 +898,145 @@ impl MyApp {
             ui.monospace(info.listener_id.as_str());
         });
 
-        // Step 2 of the exchange: mint a capability for the client's Endpoint ID.
-        ui.horizontal(|ui| {
-            ui.label("Client Endpoint ID:");
-            ui.text_edit_singleline(&mut self.client_endpoint_id);
-        });
-        if ui.button("Issue capability").clicked() {
-            let endpoint = self.client_endpoint_id.trim().to_string();
-            if !endpoint.is_empty() {
-                self.issue_capability(endpoint);
+        ui.separator();
+        self.pairing_ui(ui, &ctx);
+        ui.separator();
+        self.grants_ui(ui);
+        ui.separator();
+        self.activity_ui(ui);
+
+        // The exchange this replaces. Kept for a proxy without grants, and for
+        // when something in the automatic path needs to be worked around.
+        ui.separator();
+        egui::CollapsingHeader::new("Manual exchange (capability + connection id)")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Client Endpoint ID:");
+                    ui.text_edit_singleline(&mut self.client_endpoint_id);
+                });
+                if ui.button("Issue capability").clicked() {
+                    let endpoint = self.client_endpoint_id.trim().to_string();
+                    if !endpoint.is_empty() {
+                        self.issue_capability(endpoint);
+                    }
+                }
+                if let Some(cap) = capability {
+                    ui.horizontal(|ui| {
+                        ui.label("Capability:");
+                        ui.monospace(cap.as_str());
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Client Connection ID:");
+                    ui.text_edit_singleline(&mut self.client_connection_id);
+                });
+                if ui.button("Bind relay").clicked() {
+                    let connection = self.client_connection_id.trim().to_string();
+                    if !connection.is_empty() {
+                        self.bind_connection(connection);
+                    }
+                }
+            });
+    }
+
+    /// Show a code for someone to scan or type. Nothing comes back the other
+    /// way, which is what makes this one-directional exchange work.
+    fn pairing_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Add a device");
+        let shown = self.p2p_shared.lock().unwrap().pairing_code.clone();
+        match shown {
+            Some((code, shown_at)) => {
+                let ttl = Duration::from_secs(300);
+                match code_remaining(shown_at, ttl) {
+                    Some(left) => {
+                        ui.label("Scan this, or type the code into the viewer:");
+                        if self.qr_texture.is_none()
+                            && let Some(image) = qr_image(&code.code)
+                        {
+                            self.qr_texture = Some(ctx.load_texture(
+                                "pairing-qr",
+                                image,
+                                egui::TextureOptions::NEAREST,
+                            ));
+                        }
+                        if let Some(texture) = &self.qr_texture {
+                            ui.image((texture.id(), texture.size_vec2()));
+                        }
+                        ui.label(egui::RichText::new(&code.code).monospace().size(24.0));
+                        ui.label(format!("expires in {}s", left.as_secs()));
+                        // The code stops working on its own, so the countdown
+                        // has to keep moving without anything else happening.
+                        ctx.request_repaint_after(Duration::from_secs(1));
+                    }
+                    None => {
+                        self.p2p_shared.lock().unwrap().pairing_code = None;
+                        self.qr_texture = None;
+                        ui.label("that code has expired");
+                    }
+                }
+            }
+            None => {
+                ui.label("A device that pairs once can connect whenever it likes afterwards.");
             }
         }
-        if let Some(cap) = capability {
+        if ui.button("Show a pairing code").clicked() {
+            // Any previous code stops working the moment a new one is issued,
+            // so the old image must not stay on screen.
+            self.qr_texture = None;
+            self.show_pairing_code();
+        }
+    }
+
+    /// Who may connect, and how to stop them.
+    fn grants_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Allowed devices");
+        let grants = self.p2p_shared.lock().unwrap().grants.clone();
+        if grants.is_empty() {
+            ui.label("none yet — pair a device to add one");
+        }
+        let mut revoke = None;
+        for grant in &grants {
             ui.horizontal(|ui| {
-                ui.label("Capability:");
-                ui.monospace(cap.as_str());
+                let name = grant.label.as_deref().unwrap_or(&grant.allowed_endpoint);
+                ui.label(name);
+                ui.label(
+                    egui::RichText::new(match grant.origin.as_str() {
+                        "pairing" => "paired",
+                        "owner_match" => "same account",
+                        _ => "added by hand",
+                    })
+                    .small()
+                    .weak(),
+                );
+                if ui.button("Remove").clicked() {
+                    revoke = Some(grant.grant_id.clone());
+                }
             });
         }
+        if let Some(grant_id) = revoke {
+            self.revoke_grant(grant_id);
+        }
+        if ui.button("Refresh").clicked() {
+            self.refresh_grants();
+        }
+    }
 
-        // Step 4: bind the relay once the client reports its connection id.
-        ui.horizontal(|ui| {
-            ui.label("Client Connection ID:");
-            ui.text_edit_singleline(&mut self.client_connection_id);
-        });
-        if ui.button("Bind relay").clicked() {
-            let connection = self.client_connection_id.trim().to_string();
-            if !connection.is_empty() {
-                self.bind_connection(connection);
-            }
+    /// What the session did without being asked, so it is not invisible.
+    fn activity_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Connections");
+        let (activity, error) = {
+            let s = self.p2p_shared.lock().unwrap();
+            (s.activity.clone(), s.error.clone())
+        };
+        if let Some(error) = error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+        if activity.is_empty() {
+            ui.label("nothing yet");
+        }
+        for line in &activity {
+            ui.label(line);
         }
     }
 }

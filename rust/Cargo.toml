@@ -17,6 +17,8 @@ bytes = "1"
 eframe = "0.34.3"
 egui = "0.34.3"
 egui_plot = "0.35.0"
+# Renders the pairing code as a QR for a phone to scan (camera-server UI).
+qrcode = { version = "0.14", default-features = false }
 futures = "0.3"
 futures-concurrency = "7.6.3"
 h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }

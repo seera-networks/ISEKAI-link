@@ -632,13 +632,16 @@ POST /v1/peer/connect
 | Phase | 内容 | リポジトリ | 依存 |
 | --- | --- | --- | --- |
 | 0 | 設計判断（§13）と実装確認 … **完了** | 設計 | — |
-| 1 | `peer_grants` テーブル、grant CRUD、`connect` の capability 任意化 | link-server | 0 |
-| 2 | ペアリングコード API、`GET /v1/peer/listeners`、`owner_auto_grant`（既定オフ） | link-server | 1 |
-| 3 | `isekai-p2p-core::proxy` にクライアント側メソッド。**`serve_signaling` をポーリングで実装** | ISEKAI-link | 2 |
-| 4 | カメラアプリ: ペアリング UI（QR 表示/撮影）、カメラ一覧、grant 管理 | ISEKAI-link | 3 |
+| 1 | `peer_grants` テーブル、grant CRUD、`connect` の capability 任意化 … **完了** | link-server | 0 |
+| 2 | ペアリングコード API、`GET /v1/peer/listeners`、`owner_auto_grant`（既定オフ） … **完了** | link-server | 1 |
+| 3 | `isekai-p2p-core::proxy` にクライアント側メソッド。**`serve_signaling` をポーリングで実装** … **完了** | ISEKAI-link | 2 |
+| 4 | カメラアプリ: ペアリング UI（QR 表示/撮影）、カメラ一覧、grant 管理 … **デスクトップ完了、iOS 未** | ISEKAI-link | 3 |
 | 5 | イベントストリーム（サーバ側）＋購読への切り替え（クライアント側） | 両方 | 4 |
 | 6 | 方式 C（承認プロンプト、状態追加） | 両方 | 5 |
 | 7 | 実機 E2E、`VIDEO_CONNECT_DEADLINE` 見直し、ドキュメント更新 | ISEKAI-link | 6 |
+
+iOS 側（FFI・SwiftUI・QR 撮影）は Phase 4 の残りとして別に進める。デスクトップの
+2 つのアプリだけでも、ペアリングから接続までは手作業なしで通る。
 
 **Phase 4 の完了時点で手作業は実質的に消える。** イベントストリーム（Phase 5）は
 遅延と負荷の改善であって機能の前提ではない。この順序なら、サーバ側の大きい改修を
