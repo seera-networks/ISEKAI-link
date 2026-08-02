@@ -87,6 +87,17 @@ pub struct ServerHandle {
     /// client as a direct path; surfacing it makes a stuck migration
     /// diagnosable from the UI.
     pub observed: ObservedAddressWatch,
+    /// Resolves once the session has shut down and its listener has been
+    /// withdrawn from the proxy.
+    ///
+    /// **An application that exits without awaiting this races its own
+    /// cleanup.** Cancelling the token only makes the loop start closing; the
+    /// withdrawal that follows is an HTTP request over the same msquic
+    /// registration the process is about to drain, so a drain that finishes
+    /// first takes the request with it and the listener is left to lapse —
+    /// visible to every paired peer, for the rest of its lease, as something
+    /// that looks connectable and is not.
+    pub finished: tokio::task::JoinHandle<()>,
     /// The video listener's msquic registration. A `msquic_async::Listener`
     /// borrows its registration rather than keeping it alive, so this must
     /// outlive the listener (which runs in the spawned `serve_frames` task);
@@ -165,7 +176,7 @@ pub async fn spawn_p2p_server(
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (signaling, _) = broadcast::channel(32);
-    tokio::spawn(command_loop(
+    let finished = tokio::spawn(command_loop(
         session,
         cmd_rx,
         policy,
@@ -178,6 +189,7 @@ pub async fn spawn_p2p_server(
         commands: cmd_tx,
         signaling,
         observed: observed_for_handle,
+        finished,
         _video_reg: video_reg,
     })
 }

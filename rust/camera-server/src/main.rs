@@ -331,6 +331,10 @@ async fn main() -> eframe::Result<()> {
         anyhow::Ok(())
     });
 
+    // Filled in when a session starts, taken after the window closes. See
+    // `ServerHandle::finished`.
+    let p2p_finished: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]),
         ..Default::default()
@@ -344,6 +348,7 @@ async fn main() -> eframe::Result<()> {
                 rx,
                 is_streaming,
                 mjpeg_tx_holder,
+                Arc::clone(&p2p_finished),
             )))
         }),
     );
@@ -351,6 +356,25 @@ async fn main() -> eframe::Result<()> {
     is_terminated.store(true, Ordering::Relaxed);
     camera_task_handle.await.unwrap().unwrap();
     tracing::debug!("camera task finished");
+
+    // Closing the window dropped the app, which cancelled the P2P session; what
+    // that starts is a request to withdraw the listener, over the same msquic
+    // registration drained below. Leaving without waiting means the drain ends
+    // the process first and the listener stays up for the rest of its lease —
+    // in every paired peer's list, as something that looks connectable and is
+    // not. The handle is taken out of the lock before the await rather than
+    // held across it.
+    let finished = p2p_finished.lock().unwrap().take();
+    if let Some(finished) = finished {
+        match tokio::time::timeout(P2P_SHUTDOWN_TIMEOUT, finished).await {
+            Ok(Ok(())) => tracing::debug!("P2P session shut down"),
+            Ok(Err(e)) => tracing::warn!("P2P session shutdown task failed: {e}"),
+            Err(_) => tracing::warn!(
+                "P2P session did not shut down within {P2P_SHUTDOWN_TIMEOUT:?}; \
+                 its listener will lapse with its lease"
+            ),
+        }
+    }
 
     // `run_native` has returned, so the app — and with it the listener and any
     // relay session it was running — is dropped. Give msquic a moment to close
@@ -365,6 +389,12 @@ async fn main() -> eframe::Result<()> {
 
 /// How long to wait for msquic handles to close before leaving anyway.
 const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the P2P session to shut down and withdraw its listener.
+///
+/// Longer than the withdrawal's own timeout inside `ListenerSession::close`, so
+/// that a slow proxy is decided by that bound rather than by this one racing it.
+const P2P_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// How the camera stream reaches clients.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -539,6 +569,10 @@ struct MyApp {
     /// that no longer works.
     qr_texture: Option<egui::TextureHandle>,
     p2p_commands: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ServerCommand>>>>,
+    /// The running session's shutdown, for `main` to wait on after the window
+    /// closes. Shared rather than owned because this app is dropped inside
+    /// `run_native`, and what has to be awaited outlives it.
+    p2p_finished: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 
     // カメラ表示
     rx: mpsc::Receiver<([usize; 2], Bytes)>,
@@ -555,6 +589,7 @@ impl MyApp {
         rx: mpsc::Receiver<([usize; 2], Bytes)>,
         is_streaming: Arc<AtomicBool>,
         mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
+        p2p_finished: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     ) -> Self {
         Self {
             reg,
@@ -578,6 +613,7 @@ impl MyApp {
             p2p_shared: Arc::new(Mutex::new(P2pShared::default())),
             qr_texture: None,
             p2p_commands: Arc::new(Mutex::new(None)),
+            p2p_finished,
             rx,
             texture: None,
             is_streaming,
@@ -644,6 +680,7 @@ impl MyApp {
         let reg = Arc::clone(&self.reg);
         let shared = Arc::clone(&self.p2p_shared);
         let cmd_holder = Arc::clone(&self.p2p_commands);
+        let finished_holder = Arc::clone(&self.p2p_finished);
         let identity_url = self.identity_url.clone();
         let proxy_url = self.proxy_url.clone();
         let auth0_token = self.auth0_token.clone();
@@ -731,6 +768,9 @@ impl MyApp {
                     });
                     let commands = server.commands.clone();
                     *cmd_holder.lock().unwrap() = Some(server.commands);
+                    // What `main` waits on so the listener is withdrawn before
+                    // the process drains msquic out from under the request.
+                    *finished_holder.lock().unwrap() = Some(server.finished);
                     // Before the operator can look at an empty list and read it
                     // as "the devices I paired are gone". After the commands are
                     // published, so the buttons work while this is in flight.

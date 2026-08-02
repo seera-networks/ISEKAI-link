@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use isekai_p2p_core::bind::{open_bind_session, BindSession, RelayOptions};
 use isekai_p2p_core::endpoint::EndpointKey;
@@ -30,6 +31,14 @@ use isekai_p2p_core::transport::MasqueH3Transport;
 use tokio::sync::watch;
 
 use crate::config::{issue_endpoint_token, P2pConfig};
+
+/// How long [`ListenerSession::close`] waits for the proxy to take the listener
+/// down before giving up and letting the lease do it.
+///
+/// Short on purpose: this runs while an application is trying to exit, and the
+/// only thing lost by giving up is that a listener nobody can connect to stays
+/// in its owner's peers' lists until its lease ends.
+const WITHDRAW_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A target-side P2P session. Holds the relay bind leg open until dropped or
 /// [`close`](ListenerSession::close)d.
@@ -274,6 +283,12 @@ impl ListenerSession {
 
     /// Mint a pairing code for the owner to display (spec §8.9.1).
     ///
+    /// **This and the two grant methods below act on the Endpoint, not on this
+    /// session.** Two sessions of the same Endpoint see and change the same
+    /// codes and grants; only [`close`](Self::close) is about this listener.
+    /// They live here because this is where an app that accepts connections
+    /// already is, not because a listener scopes them.
+    ///
     /// Issuing one invalidates this Endpoint's previous code for this protocol:
     /// there is only ever one, because the owner is showing it on one screen.
     /// What it hands out is access to this Endpoint, not to this listener, so
@@ -371,18 +386,40 @@ impl ListenerSession {
     /// go with it; before that, this would have thrown away every pairing.
     ///
     /// A failure is logged and not returned. This runs on the way out, the
-    /// listener lapses on its own within the hour either way, and there is
-    /// nothing a caller shutting down could usefully do about it.
+    /// listener lapses with its lease either way (60s–24h, an hour by default),
+    /// and there is nothing a caller shutting down could usefully do about it.
+    ///
+    /// The withdrawal is bounded by [`WITHDRAW_TIMEOUT`]. Without a bound,
+    /// closing the window while the proxy is unreachable would keep the process
+    /// alive until the transport gave up on a request whose only purpose is
+    /// tidiness.
+    ///
+    /// **Awaiting this is what makes the withdrawal happen.** It is an HTTP
+    /// request over the same msquic registration an exiting process is about to
+    /// drain, so a caller that cancels and leaves will usually find the listener
+    /// still up.
     pub async fn close(mut self) {
         if let Some(guard) = self.bind.take() {
             guard.handle.abort();
             let _ = guard.handle.await;
         }
-        if let Err(e) = self.proxy.delete_peer_listener(&self.listener_id).await {
-            tracing::warn!(
+        let withdrawn = tokio::time::timeout(
+            WITHDRAW_TIMEOUT,
+            self.proxy.delete_peer_listener(&self.listener_id),
+        )
+        .await;
+        match withdrawn {
+            Ok(Ok(())) => {
+                tracing::debug!(listener_id = %self.listener_id, "peer listener withdrawn");
+            }
+            Ok(Err(e)) => tracing::warn!(
                 listener_id = %self.listener_id,
                 "could not withdraw the peer listener; it will lapse with its lease: {e}"
-            );
+            ),
+            Err(_) => tracing::warn!(
+                listener_id = %self.listener_id,
+                "timed out withdrawing the peer listener; it will lapse with its lease"
+            ),
         }
     }
 }

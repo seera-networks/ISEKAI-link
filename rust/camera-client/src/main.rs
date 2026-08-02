@@ -122,6 +122,19 @@ enum Mode {
 /// to. The operator has one camera and should be offered one entry; the live
 /// one is the listener with the later deadline, since both were leased for the
 /// same span and the survivor was leased later.
+///
+/// **That rests on two things being true, and the listing does not carry enough
+/// to check either.**
+///
+/// - Every listener of one camera is created with the same TTL. Vary it and a
+///   long-leased dead listener outranks a short-leased live one, leaving a row
+///   that cannot connect. Anyone changing the TTL passed to
+///   `ListenerSession::create` should come back here; the durable fix is a
+///   `created_at` on `GET /v1/peer/listeners`, which the proxy does not return.
+/// - `expires_at` is compared as a string, so the proxy has to keep formatting
+///   it the way it does today — UTC, `Z`, whole seconds. An offset form or a
+///   fractional part would sort by text in a way that is not time order, and
+///   would do it quietly.
 fn one_per_camera(
     mut listeners: Vec<camera_core::ReachableListener>,
 ) -> Vec<camera_core::ReachableListener> {
