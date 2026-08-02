@@ -109,9 +109,10 @@ mod tests {
     async fn drains_once_the_listener_is_dropped() {
         let reg = registration();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let (reg, listener, _bound) =
-            crate::bind_video_listener(Some(reg), addr, None).expect("bind the video listener");
+        let (reg, listener, _bound) = crate::bind_video_listener(Some(reg), addr, None)
+            .expect("bind the video listener");
         drop(listener);
         assert!(drain_registration(&reg, Duration::from_secs(5)).await);
     }
+
 }

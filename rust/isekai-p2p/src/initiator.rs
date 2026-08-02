@@ -94,6 +94,35 @@ impl PeerDirectory {
     pub async fn enrol(&self, listener_id: &str, label: Option<&str>) -> anyhow::Result<Grant> {
         Ok(self.proxy.pair_with_listener(listener_id, label).await?)
     }
+
+    /// Connect to one of these listeners on a grant, over the control-plane
+    /// connection this already holds.
+    ///
+    /// The reason for going through here rather than
+    /// [`InitiatorSession::connect_with_grant`] is the same reason
+    /// [`Self::endpoint_token`] exists: an app that has just listed what it can
+    /// reach should not open a second QUIC connection to the proxy to act on
+    /// the answer.
+    pub async fn connect(
+        &self,
+        cfg: &P2pConfig,
+        listener_id: &str,
+        candidates: &[Candidate],
+        local_bind: SocketAddr,
+        opts: RelayOptions,
+    ) -> anyhow::Result<InitiatorSession> {
+        InitiatorSession::connect_over(
+            cfg,
+            &self.proxy,
+            &self.endpoint_token,
+            Authorization::Grant,
+            listener_id,
+            candidates,
+            local_bind,
+            opts,
+        )
+        .await
+    }
 }
 
 impl InitiatorSession {
@@ -261,6 +290,34 @@ impl InitiatorSession {
             cfg.key.clone(),
             endpoint_token,
         );
+        Self::connect_over(
+            cfg,
+            &proxy,
+            endpoint_token,
+            auth,
+            listener_id,
+            candidates,
+            local_bind,
+            opts,
+        )
+        .await
+    }
+
+    /// The connect itself, over a control-plane connection the caller supplies.
+    ///
+    /// Split out so a caller that already has one — [`PeerDirectory`], which
+    /// opened one to answer what is reachable — does not open a second.
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_over(
+        cfg: &P2pConfig,
+        proxy: &ProxyClient<MasqueH3Transport>,
+        endpoint_token: &str,
+        auth: Authorization<'_>,
+        listener_id: &str,
+        candidates: &[Candidate],
+        local_bind: SocketAddr,
+        opts: RelayOptions,
+    ) -> anyhow::Result<Self> {
         let connection = match auth {
             Authorization::Capability(capability) => {
                 proxy

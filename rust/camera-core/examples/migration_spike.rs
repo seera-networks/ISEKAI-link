@@ -207,9 +207,7 @@ async fn role_server(reg: &Arc<Registration>) -> anyhow::Result<String> {
         match push_frame(&accepted, VIDEO_SIZED_PAYLOAD).await {
             Ok(()) => pushed += 1,
             Err(e) => {
-                return Ok(format!(
-                    "pushed {pushed} frames before the connection ended: {e}"
-                ));
+                return Ok(format!("pushed {pushed} frames before the connection ended: {e}"));
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -223,9 +221,7 @@ async fn role_client(reg: &Arc<Registration>) -> anyhow::Result<String> {
 
     let sock = tokio::net::TcpStream::connect(control_addr())
         .await
-        .context(
-            "could not reach the server process; start it with `... migration_spike server`",
-        )?;
+        .context("could not reach the server process; start it with `... migration_spike server`")?;
     let mut lines = tokio::io::BufReader::new(sock).lines();
     let line = lines
         .next_line()
@@ -251,19 +247,13 @@ async fn role_client(reg: &Arc<Registration>) -> anyhow::Result<String> {
             .context("add_candidate_addr with an unreachable observed address")?;
     }
     conn.add_candidate_addr(client_leg.addr, client_leg.addr)?;
-    conn.start(
-        &client_config(reg, true)?,
-        "127.0.0.1",
-        bridge.front_addr.port(),
-    )
-    .await
-    .context("relay-path handshake")?;
+    conn.start(&client_config(reg, true)?, "127.0.0.1", bridge.front_addr.port())
+        .await
+        .context("relay-path handshake")?;
     let relay_path = (conn.get_local_addr()?, conn.get_remote_addr()?);
     println!("client: relay path {} -> {}", relay_path.0, relay_path.1);
 
-    let relay_frames = read_frames(&conn, 3)
-        .await
-        .context("no frames over the relay")?;
+    let relay_frames = read_frames(&conn, 3).await.context("no frames over the relay")?;
 
     let direct = tokio::time::timeout(PATH_VALIDATION_TIMEOUT, async {
         loop {
@@ -309,8 +299,7 @@ async fn role_server_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
     // Stand in for the bind leg's observed-address watch. Held for the whole
     // run: dropping the sender would close the watch and stop the advertisement
     // for the wrong reason.
-    let (_observed_tx, observed_rx) =
-        tokio::sync::watch::channel(Some(observed_for(server_leg.addr)?));
+    let (_observed_tx, observed_rx) = tokio::sync::watch::channel(Some(observed_for(server_leg.addr)?));
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
     let shutdown = CancellationToken::new();
@@ -337,9 +326,7 @@ async fn role_server_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
     let mut pushed = 0usize;
     loop {
         if frame_tx.send(payload.clone()).await.is_err() {
-            return Ok(format!(
-                "pushed {pushed} frames before the frame sink closed"
-            ));
+            return Ok(format!("pushed {pushed} frames before the frame sink closed"));
         }
         pushed += 1;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -350,11 +337,9 @@ async fn role_server_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
 async fn role_client_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
     use tokio::io::AsyncBufReadExt as _;
 
-    let sock = tokio::net::TcpStream::connect(control_addr())
-        .await
-        .context(
-            "could not reach the server process; start it with `... migration_spike server-prod`",
-        )?;
+    let sock = tokio::net::TcpStream::connect(control_addr()).await.context(
+        "could not reach the server process; start it with `... migration_spike server-prod`",
+    )?;
     let mut lines = tokio::io::BufReader::new(sock).lines();
     let line = lines
         .next_line()
@@ -403,9 +388,7 @@ async fn role_client_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
     let direct = tokio::time::timeout(PATH_VALIDATION_TIMEOUT, async {
         while let Some(event) = path_rx.recv().await {
             match event {
-                camera_core::PathEvent::Relay { local, remote } => {
-                    relay_path = Some((local, remote))
-                }
+                camera_core::PathEvent::Relay { local, remote } => relay_path = Some((local, remote)),
                 camera_core::PathEvent::DirectValidated { local, remote } => {
                     return Some((local, remote))
                 }
@@ -514,8 +497,9 @@ async fn spike() -> anyhow::Result<bool> {
     // report six identical certificate failures as design findings.
     let listener_probe = spawn_listener(&reg, loopback(0)).await;
     if let Err(e) = &listener_probe {
-        let reason =
-            format!("この環境では listener を立てられないためスキップ (設計判断ではない): {e:#}");
+        let reason = format!(
+            "この環境では listener を立てられないためスキップ (設計判断ではない): {e:#}"
+        );
         for (id, question) in MSQUIC_CHECKS {
             report.skip(id, question, &reason);
         }
@@ -554,14 +538,7 @@ async fn spike() -> anyhow::Result<bool> {
         "6a",
         Required::No,
         "リレー型トポロジで直接経路が PathValidated されるか (listener は現行の設定のまま)",
-        run(check_direct_path_migration(
-            &reg,
-            false,
-            ClientBinding::PinnedToLeg,
-            false,
-            false,
-        ))
-        .await,
+        run(check_direct_path_migration(&reg, false, ClientBinding::PinnedToLeg, false, false)).await,
     );
     // The NAT-traversal listener variant builds its configuration by hand and
     // loads it from PEM files, which is the Unix credential path; probe it
@@ -575,14 +552,7 @@ async fn spike() -> anyhow::Result<bool> {
                 id,
                 Required::No,
                 question,
-                run(check_direct_path_migration(
-                    &reg,
-                    true,
-                    ClientBinding::PinnedToLeg,
-                    false,
-                    false,
-                ))
-                .await,
+                run(check_direct_path_migration(&reg, true, ClientBinding::PinnedToLeg, false, false)).await,
             );
         }
         Ok(None) => report.skip(
@@ -687,10 +657,7 @@ async fn check_os_udp() -> anyhow::Result<String> {
     let video = UdpSocket::bind(probe)
         .await
         .with_context(|| format!("step 2: rebind the probe address {probe}"))?;
-    anyhow::ensure!(
-        video.local_addr()? == probe,
-        "rebind landed on another port"
-    );
+    anyhow::ensure!(video.local_addr()? == probe, "rebind landed on another port");
 
     // Uplink: real-IP source -> loopback destination. This is the step Windows
     // rejects (WSAEADDRNOTAVAIL / os error 10049): a socket bound to a specific
@@ -718,10 +685,7 @@ async fn check_os_udp() -> anyhow::Result<String> {
         .await
         .context("step 6: the real-IP socket never received the downlink datagram")??;
     anyhow::ensure!(&buf[..n] == b"downlink", "downlink payload was corrupted");
-    anyhow::ensure!(
-        from == bridge_addr,
-        "downlink came from {from}, expected {bridge_addr}"
-    );
+    anyhow::ensure!(from == bridge_addr, "downlink came from {from}, expected {bridge_addr}");
 
     // Why `set_unconnected_socket(true)` is mandatory: a connected socket
     // silently drops the direct path's packets.
@@ -787,14 +751,8 @@ async fn check_wildcard_bind() -> anyhow::Result<String> {
     let (n, direct_src) = tokio::time::timeout(Duration::from_secs(2), wild.recv_from(&mut buf))
         .await
         .context("step 7: the wildcard socket never received the direct-path datagram")??;
-    anyhow::ensure!(
-        &buf[..n] == b"direct-path",
-        "direct-path payload was corrupted"
-    );
-    anyhow::ensure!(
-        direct_src == peer_addr,
-        "direct path source was {direct_src}"
-    );
+    anyhow::ensure!(&buf[..n] == b"direct-path", "direct-path payload was corrupted");
+    anyhow::ensure!(direct_src == peer_addr, "direct path source was {direct_src}");
 
     Ok(format!(
         "wildcard 0.0.0.0:{port} が両経路を捌ける: リレー側から見た送信元 {relay_src}, \
@@ -920,9 +878,7 @@ async fn check_candidate_with_pinned_local(reg: &Arc<Registration>) -> anyhow::R
     let _accepted = listener.accept_one().await?;
 
     bridge.stop();
-    Ok(format!(
-        "併用可: local {got_local} のままハンドシェイク成立"
-    ))
+    Ok(format!("併用可: local {got_local} のままハンドシェイク成立"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,13 +1012,9 @@ async fn check_direct_path_migration(
         conn.add_candidate_addr(client_leg.addr, dead)
             .context("add_candidate_addr with an unreachable observed address")?;
     }
-    conn.start(
-        &client_config(reg, true)?,
-        "127.0.0.1",
-        bridge.front_addr.port(),
-    )
-    .await
-    .context("relay-path handshake")?;
+    conn.start(&client_config(reg, true)?, "127.0.0.1", bridge.front_addr.port())
+        .await
+        .context("relay-path handshake")?;
     let relay_path = (conn.get_local_addr()?, conn.get_remote_addr()?);
 
     let accepted = listener.accept_one().await?;
@@ -1263,10 +1215,7 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
     // SPIKE_MAX_MTU: the real config pins MaximumMtu to 1200 to fit inside the
     // relay tunnel. msquic's default MinimumMtu is 1248, so that leaves the
     // range inverted — and a freshly opened path has to size itself.
-    let settings = match std::env::var("SPIKE_MAX_MTU")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
+    let settings = match std::env::var("SPIKE_MAX_MTU").ok().and_then(|v| v.parse().ok()) {
         Some(mtu) => settings.set_MaximumMtu(mtu),
         None => settings,
     };
@@ -1314,10 +1263,7 @@ impl SpikeListener {
 
 /// A listener with production settings — literally `make_msquic_async_listener`,
 /// the same call `bind_video_listener` makes.
-async fn spawn_listener(
-    reg: &Arc<Registration>,
-    addr: SocketAddr,
-) -> anyhow::Result<SpikeListener> {
+async fn spawn_listener(reg: &Arc<Registration>, addr: SocketAddr) -> anyhow::Result<SpikeListener> {
     let cert = camera_core::tls::dev_cert(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
     let (reg, listener): (Arc<Registration>, Listener) =
         isekai_link_utils::make_msquic_async_listener(
@@ -1356,8 +1302,7 @@ async fn spawn_listener_variant(
     {
         use std::io::Write as _;
 
-        let cert =
-            camera_core::tls::dev_cert(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
+        let cert = camera_core::tls::dev_cert(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
         let alpn = [msquic::BufferRef::from(ALPN)];
         // Identical to make_msquic_async_listener's settings, plus the two
         // knobs under test.
@@ -1384,12 +1329,14 @@ async fn spawn_listener_variant(
         let mut key_file = tempfile::NamedTempFile::new()?;
         key_file.write_all(cert.key_pem.as_bytes())?;
         let key_path = key_file.into_temp_path();
-        config.load_credential(&msquic::CredentialConfig::new().set_credential(
-            msquic::Credential::CertificateFile(msquic::CertificateFile::new(
-                key_path.to_string_lossy().into_owned(),
-                cert_path.to_string_lossy().into_owned(),
+        config.load_credential(
+            &msquic::CredentialConfig::new().set_credential(msquic::Credential::CertificateFile(
+                msquic::CertificateFile::new(
+                    key_path.to_string_lossy().into_owned(),
+                    cert_path.to_string_lossy().into_owned(),
+                ),
             )),
-        ))?;
+        )?;
 
         let listener = Listener::new(reg, config)?;
         listener.start(&alpn, Some(addr))?;
@@ -1503,12 +1450,12 @@ async fn round_trip_sized(
     out.write_all(&payload).await?;
     poll_fn(|cx| out.poll_finish_write(cx)).await?;
 
-    let mut inbound =
-        tokio::time::timeout(Duration::from_secs(10), client.accept_inbound_uni_stream())
-            .await
-            .with_context(|| {
-                format!("no inbound stream of {size} bytes arrived on the active path")
-            })??;
+    let mut inbound = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.accept_inbound_uni_stream(),
+    )
+    .await
+    .with_context(|| format!("no inbound stream of {size} bytes arrived on the active path"))??;
     let mut got = Vec::new();
     inbound.read_to_end(&mut got).await?;
     anyhow::ensure!(
@@ -1614,19 +1561,11 @@ impl Report {
 
     /// A Markdown table, so CI can paste it straight into the job summary.
     fn print(&self) {
-        println!(
-            "\n## Phase 0 spike ({} / {})\n",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
+        println!("\n## Phase 0 spike ({} / {})\n", std::env::consts::OS, std::env::consts::ARCH);
         println!("| # | 必須 | 問い | 結果 | 備考 |");
         println!("| --- | --- | --- | --- | --- |");
         for (id, required, question, verdict, note) in &self.rows {
-            let required = if *required == Required::Yes {
-                "必須"
-            } else {
-                "参考"
-            };
+            let required = if *required == Required::Yes { "必須" } else { "参考" };
             let note = note.replace('|', "\\|").replace('\n', " ");
             println!(
                 "| {id} | {required} | {question} | **{}** | {note} |",

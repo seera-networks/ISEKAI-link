@@ -322,21 +322,12 @@ async fn push_one(conn: &Connection, frame: &[u8]) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathEvent {
     /// The path the connection established on — over the relay.
-    Relay {
-        local: SocketAddr,
-        remote: SocketAddr,
-    },
+    Relay { local: SocketAddr, remote: SocketAddr },
     /// A path other than the relay one has been validated: the peers punched a
     /// direct route and [`migrate`](VideoRecvOptions::migrate) can switch to it.
-    DirectValidated {
-        local: SocketAddr,
-        remote: SocketAddr,
-    },
+    DirectValidated { local: SocketAddr, remote: SocketAddr },
     /// `activate_path` succeeded and this is now the active path.
-    Activated {
-        local: SocketAddr,
-        remote: SocketAddr,
-    },
+    Activated { local: SocketAddr, remote: SocketAddr },
 }
 
 /// How [`receive_frames_with`] connects and what it reports back. Default is
@@ -836,26 +827,26 @@ fn video_client_config(
     };
     let alpn = [msquic::BufferRef::from(VIDEO_ALPN)];
     let settings = msquic::Settings::new()
-        .set_IdleTimeoutMs(30_000)
-        // Keep a single unanswered handshake alive long enough to span
-        // the peer's relay-bind gap: msquic keeps retransmitting the
-        // Initial on ONE connection until the far leg comes up, rather
-        // than many short-lived attempts (which poison the relay path).
-        .set_HandshakeIdleTimeoutMs(60_000)
-        // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
-        // (1248), so asking for less is silently ignored — 1248 is what
-        // this connection actually uses, and stating it keeps the code
-        // honest about the cap it is applying.
-        //
-        // The cap exists so a video QUIC packet plus CONNECT-UDP
-        // encapsulation fits inside the relay tunnel's HTTP datagram.
-        // Without it the default 1500 overflows the tunnel and packets
-        // are dropped as `TooLarge`. The outer connection's
-        // MinimumMtu(1400) (see `isekai_p2p_core::transport`) is sized
-        // to carry 1248 plus that encapsulation.
-        .set_MaximumMtu(1248)
-        .set_PeerUnidiStreamCount(100)
-        .set_StreamMultiReceiveEnabled();
+                .set_IdleTimeoutMs(30_000)
+                // Keep a single unanswered handshake alive long enough to span
+                // the peer's relay-bind gap: msquic keeps retransmitting the
+                // Initial on ONE connection until the far leg comes up, rather
+                // than many short-lived attempts (which poison the relay path).
+                .set_HandshakeIdleTimeoutMs(60_000)
+                // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
+                // (1248), so asking for less is silently ignored — 1248 is what
+                // this connection actually uses, and stating it keeps the code
+                // honest about the cap it is applying.
+                //
+                // The cap exists so a video QUIC packet plus CONNECT-UDP
+                // encapsulation fits inside the relay tunnel's HTTP datagram.
+                // Without it the default 1500 overflows the tunnel and packets
+                // are dropped as `TooLarge`. The outer connection's
+                // MinimumMtu(1400) (see `isekai_p2p_core::transport`) is sized
+                // to carry 1248 plus that encapsulation.
+                .set_MaximumMtu(1248)
+                .set_PeerUnidiStreamCount(100)
+                .set_StreamMultiReceiveEnabled();
     // NAT-traversal mode is what makes the peer probe our candidate address and
     // report a `PathValidated` for the direct path; the observed-address reports
     // are the other half of the exchange.
@@ -940,20 +931,14 @@ mod tests {
     /// first address seen has to be applied whenever it arrives.
     #[test]
     fn a_first_address_is_applied() {
-        assert_eq!(
-            address_to_apply(None, Some(observed(1000))),
-            Some(observed(1000))
-        );
+        assert_eq!(address_to_apply(None, Some(observed(1000))), Some(observed(1000)));
     }
 
     /// Re-applying the same address fails with ADDRESS_IN_USE, so an unchanged
     /// report must be a no-op rather than a logged failure.
     #[test]
     fn an_unchanged_address_is_not_reapplied() {
-        assert_eq!(
-            address_to_apply(Some(observed(1000)), Some(observed(1000))),
-            None
-        );
+        assert_eq!(address_to_apply(Some(observed(1000)), Some(observed(1000))), None);
     }
 
     /// A rebind onto a new leg is a genuine change and has to be advertised.

@@ -753,6 +753,116 @@ mod tests {
         assert_eq!(sent["candidates"][0]["type"], "srflx");
     }
 
+    /// The shape of what goes out matters more than the plumbing: the server
+    /// decides what a request means from these fields, and a rename on either
+    /// side is otherwise only found on a device.
+    #[tokio::test]
+    async fn pairing_sends_the_two_shapes_the_proxy_distinguishes() {
+        let body = r#"{"grant_id":"gr_1","listener_id":"pl_1","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"pairing",
+            "created_at":"2026-08-02T09:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let grant = client
+            .pair_with_code("K7M2-QX4P", Some("laptop"))
+            .await
+            .unwrap();
+        assert_eq!(grant.origin, "pairing");
+        assert_eq!(
+            grant.expires_at, None,
+            "a paired grant stands until revoked"
+        );
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, body) = calls.last().unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1/peer/pair"));
+        let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(sent["code"], "K7M2-QX4P");
+        assert_eq!(sent["label"], "laptop");
+        assert!(sent["listener_id"].is_null(), "a code is not a listener id");
+    }
+
+    /// The other pairing shape, and that an absent label is sent as null rather
+    /// than as the string "null" or omitted.
+    #[tokio::test]
+    async fn enrolling_names_the_listener_and_sends_a_null_label() {
+        let body = r#"{"grant_id":"gr_2","listener_id":"pl_1","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"owner_match",
+            "created_at":"2026-08-02T09:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        client.pair_with_listener("pl_1", None).await.unwrap();
+
+        let calls = client.transport.calls.lock().unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&calls.last().unwrap().3).unwrap();
+        assert_eq!(sent["listener_id"], "pl_1");
+        assert!(sent["label"].is_null());
+        assert!(sent["code"].is_null());
+    }
+
+    /// The filter goes in the query string, and a truncated answer has to
+    /// survive the round trip — a listener that misses it believes it has seen
+    /// everyone waiting.
+    #[tokio::test]
+    async fn listing_connections_filters_by_state_and_keeps_truncated() {
+        let body = r#"{"connections":[{"connection_id":"conn_1","state":"relay",
+            "listener_id":"pl_1","initiator_endpoint":"ep:A","target_endpoint":"ep:B",
+            "protocol":"mjpeg","candidates":[],"peer_candidates":[],
+            "created_at":"2026-08-02T09:00:00Z","expires_at":"2026-08-02T09:05:00Z",
+            "updated_at":"2026-08-02T09:00:00Z"}],"truncated":true}"#;
+        let (client, _key) = client(MockTransport::with_response(200, body));
+        let listing = client
+            .list_listener_connections("pl_1", Some(ConnectionStateFilter::Relay))
+            .await
+            .unwrap();
+
+        assert!(listing.truncated);
+        assert_eq!(listing.connections.len(), 1);
+        // The listing names both parties; the listener is the target.
+        assert_eq!(listing.connections[0].other_party("ep:B"), Some("ep:A"));
+
+        let calls = client.transport.calls.lock().unwrap();
+        assert_eq!(
+            calls.last().unwrap().1,
+            "/v1/peer-listeners/pl_1/connections?state=relay"
+        );
+    }
+
+    /// Omitting the filter must not send an empty one — the proxy answers 400
+    /// to a `?state` with no value.
+    #[tokio::test]
+    async fn listing_connections_without_a_filter_sends_no_query() {
+        let (client, _key) = client(MockTransport::with_response(200, r#"{"connections":[]}"#));
+        let listing = client
+            .list_listener_connections("pl_1", None)
+            .await
+            .unwrap();
+        assert!(!listing.truncated, "absent means not truncated");
+
+        let calls = client.transport.calls.lock().unwrap();
+        assert_eq!(
+            calls.last().unwrap().1,
+            "/v1/peer-listeners/pl_1/connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn connecting_on_a_grant_sends_no_capability() {
+        let body = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
+            "peer_endpoint":"ep:B","protocol":"mjpeg"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        client
+            .peer_connect_with_grant("pl_1", "mjpeg", &[])
+            .await
+            .unwrap();
+
+        let calls = client.transport.calls.lock().unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&calls.last().unwrap().3).unwrap();
+        assert!(
+            sent.get("capability").is_none(),
+            "sending a null capability would be a capability the proxy has to reject"
+        );
+        assert_eq!(sent["listener_id"], "pl_1");
+    }
+
     #[tokio::test]
     async fn error_response_maps_to_problem() {
         let resp = r#"{"type":"https://proxy.isekai.link/problems/capability-invalid",
