@@ -171,11 +171,23 @@ pub async fn serve_frames_with(
 /// Tell `conn` about the relay leg's binding, so the peer can punch a direct
 /// path to it and migrate off the relay.
 ///
-/// The address may not be known yet. In P2P mode the bind leg only comes up
-/// once an operator pastes the connection id, which can happen *after* the
-/// video connection has been accepted — so when the watch is still empty this
-/// keeps a task alive to apply the address when it arrives. It also re-applies
-/// on a genuine change, which is what a rebind onto a new leg produces.
+/// **Applied once, and never changed afterwards.** Each peer reaches this
+/// listener through its own relay leg, and every leg has its own local port —
+/// `set_local_addr` is given a freshly bound ephemeral socket per leg. So the
+/// addresses in this watch belong to different peers' paths, and re-applying
+/// the latest one would hand a connection the binding of somebody else's leg.
+/// That is what it did: a second viewer arriving re-pointed the first viewer's
+/// connection at the new leg, and the first viewer's relay traffic stopped.
+///
+/// The address may not be known yet when the connection is accepted, so an
+/// empty watch keeps a task alive to apply the first one that arrives. In
+/// automatic mode the leg is established before the peer's video traffic can
+/// flow through it, so the first address to arrive is that peer's.
+///
+/// The durable fix is to attribute a connection to the leg it came in on — its
+/// peer address is that leg's forwarding socket — and give it only that leg's
+/// watch. That needs the forwarding socket's address surfaced out of the MASQUE
+/// client, which it is not today.
 ///
 /// Failures are logged, not fatal: an Endpoint that cannot advertise a direct
 /// path simply keeps streaming over the relay.
@@ -184,10 +196,9 @@ fn advertise_direct_path(
     mut observed: ObservedAddressWatch,
     shutdown: CancellationToken,
 ) {
-    let mut applied: Option<ObservedAddress> = None;
-    if let Some(address) = address_to_apply(applied, *observed.borrow_and_update()) {
+    if let Some(address) = first_address(None, *observed.borrow_and_update()) {
         apply_direct_path(&conn, address);
-        applied = Some(address);
+        return;
     }
     tokio::spawn(async move {
         loop {
@@ -197,9 +208,9 @@ fn advertise_direct_path(
                     if changed.is_err() {
                         break;
                     }
-                    if let Some(address) = address_to_apply(applied, *observed.borrow_and_update()) {
+                    if let Some(address) = first_address(None, *observed.borrow_and_update()) {
                         apply_direct_path(&conn, address);
-                        applied = Some(address);
+                        break;
                     }
                 }
             }
@@ -207,19 +218,19 @@ fn advertise_direct_path(
     });
 }
 
-/// Which address, if any, to hand to the connection given what is already on it.
+/// The address to hand to a connection that has not been given one.
 ///
-/// Applying the *same* address twice fails with `QUIC_STATUS_ADDRESS_IN_USE` —
-/// the binding is already attached — so an unchanged report is a no-op rather
-/// than a logged failure. A watch that goes back to `None` is also a no-op: the
+/// Applying twice fails with `QUIC_STATUS_ADDRESS_IN_USE` — the binding is
+/// already attached — and a second address is somebody else's leg anyway
+/// (see [`advertise_direct_path`]). A watch that is `None` is also a no-op: the
 /// address already on the connection stays valid, and there is nothing better
 /// to replace it with.
-fn address_to_apply(
+fn first_address(
     applied: Option<ObservedAddress>,
     latest: Option<ObservedAddress>,
 ) -> Option<ObservedAddress> {
     match latest {
-        Some(address) if applied != Some(address) => Some(address),
+        Some(address) if applied.is_none() => Some(address),
         _ => None,
     }
 }
@@ -322,12 +333,21 @@ async fn push_one(conn: &Connection, frame: &[u8]) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathEvent {
     /// The path the connection established on — over the relay.
-    Relay { local: SocketAddr, remote: SocketAddr },
+    Relay {
+        local: SocketAddr,
+        remote: SocketAddr,
+    },
     /// A path other than the relay one has been validated: the peers punched a
     /// direct route and [`migrate`](VideoRecvOptions::migrate) can switch to it.
-    DirectValidated { local: SocketAddr, remote: SocketAddr },
+    DirectValidated {
+        local: SocketAddr,
+        remote: SocketAddr,
+    },
     /// `activate_path` succeeded and this is now the active path.
-    Activated { local: SocketAddr, remote: SocketAddr },
+    Activated {
+        local: SocketAddr,
+        remote: SocketAddr,
+    },
 }
 
 /// How [`receive_frames_with`] connects and what it reports back. Default is
@@ -827,26 +847,26 @@ fn video_client_config(
     };
     let alpn = [msquic::BufferRef::from(VIDEO_ALPN)];
     let settings = msquic::Settings::new()
-                .set_IdleTimeoutMs(30_000)
-                // Keep a single unanswered handshake alive long enough to span
-                // the peer's relay-bind gap: msquic keeps retransmitting the
-                // Initial on ONE connection until the far leg comes up, rather
-                // than many short-lived attempts (which poison the relay path).
-                .set_HandshakeIdleTimeoutMs(60_000)
-                // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
-                // (1248), so asking for less is silently ignored — 1248 is what
-                // this connection actually uses, and stating it keeps the code
-                // honest about the cap it is applying.
-                //
-                // The cap exists so a video QUIC packet plus CONNECT-UDP
-                // encapsulation fits inside the relay tunnel's HTTP datagram.
-                // Without it the default 1500 overflows the tunnel and packets
-                // are dropped as `TooLarge`. The outer connection's
-                // MinimumMtu(1400) (see `isekai_p2p_core::transport`) is sized
-                // to carry 1248 plus that encapsulation.
-                .set_MaximumMtu(1248)
-                .set_PeerUnidiStreamCount(100)
-                .set_StreamMultiReceiveEnabled();
+        .set_IdleTimeoutMs(30_000)
+        // Keep a single unanswered handshake alive long enough to span
+        // the peer's relay-bind gap: msquic keeps retransmitting the
+        // Initial on ONE connection until the far leg comes up, rather
+        // than many short-lived attempts (which poison the relay path).
+        .set_HandshakeIdleTimeoutMs(60_000)
+        // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
+        // (1248), so asking for less is silently ignored — 1248 is what
+        // this connection actually uses, and stating it keeps the code
+        // honest about the cap it is applying.
+        //
+        // The cap exists so a video QUIC packet plus CONNECT-UDP
+        // encapsulation fits inside the relay tunnel's HTTP datagram.
+        // Without it the default 1500 overflows the tunnel and packets
+        // are dropped as `TooLarge`. The outer connection's
+        // MinimumMtu(1400) (see `isekai_p2p_core::transport`) is sized
+        // to carry 1248 plus that encapsulation.
+        .set_MaximumMtu(1248)
+        .set_PeerUnidiStreamCount(100)
+        .set_StreamMultiReceiveEnabled();
     // NAT-traversal mode is what makes the peer probe our candidate address and
     // report a `PathValidated` for the direct path; the observed-address reports
     // are the other half of the exchange.
@@ -927,34 +947,34 @@ mod tests {
         }
     }
 
-    /// The bind leg usually comes up after the connection was accepted, so the
-    /// first address seen has to be applied whenever it arrives.
+    /// A connection takes the first address it is offered and keeps it.
+    ///
+    /// The rule this replaces was "apply the latest", which read as caution —
+    /// a rebind onto a new leg ought to be advertised — but the watch carries
+    /// every leg's address, and legs belong to different peers. Following the
+    /// latest handed one viewer the binding of another viewer's leg.
     #[test]
-    fn a_first_address_is_applied() {
-        assert_eq!(address_to_apply(None, Some(observed(1000))), Some(observed(1000)));
-    }
-
-    /// Re-applying the same address fails with ADDRESS_IN_USE, so an unchanged
-    /// report must be a no-op rather than a logged failure.
-    #[test]
-    fn an_unchanged_address_is_not_reapplied() {
-        assert_eq!(address_to_apply(Some(observed(1000)), Some(observed(1000))), None);
-    }
-
-    /// A rebind onto a new leg is a genuine change and has to be advertised.
-    #[test]
-    fn a_changed_address_is_applied() {
+    fn the_first_address_is_the_one_kept() {
         assert_eq!(
-            address_to_apply(Some(observed(1000)), Some(observed(2000))),
-            Some(observed(2000))
+            first_address(None, Some(observed(1000))),
+            Some(observed(1000))
+        );
+        assert_eq!(
+            first_address(Some(observed(1000)), Some(observed(2000))),
+            None,
+            "a later leg belongs to a later peer, not to this connection"
+        );
+        assert_eq!(
+            first_address(Some(observed(1000)), Some(observed(1000))),
+            None
         );
     }
 
-    /// A watch that empties leaves the connection as it is: what it already has
-    /// still works, and there is nothing better to offer.
+    /// An empty watch is not an address, so there is nothing to apply and the
+    /// connection keeps whatever it has.
     #[test]
     fn an_empty_report_leaves_the_connection_alone() {
-        assert_eq!(address_to_apply(Some(observed(1000)), None), None);
-        assert_eq!(address_to_apply(None, None), None);
+        assert_eq!(first_address(Some(observed(1000)), None), None);
+        assert_eq!(first_address(None, None), None);
     }
 }
