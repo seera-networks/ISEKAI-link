@@ -5,6 +5,7 @@
 
 use std::future::poll_fn;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -305,6 +306,69 @@ async fn next_frame(frames: &mut watch::Receiver<Option<Bytes>>) -> Option<Bytes
     }
 }
 
+/// Abort a task when the value is dropped, so a watchdog cannot outlive what it
+/// is watching.
+struct CancelOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// How long a connection may go on receiving without producing a frame before
+/// that is worth saying out loud.
+///
+/// Generous compared with the frame period: a camera that has stopped capturing
+/// is not this, and neither is a slow link. What this is looking for is bytes
+/// arriving with nothing coming out, which is not something a working stream
+/// does for seconds at a time.
+const STALLED_READ_WARN: Duration = Duration::from_secs(5);
+
+/// Report the connection's counters, and say so when it is receiving bytes but
+/// producing no frames.
+///
+/// That combination has one meaning: data has arrived and been acknowledged at
+/// the connection level, and a stream's share of it is not being handed to the
+/// application — so the read this loop is parked on will never finish. Left
+/// unlabelled it looks like a dead camera, a dead network, or a stalled
+/// migration, and telling those apart from the outside took three rounds of
+/// logs the first time it happened.
+async fn watch_for_a_stalled_read(conn: Connection, delivered: Arc<AtomicU64>) {
+    let mut interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
+    let mut last_frames = delivered.load(Ordering::Relaxed);
+    let mut last_bytes = 0u64;
+    let mut silent_since: Option<Instant> = None;
+    loop {
+        interval.tick().await;
+        let Ok(stats) = conn.get_stats() else { break };
+        log_connection_stats(&conn, &stats, "receiving");
+
+        let frames = delivered.load(Ordering::Relaxed);
+        let bytes = stats.Recv.TotalBytes;
+        let receiving = bytes > last_bytes;
+        let producing = frames > last_frames;
+        (last_frames, last_bytes) = (frames, bytes);
+
+        match (receiving, producing) {
+            (true, false) => {
+                let since = *silent_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= STALLED_READ_WARN {
+                    tracing::warn!(
+                        stalled_for_s = since.elapsed().as_secs(),
+                        recv_bytes = bytes,
+                        "the connection is still receiving but no frame has been \
+                         delivered: a stream's buffered data is not reaching the \
+                         application, and the read waiting on it cannot finish",
+                    );
+                    silent_since = Some(Instant::now());
+                }
+            }
+            _ => silent_since = None,
+        }
+    }
+}
+
 /// Log a connection's counters once a second for as long as it lives.
 async fn log_stats_until_closed(conn: Connection) {
     let mut interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
@@ -461,6 +525,14 @@ pub async fn receive_frames_with(
     )
     .await;
 
+    // Sampled from its own task, not from the loop below. The loop reads one
+    // stream to completion at a time, so a read that never finishes takes the
+    // loop's own sampling down with it — which is exactly when the numbers are
+    // worth having. The server side already works this way (see `push_frames`).
+    let delivered = Arc::new(AtomicU64::new(0));
+    let watchdog = tokio::spawn(watch_for_a_stalled_read(conn.clone(), delivered.clone()));
+    let _watchdog = CancelOnDrop(watchdog);
+
     let mut rtt_interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
     // Watchdog state for a migration that silently carries nothing. `None` while
     // on the relay path; `Some(when)` records when we left it, and is pushed
@@ -560,6 +632,7 @@ pub async fn receive_frames_with(
                 let seq = stream.id().unwrap_or(0);
                 let mut buf = Vec::new();
                 stream.read_to_end(&mut buf).await?;
+                delivered.fetch_add(1, Ordering::Relaxed);
                 // Full/closed receiver: drop the frame (UDP-like semantics).
                 let _ = frame_tx.try_send((seq, Bytes::from(buf)));
             }
