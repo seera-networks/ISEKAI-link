@@ -175,6 +175,32 @@ pub struct PairingCode {
     pub expires_at: String,
 }
 
+/// A connection state to filter a listing by (spec §8.5.2).
+///
+/// Typed rather than a string because the proxy answers `400` to anything it
+/// does not recognise — a set fixed by the spec is better spelled out than
+/// spelled wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStateFilter {
+    Relay,
+    HolePunching,
+    Direct,
+    Closed,
+    Failed,
+}
+
+impl ConnectionStateFilter {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Relay => "relay",
+            Self::HolePunching => "hole_punching",
+            Self::Direct => "direct",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// A listener this Endpoint can reach or enrol on (spec §8.10).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReachableListener {
@@ -189,6 +215,29 @@ pub struct ReachableListener {
 #[derive(Debug, Clone, Deserialize)]
 struct ReachableListenerList {
     listeners: Vec<ReachableListener>,
+}
+
+impl PeerConnection {
+    /// Who is on the other end, from `caller`'s point of view.
+    ///
+    /// Which field carries it depends on which call produced this: the connect
+    /// response names the peer directly, while the reads name both parties and
+    /// leave it to the reader to work out which one it is not. Asking here
+    /// keeps callers from having to know that.
+    pub fn other_party(&self, caller: &str) -> Option<&str> {
+        if let Some(peer) = self.peer_endpoint.as_deref() {
+            return Some(peer);
+        }
+        match (
+            self.initiator_endpoint.as_deref(),
+            self.target_endpoint.as_deref(),
+        ) {
+            (Some(initiator), Some(target)) if initiator == caller => Some(target),
+            (Some(initiator), Some(_)) => Some(initiator),
+            (Some(initiator), None) => Some(initiator),
+            (None, other) => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -215,8 +264,19 @@ pub struct PeerConnection {
     pub state: String,
     pub listener_id: String,
     pub protocol: String,
+    /// The other party, as `POST /v1/peer/connect` names it. **Only that
+    /// response carries it** — the connection reads (`GET /v1/peer/connections/{id}`
+    /// and the listener's listing) name both parties explicitly instead, so
+    /// this is `None` there. Use [`Self::other_party`] rather than reaching for
+    /// it directly.
     #[serde(default)]
     pub peer_endpoint: Option<String>,
+    /// Present on the connection reads (spec §8.5.1, §8.5.3).
+    #[serde(default)]
+    pub initiator_endpoint: Option<String>,
+    /// Present on the connection reads (spec §8.5.1, §8.5.3).
+    #[serde(default)]
+    pub target_endpoint: Option<String>,
     #[serde(default)]
     pub relay: Option<RelayInfo>,
     #[serde(default)]
@@ -435,10 +495,13 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     pub async fn list_listener_connections(
         &self,
         listener_id: &str,
-        state: Option<&str>,
+        state: Option<ConnectionStateFilter>,
     ) -> Result<ListenerConnections, ProxyError> {
         let path = match state {
-            Some(state) => format!("/v1/peer-listeners/{listener_id}/connections?state={state}"),
+            Some(state) => format!(
+                "/v1/peer-listeners/{listener_id}/connections?state={}",
+                state.as_str()
+            ),
             None => format!("/v1/peer-listeners/{listener_id}/connections"),
         };
         let list: ConnectionList = self.request_json("GET", &path, Vec::new()).await?;

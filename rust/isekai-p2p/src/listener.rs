@@ -23,7 +23,9 @@ use std::net::SocketAddr;
 use isekai_p2p_core::bind::{open_bind_session, BindSession, RelayOptions};
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
-use isekai_p2p_core::proxy::{Capability, PeerConnection, ProxyClient};
+use isekai_p2p_core::proxy::{
+    Capability, ConnectionStateFilter, PeerConnection, ProxyClient,
+};
 use isekai_p2p_core::transport::MasqueH3Transport;
 use tokio::sync::watch;
 
@@ -86,6 +88,11 @@ pub enum SignalingEvent {
         replaced: Option<String>,
     },
     /// A connection is waiting and the policy says not to bind it.
+    ///
+    /// Only reachable by a caller that polls under
+    /// [`AcceptPolicy::Manual`]. `camera-core` does not poll at all in that
+    /// mode — the operator is driving [`bind`](ListenerSession::bind) — so this
+    /// is for a library user that wants to see who is waiting without binding.
     Waiting {
         connection_id: String,
         peer_endpoint: String,
@@ -287,7 +294,7 @@ impl ListenerSession {
     ) -> anyhow::Result<Vec<SignalingEvent>> {
         let listing = self
             .proxy
-            .list_listener_connections(&self.listener_id, Some("relay"))
+            .list_listener_connections(&self.listener_id, Some(ConnectionStateFilter::Relay))
             .await?;
         let mut events = Vec::new();
         if listing.truncated {
@@ -298,10 +305,13 @@ impl ListenerSession {
             return Ok(events);
         };
         let next = next.clone();
+        // The listing names both parties rather than "the peer", so this has
+        // to be worked out; the listener is the target, so the other end is the
+        // initiator.
         let peer_endpoint = next
-            .peer_endpoint
-            .clone()
-            .unwrap_or_else(|| "unknown".to_owned());
+            .other_party(&self.endpoint_id)
+            .unwrap_or("unknown")
+            .to_owned();
         if !policy.binds_automatically() {
             events.push(SignalingEvent::Waiting {
                 connection_id: next.connection_id.clone(),
@@ -408,13 +418,23 @@ fn forget_gone(state: &mut SignalingState, connections: &[PeerConnection]) {
 
 /// The connection to bind next, if any.
 ///
-/// The proxy returns newest first, so the first one not already bound is the
-/// newest waiting. Only one leg exists at a time, so this is also the one that
-/// takes over from whatever is bound now.
+/// The proxy returns newest first, so the newest waiting is simply the first.
+/// What changes is whether the ones already bound are skipped:
+///
+/// - **Holding a leg** — skip them, or every poll would rebind what is being
+///   served and tear down the leg it had just built.
+/// - **Holding nothing** — do not. A peer that was displaced by a newer one is
+///   still waiting and still listed, and if it stayed skipped it would sit
+///   there until its TTL ran out while the leg was free. Whoever is newest gets
+///   it, which is the same rule as always; having been bound once before is
+///   not a reason to be passed over now.
 fn next_to_bind<'a>(
     connections: &'a [PeerConnection],
     state: &SignalingState,
 ) -> Option<&'a PeerConnection> {
+    if state.current.is_none() {
+        return connections.first();
+    }
     connections
         .iter()
         .find(|c| !state.bound.contains(&c.connection_id))
@@ -424,38 +444,61 @@ fn next_to_bind<'a>(
 mod tests {
     use super::*;
 
+    /// Built from the JSON the proxy actually sends, not from the struct.
+    ///
+    /// A hand-written fixture agrees with whatever the struct happens to say
+    /// and so cannot notice a field the server never sends — which is exactly
+    /// how `peer_endpoint` came to be read here when the listing does not carry
+    /// it. This shape is `ConnectionResponse` from the server's §8.5.3.
     fn conn(id: &str) -> PeerConnection {
-        PeerConnection {
-            connection_id: id.to_owned(),
-            state: "relay".to_owned(),
-            listener_id: "pl_1".to_owned(),
-            protocol: "mjpeg".to_owned(),
-            peer_endpoint: Some("ep:A".to_owned()),
-            relay: None,
-            relay_session_id: None,
-            video_host: None,
-            candidates: Vec::new(),
-            peer_candidates: Vec::new(),
-            established_at: None,
-            created_at: None,
-            expires_at: None,
-            updated_at: None,
-        }
+        serde_json::from_str(&format!(
+            r#"{{
+                "connection_id": "{id}",
+                "state": "relay",
+                "listener_id": "pl_1",
+                "initiator_endpoint": "ep:A",
+                "target_endpoint": "ep:B",
+                "protocol": "mjpeg",
+                "relay_session_id": "sess_1",
+                "candidates": [],
+                "peer_candidates": [],
+                "created_at": "2026-08-02T09:00:00Z",
+                "expires_at": "2026-08-02T09:05:00Z",
+                "updated_at": "2026-08-02T09:00:00Z"
+            }}"#
+        ))
+        .expect("the listing's connection shape")
+    }
+
+    /// The listing names both parties; the listener is the target, so the peer
+    /// it reports is the initiator. Getting this wrong is invisible in the
+    /// happy path — it just shows the operator the wrong name, or none.
+    #[test]
+    fn the_peer_is_read_from_the_shape_the_listing_actually_sends() {
+        let c = conn("conn_1");
+        assert_eq!(c.peer_endpoint, None, "the listing does not carry this");
+        assert_eq!(c.other_party("ep:B"), Some("ep:A"));
+        assert_eq!(c.other_party("ep:A"), Some("ep:B"));
     }
 
     /// Binding is a data-plane action, so a bound connection keeps showing up
     /// in the listing exactly as it did before. Without remembering, every poll
     /// would rebind it — and rebinding tears down the leg it just built.
     #[test]
-    fn a_bound_connection_is_not_picked_again() {
+    fn the_connection_being_served_is_not_bound_again() {
         let listing = vec![conn("conn_1")];
         let mut state = SignalingState::default();
         assert_eq!(
             next_to_bind(&listing, &state).map(|c| c.connection_id.as_str()),
             Some("conn_1")
         );
+        // What a successful bind leaves behind: remembered, and held.
         state.bound.insert("conn_1".to_owned());
-        assert!(next_to_bind(&listing, &state).is_none());
+        state.current = Some("conn_1".to_owned());
+        assert!(
+            next_to_bind(&listing, &state).is_none(),
+            "rebinding what is being served would tear down its own leg"
+        );
     }
 
     /// The proxy lists newest first, and only one leg exists at a time, so a
@@ -498,6 +541,32 @@ mod tests {
 
         assert_eq!(state.current(), Some("conn_live"));
         assert!(next_to_bind(&[conn("conn_live")], &state).is_none());
+    }
+
+    /// A peer displaced by a newer one is still waiting and still listed. Once
+    /// the leg is free it has to be picked up again, or it sits there until its
+    /// TTL runs out while the camera serves nobody.
+    #[test]
+    fn a_displaced_connection_is_picked_up_once_the_leg_is_free() {
+        let mut state = SignalingState::default();
+        // A is bound, then B takes over.
+        state.bound.insert("conn_a".to_owned());
+        state.bound.insert("conn_b".to_owned());
+        state.current = Some("conn_b".to_owned());
+
+        // While B is held, nothing else is picked.
+        let both = vec![conn("conn_b"), conn("conn_a")];
+        assert!(next_to_bind(&both, &state).is_none());
+
+        // B goes away. A is still listed and still waiting.
+        let only_a = vec![conn("conn_a")];
+        forget_gone(&mut state, &only_a);
+        assert_eq!(state.current(), None);
+        assert_eq!(
+            next_to_bind(&only_a, &state).map(|c| c.connection_id.as_str()),
+            Some("conn_a"),
+            "an idle listener must pick up whoever is still waiting"
+        );
     }
 
     #[test]

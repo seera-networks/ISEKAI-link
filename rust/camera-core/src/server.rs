@@ -19,7 +19,7 @@ use isekai_p2p::{
     SignalingEvent, SignalingState,
 };
 use msquic_async::Registration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::video::{bind_video_listener, serve_frames_with, ServeOptions};
@@ -57,10 +57,14 @@ pub enum ServerCommand {
 pub struct ServerHandle {
     pub info: ServerInfo,
     pub commands: mpsc::Sender<ServerCommand>,
-    /// What the automatic binding did, for the UI to show. Bounded, and dropped
-    /// rather than queued when nobody is reading: a stalled notification must
-    /// never hold up the loop that binds connections.
-    pub signaling: mpsc::Receiver<SignalingEvent>,
+    /// What the automatic binding did, for the UI to show.
+    ///
+    /// A broadcast rather than a queue: the handle is passed around behind a
+    /// lock, so a single `Receiver` could only be read from wherever it was
+    /// moved to. Subscribers that fall behind lose the oldest events, which is
+    /// the right trade — a stalled notification must never hold up the loop
+    /// that binds connections.
+    pub signaling: broadcast::Sender<SignalingEvent>,
     /// How the proxy sees this Endpoint's relay bind leg — `None` until a leg
     /// is bound and reports. This is the address advertised to each video
     /// client as a direct path; surfacing it makes a stuck migration
@@ -143,8 +147,14 @@ pub async fn spawn_p2p_server(
     ));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    let (event_tx, signaling) = mpsc::channel(32);
-    tokio::spawn(command_loop(session, cmd_rx, policy, event_tx, shutdown));
+    let (signaling, _) = broadcast::channel(32);
+    tokio::spawn(command_loop(
+        session,
+        cmd_rx,
+        policy,
+        signaling.clone(),
+        shutdown,
+    ));
 
     Ok(ServerHandle {
         info,
@@ -167,7 +177,7 @@ async fn command_loop(
     mut session: ListenerSession,
     mut cmd_rx: mpsc::Receiver<ServerCommand>,
     policy: AcceptPolicy,
-    events: mpsc::Sender<SignalingEvent>,
+    events: broadcast::Sender<SignalingEvent>,
     shutdown: CancellationToken,
 ) {
     let mut signaling = SignalingState::default();
@@ -182,10 +192,9 @@ async fn command_loop(
                     Ok(found) => {
                         for event in found {
                             tracing::info!("signaling: {event:?}");
-                            // Bounded channel, and the stream matters more than
-                            // the notification: drop rather than stall the loop
-                            // that is binding connections.
-                            let _ = events.try_send(event);
+                            // No subscribers is not a failure — the camera
+                            // binds whether or not a UI is watching.
+                            let _ = events.send(event);
                         }
                     }
                     // The proxy being briefly unreachable is not a reason to
