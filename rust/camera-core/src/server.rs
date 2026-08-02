@@ -149,7 +149,7 @@ pub async fn spawn_p2p_server(
         video_addr,
         None,
         RelayOptions {
-            unconnected: true,
+            unconnected: relay_legs_unconnected(),
             registration: Some(video_reg.clone()),
         },
     )
@@ -192,6 +192,31 @@ pub async fn spawn_p2p_server(
         finished,
         _video_reg: video_reg,
     })
+}
+
+/// Whether relay legs are opened on shared, unconnected sockets.
+///
+/// On by default, because that is what lets a peer punch a direct path to this
+/// listener's binding and migrate off the relay.
+///
+/// `ISEKAI_RELAY_LEGS_CONNECTED=1` turns it off, which is a diagnostic rather
+/// than a feature. Serving two peers means two legs, and on hardware the second
+/// leg starting stopped the first leg receiving — no error, no close, the
+/// counters simply froze. Both legs share one msquic registration and take an
+/// unconnected socket with an explicit local address, so this switch says
+/// whether that is where the interference is: with it set, every peer keeps
+/// working over the relay and nobody can migrate.
+fn relay_legs_unconnected() -> bool {
+    match std::env::var("ISEKAI_RELAY_LEGS_CONNECTED") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => {
+            tracing::warn!(
+                "ISEKAI_RELAY_LEGS_CONNECTED is set: relay legs use connected sockets, \
+                 so no peer can migrate to a direct path"
+            );
+            false
+        }
+        _ => true,
+    }
 }
 
 /// How often the listener asks the proxy whether anyone is waiting.
