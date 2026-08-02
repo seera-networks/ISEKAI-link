@@ -539,7 +539,18 @@ impl MyApp {
                 token_ttl: None,
                 key,
             };
-            match camera_core::spawn_p2p_server(Some(reg), cfg, mjpeg_rx, shutdown).await {
+            // Automatic, since the proxy has already checked that a grant
+            // authorizes the peer and this is what removes the operator from
+            // the connection path. The UI shows who is connected.
+            match camera_core::spawn_p2p_server(
+                Some(reg),
+                cfg,
+                mjpeg_rx,
+                camera_core::AcceptPolicy::AutoNotify,
+                shutdown,
+            )
+            .await
+            {
                 Ok(server) => {
                     {
                         let mut s = shared.lock().unwrap();

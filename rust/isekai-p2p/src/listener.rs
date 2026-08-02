@@ -17,12 +17,13 @@
 //! 3. the initiator connects and reveals its `connection_id`;
 //! 4. this side [`bind`](ListenerSession::bind)s that `connection_id`.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use isekai_p2p_core::bind::{open_bind_session, BindSession, RelayOptions};
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
-use isekai_p2p_core::proxy::{Capability, ProxyClient};
+use isekai_p2p_core::proxy::{Capability, PeerConnection, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 use tokio::sync::watch;
 
@@ -51,6 +52,72 @@ pub struct ListenerSession {
     /// hand — must keep seeing updates across rebinds. So the leg's watch is
     /// forwarded into this one rather than handed out directly.
     observed_tx: watch::Sender<Option<ObservedAddress>>,
+}
+
+/// What a listener does when a connection is waiting for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptPolicy {
+    /// Bind it. The proxy already checked that a grant authorizes the peer;
+    /// this says the listener is content to let that be the whole decision.
+    Auto,
+    /// Bind it and say so, so the operator can see who is connected and cut
+    /// them off afterwards. Same authorization, more visibility.
+    AutoNotify,
+    /// Bind nothing automatically. The operator drives
+    /// [`bind`](ListenerSession::bind) as before.
+    Manual,
+}
+
+impl AcceptPolicy {
+    fn binds_automatically(self) -> bool {
+        matches!(self, Self::Auto | Self::AutoNotify)
+    }
+}
+
+/// What a poll did, for the UI and the log.
+#[derive(Debug, Clone)]
+pub enum SignalingEvent {
+    /// A connection was bound and traffic can now reach the video listener.
+    Bound {
+        connection_id: String,
+        peer_endpoint: String,
+        /// The connection this replaced, if it displaced one. Only one leg
+        /// exists at a time, so a new peer takes over from the last.
+        replaced: Option<String>,
+    },
+    /// A connection is waiting and the policy says not to bind it.
+    Waiting {
+        connection_id: String,
+        peer_endpoint: String,
+    },
+    /// Binding failed. The connection is left unbound and will be tried again
+    /// on the next poll, until it expires.
+    BindFailed {
+        connection_id: String,
+        error: String,
+    },
+    /// The proxy had more connections waiting than it would list. Whoever is
+    /// beyond the cut cannot be seen from here (spec §8.5.3).
+    Truncated,
+}
+
+/// What [`ListenerSession::poll_signaling`] remembers between polls.
+///
+/// Only which connections have been bound. The control plane cannot answer
+/// that — binding is a data-plane action and leaves the connection in `relay`
+/// either way — so without this every poll would bind the same connection
+/// again, tearing down the leg it had just built.
+#[derive(Debug, Default)]
+pub struct SignalingState {
+    bound: HashSet<String>,
+    current: Option<String>,
+}
+
+impl SignalingState {
+    /// The connection currently bound, if any.
+    pub fn current(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
 }
 
 /// Keeps the spawned bind leg alive; cancels it on drop / close.
@@ -198,6 +265,72 @@ impl ListenerSession {
         Ok(())
     }
 
+    /// Look for connections waiting on this listener and bind one, once.
+    ///
+    /// This is a single pass rather than a loop because binding needs `&mut
+    /// self`, and the caller already owns this session to serve its other
+    /// commands — a loop in here would take that ownership away. Call it on a
+    /// timer.
+    ///
+    /// **The newest unbound connection wins.** A listener holds one bind leg
+    /// (see [`bind`](Self::bind)), so a second peer connecting takes over from
+    /// the first, and the returned [`SignalingEvent::Bound`] names what it
+    /// displaced. Serving two peers at once needs a leg each, which this does
+    /// not do yet.
+    ///
+    /// Errors from the proxy are returned; a failure to bind one connection is
+    /// reported as an event and does not stop the pass.
+    pub async fn poll_signaling(
+        &mut self,
+        state: &mut SignalingState,
+        policy: AcceptPolicy,
+    ) -> anyhow::Result<Vec<SignalingEvent>> {
+        let listing = self
+            .proxy
+            .list_listener_connections(&self.listener_id, Some("relay"))
+            .await?;
+        let mut events = Vec::new();
+        if listing.truncated {
+            events.push(SignalingEvent::Truncated);
+        }
+        forget_gone(state, &listing.connections);
+        let Some(next) = next_to_bind(&listing.connections, state) else {
+            return Ok(events);
+        };
+        let next = next.clone();
+        let peer_endpoint = next
+            .peer_endpoint
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        if !policy.binds_automatically() {
+            events.push(SignalingEvent::Waiting {
+                connection_id: next.connection_id.clone(),
+                peer_endpoint,
+            });
+            return Ok(events);
+        }
+        match self.bind(&next.connection_id).await {
+            Ok(()) => {
+                let replaced = state.current.replace(next.connection_id.clone());
+                state.bound.insert(next.connection_id.clone());
+                events.push(SignalingEvent::Bound {
+                    connection_id: next.connection_id.clone(),
+                    peer_endpoint,
+                    replaced,
+                });
+            }
+            Err(e) => {
+                // Deliberately not remembered as bound: the next pass tries
+                // again, which is what a transient proxy failure wants.
+                events.push(SignalingEvent::BindFailed {
+                    connection_id: next.connection_id.clone(),
+                    error: format!("{e:#}"),
+                });
+            }
+        }
+        Ok(events)
+    }
+
     /// Stop the relay bind leg (if any). The Peer Listener stays until its TTL
     /// expires or the process ends.
     pub async fn close(mut self) {
@@ -258,9 +391,121 @@ fn republish_observed(
     true
 }
 
+/// Drop what the proxy no longer lists.
+///
+/// Without this the remembered set would grow for as long as the process runs.
+/// The proxy's listing is already capped, so bounding this by it bounds it.
+fn forget_gone(state: &mut SignalingState, connections: &[PeerConnection]) {
+    let live: HashSet<&str> = connections
+        .iter()
+        .map(|c| c.connection_id.as_str())
+        .collect();
+    state.bound.retain(|id| live.contains(id.as_str()));
+    if state.current.as_deref().is_some_and(|id| !live.contains(id)) {
+        state.current = None;
+    }
+}
+
+/// The connection to bind next, if any.
+///
+/// The proxy returns newest first, so the first one not already bound is the
+/// newest waiting. Only one leg exists at a time, so this is also the one that
+/// takes over from whatever is bound now.
+fn next_to_bind<'a>(
+    connections: &'a [PeerConnection],
+    state: &SignalingState,
+) -> Option<&'a PeerConnection> {
+    connections
+        .iter()
+        .find(|c| !state.bound.contains(&c.connection_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conn(id: &str) -> PeerConnection {
+        PeerConnection {
+            connection_id: id.to_owned(),
+            state: "relay".to_owned(),
+            listener_id: "pl_1".to_owned(),
+            protocol: "mjpeg".to_owned(),
+            peer_endpoint: Some("ep:A".to_owned()),
+            relay: None,
+            relay_session_id: None,
+            video_host: None,
+            candidates: Vec::new(),
+            peer_candidates: Vec::new(),
+            established_at: None,
+            created_at: None,
+            expires_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// Binding is a data-plane action, so a bound connection keeps showing up
+    /// in the listing exactly as it did before. Without remembering, every poll
+    /// would rebind it — and rebinding tears down the leg it just built.
+    #[test]
+    fn a_bound_connection_is_not_picked_again() {
+        let listing = vec![conn("conn_1")];
+        let mut state = SignalingState::default();
+        assert_eq!(
+            next_to_bind(&listing, &state).map(|c| c.connection_id.as_str()),
+            Some("conn_1")
+        );
+        state.bound.insert("conn_1".to_owned());
+        assert!(next_to_bind(&listing, &state).is_none());
+    }
+
+    /// The proxy lists newest first, and only one leg exists at a time, so a
+    /// peer that connects later takes over.
+    #[test]
+    fn the_newest_unbound_connection_is_the_one_picked() {
+        let listing = vec![conn("conn_new"), conn("conn_old")];
+        let mut state = SignalingState::default();
+        state.bound.insert("conn_old".to_owned());
+        assert_eq!(
+            next_to_bind(&listing, &state).map(|c| c.connection_id.as_str()),
+            Some("conn_new")
+        );
+    }
+
+    #[test]
+    fn what_the_proxy_stops_listing_is_forgotten() {
+        let mut state = SignalingState::default();
+        state.bound.insert("conn_gone".to_owned());
+        state.bound.insert("conn_here".to_owned());
+        state.current = Some("conn_gone".to_owned());
+
+        forget_gone(&mut state, &[conn("conn_here")]);
+
+        assert_eq!(state.bound.len(), 1);
+        assert!(state.bound.contains("conn_here"));
+        // The one being served expired, so nothing is being served.
+        assert_eq!(state.current(), None);
+    }
+
+    /// Forgetting an expired connection lets its id be picked again if the
+    /// proxy ever lists it once more — but it must not disturb the one in use.
+    #[test]
+    fn forgetting_leaves_the_connection_in_use_alone() {
+        let mut state = SignalingState::default();
+        state.bound.insert("conn_live".to_owned());
+        state.current = Some("conn_live".to_owned());
+
+        forget_gone(&mut state, &[conn("conn_live"), conn("conn_other")]);
+
+        assert_eq!(state.current(), Some("conn_live"));
+        assert!(next_to_bind(&[conn("conn_live")], &state).is_none());
+    }
+
+    #[test]
+    fn manual_is_the_only_policy_that_binds_nothing() {
+        assert!(AcceptPolicy::Auto.binds_automatically());
+        assert!(AcceptPolicy::AutoNotify.binds_automatically());
+        assert!(!AcceptPolicy::Manual.binds_automatically());
+    }
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([192, 168, 1, 59], port))

@@ -10,10 +10,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use isekai_p2p::agent::{ObservedAddressWatch, RelayOptions};
-use isekai_p2p::{fetch_relay_certificate, issue_endpoint_token, ListenerSession, P2pConfig};
+use isekai_p2p::{
+    fetch_relay_certificate, issue_endpoint_token, AcceptPolicy, ListenerSession, P2pConfig,
+    SignalingEvent, SignalingState,
+};
 use msquic_async::Registration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -53,6 +57,10 @@ pub enum ServerCommand {
 pub struct ServerHandle {
     pub info: ServerInfo,
     pub commands: mpsc::Sender<ServerCommand>,
+    /// What the automatic binding did, for the UI to show. Bounded, and dropped
+    /// rather than queued when nobody is reading: a stalled notification must
+    /// never hold up the loop that binds connections.
+    pub signaling: mpsc::Receiver<SignalingEvent>,
     /// How the proxy sees this Endpoint's relay bind leg — `None` until a leg
     /// is bound and reports. This is the address advertised to each video
     /// client as a direct path; surfacing it makes a stuck migration
@@ -73,6 +81,7 @@ pub async fn spawn_p2p_server(
     reg: Option<Arc<Registration>>,
     cfg: P2pConfig,
     frame_rx: mpsc::Receiver<Bytes>,
+    policy: AcceptPolicy,
     shutdown: CancellationToken,
 ) -> anyhow::Result<ServerHandle> {
     // Issue the Endpoint Token once, then reuse it for both the certificate
@@ -134,24 +143,56 @@ pub async fn spawn_p2p_server(
     ));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    tokio::spawn(command_loop(session, cmd_rx, shutdown));
+    let (event_tx, signaling) = mpsc::channel(32);
+    tokio::spawn(command_loop(session, cmd_rx, policy, event_tx, shutdown));
 
     Ok(ServerHandle {
         info,
         commands: cmd_tx,
+        signaling,
         observed: observed_for_handle,
         _video_reg: video_reg,
     })
 }
 
+/// How often the listener asks the proxy whether anyone is waiting.
+///
+/// The wait it replaces was a person reading a connection id off one screen and
+/// typing it into another, so seconds is already an enormous improvement and
+/// there is nothing to gain from going lower. It also bounds how much traffic a
+/// camera generates while nobody is connecting, which is most of the time.
+const SIGNALING_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 async fn command_loop(
     mut session: ListenerSession,
     mut cmd_rx: mpsc::Receiver<ServerCommand>,
+    policy: AcceptPolicy,
+    events: mpsc::Sender<SignalingEvent>,
     shutdown: CancellationToken,
 ) {
+    let mut signaling = SignalingState::default();
+    let mut poll = tokio::time::interval(SIGNALING_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            // Nothing to poll for under `Manual`: the operator binds, as before.
+            _ = poll.tick(), if policy != AcceptPolicy::Manual => {
+                match session.poll_signaling(&mut signaling, policy).await {
+                    Ok(found) => {
+                        for event in found {
+                            tracing::info!("signaling: {event:?}");
+                            // Bounded channel, and the stream matters more than
+                            // the notification: drop rather than stall the loop
+                            // that is binding connections.
+                            let _ = events.try_send(event);
+                        }
+                    }
+                    // The proxy being briefly unreachable is not a reason to
+                    // stop serving; the next tick tries again.
+                    Err(e) => tracing::warn!("signaling poll failed: {e:#}"),
+                }
+            }
             cmd = cmd_rx.recv() => match cmd {
                 Some(ServerCommand::IssueCapability { allowed_endpoint, ttl, reply }) => {
                     let result = session

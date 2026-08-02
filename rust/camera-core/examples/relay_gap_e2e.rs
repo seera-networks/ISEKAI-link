@@ -105,7 +105,7 @@ async fn run(
     let server_cfg = config(auth0, identity, proxy, protocol, "gap-server.pem");
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
     let server =
-        camera_core::spawn_p2p_server(None, server_cfg, frame_rx, shutdown.clone()).await?;
+        camera_core::spawn_p2p_server(None, server_cfg, frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
     println!(
         "server ready: listener={} endpoint={} video={}",
         server.info.listener_id, server.info.endpoint_id, server.info.video_addr

@@ -254,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(4);
-    let server = camera_core::spawn_p2p_server(None, cfg, frame_rx, shutdown.clone()).await?;
+    let server = camera_core::spawn_p2p_server(None, cfg, frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
 
     println!(
         "listener={} endpoint={} video={}",
