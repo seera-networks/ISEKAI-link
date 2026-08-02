@@ -127,6 +127,25 @@ Endpoint Token の claim に `sub`（`auth0|123456`）があり（サーバ仕�
 | Listener / Connection は当事者以外には常に `404`（存在の秘匿）も防御境界 | §11.3 | 一覧 API は grant を持つものだけ返す（§5.2）。境界と整合 |
 | `p2p.db` は SQLite、Listener 削除時に FK カスケード | §10.2 | grant も `listener_id` FK でカスケードさせる |
 | ストリーミング応答の実装は**存在しない** | 実装確認 | §5.4 は新規。Phase 5 に置いた理由でもある |
+| permission の検査は**ルートごとに 1 つ**（`require_permission`）。GET 系は permission ではなく**当事者性**で守っている | `handlers.rs` | 新 API も同じ形に揃える（§6.1） |
+| 失効した Endpoint は**認証層で全要求が弾かれる**（`auth.rs` の `is_revoked`） | §9.5 | 失効した Endpoint 宛の grant は自然に無効になる。掃引は衛生上の理由だけで足りる |
+
+### 2.5 Identity 側の確認結果
+
+`ISEKAI-identity` も確認した。**新しい permission を作らずに済む**という結論に
+直結する事実がある。
+
+| 事実 | 出典 | 影響 |
+| --- | --- | --- |
+| `Permission` は **5 値の閉じた Rust enum**、完全一致パース | `domain/permission.rs` | 追加は Identity のコード変更を伴う |
+| 各 Endpoint の権限は**登録時に `default_permissions` から焼き込まれ、DB に保存**される | `handlers/register.rs` | **新 permission を足しても既存 Endpoint には付かない**。移行か再登録が要る |
+| トークン発行時は `requested_permissions` で**絞れるだけ**（付与外を含むと 403） | `openapi.yaml`, `handlers/tokens.rs` | 実行時に権限を増やす経路は無い |
+| Identity → Proxy の通知経路は**既に存在**（`ProxyNotifier`、`POST /internal/v1/endpoints/{id}/revoke`、リトライ付き） | `proxy.rs` | 将来 Endpoint 登録通知を足すなら前例がある。ただし本提案では**使わない**（§13.1） |
+
+**結論: 新 permission は作らない。** 既存の
+`peer-connect:accept`（受け入れ側）と `peer-connect:initiate`（発信側）で
+過不足なく賄える（§6.1）。これで **ISEKAI-identity への変更も、既存 Endpoint の
+移行も不要**になり、Phase 1〜2 が `ISEKAI-link-server` の中だけで完結する。
 
 ---
 
@@ -147,10 +166,36 @@ Endpoint Token の claim に `sub`（`auth0|123456`）があり（サーバ仕�
 
 ## 4. 導入（ペアリング）の方式
 
-### 4.1 方式 A — 所有者一致による grant の自動作成（推奨・既定）
+### 4.1 方式 A — 所有者一致による grant の作成（**opt-in・既定オフ**）
 
-**自分のカメラを自分の端末から見る**という最も多い場合を、導入操作ゼロにする。
-ただし §2.3 の境界を守るため、**認可の経路には `sub` を入れない**。
+初版はこれを既定にしていた。**Phase 0 で既定から外した。** 理由を先に書く。
+
+#### なぜ既定にしないのか
+
+grant を挟んで認可入力を Endpoint 単位に保っても、**「所有者が同じなら通る」と
+いう性質そのもの**は残る。すると次が成立してしまう。
+
+> 攻撃者が被害者の Auth0 アカウントで**新しい Endpoint を登録すると、
+> 所有者は何もしていないのにカメラへ到達できる。**
+
+現行はこれができない。カメラの持ち主が capability を発行しない限り、
+同一ユーザーの別デバイスであっても通らない（サーバ仕様 §8.7）。
+つまり §11.3 の境界は **アカウント侵害の被害をカメラに波及させない**ために
+効いており、所有者一致での自動許可はその性質を確実に削る。
+
+削るかどうかは利便性との取引であって、**実装者が既定で決めてよい種類の
+判断ではない**。したがって:
+
+- **既定はオフ。** リスナ単位の `owner_auto_grant`（既定 `false`）で有効化する
+- 有効化の UI には、上の一文をそのまま表示する
+- `origin=owner_match` の grant は一覧で他と区別できるようにする
+
+方式 B（ペアリング）は**この性質を持たない** ── コードを見た人だけが grant を
+得るので、アカウントを取られただけでは到達できない。だから既定は B にする。
+
+#### 有効にした場合の仕組み
+
+有効時も、§2.3 の境界を守るため **認可の経路には `sub` を入れない**。
 
 ```
    端末を登録             ┌─────────────────────────────┐
@@ -177,19 +222,25 @@ Endpoint Token の claim に `sub`（`auth0|123456`）があり（サーバ仕�
 `sub` の一致は **grant を作るきっかけ**にすぎず、作られた grant は他の方式で
 作られたものと完全に同じ扱いになる。
 
-自動作成のタイミングは 2 案あり、Phase 1 で決める。
+作成の契機は **明示的な登録操作**とする（Phase 0 で確定、§13.1）。
 
-- **(a) 遅延作成**: `connect` 時に grant が無く、かつ所有者が一致する場合に
-  grant を作ってから通す。実装が 1 箇所で済むが、「認可の直前に認可を作る」形
-  になるため、監査ログ上で自動作成と通常許可の区別を明示する必要がある。
-- **(b) 事前作成**: リスナ作成時／Endpoint 登録時に、同一所有者の既存 Endpoint
-  との組み合わせぶんを作る。境界としてはこちらが素直だが、**Identity 側からの
-  通知が要る**（新規 Endpoint 登録をプロキシが知る手段が現状ない）。
+```
+GET  /v1/peer/listeners?scope=owned   所有者が同じリスナを列挙（認可には使わない）
+POST /v1/peer/pair { "listener_id": "pl_..." }   コード無し。所有者一致で grant 作成
+```
 
-**当面は (a) を採り、監査ログで区別する。** リスナ単位で
-`owner_auto_grant: false` にして無効化できるようにする。
+クライアントの UI では「このアカウントのカメラ」一覧から選んで追加する形になる。
+**接続のたびの操作はやはりゼロ**で、増えるのは導入時の 1 タップだけである。
 
-### 4.2 方式 B — ペアリングコード / QR（推奨・他者への付与）
+`connect` の中で暗黙に grant を作る案（初版の (a)）は採らない。認可の直前に
+認可を作る形になり、監査ログ上でしか他と区別できなくなるため。**登録という
+行為を実際に起こさせるほうが、記録としても UI としても正直**である。
+
+Identity からの Endpoint 登録通知に乗せる案（初版の (b)）も採らない。通知経路
+自体は既に存在するが（§2.5）、プロキシは「あるアカウントに属する Endpoint の
+一覧」を持っておらず、それを持たせるのは grant の話より大きな設計変更になる。
+
+### 4.2 方式 B — ペアリングコード / QR（**推奨・既定**）
 
 カメラがコードを表示し、クライアントがそれを読む。**値が一方向にしか流れない**
 のが利点で、往復が消える。
@@ -220,13 +271,16 @@ exp     有効期限（UNIX 秒）
 
 ### 4.4 比較
 
-| | 導入操作 | 他者へ付与 | 無人カメラ | 共有秘密 | 実装の重さ |
-| --- | --- | --- | --- | --- | --- |
-| A 所有者一致で grant 自動作成 | **不要** | 不可 | 可 | 無し | 小 |
-| B ペアリングコード | コードを 1 回運ぶ | 可 | 可 | 短命コード | 中 |
-| C 承認プロンプト | 承認を押す | 可 | **不可** | 無し | 大（状態追加） |
+| | 導入操作 | 他者へ付与 | 無人カメラ | 共有秘密 | アカウント侵害への耐性 | 実装 |
+| --- | --- | --- | --- | --- | --- | --- |
+| **B ペアリングコード** | コードを 1 回運ぶ | 可 | 可 | 短命コード | **保つ** | 中 |
+| A 所有者一致 | 一覧から 1 タップ | 不可 | 可 | 無し | **落ちる**（§4.1） | 小 |
+| C 承認プロンプト | 承認を押す | 可 | **不可** | 無し | 保つ | 大（状態追加） |
 
-**既定は A + B**。C は任意。
+**既定は B。** A はリスナ単位の opt-in（既定オフ）。C は任意。
+
+いずれの方式でも、**できあがる grant は同じ**であり、接続時の扱いに差は無い。
+違うのは grant がどう作られたか（`origin`）だけである。
 
 ---
 
@@ -367,22 +421,27 @@ pub enum AcceptPolicy {
 
 ### 6.1 プロキシ制御プレーン
 
-| メソッド | パス | 必要 permission |
-| --- | --- | --- |
-| `POST` | `/v1/peer-listeners/{id}/pairing-codes` | `peer-grant:create`（新設） |
-| `POST` | `/v1/peer/pair` | `peer-grant:accept`（新設） |
-| `GET` | `/v1/peer-listeners/{id}/grants` | `peer-connect:accept`（既存で足りる） |
-| `DELETE` | `/v1/peer-listeners/{id}/grants/{grant_id}` | `peer-grant:create` |
-| `GET` | `/v1/peer-listeners/{id}/events` | `peer-connect:accept` |
-| `GET` | `/v1/peer-listeners/{id}/connections` | `peer-connect:accept` |
-| `GET` | `/v1/peer/listeners` | `peer-connect:initiate` |
-| `POST` | `/v1/peer/connect` | 既存（`capability` を任意化） |
+**新しい permission は作らない**（Phase 0 で確定、§2.5）。既存の 2 つで賄う。
 
-**`permissions` は完全一致でワイルドカード不可**（サーバ仕様 §5.4）なので、
-新設分は **Identity API 側の Endpoint Token 発行にも手が入る**。
-ここは `ISEKAI-identity` リポジトリとの調整が要る。既存の
-`peer-connect:accept` / `peer-connect:initiate` で足りる範囲は流用し、
-新設は最小限（2 つ）に抑えている。
+| メソッド | パス | permission | 追加の認可 |
+| --- | --- | --- | --- |
+| `POST` | `/v1/peer-listeners/{id}/pairing-codes` | `peer-connect:accept` | owner のみ |
+| `GET` | `/v1/peer-listeners/{id}/grants` | `peer-connect:accept` | owner のみ |
+| `DELETE` | `/v1/peer-listeners/{id}/grants/{grant_id}` | `peer-connect:accept` | owner のみ |
+| `GET` | `/v1/peer-listeners/{id}/events` | `peer-connect:accept` | owner のみ |
+| `GET` | `/v1/peer-listeners/{id}/connections` | `peer-connect:accept` | owner のみ |
+| `POST` | `/v1/peer/pair` | `peer-connect:initiate` | コード、または所有者一致 |
+| `GET` | `/v1/peer/listeners` | `peer-connect:initiate` | grant のあるもののみ |
+| `POST` | `/v1/peer/connect` | `peer-connect:initiate`（既存） | grant または capability |
+
+対応関係は既存の実装と同じ形にしている ── `peer-connect:accept` は
+「接続を受け入れる側の操作」（現行は `issue_capability` を守っている）、
+`peer-connect:initiate` は「接続を開始する側の操作」。所有者・当事者の判定は
+permission ではなく個別に行う点も、既存の GET 系と揃えている（§2.4）。
+
+**この設計により `ISEKAI-identity` への変更は不要**になり、既存 Endpoint の
+権限移行も発生しない。将来ペアリングだけを禁じたトークンを発行したくなったら、
+そのときに permission を足せばよい（加算的な変更で、移行が要るのはその時点）。
 
 方式 C を実装する場合は、これに加えて
 `POST /v1/peer/connections/{id}/accept` / `.../reject` と、接続状態の追加が要る。
@@ -453,11 +512,14 @@ impl InitiatorSession {
 - 「Bind Relay」は `AcceptPolicy::Manual` のときだけ残す
 - 追加: ペアリングコード表示（QR）、接続中の端末一覧、grant 一覧と失効
 - 起動時に `serve_signaling` を開始
+- `owner_auto_grant` のトグル（**既定オフ**）。有効化の確認文には §4.1 の
+  「アカウントを取られると、持ち主が何もしなくてもカメラへ到達される」を出す
 
 **camera-client / iOS**
 
 - Listener ID / Capability の入力欄を**接続可能なカメラの一覧**に置き換える
 - 追加: QR 撮影またはコード入力によるペアリング
+- `owner_auto_grant` が有効なリスナがあれば「このアカウントのカメラ」から追加
 - 現行の手入力は「詳細」に残す（§9）
 
 ---
@@ -529,6 +591,16 @@ POST /v1/peer/connect
 - **リスナの列挙**: `GET /v1/peer/listeners` は grant を持つものだけ返す。
   存在しない `listener_id` への `connect` は、認可が無い場合と同じ応答にする
   （サーバ仕様 §11.3 の「存在の秘匿」）
+- **`scope=owned` の列挙**（§4.1）は所有者一致でしか返さないが、これは
+  **同一アカウントに対しては存在を明かす**ことを意味する。`owner_auto_grant` が
+  無効なリスナは、この一覧にも出さない
+
+### 8.3.1 失効した Endpoint と grant
+
+失効した Endpoint は**認証層で全要求が弾かれる**（サーバ仕様 §9.5、`auth.rs`）
+ため、その Endpoint 宛の grant は残っていても効力を持たない。したがって
+失効時に grant を消す処理は**正しさのためには不要**である。掃引は
+クォータと一覧の見た目のためだけに行えばよい。
 
 ### 8.4 プライバシ
 
@@ -559,9 +631,9 @@ POST /v1/peer/connect
 
 | Phase | 内容 | リポジトリ | 依存 |
 | --- | --- | --- | --- |
-| 0 | §4.1 の (a)/(b)、§13 の 3 点を決める。permission 名を Identity と調整 | 設計 | — |
-| 1 | `peer_grants` テーブル、grant CRUD、`connect` の capability 任意化、所有者一致の自動作成 | link-server | 0 |
-| 2 | ペアリングコード API、`GET /v1/peer/listeners` | link-server | 1 |
+| 0 | 設計判断（§13）と実装確認 … **完了** | 設計 | — |
+| 1 | `peer_grants` テーブル、grant CRUD、`connect` の capability 任意化 | link-server | 0 |
+| 2 | ペアリングコード API、`GET /v1/peer/listeners`、`owner_auto_grant`（既定オフ） | link-server | 1 |
 | 3 | `isekai-p2p-core::proxy` にクライアント側メソッド。**`serve_signaling` をポーリングで実装** | ISEKAI-link | 2 |
 | 4 | カメラアプリ: ペアリング UI（QR 表示/撮影）、カメラ一覧、grant 管理 | ISEKAI-link | 3 |
 | 5 | イベントストリーム（サーバ側）＋購読への切り替え（クライアント側） | 両方 | 4 |
@@ -580,8 +652,8 @@ POST /v1/peer/connect
 | --- | --- | --- | --- |
 | 1 | ~~プロキシ本体仕様に grant 相当の概念が既にある可能性~~ | — | **解消**: 存在しないことを実装で確認（§2.1） |
 | 2 | ~~Identity が Endpoint の所有者を制御プレーンに伝えているか~~ | — | **解消**: `owner_sub` として保持され、`listener_owner_sub()` もある（§2.2）。ただし #3 |
-| 3 | **所有者一致を認可に使うことをサーバ仕様 §11.3 が禁じている** | 初版の方式 A が成立しない | **設計変更済み**: 所有者一致は grant 自動作成のきっかけに留め、認可入力は Endpoint 単位のまま（§4.1）。**この解釈自体をサーバ仕様の所有者に確認すること** |
-| 4 | 新 permission の発行に Identity 側の変更が要る | Phase 1〜2 が別リポジトリに依存 | Phase 0 で名前を確定し、`ISEKAI-identity` と並行で進める。既存 permission で足りる分は流用済み（§6.1） |
+| 3 | **所有者一致で通すと、アカウント侵害がカメラへ波及する** | §11.3 の境界が守っていた性質が落ちる | **既定から外した**（§4.1）。既定は方式 B（ペアリング）。所有者一致はリスナ単位の opt-in・既定オフで、有効化時に影響を明示する。認可入力は常に Endpoint 単位 |
+| 4 | ~~新 permission の発行に Identity 側の変更が要る~~ | — | **解消**: 既存の `peer-connect:accept` / `peer-connect:initiate` で賄えることを確認し、新 permission を作らない設計にした（§2.5, §6.1）。**`ISEKAI-identity` への変更も既存 Endpoint の移行も発生しない** |
 | 5 | H3 の長寿命レスポンスボディが中間装置のタイムアウトに耐えるか | ストリームが頻繁に切れる | `keepalive` を 15 秒間隔。切断は異常でなく通常として扱い、再接続＋照合で収束（§5.4）。**Phase 3 のポーリング実装が常にフォールバックとして残る** |
 | 6 | ペアリングコードの短さと総当たり耐性のトレードオフ | 不正な grant | §8.2。**表示を短くするなら試行制限は必須**であり、任意にはしない |
 | 7 | 自動受理により意図しない接続が無言で成立する | プライバシ | 既定を `Auto` にしつつ、**接続中の端末を常に UI に出す**。`AutoNotify` を選べる |
@@ -627,15 +699,55 @@ POST /v1/peer/connect
 
 ---
 
-## 13. 未解決の設計判断
+## 13. 設計判断（Phase 0 で確定）
 
-Phase 0 で結論を出す。
+### 13.1 所有者一致による grant 作成 — **明示的な登録操作。既定は無効**
 
-1. **所有者一致による自動作成のタイミング** — §4.1 の (a) 遅延作成か
-   (b) 事前作成か。(b) は Identity からの Endpoint 登録通知が要る。
-2. **grant を誰に紐づけるか** — リスナ（カメラ）か、所有者アカウントか。
-   後者ならカメラを買い替えても grant が残るが、リスナ単位の制御ができなくなる。
-3. **`capability` の将来** — 期限付き委譲の用途だけ残すのか、grant の
-   `expires_at` に一本化するのか。
-4. **`sub` を認可のきっかけに使うことの是非** — §4.1 は §11.3 の境界を守ると
-   判断しているが、**この解釈はサーバ仕様の所有者に確認する**（リスク #3）。
+初版の (a) 遅延作成（`connect` の中で暗黙に作る）も (b) Identity 通知による
+事前作成も採らない。**クライアントが一覧から選んで登録する**形にする（§4.1）。
+
+- (a) は認可の直前に認可を作る形になり、監査ログでしか他と区別できない
+- (b) は通知経路自体は存在するが（§2.5）、プロキシが「アカウントに属する
+  Endpoint 一覧」を持つ必要があり、grant より大きな設計変更になる
+
+さらに、**この方式自体を既定にしない**。アカウント侵害がカメラに波及する
+性質を持ち込むためで、リスナ単位の opt-in（既定オフ）とする。既定は方式 B。
+
+### 13.2 grant の紐づけ先 — **リスナ単位**
+
+`peer_grants.listener_id` の FK でカスケードさせる。理由:
+
+- 既存の `capabilities` と同じ形になり、Listener 削除時の後始末が既存の
+  カスケードに乗る（サーバ仕様 §10.2）
+- アカウント単位にすると、認可の判定材料にアカウントが再び入り込む。
+  §11.3 の境界を守るという本書の立て付けと衝突する
+- カメラ買い替え時に grant が引き継がれないのは欠点だが、**引き継がれない
+  ほうが安全側**であり、再ペアリングは 1 回で済む
+
+### 13.3 `capability` の将来 — **残す。一本化しない**
+
+TTL 30〜300 秒・one-shot（サーバ仕様 §8.3, §11.2）という性質は、grant の
+`expires_at` では置き換えられない。用途が違う。
+
+| | grant | capability |
+| --- | --- | --- |
+| 想定 | 継続的な許可 | **その 1 回**の委譲 |
+| 寿命 | 無期限も可 | 30〜300 秒 |
+| 再利用 | 何度でも | one-shot |
+| 用途 | 自分の端末、家族の端末 | ゲストへの一時共有 |
+
+両方を `connect` が受け付ける（§5.3）。
+
+### 13.4 permission — **新設しない**
+
+既存の `peer-connect:accept` / `peer-connect:initiate` で賄う（§2.5, §6.1）。
+`ISEKAI-identity` への変更も、既存 Endpoint の権限移行も発生しない。
+
+### 13.5 残る確認事項
+
+**§11.3 の境界に対する本書の解釈を、サーバ仕様の所有者に確認すること。**
+
+本書は「認可の入力が Endpoint 単位である限り境界は守られている」と解釈し、
+そのうえで所有者一致による grant 作成は**性質を落とすので既定にしない**、
+という二段構えを採った。前段の解釈が否とされる場合、方式 A は opt-in ですら
+提供しないことになる（方式 B・C だけで機能は成立する）。
