@@ -445,6 +445,9 @@ fn describe(event: &SignalingEvent) -> String {
         ),
         SignalingEvent::Waiting { peer_endpoint, .. } => format!("{peer_endpoint} is waiting"),
         SignalingEvent::BindFailed { error, .. } => format!("could not connect a peer: {error}"),
+        SignalingEvent::RenewFailed { error, .. } => {
+            format!("could not keep a peer's connection alive: {error}")
+        }
         SignalingEvent::Truncated => "more peers are waiting than the proxy will list".to_string(),
     }
 }

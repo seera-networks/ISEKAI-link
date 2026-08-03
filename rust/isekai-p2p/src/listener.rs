@@ -118,6 +118,13 @@ pub enum SignalingEvent {
         connection_id: String,
         error: String,
     },
+    /// A connection's lease could not be renewed. It will be tried again; if it
+    /// keeps failing the connection lapses and the peer is dropped, which shows
+    /// up as an [`Unbound`](Self::Unbound).
+    RenewFailed {
+        connection_id: String,
+        error: String,
+    },
     /// The proxy had more connections waiting than it would list. Whoever is
     /// beyond the cut cannot be seen from here (spec §8.5.3).
     Truncated,
@@ -446,6 +453,35 @@ impl ListenerSession {
             }
         }
         Ok(events)
+    }
+
+    /// Tell the proxy that every peer this listener is serving is still being
+    /// served, so their connections are not reaped underneath them (spec
+    /// §8.5.4).
+    ///
+    /// A connection is leased for the proxy's connect TTL and swept when it
+    /// lapses. Nothing about carrying video renews it — the data path and the
+    /// control plane do not talk — so a listener that says nothing loses every
+    /// peer at the same age, however well the streams are going. On a device
+    /// that was two streams cut at three hundred seconds to the tenth.
+    ///
+    /// Only the connections this listener actually holds a leg for are renewed.
+    /// A peer that has gone away should lapse, and that is what makes it.
+    ///
+    /// Failures are reported per connection and not returned: one connection
+    /// the proxy will not renew — because it has already been reaped, say —
+    /// says nothing about the others, and the next pass tries again.
+    pub async fn renew_connections(&self, state: &SignalingState) -> Vec<SignalingEvent> {
+        let mut events = Vec::new();
+        for connection_id in state.bound() {
+            if let Err(e) = self.proxy.renew_connection(connection_id).await {
+                events.push(SignalingEvent::RenewFailed {
+                    connection_id: connection_id.to_owned(),
+                    error: format!("{e}"),
+                });
+            }
+        }
+        events
     }
 
     /// Stop the relay bind leg (if any) and withdraw the Peer Listener.

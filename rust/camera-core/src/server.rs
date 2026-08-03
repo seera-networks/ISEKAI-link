@@ -227,6 +227,15 @@ fn relay_legs_unconnected() -> bool {
 /// camera generates while nobody is connecting, which is most of the time.
 const SIGNALING_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// How often the listener tells the proxy that the peers it is serving are
+/// still being served (spec §8.5.4).
+///
+/// Well inside the proxy's connect TTL, whose default is five minutes, because
+/// this side does not know that number and losing every viewer at once is what
+/// happens if the guess is wrong. A request per peer per minute is nothing next
+/// to the video going the other way.
+const CONNECTION_RENEW_INTERVAL: Duration = Duration::from_secs(60);
+
 async fn command_loop(
     mut session: ListenerSession,
     mut cmd_rx: mpsc::Receiver<ServerCommand>,
@@ -237,9 +246,20 @@ async fn command_loop(
     let mut signaling = SignalingState::default();
     let mut poll = tokio::time::interval(SIGNALING_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut renew = tokio::time::interval(CONNECTION_RENEW_INTERVAL);
+    renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            // Renewing is not conditioned on the policy: a connection bound by
+            // hand under `Manual` is being served just as much as one bound
+            // automatically, and would otherwise lapse under the operator.
+            _ = renew.tick() => {
+                for event in session.renew_connections(&signaling).await {
+                    tracing::warn!("signaling: {event:?}");
+                    let _ = events.send(event);
+                }
+            }
             // Nothing to poll for under `Manual`: the operator binds, as before.
             _ = poll.tick(), if policy != AcceptPolicy::Manual => {
                 match session.poll_signaling(&mut signaling, policy).await {

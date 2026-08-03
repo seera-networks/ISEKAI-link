@@ -440,7 +440,7 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         .await
     }
 
-    /// `POST /v1/peer/connections/{id}/state` (Q-2).
+    /// `POST /v1/peer/connections/{id}/state` (spec §8.5.2).
     pub async fn report_state(
         &self,
         connection_id: &str,
@@ -452,6 +452,30 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             "POST",
             &format!("/v1/peer/connections/{connection_id}/state"),
             to_vec(&body),
+        )
+        .await
+    }
+
+    /// Push a connection's lease out without saying anything about it
+    /// (spec §8.5.4).
+    ///
+    /// A connection is leased for `--p2p-connect-ttl-secs` and reaped when that
+    /// runs out, which is how a connect nobody followed through on is cleaned
+    /// up. A party that is still using one has to say so before then, or the
+    /// TTL becomes the longest two peers may stay connected — five minutes, by
+    /// default, however well it is going.
+    ///
+    /// Neither the state nor the candidates are sent: an empty body leaves both
+    /// as they are, so this cannot walk a connection that has reached `direct`
+    /// back to where this caller last knew it was.
+    pub async fn renew_connection(
+        &self,
+        connection_id: &str,
+    ) -> Result<PeerConnection, ProxyError> {
+        self.request_json(
+            "POST",
+            &format!("/v1/peer/connections/{connection_id}/state"),
+            to_vec(&serde_json::json!({})),
         )
         .await
     }
@@ -860,6 +884,37 @@ mod tests {
         assert_eq!(sent["allowed_endpoint"], "ep:A");
         assert_eq!(sent["protocol"], "mjpeg");
         assert!(sent["ttl"].is_null(), "no ttl means until revoked");
+    }
+
+    /// A keepalive says nothing about the connection — no state and no
+    /// candidates — so the proxy leaves both alone and only moves the deadline.
+    /// Sending the state this side last knew about would walk a connection that
+    /// had reached `direct` backwards.
+    #[tokio::test]
+    async fn renewing_a_connection_sends_an_empty_body() {
+        let body = r#"{"connection_id":"conn_1","state":"direct","listener_id":"pl_1",
+            "initiator_endpoint":"ep:A","target_endpoint":"ep:B","protocol":"mjpeg",
+            "candidates":[],"peer_candidates":[],"created_at":"t","expires_at":"t",
+            "updated_at":"t"}"#;
+        let (client, _key) = client(MockTransport::with_response(200, body));
+        let renewed = client.renew_connection("conn_1").await.unwrap();
+        assert_eq!(renewed.state, "direct");
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, body) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/peer/connections/conn_1/state")
+        );
+        let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert!(
+            sent["state"].is_null(),
+            "a keepalive must not set the state"
+        );
+        assert!(
+            sent["candidates"].is_null(),
+            "nor replace the candidates it does not have"
+        );
     }
 
     /// Revocation addresses the grant by id alone; the proxy scopes it to the
