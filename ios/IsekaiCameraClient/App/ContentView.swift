@@ -1,17 +1,23 @@
 import SwiftUI
 
-/// The whole Phase 2 skeleton: the four values that have to be exchanged with
-/// the camera server by hand, a Connect button, and the stream.
+/// The viewer: pick a camera, connect, watch.
+///
+/// Pairing replaced the exchange this screen used to be built around — an
+/// Endpoint ID read off the phone, a capability and a listener id typed back
+/// in. Those fields are still here, under "Enter a listener by hand", for a
+/// proxy without grants and for working around anything the automatic path
+/// gets wrong.
 struct ContentView: View {
     @StateObject private var model = ViewerModel()
     @State private var signInError: String?
+    @State private var pairingCode = ""
 
     var body: some View {
         NavigationStack {
             Form {
                 streamSection
                 connectionSection
-                identitySection
+                camerasSection
                 serverSection
                 authSection
                 manualTokenSection
@@ -96,26 +102,74 @@ struct ContentView: View {
         }
     }
 
-    private var identitySection: some View {
+    private var camerasSection: some View {
         Section {
-            CopyableValue(label: "Endpoint ID", value: model.endpointID)
-            Button("Reset Endpoint key", role: .destructive) { model.resetEndpointKey() }
-                .disabled(model.isConnected)
+            switch model.cameras {
+            case .none:
+                Text("Not read yet").foregroundStyle(.secondary)
+            case .some(let cameras) where cameras.isEmpty:
+                Text("None — pair with a camera below.").foregroundStyle(.secondary)
+            case .some(let cameras):
+                ForEach(cameras, id: \.listenerId) { camera in
+                    Button {
+                        model.select(camera: camera)
+                    } label: {
+                        HStack {
+                            Text(camera.label).foregroundStyle(.primary)
+                            Spacer()
+                            if camera.listenerId == model.settings.listenerID {
+                                Image(systemName: "checkmark").foregroundStyle(.tint)
+                            }
+                        }
+                    }
+                    .disabled(model.isConnected)
+                }
+            }
+
+            Button("Refresh") { model.refreshCameras() }
+                .disabled(!model.canUseControlPlane)
+
+            HStack {
+                TextField("Pairing code", text: $pairingCode)
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+                Button("Pair") {
+                    model.pair(with: pairingCode)
+                    pairingCode = ""
+                }
+                .disabled(pairingCode.trimmed.isEmpty || !model.canUseControlPlane)
+            }
+
+            if let status = model.cameraStatus {
+                Text(status).font(.footnote).foregroundStyle(.secondary)
+            }
         } header: {
-            Text("This device")
+            Text("Cameras")
         } footer: {
-            Text("Give the Endpoint ID to the camera server; it issues a capability for it.")
+            Text("Pair once with the code the camera shows; after that it stays on this list, "
+                 + "even when the camera restarts.")
         }
     }
 
     private var serverSection: some View {
-        Section("Camera server") {
-            LabeledField("Capability", text: $model.settings.capability)
-            LabeledField("Listener ID", text: $model.settings.listenerID)
+        Section("Server") {
             LabeledField("Protocol", text: $model.settings.protocolName)
             LabeledField("Identity URL", text: $model.settings.identityURL, keyboard: .URL)
             LabeledField("Proxy URL", text: $model.settings.proxyURL, keyboard: .URL)
             Toggle("Register Endpoint", isOn: $model.settings.register)
+
+            DisclosureGroup("Enter a listener by hand") {
+                LabeledField("Capability", text: $model.settings.capability)
+                LabeledField("Listener ID", text: $model.settings.listenerID)
+                CopyableValue(label: "Endpoint ID", value: model.endpointID)
+                Button("Reset Endpoint key", role: .destructive) { model.resetEndpointKey() }
+                    .disabled(model.isConnected)
+                Text("An empty Capability connects on a standing grant, which is what pairing "
+                     + "creates. The Endpoint ID is what a camera needs before it can issue a "
+                     + "capability; pairing does not need it.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

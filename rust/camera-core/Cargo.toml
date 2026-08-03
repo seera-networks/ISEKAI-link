@@ -29,6 +29,7 @@ openssl = { version = "0.10.66", features = ["vendored"] }
 base64 = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 # Only the synthetic_server example needs it; keeping it a dev-dependency keeps

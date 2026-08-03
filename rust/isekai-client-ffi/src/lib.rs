@@ -60,7 +60,10 @@ pub struct ClientConfig {
     pub identity_url: String,
     pub proxy_url: String,
     pub protocol: String,
+    /// Empty connects on a standing grant, which is what pairing creates.
+    /// Filled in, the capability is carried and used instead.
     pub capability: String,
+    /// The camera to reach, from [`list_cameras`] or typed in by hand.
     pub listener_id: String,
     /// Register the Endpoint with the Identity API before issuing a token.
     pub register: bool,
@@ -327,9 +330,163 @@ fn install_logging(filter: &str, sink: &Arc<dyn FrameSink>) {
     });
     // Runs on every connect, so a filter changed in the app takes effect on the
     // next one rather than needing the app restarted.
-    if let Some(reload) = LOG_FILTER.lock().expect("log filter mutex poisoned").as_ref() {
+    if let Some(reload) = LOG_FILTER
+        .lock()
+        .expect("log filter mutex poisoned")
+        .as_ref()
+    {
         reload(filter);
     }
+}
+
+/// A camera this Endpoint may connect to (spec §8.10).
+///
+/// One row per camera, not per listener: a grant is against the Endpoint, so
+/// the proxy answers with every listener that Endpoint is running, and a camera
+/// that crashed without withdrawing its old one runs two — only one of which
+/// connects. See [`camera_core::one_per_camera`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Camera {
+    /// What to hand to [`connect`] as `listener_id`.
+    pub listener_id: String,
+    /// The device itself. Unlike `listener_id` this survives its restarting, so
+    /// it is what a saved selection should be keyed on.
+    pub owner_endpoint: String,
+    /// The name its owner gave it, or the listener id when it has none.
+    pub label: String,
+}
+
+impl From<camera_core::ReachableListener> for Camera {
+    fn from(l: camera_core::ReachableListener) -> Self {
+        let label = camera_core::display_name(&l)
+            .unwrap_or(&l.listener_id)
+            .to_owned();
+        Self {
+            listener_id: l.listener_id,
+            owner_endpoint: l.owner_endpoint,
+            label,
+        }
+    }
+}
+
+/// The control-plane settings shared by the calls that do not stream.
+fn directory_config(
+    config: &ClientConfig,
+    endpoint_key_pem: &str,
+) -> Result<P2pConfig, ClientError> {
+    if config.insecure_skip_verify {
+        // SAFETY: set before any transport connects; process-wide by design.
+        unsafe { std::env::set_var("ISEKAI_INSECURE_SKIP_VERIFY", "1") };
+    }
+    Ok(P2pConfig {
+        identity_url: config.identity_url.clone(),
+        identity_http3: false,
+        proxy_url: config.proxy_url.clone(),
+        auth0_token: String::new(),
+        protocol: config.protocol.clone(),
+        register: config.register,
+        device_name: Some("ios-camera-client".to_owned()),
+        token_ttl: None,
+        key: EndpointKey::from_pkcs8_pem(endpoint_key_pem)
+            .map_err(|e| ClientError::InvalidKey(e.to_string()))?,
+    })
+}
+
+/// Run one control-plane call on a runtime of its own.
+///
+/// These are one-shot and infrequent — a list, a pairing — so they do not
+/// justify keeping a runtime alive between them, and building one here keeps
+/// them independent of whether a session is running.
+fn on_a_runtime<T>(
+    f: impl std::future::Future<Output = Result<T, ClientError>>,
+) -> Result<T, ClientError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ClientError::Runtime(e.to_string()))?
+        .block_on(f)
+}
+
+/// The cameras this Endpoint may connect to.
+///
+/// What replaces reading a Listener ID off the camera's screen. Empty is a
+/// normal answer: it means nothing has been paired with yet, not that anything
+/// failed.
+#[uniffi::export]
+pub fn list_cameras(
+    config: ClientConfig,
+    endpoint_key_pem: String,
+    auth0_token: String,
+) -> Result<Vec<Camera>, ClientError> {
+    let mut cfg = directory_config(&config, &endpoint_key_pem)?;
+    cfg.auth0_token = auth0_token;
+    on_a_runtime(async move {
+        let directory = camera_core::PeerDirectory::open(&cfg)
+            .await
+            .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
+        let found = directory
+            .reachable()
+            .await
+            .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
+        Ok(camera_core::one_per_camera(found)
+            .into_iter()
+            .map(Camera::from)
+            .collect())
+    })
+}
+
+/// Redeem a pairing code the camera displayed, and answer with the camera it
+/// let this Endpoint in to (spec §8.9.2).
+///
+/// `code` may be what was read off the screen or what a QR scan produced — the
+/// scanned value is a `isekai://pair?code=...` URI and both are accepted, so a
+/// scanner's output can be handed straight here.
+///
+/// The camera does not have to be running. A code grants access to the Endpoint
+/// behind it, so pairing with one that has just been switched off works, and
+/// connecting succeeds when it comes back.
+#[uniffi::export]
+pub fn pair_with_code(
+    config: ClientConfig,
+    endpoint_key_pem: String,
+    auth0_token: String,
+    code: String,
+    label: String,
+) -> Result<Camera, ClientError> {
+    let mut cfg = directory_config(&config, &endpoint_key_pem)?;
+    cfg.auth0_token = auth0_token;
+    let code = camera_core::pairing_code_from_input(&code);
+    if code.is_empty() {
+        return Err(ClientError::InvalidArgument("no pairing code".to_owned()));
+    }
+    let label = (!label.trim().is_empty()).then_some(label);
+    on_a_runtime(async move {
+        let directory = camera_core::PeerDirectory::open(&cfg)
+            .await
+            .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
+        let grant = directory
+            .pair(&code, label.as_deref())
+            .await
+            .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
+        // The grant names the Endpoint, not a listener, so the camera to offer
+        // comes from reading the list back — which is also where its name is.
+        let found = directory
+            .reachable()
+            .await
+            .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
+        camera_core::one_per_camera(found)
+            .into_iter()
+            .find(|c| c.owner_endpoint == grant.owner_endpoint)
+            .map(Camera::from)
+            .ok_or_else(|| {
+                // Paired, but the camera is not listening. The grant stands and
+                // it will appear once it is.
+                ClientError::Connect(format!(
+                    "paired with {}, which is not running a listener right now",
+                    grant.owner_endpoint
+                ))
+            })
+    })
 }
 
 /// Generate a fresh Endpoint key, returned as a PKCS#8 PEM string.
@@ -423,15 +580,33 @@ pub fn connect(
         unconnected: config.enable_migration,
         registration: Some(Arc::clone(&registration)),
     };
+    // An empty capability means there is nothing to present, which is the point
+    // of a grant: the proxy already holds the authorization, so only the
+    // camera's listener id is needed. A filled one still uses the capability,
+    // so the hand-carried flow is unchanged.
     let session = runtime
-        .block_on(InitiatorSession::connect_with_options(
-            &cfg,
-            &config.capability,
-            &config.listener_id,
-            &[],
-            local_bind,
-            relay_options,
-        ))
+        .block_on(async {
+            if config.capability.trim().is_empty() {
+                InitiatorSession::connect_with_grant(
+                    &cfg,
+                    &config.listener_id,
+                    &[],
+                    local_bind,
+                    relay_options,
+                )
+                .await
+            } else {
+                InitiatorSession::connect_with_options(
+                    &cfg,
+                    &config.capability,
+                    &config.listener_id,
+                    &[],
+                    local_bind,
+                    relay_options,
+                )
+                .await
+            }
+        })
         .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
 
     let connection_id = session.connection_id().to_owned();
@@ -610,6 +785,9 @@ mod tests {
             local: loopback(1),
             remote: loopback(2),
         });
-        assert!(paths.status().on_relay, "the fallback put us back on the relay");
+        assert!(
+            paths.status().on_relay,
+            "the fallback put us back on the relay"
+        );
     }
 }

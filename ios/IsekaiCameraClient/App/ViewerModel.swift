@@ -38,6 +38,15 @@ final class ViewerModel: ObservableObject {
     @Published private(set) var logLines: [String] = []
     @Published private(set) var errorMessage: String?
 
+    /// The cameras this Endpoint may connect to, or nil before the proxy has
+    /// been asked. "none" and "not asked yet" have to look different: someone
+    /// who paired yesterday should not be shown a bare "none" and conclude the
+    /// camera is gone.
+    @Published private(set) var cameras: [Camera]?
+    /// What the last listing or pairing said, shown under the picker.
+    @Published private(set) var cameraStatus: String?
+    @Published private(set) var isBusyWithCameras = false
+
     private var session: ViewerSession?
     private var sink: ViewerSink?
     private var lastSeq: UInt64 = 0
@@ -59,11 +68,100 @@ final class ViewerModel: ObservableObject {
 
     var isConnected: Bool { session != nil }
 
+    /// A camera and a credential are enough. The capability is not required —
+    /// leaving it empty is what connects on the standing grant that pairing
+    /// creates, and filling it in is the older hand-carried route.
     var canConnect: Bool {
         session == nil
-            && !settings.capability.isBlank
             && !settings.listenerID.isBlank
             && (auth.isSignedIn || !auth0Token.isBlank)
+    }
+
+    var canUseControlPlane: Bool {
+        !isBusyWithCameras && (auth.isSignedIn || !auth0Token.isBlank)
+    }
+
+    // MARK: - Cameras
+
+    /// Ask the proxy which cameras this Endpoint may connect to.
+    func refreshCameras() {
+        runControlPlane { config, pem, token in
+            let found = try listCameras(config: config, endpointKeyPem: pem, auth0Token: token)
+            return { model in
+                model.cameras = found
+                model.cameraStatus = found.isEmpty ? "No cameras yet — pair with one below." : nil
+                // A camera that has gone is not one to still be pointing at.
+                if !found.contains(where: { $0.listenerId == model.settings.listenerID }) {
+                    model.settings.listenerID = ""
+                }
+            }
+        }
+    }
+
+    /// Redeem a code the camera displayed. Accepts what was typed and what a QR
+    /// scan produced; the core takes the code out of either.
+    func pair(with code: String) {
+        let code = code.trimmed
+        guard !code.isEmpty else { return }
+        runControlPlane { config, pem, token in
+            let paired = try pairWithCode(
+                config: config,
+                endpointKeyPem: pem,
+                auth0Token: token,
+                code: code,
+                label: UIDevice.current.name
+            )
+            let found = try listCameras(config: config, endpointKeyPem: pem, auth0Token: token)
+            return { model in
+                model.cameras = found
+                model.cameraStatus = "Paired with \(paired.label)."
+                // Select it, and clear any capability: a grant is what
+                // authorizes this now, and a stale capability would be carried
+                // instead of it.
+                model.settings.listenerID = paired.listenerId
+                model.settings.capability = ""
+                model.settings.save()
+            }
+        }
+    }
+
+    func select(camera: Camera) {
+        settings.listenerID = camera.listenerId
+        settings.capability = ""
+        settings.save()
+    }
+
+    /// One shape for both control-plane calls: gather the settings on the main
+    /// actor, do the blocking work off it, apply the result back on it.
+    ///
+    /// The core blocks for an Identity round trip and a QUIC connection to the
+    /// proxy, so none of it can run on the main thread.
+    private func runControlPlane(
+        _ work: @escaping (ClientConfig, String, String) throws -> (ViewerModel) -> Void
+    ) {
+        guard !isBusyWithCameras else { return }
+        let pem: String
+        do {
+            pem = try EndpointKeyStore.loadOrCreate()
+        } catch {
+            cameraStatus = "Endpoint key: \(error.localizedDescription)"
+            return
+        }
+        let config = clientConfig()
+        isBusyWithCameras = true
+        cameraStatus = nil
+        Task {
+            do {
+                let token = try await self.currentToken()
+                let apply = try await Task.detached(priority: .userInitiated) {
+                    try work(config, pem, token)
+                }.value
+                apply(self)
+            } catch {
+                self.cameraStatus = error.localizedDescription
+            }
+            self.isBusyWithCameras = false
+        }
     }
 
     var statusText: String {
@@ -113,17 +211,7 @@ final class ViewerModel: ObservableObject {
             return
         }
 
-        let config = ClientConfig(
-            identityUrl: settings.identityURL.trimmed,
-            proxyUrl: settings.proxyURL.trimmed,
-            protocol: settings.protocolName.trimmed,
-            capability: settings.capability.trimmed,
-            listenerId: settings.listenerID.trimmed,
-            register: settings.register,
-            insecureSkipVerify: settings.insecureSkipVerify,
-            enableMigration: settings.enableMigration,
-            logFilter: settings.logFilter.trimmed
-        )
+        let config = clientConfig()
         let sink = ViewerSink(model: self)
         self.sink = sink
 
@@ -137,6 +225,23 @@ final class ViewerModel: ObservableObject {
                 self.fail(error.localizedDescription)
             }
         }
+    }
+
+    /// The settings as the core wants them, shared by connecting and by the
+    /// control-plane calls so the two cannot describe the same session
+    /// differently.
+    private func clientConfig() -> ClientConfig {
+        ClientConfig(
+            identityUrl: settings.identityURL.trimmed,
+            proxyUrl: settings.proxyURL.trimmed,
+            protocol: settings.protocolName.trimmed,
+            capability: settings.capability.trimmed,
+            listenerId: settings.listenerID.trimmed,
+            register: settings.register,
+            insecureSkipVerify: settings.insecureSkipVerify,
+            enableMigration: settings.enableMigration,
+            logFilter: settings.logFilter.trimmed
+        )
     }
 
     /// The signed-in session's access token, renewed if it has gone stale.

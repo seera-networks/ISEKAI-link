@@ -114,51 +114,6 @@ enum Mode {
     P2p,
 }
 
-/// One row per camera, not per listener.
-///
-/// A grant is against the Endpoint, so the proxy answers with every listener
-/// that Endpoint is running — and a camera that crashed without withdrawing its
-/// listener runs two until the old lease ends, one of which cannot be connected
-/// to. The operator has one camera and should be offered one entry; the live
-/// one is the listener with the later deadline, since both were leased for the
-/// same span and the survivor was leased later.
-///
-/// **That rests on two things being true, and the listing does not carry enough
-/// to check either.**
-///
-/// - Every listener of one camera is created with the same TTL. Vary it and a
-///   long-leased dead listener outranks a short-leased live one, leaving a row
-///   that cannot connect. Anyone changing the TTL passed to
-///   `ListenerSession::create` should come back here; the durable fix is a
-///   `created_at` on `GET /v1/peer/listeners`, which the proxy does not return.
-/// - `expires_at` is compared as a string, so the proxy has to keep formatting
-///   it the way it does today — UTC, `Z`, whole seconds. An offset form or a
-///   fractional part would sort by text in a way that is not time order, and
-///   would do it quietly.
-fn one_per_camera(
-    mut listeners: Vec<camera_core::ReachableListener>,
-) -> Vec<camera_core::ReachableListener> {
-    // Latest deadline first, so the first row seen for an owner is the keeper.
-    listeners.sort_by(|a, b| {
-        b.expires_at
-            .cmp(&a.expires_at)
-            .then_with(|| a.listener_id.cmp(&b.listener_id))
-    });
-    let mut seen = std::collections::HashSet::new();
-    listeners.retain(|l| seen.insert(l.owner_endpoint.clone()));
-    listeners
-}
-
-/// What to call a camera on screen: the name its owner gave it, falling back to
-/// the listener id, which is at least unambiguous.
-fn display_name(camera: &camera_core::ReachableListener) -> Option<&str> {
-    camera
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("label"))
-        .and_then(|l| l.as_str())
-}
-
 /// The proxy control plane, kept open between the actions that use it.
 ///
 /// [`PeerDirectory::open`](camera_core::PeerDirectory::open) issues an Endpoint
@@ -730,7 +685,7 @@ impl MyApp {
             };
             match dir.reachable().await {
                 Ok(found) => {
-                    *cameras.lock().unwrap() = Some(one_per_camera(found));
+                    *cameras.lock().unwrap() = Some(camera_core::one_per_camera(found));
                     *status.lock().unwrap() = None;
                 }
                 Err(e) => *status.lock().unwrap() = Some(format!("list failed: {e:#}")),
@@ -770,11 +725,11 @@ impl MyApp {
                         // Matched on the owner Endpoint, not the listener id:
                         // the grant is against the device, and the listener it
                         // is running is whichever one it started most recently.
-                        let found = one_per_camera(found);
+                        let found = camera_core::one_per_camera(found);
                         named = found
                             .iter()
                             .find(|c| c.owner_endpoint == grant.owner_endpoint)
-                            .and_then(display_name)
+                            .and_then(camera_core::display_name)
                             .map(str::to_owned);
                         *cameras.lock().unwrap() = Some(found);
                     }
@@ -805,7 +760,7 @@ impl MyApp {
         };
         for camera in cameras {
             ui.horizontal(|ui| {
-                let name = display_name(camera).unwrap_or(&camera.listener_id);
+                let name = camera_core::display_name(camera).unwrap_or(&camera.listener_id);
                 let selected = self.listener_id == camera.listener_id;
                 if ui.selectable_label(selected, name).clicked() {
                     // Selecting a camera is all the connect needs: a grant is
@@ -1123,55 +1078,5 @@ impl eframe::App for MyApp {
         }
 
         ctx.request_repaint();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn listener(id: &str, owner: &str, expires_at: &str) -> camera_core::ReachableListener {
-        camera_core::ReachableListener {
-            listener_id: id.to_owned(),
-            owner_endpoint: owner.to_owned(),
-            protocol: "mjpeg".to_owned(),
-            metadata: None,
-            expires_at: expires_at.to_owned(),
-        }
-    }
-
-    /// A camera that restarted without withdrawing its old listener is still
-    /// one camera. Offering both would mean half the rows do not connect.
-    #[test]
-    fn a_restarted_camera_is_one_row_and_it_is_the_live_one() {
-        let rows = one_per_camera(vec![
-            listener("pl_old", "ep:B", "2026-08-02T09:00:00Z"),
-            listener("pl_new", "ep:B", "2026-08-02T10:00:00Z"),
-            listener("pl_other", "ep:C", "2026-08-02T09:30:00Z"),
-        ]);
-        assert_eq!(
-            rows.iter()
-                .map(|l| l.listener_id.as_str())
-                .collect::<Vec<_>>(),
-            ["pl_new", "pl_other"],
-            "the later deadline is the listener that is actually up"
-        );
-    }
-
-    /// Two listeners leased in the same second must still resolve the same way
-    /// on every refresh, or the selected camera moves under the operator.
-    #[test]
-    fn an_exact_tie_is_broken_the_same_way_every_time() {
-        let same = "2026-08-02T10:00:00Z";
-        let first = one_per_camera(vec![
-            listener("pl_b", "ep:B", same),
-            listener("pl_a", "ep:B", same),
-        ]);
-        let second = one_per_camera(vec![
-            listener("pl_a", "ep:B", same),
-            listener("pl_b", "ep:B", same),
-        ]);
-        assert_eq!(first[0].listener_id, "pl_a");
-        assert_eq!(first[0].listener_id, second[0].listener_id);
     }
 }
