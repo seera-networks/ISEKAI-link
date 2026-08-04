@@ -40,12 +40,21 @@ struct QRScannerView: View {
                 default:
                     // Denied or restricted. Not a dead end: the code can be
                     // typed, and saying so beats a black rectangle.
-                    ContentUnavailableView {
-                        Label("No camera access", systemImage: "camera.fill")
-                    } description: {
+                    //
+                    // Spelled out rather than `ContentUnavailableView`, which
+                    // wants iOS 17 and this app runs on 16.
+                    VStack(spacing: 12) {
+                        Image(systemName: "camera.fill")
+                            .font(.largeTitle)
+                            .foregroundStyle(.secondary)
+                        Text("No camera access").font(.headline)
                         Text("Allow camera access in Settings to scan, or type the "
                              + "code in instead.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
                     }
+                    .padding()
                 }
             }
             .navigationTitle("Scan a pairing code")
