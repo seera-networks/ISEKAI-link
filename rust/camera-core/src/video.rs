@@ -3,6 +3,7 @@
 //! already use; here it is factored out so it works over any address — a public
 //! one (legacy) or the P2P relay's loopback address.
 
+use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,6 +51,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// it. The report normally lands within a round trip of the leg coming up; if it
 /// does not, streaming over the relay matters more than a direct path.
 const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
+/// How often each side pings, so a path nobody sends on does not decay.
+///
+/// Matches the listener's (`isekai_link_utils::make_msquic_async_listener_with`)
+/// and sits well inside the 30 s idle timeout. Both ends have to set it — a
+/// connection's keepalive timer runs off its own settings, so a camera that
+/// leaves it at the default 0 never originates a packet whatever the viewer
+/// does, and 0 *is* the default.
+const DIRECT_PATH_KEEPALIVE: Duration = Duration::from_secs(10);
+
 /// How long a migrated path may carry nothing before falling back to the relay.
 ///
 /// Generous next to a frame interval, so a stutter never triggers it, and short
@@ -87,13 +97,20 @@ pub fn bind_video_listener(
             (dev.cert_pem, dev.key_pem, dev.pkcs12)
         }
     };
-    let (reg, listener) = isekai_link_utils::make_msquic_async_listener(
+    let (reg, listener) = isekai_link_utils::make_msquic_async_listener_with(
         reg,
         VIDEO_ALPN,
         Some(addr),
         &cert_pem,
         &key_pem,
         pkcs12.as_deref(),
+        isekai_link_utils::ListenerOptions {
+            // Offered unconditionally. A viewer that has not been updated does
+            // not offer it back, so the connection is exactly the one it always
+            // got — the spike asks that as question 6 — which is what lets the
+            // camera ship before the viewers.
+            multipath: true,
+        },
     )?;
     let local = listener
         .local_addr()
@@ -393,6 +410,67 @@ async fn push_one(conn: &Connection, frame: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The connection's first path — the relay one — as msquic numbers it.
+///
+/// There is no event that names it: `PathAdded` reports paths that were opened
+/// after a probe validated, and the path the handshake ran on was never probed.
+/// It is `Paths[0]`, whose path id is 0.
+const RELAY_PATH_ID: u32 = 0;
+
+/// What a request to move onto a path turns into.
+///
+/// The two arms are the two worlds this has to work in at once, and which one
+/// applies is decided by the peer rather than by us: multipath is negotiated, so
+/// a viewer that has been updated still talks to cameras that have not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathPreference {
+    /// Multipath: say which path is preferred and leave every path active.
+    ///
+    /// This is the operation that replaces switching. A path declared backup is
+    /// still carried and still kept alive, so the direct path no longer decays
+    /// while it waits to be used — which is the whole of risk #24.
+    Declare { available: u32, backup: Vec<u32> },
+    /// The peer never sent a `PathAdded`, so it has no multipath and the only
+    /// operation available is the old switch.
+    Switch,
+}
+
+/// Turn a request to move onto `wanted` into the operation to perform.
+///
+/// `direct_paths` is what `PathAdded` has named so far. Empty means the peer has
+/// no multipath — and it stays empty for a path that only ever validated, which
+/// is exactly the pre-multipath camera.
+///
+/// Everything known and not preferred is declared backup, not just the path
+/// being left. Two candidates are offered whenever the observed address differs
+/// from the host one, and both can validate on the same LAN, so "the other path"
+/// is not always one path.
+fn preference_for(
+    wanted: (SocketAddr, SocketAddr),
+    relay_path: (SocketAddr, SocketAddr),
+    direct_paths: &BTreeMap<(SocketAddr, SocketAddr), u32>,
+) -> PathPreference {
+    if direct_paths.is_empty() {
+        return PathPreference::Switch;
+    }
+    let available = if wanted == relay_path {
+        RELAY_PATH_ID
+    } else {
+        match direct_paths.get(&wanted) {
+            Some(id) => *id,
+            // Validated but never added: the peer has multipath for some other
+            // path and not for this one, which should not happen — switching is
+            // still better than doing nothing.
+            None => return PathPreference::Switch,
+        }
+    };
+    let backup = std::iter::once(RELAY_PATH_ID)
+        .chain(direct_paths.values().copied())
+        .filter(|id| *id != available)
+        .collect();
+    PathPreference::Declare { available, backup }
+}
+
 /// What happened to the video connection's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathEvent {
@@ -538,6 +616,10 @@ pub async fn receive_frames_with(
     // on the relay path; `Some(when)` records when we left it, and is pushed
     // forward by every frame that arrives afterwards.
     let mut migrated_since: Option<Instant> = None;
+    // Path ids, learned from `PathAdded` and keyed by the address pair the
+    // caller asks to move onto. Empty means the peer has no multipath, and the
+    // old switch is all there is.
+    let mut direct_paths: BTreeMap<(SocketAddr, SocketAddr), u32> = BTreeMap::new();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -554,33 +636,27 @@ pub async fn receive_frames_with(
                     }
                     Err(e) => tracing::debug!("could not read connection stats: {e}"),
                 }
-                // A direct path that validates and then carries nothing takes
+                // A direct path that is preferred and then carries nothing takes
                 // the whole connection down with it: the peer never sees our
-                // packets, so it never follows the migration, and both ends sit
-                // there until the idle timeout fires. Go back to the path that
-                // was working rather than let that happen.
+                // packets, and both ends sit there until the idle timeout fires.
+                // Go back to the path that was working rather than let that
+                // happen. Under multipath that is a smaller move than it used to
+                // be — the relay path was never left, only declared backup, so
+                // this is withdrawing a preference rather than switching back.
                 if let Some(since) = migrated_since {
                     if since.elapsed() >= MIGRATED_PATH_GRACE {
                         tracing::warn!(
                             local = %relay_path.0,
                             remote = %relay_path.1,
-                            "no frames for {MIGRATED_PATH_GRACE:?} since migrating; \
-                             falling back to the relay path",
+                            "no frames for {MIGRATED_PATH_GRACE:?} since preferring the \
+                             direct path; going back to the relay path",
                         );
-                        match conn.activate_path(relay_path.0, relay_path.1) {
-                            Ok(()) => {
-                                migrated_since = None;
-                                report_path(&path_events, PathEvent::Activated {
-                                    local: relay_path.0,
-                                    remote: relay_path.1,
-                                }).await;
-                            }
-                            Err(e) => {
-                                // Nothing else to try; let the idle timeout end
-                                // it rather than spin on a failing call.
-                                tracing::error!("could not fall back to the relay path: {e}");
-                                migrated_since = None;
-                            }
+                        migrated_since = None;
+                        if prefer_path(&conn, relay_path, relay_path, &direct_paths).is_ok() {
+                            report_path(&path_events, PathEvent::Activated {
+                                local: relay_path.0,
+                                remote: relay_path.1,
+                            }).await;
                         }
                     }
                 }
@@ -588,12 +664,46 @@ pub async fn receive_frames_with(
             event = poll_fn(|cx| conn.poll_event(cx)) => match event {
                 Ok(ConnectionEvent::PathValidated { local_address, remote_address }) => {
                     // Anything but the path we started on is the direct one.
+                    // Still raised with multipath negotiated — `PathAdded`
+                    // follows it for the same path — so this stays the report
+                    // the UI hangs "a direct path exists" off, whichever kind of
+                    // camera is on the other end.
                     if (local_address, remote_address) != relay_path {
                         report_path(&path_events, PathEvent::DirectValidated {
                             local: local_address,
                             remote: remote_address,
                         }).await;
                     }
+                }
+                // Multipath. The path id is what every later operation needs and
+                // this event is the only thing that carries it, so remember it
+                // against the pair the caller will ask for.
+                Ok(ConnectionEvent::PathAdded { path_id, local_address, peer_address }) => {
+                    if (local_address, peer_address) != relay_path {
+                        tracing::info!(
+                            path_id, local = %local_address, remote = %peer_address,
+                            "the peer has multipath; the direct path is active rather than \
+                             waiting to be migrated onto",
+                        );
+                        direct_paths.insert((local_address, peer_address), path_id);
+                    }
+                }
+                Ok(ConnectionEvent::PathRemoved { path_id, local_address, peer_address }) => {
+                    tracing::warn!(
+                        path_id, local = %local_address, remote = %peer_address,
+                        "a path was removed",
+                    );
+                    direct_paths.remove(&(local_address, peer_address));
+                    // Preferring a path that no longer exists is not something to
+                    // keep waiting on.
+                    if (local_address, peer_address) != relay_path {
+                        migrated_since = None;
+                    }
+                }
+                // The peer's own view of a path, which is the only way to read
+                // it back: `QUIC_PARAM_CONN_PATH_STATUS` is set-only.
+                Ok(ConnectionEvent::PathStatusChanged { path_id, is_active, .. }) => {
+                    tracing::info!(path_id, is_active, "the peer declared a path status");
                 }
                 Ok(other) => tracing::debug!("video connection event: {other:?}"),
                 Err(e) => {
@@ -603,23 +713,21 @@ pub async fn receive_frames_with(
             },
             request = async { migrate.as_mut().unwrap().recv().await }, if migrate.is_some() => {
                 match request {
-                    Some((local, remote)) => match conn.activate_path(local, remote) {
-                        Ok(()) => {
-                            tracing::info!(%local, %remote, "activated path");
+                    Some((local, remote)) => {
+                        if prefer_path(&conn, (local, remote), relay_path, &direct_paths).is_ok() {
                             // Watch a move *away* from the relay; a move back to
                             // it is the recovery, not something to time out.
                             migrated_since = ((local, remote) != relay_path).then(Instant::now);
-                            // A snapshot on each side of the switch is what
-                            // tells a stalled migration apart from a broken
-                            // one: whether packets still leave, whether any
-                            // arrive, and what MTU the new path settled on.
+                            // A snapshot on each side is what tells a stalled
+                            // move apart from a broken one: whether packets
+                            // still leave, whether any arrive, and what MTU the
+                            // path settled on.
                             if let Ok(stats) = conn.get_stats() {
-                                log_connection_stats(&conn, &stats, "after activate_path");
+                                log_connection_stats(&conn, &stats, "after preferring a path");
                             }
                             report_path(&path_events, PathEvent::Activated { local, remote }).await;
                         }
-                        Err(e) => tracing::warn!(%local, %remote, "could not activate path: {e}"),
-                    },
+                    }
                     // The requester is gone; stop polling but keep streaming.
                     None => migrate = None,
                 }
@@ -701,6 +809,57 @@ fn spawn_heartbeat(shutdown: CancellationToken) {
             }
         }
     });
+}
+
+/// Move the connection onto `wanted`, by whichever operation the peer supports.
+///
+/// Errors are logged rather than returned upward: a connection that cannot be
+/// moved keeps streaming on the path it is already on, which is worse than the
+/// caller asked for and much better than dropping the video. `Err(())` says only
+/// that nothing changed, so the caller does not report a move that did not
+/// happen.
+fn prefer_path(
+    conn: &Connection,
+    wanted: (SocketAddr, SocketAddr),
+    relay_path: (SocketAddr, SocketAddr),
+    direct_paths: &BTreeMap<(SocketAddr, SocketAddr), u32>,
+) -> Result<(), ()> {
+    let (local, remote) = wanted;
+    match preference_for(wanted, relay_path, direct_paths) {
+        PathPreference::Declare { available, backup } => {
+            // Demote first: declaring the preferred path available before the
+            // others are backup would leave a moment with two available paths,
+            // and the peer acts on each declaration as it arrives.
+            for id in &backup {
+                if let Err(e) = conn.set_path_status(*id, false) {
+                    tracing::warn!(path_id = id, "could not declare a path backup: {e}");
+                }
+            }
+            match conn.set_path_status(available, true) {
+                Ok(()) => {
+                    tracing::info!(
+                        %local, %remote, path_id = available, ?backup,
+                        "declared a path available; every path stays active",
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(%local, %remote, "could not declare a path available: {e}");
+                    Err(())
+                }
+            }
+        }
+        PathPreference::Switch => match conn.activate_path(local, remote) {
+            Ok(()) => {
+                tracing::info!(%local, %remote, "activated path (the peer has no multipath)");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(%local, %remote, "could not activate path: {e}");
+                Err(())
+            }
+        },
+    }
 }
 
 async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent) {
@@ -943,10 +1102,26 @@ fn video_client_config(
     // NAT-traversal mode is what makes the peer probe our candidate address and
     // report a `PathValidated` for the direct path; the observed-address reports
     // are the other half of the exchange.
+    //
+    // Multipath goes on top of that rather than instead of it. NAT traversal is
+    // what opens a path between two peers behind NATs — an application adding
+    // paths by hand cannot hole-punch — so the probing stays exactly as it was;
+    // what multipath changes is what a validated path *becomes*: another active
+    // path instead of somewhere to migrate to.
+    //
+    // And the keepalive is what stops the second path decaying while nothing is
+    // sent on it, which is the whole of risk #24. It is not optional and it is
+    // not symmetric with the listener's: the timer runs off each connection's
+    // own settings, so this side pinging says nothing about the other side. Ten
+    // seconds matches the listener (`isekai_link_utils`), well inside the 30s
+    // idle timeout. With multipath negotiated msquic pings *every* in-use path,
+    // each in its own datagram, which is exactly the path nobody sends on.
     let settings = if enable_migration {
         settings
             .set_ReceiveObservedAddressReports()
             .set_AddAddressMode(msquic::AddAddressMode::NatTraversal)
+            .set_MultipathEnabled()
+            .set_KeepAliveIntervalMs(DIRECT_PATH_KEEPALIVE.as_millis() as u32)
     } else {
         settings
     };
@@ -1049,5 +1224,93 @@ mod tests {
     fn an_empty_report_leaves_the_connection_alone() {
         assert_eq!(first_address(Some(observed(1000)), None), None);
         assert_eq!(first_address(None, None), None);
+    }
+
+    fn pair(port: u16) -> (SocketAddr, SocketAddr) {
+        (
+            SocketAddr::from(([192, 168, 1, 59], port)),
+            SocketAddr::from(([203, 0, 113, 5], port)),
+        )
+    }
+
+    /// The relay pair, standing in for the loopback bridge the video connection
+    /// actually runs over.
+    fn relay() -> (SocketAddr, SocketAddr) {
+        (
+            SocketAddr::from(([127, 0, 0, 1], 5000)),
+            SocketAddr::from(([127, 0, 0, 1], 5001)),
+        )
+    }
+
+    /// A camera without multipath never sends `PathAdded`, so there are no path
+    /// ids and the only thing that can be done is what was always done.
+    ///
+    /// This is the mixed pair, and it is not hypothetical: cameras and viewers
+    /// are updated separately, so an updated viewer meets old cameras for as
+    /// long as the rollout takes.
+    #[test]
+    fn a_peer_without_multipath_still_gets_the_old_switch() {
+        assert_eq!(
+            preference_for(pair(1000), relay(), &BTreeMap::new()),
+            PathPreference::Switch,
+        );
+    }
+
+    /// With multipath, moving onto the direct path declares it available and the
+    /// relay backup — and the relay is *kept*, which is the whole difference.
+    #[test]
+    fn moving_onto_the_direct_path_declares_the_relay_backup() {
+        let direct = BTreeMap::from([(pair(1000), 1)]);
+        assert_eq!(
+            preference_for(pair(1000), relay(), &direct),
+            PathPreference::Declare {
+                available: 1,
+                backup: vec![RELAY_PATH_ID],
+            },
+        );
+    }
+
+    /// And going back is the same operation with the preference reversed, not a
+    /// different one — there is nothing to switch back to, because nothing was
+    /// left.
+    #[test]
+    fn going_back_to_the_relay_is_the_same_operation_reversed() {
+        let direct = BTreeMap::from([(pair(1000), 1)]);
+        assert_eq!(
+            preference_for(relay(), relay(), &direct),
+            PathPreference::Declare {
+                available: RELAY_PATH_ID,
+                backup: vec![1],
+            },
+        );
+    }
+
+    /// Both candidates can validate at once — the host address and the observed
+    /// one, which is what happens on the LAN behind the peer's own NAT — so
+    /// "the other path" is not always a single path. Everything not preferred
+    /// is declared backup, or the peer is left with two available paths and a
+    /// preference that says nothing.
+    #[test]
+    fn every_path_that_is_not_preferred_is_declared_backup() {
+        let direct = BTreeMap::from([(pair(1000), 1), (pair(2000), 2)]);
+        assert_eq!(
+            preference_for(pair(2000), relay(), &direct),
+            PathPreference::Declare {
+                available: 2,
+                backup: vec![RELAY_PATH_ID, 1],
+            },
+        );
+    }
+
+    /// A pair that validated but was never added has no id to declare anything
+    /// about. Switching is worse than declaring and much better than ignoring
+    /// the request.
+    #[test]
+    fn a_path_with_no_id_falls_back_to_switching() {
+        let direct = BTreeMap::from([(pair(1000), 1)]);
+        assert_eq!(
+            preference_for(pair(9999), relay(), &direct),
+            PathPreference::Switch,
+        );
     }
 }

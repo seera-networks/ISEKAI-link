@@ -577,6 +577,41 @@ NAT 越えの検証（§7-17）は 2026-08-01 の実機 2 台試験で解消し�
 - §2.5 の制御プレーン candidates 方式の併用（対称 NAT 環境での候補追加）。
 - RTT に基づく自動 migration。
 
+### Phase 8 — Multipath への移行（リスク #24 の解消）  … **実装済み（実機検証は未）**
+
+検証は `rust/camera-core/examples/multipath_spike.rs`（#94）。リレー構成を 1 ホストに
+再現し、6 問すべて PASS。**設計上の未解決点は残っていない。**
+
+**入った変更**
+
+1. **`KeepAliveIntervalMs` を映像接続にも設定**（`video_client_config`、10 秒）。
+   既定は **0＝PING を一切送らない**ため、これが無いと「誰も送らない経路」は温まらない。
+   タイマーは各接続が自分の設定で回すので**両側**に要る。リスナ側は
+   `make_msquic_async_listener` が元から 10 秒を入れていた。
+   multipath ネゴシエート時、msquic は **in-use の全経路**に個別のデータグラムで PING を打つ
+   （`QuicConnProcessKeepAliveOperation` / `QuicSendPathKeepAlives`）— アクティブ経路のパケットに
+   相乗りできないため。これがリスク #24 が求めていた挙動そのもの。
+2. **`MultipathEnabled` を両側に**。クライアントは `enable_migration` 時、リスナは常時
+   （`ListenerOptions { multipath: true }`）。
+3. **「切り替え」から「宣言」へ**。`activate_path` を `set_path_status` に置き換え、
+   relay を backup、direct を available と宣言する。**両経路ともアクティブのまま**なので、
+   直接経路が使われないまま腐る問題自体が消える。
+4. **経路 id は `PathAdded` から学ぶ**。id を運ぶのはこのイベントだけで、
+   `QUIC_PARAM_CONN_PATH_STATUS` は set 専用なので読み戻せない。
+   リレー経路は `Paths[0]`＝id 0（`PathAdded` は来ない）。
+
+**混在バージョン**: multipath はネゴシエーションなので、**どちらの側を先に出しても壊れない**
+（spike の質問 4 と 6 で両方向を実測）。`PathAdded` が来ない相手＝multipath 無しと判定でき、
+その場合は従来の `activate_path` にフォールバックする。カメラ側とビューア側を別々に
+出せるので、更新順の制約は無い。
+
+**API は変えていない**: `PathEvent` も migrate チャネルの `(local, remote)` も従来のまま。
+`PathValidated` は multipath 下でも（`PathAdded` の直前に）上がるので、UI の
+「直接経路が見つかった」表示はどちらの相手でも従来どおり動く。
+
+**未了**: 実機での検証。ループバックは NAT ではないので、spike が言えるのは
+「msquic が自分から経路を落とさない」ところまで。**マッピングの失効は実機でしか見えない。**
+
 ---
 
 ## 4. API 変更案
@@ -799,7 +834,7 @@ pub async fn receive_frames_with(
 | 21 | ~~`VIDEO_CONNECT_DEADLINE`（120 秒）が手作業の所要時間より短い~~ | — | **解消**: これが iOS 実機の接続失敗の主因だった。この待ち時間は「携帯の画面から接続 ID を読む → PC に打ち込む → **カメラを起動する** → Bind Relay を押す」という完全な手作業を跨ぐ。カメラ起動を先に済ませて所要時間を縮めたところ接続した。失敗ログは**全て 120 秒ちょうどで終わって**おり、その間リレーレグは健全なままだった。900 秒に延長。待つコストはゼロで、中断は `shutdown`（Disconnect ボタン）でできる |
 | 22 | ~~失敗メッセージが「相手がレグを bind していない」と断定する~~ | — | **解消**: 断定が外れているときに調査を丸一日ミスリードした。観測値（送信 N・受信 M）をそのまま出す形に変更。受信 0 は「相手が一度も応答していない」であり、そこから先の解釈は読み手に委ねる。あわせて `channel-masque` のブリッジが上り/下り/上り破棄を毎秒計測するようにした（`connect-udp bridge up=… down=…`） |
 | 23 | ~~iOS では映像接続の証明書検証が通らないのではないか~~ | — | **否定**: 実機で Skip TLS verification **OFF のまま接続・再生できた**。msquic の OpenSSL ビルドに CA ストアが無いという推測は誤りだった。`ISEKAI_INSECURE_SKIP_VERIFY` を映像接続でも尊重する変更自体は残す（他の接続と挙動を揃えるため。開発用途限定） |
-| 24 | **検証済みの直接経路は、使われないまま置くと腐る** | 押すのが遅いと Migrate が失敗し、5 秒無音のあと relay に復帰する | **msquic 側で対応**（ISEKAI-link 側は変更なし）。実機の 2 台同時テストで、同じ LAN・同じ NAT 配下の 2 クライアントが host と srflx の両方を検証成功し、両方とも srflx を activate したにもかかわらず、**検証から 39 秒後に押した A は失敗し、14 秒後に押した B は成功した**。1 台のみ・1 分待ちでも再現。サーバ側の統計では B の接続だけが `192.168.0.12:<legB> -> <B の public>` へ切り替わり、A の接続は最後まで relay のままだった — QUIC の移行はクライアント起点でサーバは新経路のパケットを受けて追随するので、**A のパケットが届いていない**。検証時には届いていた同じ経路である。検証で作られたヘアピンの NAT マッピングが、その後どちらの端も何も送らないまま失われる。映像設定に `KeepAliveIntervalMs` は無く、接続が生きているのは relay 側に映像が流れているからで、**直接経路には検証後 1 パケットも流れない**。RFC 9000 §9.1 の probing packet に入れられるのは PATH_CHALLENGE / PATH_RESPONSE / NEW_CONNECTION_ID / PADDING だけで、**PING は probing frame ではない** — 混ぜた時点で non-probing packet になり、相手は経路移行として扱う。非アクティブな経路を標準の枠内で温める手段は PATH_CHALLENGE を定期的に打つことだけであり、「アクティブにせず再プローブする」API が要る。Multipath 拡張なら複数経路が同時にアクティブになるため自然に温まる。**採る方針はこれで確定した。** msquic-async-rs の更新（#93）で、`ConnectionEvent::PathAdded` / `PathRemoved` / `PathStatusChanged` と `Connection::set_path_status()` がこちらから使えるようになった — path id を運ぶのは `PathAdded` で、それが以後の操作のハンドルになる。`QUIC_PARAM_CONN_PATH_STATUS` はコア側が set 専用なので getter は無く、ピア側の見方は `PathStatusChanged` で観測する。これに伴い「Migrate to P2P」は**経路を切り替える操作から、どちらを優先するか宣言する操作へ変わる** — relay を backup、direct を available と宣言し、両方をアクティブに保つ。温存の問題は「使わない経路を温める」ではなく「両方を使う」ことで消える |
+| 24 | ~~**検証済みの直接経路は、使われないまま置くと腐る**~~ | 押すのが遅いと Migrate が失敗し、5 秒無音のあと relay に復帰する | **解消（実装済み・実機検証は未）**: §3-Phase 8。当初「msquic 側で対応、ISEKAI-link 側は変更なし」と見ていたが、**それは誤り**だった — multipath を有効にしても `KeepAliveIntervalMs` は既定 0 で、**PING は 1 つも出ない**。経路ごとの keepalive は multipath ネゴシエート時に msquic が正しく実装しているが、**間隔を設定して初めて動く**。以下は経緯。実機の 2 台同時テストで、同じ LAN・同じ NAT 配下の 2 クライアントが host と srflx の両方を検証成功し、両方とも srflx を activate したにもかかわらず、**検証から 39 秒後に押した A は失敗し、14 秒後に押した B は成功した**。1 台のみ・1 分待ちでも再現。サーバ側の統計では B の接続だけが `192.168.0.12:<legB> -> <B の public>` へ切り替わり、A の接続は最後まで relay のままだった — QUIC の移行はクライアント起点でサーバは新経路のパケットを受けて追随するので、**A のパケットが届いていない**。検証時には届いていた同じ経路である。検証で作られたヘアピンの NAT マッピングが、その後どちらの端も何も送らないまま失われる。映像設定に `KeepAliveIntervalMs` は無く、接続が生きているのは relay 側に映像が流れているからで、**直接経路には検証後 1 パケットも流れない**。RFC 9000 §9.1 の probing packet に入れられるのは PATH_CHALLENGE / PATH_RESPONSE / NEW_CONNECTION_ID / PADDING だけで、**PING は probing frame ではない** — 混ぜた時点で non-probing packet になり、相手は経路移行として扱う。非アクティブな経路を標準の枠内で温める手段は PATH_CHALLENGE を定期的に打つことだけであり、「アクティブにせず再プローブする」API が要る。Multipath 拡張なら複数経路が同時にアクティブになるため自然に温まる。**採る方針はこれで確定した。** msquic-async-rs の更新（#93）で、`ConnectionEvent::PathAdded` / `PathRemoved` / `PathStatusChanged` と `Connection::set_path_status()` がこちらから使えるようになった — path id を運ぶのは `PathAdded` で、それが以後の操作のハンドルになる。`QUIC_PARAM_CONN_PATH_STATUS` はコア側が set 専用なので getter は無く、ピア側の見方は `PathStatusChanged` で観測する。これに伴い「Migrate to P2P」は**経路を切り替える操作から、どちらを優先するか宣言する操作へ変わる** — relay を backup、direct を available と宣言し、両方をアクティブに保つ。温存の問題は「使わない経路を温める」ではなく「両方を使う」ことで消える |
 
 ---
 
