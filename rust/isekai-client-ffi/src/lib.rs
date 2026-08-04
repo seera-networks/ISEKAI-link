@@ -104,9 +104,13 @@ impl PathInfo {
 
 /// Which route the video is on, and which one it could move to.
 ///
+/// Both are live once both are here. A path that is not carrying the video is
+/// still open and still kept warm, so `on_relay` says where the traffic is, not
+/// which path exists.
+///
 /// `direct` stays `None` where no direct path can be established — a symmetric
 /// NAT, say. That is not a failure: the stream runs over the relay and
-/// [`ViewerSession::migrate`] simply has nothing to switch to.
+/// [`ViewerSession::migrate`] simply has nothing else to choose.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PathStatus {
     /// Over the Isekai Link relay. Present from the moment video starts.
@@ -216,16 +220,23 @@ impl ViewerSession {
         self.paths.lock().expect("path mutex poisoned").status()
     }
 
-    /// Switch between the relay path and a validated direct path.
+    /// Choose which of the known paths carries the video: the relay one, or a
+    /// validated direct one.
     ///
-    /// Returns whether a switch was requested — `false` when there is nothing to
-    /// switch to, which is the normal state until a direct path is validated and
-    /// the permanent state where none can be.
+    /// Nothing is torn down. Both paths stay open, validated and kept warm by a
+    /// per-path keepalive, and this only declares which one traffic goes on — so
+    /// coming back is the same call again and costs nothing. That is what stops
+    /// a direct path decaying while it waits to be used, which is the failure
+    /// this replaced (`docs/p2p_mode_migration_plan.md` risk #24).
     ///
-    /// The request is asynchronous: the switch has taken effect when
-    /// [`FrameSink::on_path`] reports it, not when this returns. If the new path
-    /// turns out to carry nothing, the session falls back to the relay on its
-    /// own after a few seconds.
+    /// Returns whether a change was requested — `false` when there is no other
+    /// path to choose, which is the normal state until a direct path is
+    /// validated and the permanent state where none can be.
+    ///
+    /// The request is asynchronous: it has taken effect when
+    /// [`FrameSink::on_path`] reports it, not when this returns. If the chosen
+    /// path turns out to carry nothing, the session goes back to the relay on
+    /// its own after a few seconds.
     pub fn migrate(&self) -> bool {
         let target = self
             .paths
