@@ -38,18 +38,26 @@
 //! viewers that have never heard of it.
 //!
 //! Question 5 is the point of the exercise, and it turns on a setting neither
-//! side had: `KeepAliveIntervalMs` defaults to 0, which means no PING is ever
-//! sent. With multipath negotiated msquic marks *every* in-use path and sends a
-//! PING on each in its own datagram — exactly what a path nobody sends on needs
-//! — but only if the interval is set, and each connection's timer is driven by
-//! its own settings. So both sides set it, and `SPIKE_KEEPALIVE` is there to run
-//! the controls.
+//! side had: `PathKeepAliveIntervalMs` defaults to 0, which means no PING is
+//! ever sent. With multipath negotiated msquic sends one on *every* in-use path,
+//! each in its own datagram — exactly what a path nobody sends on needs — but
+//! only if the interval is set, and each connection's timer is driven by its own
+//! settings. So both sides set it, and `SPIKE_KEEPALIVE` runs the controls.
 //!
-//! The window is deliberately silent: the application sends nothing for sixty
-//! seconds, so the keepalive is the only thing holding either path up, and the
-//! 30s idle timeout is the detector. A pass is still necessary and not
-//! sufficient — a loopback bridge is not a NAT, so what would fail on hardware
-//! and pass here is a mapping that lapses.
+//! **Read that setting name carefully, because this file got it wrong once.** An
+//! earlier version set `KeepAliveIntervalMs`, passed every question, and shipped
+//! a direct path that still decayed on a device. The connection keepalive is
+//! re-armed by any activity anywhere on the connection, so on a connection
+//! carrying video it never fires; the silent window below is the one condition
+//! where that mistake looks like a pass. The fix was upstream — paths got a
+//! timer of their own (`seera-msquic` #76) — and the lesson is local: a green
+//! harness is worth what its conditions are worth.
+//!
+//! The window is still silent, and now *only* the path keepalive can carry it:
+//! nothing here sets the connection keepalive. A pass remains necessary and not
+//! sufficient. A loopback bridge is not a NAT, so a mapping that lapses is still
+//! invisible — and neither can this reproduce a busy connection with an idle
+//! path, because `QuicConnChoosePath` picks a random active path per send.
 //!
 //! ```text
 //! cargo run --example multipath_spike -p camera-core
@@ -76,15 +84,22 @@ const ALPN: &str = "multipath-spike";
 /// later worked.
 const OBSERVE: Duration = Duration::from_secs(60);
 
-/// How often each side sends a keepalive PING.
+/// How long a path may go without sending before it gets a PING.
 ///
-/// Load-bearing, and needed on **both** sides. The default is 0 — no PING is
-/// ever sent — and the timer is driven by each connection's own settings, so a
-/// camera that does not set it never pings whatever the viewer does. Multipath
-/// makes that worse rather than better: with it negotiated, msquic marks *every*
-/// in-use path and sends a PING on each in its own datagram, precisely because a
-/// path the peer stops hearing from is abandoned. Without the setting there is
-/// nothing to mark, and a path nobody sends on is exactly risk #24.
+/// `PathKeepAliveIntervalMs`, and the distinction from `KeepAliveIntervalMs`
+/// next to it is the whole reason this spike was not enough. **An earlier
+/// version of this file set the connection keepalive and passed**, and the
+/// direct path still decayed on a device — because
+/// `QuicConnResetIdleTimeout` re-arms the connection keepalive on every
+/// ack-eliciting packet received and on the first packet put in flight, so it
+/// fires only once the *whole connection* has gone quiet. A video connection is
+/// never quiet. The silent window below is precisely the one condition where the
+/// wrong setting looks right, which is how a PASS here coexisted with a failure
+/// in the field. Fixed upstream by giving paths a timer of their own
+/// (`seera-msquic` #76), counted per path and reset by nothing.
+///
+/// Still needed on **both** sides: the default is 0, meaning no PING at all, and
+/// the timer is driven by each connection's own settings.
 ///
 /// Below `IdleTimeoutMs` by design, so a run where the PINGs do not happen dies
 /// of the idle timeout rather than passing quietly. The shipping value is a
@@ -92,23 +107,31 @@ const OBSERVE: Duration = Duration::from_secs(60);
 /// worth surviving, and every ping costs a wakeup on a battery-powered camera.
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 
-/// Which sides send keepalives: `SPIKE_KEEPALIVE=both` (the default), `client`,
-/// `server` or `none`. Question 5 reads the difference.
+/// Which sides keep their paths alive: `SPIKE_KEEPALIVE=both` (the default),
+/// `client`, `server` or `none`. Question 5 reads the difference.
 ///
 /// `none` is the control that makes the setting's absence visible: the
 /// connection dies of the idle timeout 30s into a silent window, which is the
-/// whole argument for setting it at all.
+/// whole argument for setting it at all. Nothing here sets the *connection*
+/// keepalive, deliberately — it would carry the silent window on its own and the
+/// control would prove nothing about paths, which is exactly the trap the first
+/// version of this file fell into.
 ///
-/// What the controls *cannot* settle is whether both sides are required. On
-/// loopback there is no mapping to lapse, and a PING is ack-eliciting, so one
-/// side pinging still pulls acknowledgements out of the other along the same
-/// paths — `client` and `server` pass here just as `both` does. Nor does the
-/// relay-path packet count separate them: a side's own PING and its
-/// acknowledgement of the peer's ride in the same datagram when the timers line
-/// up, so `both` is anywhere from the one-sided count to twice it. The reason to
-/// set it on both is structural rather than measured here — the timer is driven
-/// by each connection's own settings, so a camera that leaves it at 0 never
-/// originates anything and its side of the traffic is only ever a reply.
+/// Two things the controls **cannot** settle.
+///
+/// Whether both sides are required: on loopback there is no mapping to lapse,
+/// and a PING is ack-eliciting, so one side pinging still pulls acknowledgements
+/// out of the other along the same paths — `client` and `server` pass here just
+/// as `both` does. Nor does the relay-path packet count separate them, since a
+/// side's own PING and its acknowledgement of the peer's ride in the same
+/// datagram when the timers line up. The reason to set it on both is structural:
+/// a camera that leaves it at 0 never originates anything.
+///
+/// And whether the timer survives a *busy* connection, which is the field
+/// condition and the one that actually failed. It cannot be reproduced here for
+/// the same reason msquic's own test only measures it: `QuicConnChoosePath`
+/// picks a random active path per send, so under load neither path stays idle
+/// long enough for the keepalive to be what is being counted.
 fn keep_alive_ms(side: Side) -> u32 {
     let setting = std::env::var("SPIKE_KEEPALIVE").unwrap_or_else(|_| "both".to_owned());
     let on = match setting.as_str() {
@@ -487,7 +510,7 @@ fn client_config(reg: &Registration, multipath: bool) -> anyhow::Result<msquic::
         .set_DatagramReceiveEnabled()
         .set_ReceiveObservedAddressReports()
         // Both sides set it, and each only pings for itself. See `KEEP_ALIVE`.
-        .set_KeepAliveIntervalMs(keep_alive_ms(Side::Client))
+        .set_PathKeepAliveIntervalMs(keep_alive_ms(Side::Client))
         // NAT traversal stays. It is what opens a path between two peers that
         // are both behind NATs — hole punching is the whole point — and an
         // application adding paths by hand cannot do that. Multipath goes on
@@ -527,7 +550,7 @@ async fn start_listener(reg: &Arc<Registration>, multipath: bool) -> anyhow::Res
         .set_DatagramReceiveEnabled()
         .set_ReceiveObservedAddressReports()
         // Both sides set it, and each only pings for itself. See `KEEP_ALIVE`.
-        .set_KeepAliveIntervalMs(keep_alive_ms(Side::Server))
+        .set_PathKeepAliveIntervalMs(keep_alive_ms(Side::Server))
         .set_AddAddressMode(msquic::AddAddressMode::NatTraversal);
     let settings = if multipath {
         settings.set_MultipathEnabled()

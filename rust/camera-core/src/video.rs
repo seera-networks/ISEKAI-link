@@ -51,13 +51,22 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// it. The report normally lands within a round trip of the leg coming up; if it
 /// does not, streaming over the relay matters more than a direct path.
 const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
-/// How often each side pings, so a path nobody sends on does not decay.
+/// How long a path may go without sending before it gets a PING.
 ///
-/// Matches the listener's (`isekai_link_utils::make_msquic_async_listener_with`)
-/// and sits well inside the 30 s idle timeout. Both ends have to set it — a
-/// connection's keepalive timer runs off its own settings, so a camera that
-/// leaves it at the default 0 never originates a packet whatever the viewer
-/// does, and 0 *is* the default.
+/// `PathKeepAliveIntervalMs`, and **not** `KeepAliveIntervalMs`. The two look
+/// interchangeable and are not: the connection keepalive is re-armed by
+/// `QuicConnResetIdleTimeout` on every ack-eliciting packet received and on the
+/// first packet put in flight, so it fires only once the *whole connection* has
+/// gone quiet. A video connection is never quiet — that is what it is for — so
+/// it never fired, and the direct path decayed exactly as it did before, with
+/// the setting apparently in place. This one is counted per path, from what that
+/// path itself carried, and nothing resets it.
+///
+/// Both ends still have to set it: the timer runs off each connection's own
+/// settings, and the default is 0, meaning no PING is ever sent.
+///
+/// Ten seconds is well inside the 30 s idle timeout and cheap — a path that is
+/// carrying traffic on its own never gets a redundant PING.
 const DIRECT_PATH_KEEPALIVE: Duration = Duration::from_secs(10);
 
 /// How long a migrated path may carry nothing before falling back to the relay.
@@ -1109,19 +1118,18 @@ fn video_client_config(
     // what multipath changes is what a validated path *becomes*: another active
     // path instead of somewhere to migrate to.
     //
-    // And the keepalive is what stops the second path decaying while nothing is
-    // sent on it, which is the whole of risk #24. It is not optional and it is
-    // not symmetric with the listener's: the timer runs off each connection's
-    // own settings, so this side pinging says nothing about the other side. Ten
-    // seconds matches the listener (`isekai_link_utils`), well inside the 30s
-    // idle timeout. With multipath negotiated msquic pings *every* in-use path,
-    // each in its own datagram, which is exactly the path nobody sends on.
+    // And the path keepalive is what stops the second path decaying while
+    // nothing is sent on it, which is the whole of risk #24. It is not optional,
+    // it is not the connection keepalive — see `DIRECT_PATH_KEEPALIVE` for why
+    // that distinction cost a field test — and it is not symmetric with the
+    // listener's: the timer runs off each connection's own settings, so this
+    // side pinging says nothing about the other side.
     let settings = if enable_migration {
         settings
             .set_ReceiveObservedAddressReports()
             .set_AddAddressMode(msquic::AddAddressMode::NatTraversal)
             .set_MultipathEnabled()
-            .set_KeepAliveIntervalMs(DIRECT_PATH_KEEPALIVE.as_millis() as u32)
+            .set_PathKeepAliveIntervalMs(DIRECT_PATH_KEEPALIVE.as_millis() as u32)
     } else {
         settings
     };

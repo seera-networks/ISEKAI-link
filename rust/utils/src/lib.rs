@@ -70,6 +70,12 @@ pub fn make_msquic_async_client_config(
     Ok((registration, Arc::new(configuration)))
 }
 
+/// How long a path may go without sending before it gets a PING.
+///
+/// Matches the video client's `DIRECT_PATH_KEEPALIVE`, which documents why this
+/// is `PathKeepAliveIntervalMs` and not the connection keepalive next to it.
+const PATH_KEEP_ALIVE_INTERVAL_MS: u32 = 10_000;
+
 /// Listener settings that only some callers want.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ListenerOptions {
@@ -131,8 +137,10 @@ pub fn make_msquic_async_listener_with(
         // Matches the video client (see `camera_core::video`), so the
         // relay tunnel carries the same packet size in both directions.
         .set_MaximumMtu(1248)
-        // Also what keeps a path nobody sends on from decaying — with multipath
-        // negotiated msquic pings every path, not just the one carrying data.
+        // Keeps the *connection* from going idle. It does not keep a path warm:
+        // it is re-armed by any activity anywhere on the connection, so on a
+        // connection that is carrying traffic it never fires at all. Keeping an
+        // idle path alive is `PathKeepAliveIntervalMs` below.
         .set_KeepAliveIntervalMs(10_000)
         .set_DestCidUpdateIdleTimeoutMs(0)
         .set_PeerBidiStreamCount(100)
@@ -140,7 +148,13 @@ pub fn make_msquic_async_listener_with(
         .set_DatagramReceiveEnabled()
         .set_StreamMultiReceiveEnabled();
     let settings = if options.multipath {
-        settings.set_MultipathEnabled()
+        settings
+            .set_MultipathEnabled()
+            // How long a path may go without sending before it gets a PING,
+            // counted per path and reset by nothing. Both ends have to set it —
+            // each connection's timer runs off its own settings, and the default
+            // is 0, which sends no PING at all.
+            .set_PathKeepAliveIntervalMs(PATH_KEEP_ALIVE_INTERVAL_MS)
     } else {
         settings
     };

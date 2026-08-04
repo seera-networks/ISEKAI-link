@@ -584,13 +584,29 @@ NAT 越えの検証（§7-17）は 2026-08-01 の実機 2 台試験で解消し�
 
 **入った変更**
 
-1. **`KeepAliveIntervalMs` を映像接続にも設定**（`video_client_config`、10 秒）。
-   既定は **0＝PING を一切送らない**ため、これが無いと「誰も送らない経路」は温まらない。
-   タイマーは各接続が自分の設定で回すので**両側**に要る。リスナ側は
-   `make_msquic_async_listener` が元から 10 秒を入れていた。
-   multipath ネゴシエート時、msquic は **in-use の全経路**に個別のデータグラムで PING を打つ
-   （`QuicConnProcessKeepAliveOperation` / `QuicSendPathKeepAlives`）— アクティブ経路のパケットに
-   相乗りできないため。これがリスク #24 が求めていた挙動そのもの。
+1. **`PathKeepAliveIntervalMs` を両側に設定**（10 秒）。既定は **0＝PING を一切送らない**。
+   msquic は multipath ネゴシエート時、**in-use の全経路**に個別のデータグラムで PING を打つ
+   （`QuicSendPathKeepAlives`）— アクティブ経路のパケットに相乗りできないため。
+   タイマーは各接続が自分の設定で回すので**両側**に要る。
+
+   **`KeepAliveIntervalMs` ではない。** 最初この設定で実装し、spike は全問 PASS したが、
+   **実機では直接経路が相変わらず腐った**。接続 keepalive は
+   `QuicConnResetIdleTimeout` が「ack-eliciting パケットの受信ごと」「最初の in-flight パケット」で
+   再武装するため、**接続全体が静かになって初めて発火する**。映像接続は静かにならないので、
+   設定してあるのに一度も飛ばない。片方の経路が忙しいともう片方は放置され、
+   NAT マッピングを失い、最終的にピアに abandon される。
+   上流で**経路専用のタイマー**として修正済み（`seera-msquic` #76、`QUIC_CONN_TIMER_PATH_KEEP_ALIVE`）。
+   経路ごとに `LastSendTimeUs` から数え、**何にもリセットされない**。
+   自力で送っている経路には冗長な PING を打たない。
+
+   **spike が見落とした理由**は記録に値する。質問 5 の観測窓は「アプリが無音」で、
+   それは**接続 keepalive が効く唯一の条件**だった。誤った設定が正しく見える条件を選んで
+   テストしていたことになる。現在の spike は接続 keepalive を一切設定せず、
+   経路 keepalive だけが窓を支えるようにしてある。
+   なお**実機の条件（接続は忙しく、片方の経路だけ暇）は spike では再現できない** —
+   `QuicConnChoosePath` が送信ごとにアクティブ経路からランダムに選ぶため、
+   負荷時はどちらの経路も暇にならない（msquic 自身のテストも同じ理由でこの半分を
+   assert せず計測に留めている）。
 2. **`MultipathEnabled` を両側に**。クライアントは `enable_migration` 時、リスナは常時
    （`ListenerOptions { multipath: true }`）。
 3. **「切り替え」から「宣言」へ**。`activate_path` を `set_path_status` に置き換え、
@@ -609,7 +625,11 @@ NAT 越えの検証（§7-17）は 2026-08-01 の実機 2 台試験で解消し�
 `PathValidated` は multipath 下でも（`PathAdded` の直前に）上がるので、UI の
 「直接経路が見つかった」表示はどちらの相手でも従来どおり動く。
 
-**未了**: 実機での検証。ループバックは NAT ではないので、spike が言えるのは
+**実機フィードバック（2026-08-04）**: 上記 1 の `KeepAliveIntervalMs` →
+`PathKeepAliveIntervalMs` は、実機で「PING が定期的に飛んでいない」ことから判明した。
+submodule を `masa-koz/qmux-01-fix-h3-datagram`（`285e484` / seera-msquic `bdf732d`）に更新。
+
+**未了**: 修正後の実機での再検証。ループバックは NAT ではないので、spike が言えるのは
 「msquic が自分から経路を落とさない」ところまで。**マッピングの失効は実機でしか見えない。**
 
 ---
