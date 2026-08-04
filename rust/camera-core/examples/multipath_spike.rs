@@ -289,10 +289,16 @@ fn client_config(reg: &Registration, multipath: bool) -> anyhow::Result<msquic::
         .set_PeerUnidiStreamCount(100)
         .set_DatagramReceiveEnabled()
         .set_ReceiveObservedAddressReports()
-        // Without this the peer's ADD_ADDRESS frames are not surfaced, so
-        // `NotifyRemoteAddressAdded` never arrives and there is nothing to open
-        // a second path to. The shipping client sets it for the same reason.
-        .set_AddAddressMode(msquic::AddAddressMode::NatTraversal);
+        // `Manual`, not `NatTraversal`. The two are alternatives: in
+        // NAT-traversal mode msquic adds paths itself and does not raise
+        // `NotifyRemoteAddressAdded`, which is exactly the event an application
+        // driving its own `add_path` needs. Asking for both — as this spike did
+        // at first — gets the automatic behaviour and no event.
+        //
+        // That is also the shape of the change to the shipping path: the video
+        // connection uses NAT traversal today, and moving to multipath means
+        // taking the addresses back rather than adding to what is there.
+        .set_AddAddressMode(msquic::AddAddressMode::Manual);
     let settings = if multipath {
         settings.set_MultipathEnabled()
     } else {
@@ -320,7 +326,7 @@ async fn start_listener(reg: &Arc<Registration>, multipath: bool) -> anyhow::Res
         .set_PeerUnidiStreamCount(100)
         .set_DatagramReceiveEnabled()
         .set_ReceiveObservedAddressReports()
-        .set_AddAddressMode(msquic::AddAddressMode::NatTraversal);
+        .set_AddAddressMode(msquic::AddAddressMode::Manual);
     let settings = if multipath {
         settings.set_MultipathEnabled()
     } else {
