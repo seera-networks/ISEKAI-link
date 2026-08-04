@@ -1190,107 +1190,124 @@ impl eframe::App for MyApp {
         let mut close_clicked = false;
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.heading("📷 Camera Stream");
+            // The window runs out of room long before the content does — a QR,
+            // a device list, an activity log and a video preview do not fit on a
+            // laptop screen at once — and what fell off the bottom simply could
+            // not be reached. `auto_shrink` off so the area still claims the
+            // whole panel when the content is short.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.heading("📷 Camera Stream");
 
-            ui.separator();
+                    ui.separator();
 
-            // ✅ 接続モード
-            ui.horizontal(|ui| {
-                ui.label("Mode:");
-                ui.add_enabled_ui(!self.is_open, |ui| {
-                    ui.selectable_value(&mut self.mode, Mode::Direct, "Direct (legacy)");
-                    ui.selectable_value(&mut self.mode, Mode::P2p, "P2P");
+                    // ✅ 接続モード
+                    ui.horizontal(|ui| {
+                        ui.label("Mode:");
+                        ui.add_enabled_ui(!self.is_open, |ui| {
+                            ui.selectable_value(&mut self.mode, Mode::Direct, "Direct (legacy)");
+                            ui.selectable_value(&mut self.mode, Mode::P2p, "P2P");
+                        });
+                    });
+
+                    // ✅ 接続設定
+                    match self.mode {
+                        Mode::Direct => {
+                            ui.horizontal(|ui| {
+                                ui.label("Target:");
+                                ui.add_enabled(
+                                    !self.is_open,
+                                    egui::TextEdit::singleline(&mut self.target)
+                                        .desired_width(300.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("JWT:   ");
+                                ui.add_enabled(
+                                    !self.is_open,
+                                    egui::TextEdit::singleline(&mut self.jwt)
+                                        .desired_width(300.0)
+                                        .password(true),
+                                );
+                            });
+                        }
+                        Mode::P2p => {
+                            self.p2p_settings_ui(ui);
+                        }
+                    }
+
+                    // ✅ Open / Closeボタン
+                    ui.horizontal(|ui| {
+                        if !self.is_open {
+                            if ui.button("🔌 Open").clicked() {
+                                open_clicked = true;
+                            }
+                        } else if ui.button("⏏ Close").clicked() {
+                            close_clicked = true;
+                        }
+                    });
+
+                    // ✅ 接続後の状態表示
+                    match self.mode {
+                        Mode::Direct => {
+                            if let Some(addr) = self.public_address.lock().unwrap().as_ref() {
+                                ui.label(format!("Public Address: {}", addr));
+                            }
+                        }
+                        Mode::P2p => {
+                            self.p2p_status_ui(ui);
+                        }
+                    }
+
+                    ui.separator();
+
+                    // ✅ 状態表示
+                    ui.label(format!(
+                        "Status: {}",
+                        if self.is_streaming.load(Ordering::Relaxed) {
+                            "Streaming"
+                        } else {
+                            "Stopped"
+                        }
+                    ));
+
+                    ui.separator();
+
+                    // ✅ Start / Stopボタン
+                    if !self.is_streaming.load(Ordering::Relaxed) {
+                        if ui.button("▶ Start").clicked() {
+                            self.is_streaming.store(true, Ordering::Relaxed);
+                            *self.log_shared.lock().unwrap() = "Streaming started.".to_string();
+                        }
+                    } else if ui.button("■ Stop").clicked() {
+                        self.is_streaming.store(false, Ordering::Relaxed);
+                        *self.log_shared.lock().unwrap() = "Streaming stopped.".to_string();
+                    }
+
+                    ui.separator();
+
+                    // ✅ ログ表示
+                    ui.label("Log:");
+                    ui.text_edit_multiline(&mut self.log);
+
+                    ui.separator();
+
+                    // Drawn straight into the page, not in a scroll area of its
+                    // own. A nested one takes whatever height is left and
+                    // scrolls inside it, so the outer area believes the content
+                    // ends where the video starts — the page stops scrolling and
+                    // the picture is cut off at the window's edge with no way to
+                    // reach the rest of it.
+                    //
+                    // Fitting to the available width keeps the whole frame on
+                    // screen without a second axis to scroll.
+                    if let Some(texture) = &self.texture {
+                        ui.add(egui::Image::new(texture).max_width(ui.available_width()));
+                    } else {
+                        ui.label("Loading camera feed...");
+                    }
                 });
-            });
-
-            // ✅ 接続設定
-            match self.mode {
-                Mode::Direct => {
-                    ui.horizontal(|ui| {
-                        ui.label("Target:");
-                        ui.add_enabled(
-                            !self.is_open,
-                            egui::TextEdit::singleline(&mut self.target).desired_width(300.0),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("JWT:   ");
-                        ui.add_enabled(
-                            !self.is_open,
-                            egui::TextEdit::singleline(&mut self.jwt)
-                                .desired_width(300.0)
-                                .password(true),
-                        );
-                    });
-                }
-                Mode::P2p => {
-                    self.p2p_settings_ui(ui);
-                }
-            }
-
-            // ✅ Open / Closeボタン
-            ui.horizontal(|ui| {
-                if !self.is_open {
-                    if ui.button("🔌 Open").clicked() {
-                        open_clicked = true;
-                    }
-                } else if ui.button("⏏ Close").clicked() {
-                    close_clicked = true;
-                }
-            });
-
-            // ✅ 接続後の状態表示
-            match self.mode {
-                Mode::Direct => {
-                    if let Some(addr) = self.public_address.lock().unwrap().as_ref() {
-                        ui.label(format!("Public Address: {}", addr));
-                    }
-                }
-                Mode::P2p => {
-                    self.p2p_status_ui(ui);
-                }
-            }
-
-            ui.separator();
-
-            // ✅ 状態表示
-            ui.label(format!(
-                "Status: {}",
-                if self.is_streaming.load(Ordering::Relaxed) {
-                    "Streaming"
-                } else {
-                    "Stopped"
-                }
-            ));
-
-            ui.separator();
-
-            // ✅ Start / Stopボタン
-            if !self.is_streaming.load(Ordering::Relaxed) {
-                if ui.button("▶ Start").clicked() {
-                    self.is_streaming.store(true, Ordering::Relaxed);
-                    *self.log_shared.lock().unwrap() = "Streaming started.".to_string();
-                }
-            } else if ui.button("■ Stop").clicked() {
-                self.is_streaming.store(false, Ordering::Relaxed);
-                *self.log_shared.lock().unwrap() = "Streaming stopped.".to_string();
-            }
-
-            ui.separator();
-
-            // ✅ ログ表示
-            ui.label("Log:");
-            ui.text_edit_multiline(&mut self.log);
-
-            ui.separator();
-
-            egui::ScrollArea::both().show(ui, |ui| {
-                if let Some(texture) = &self.texture {
-                    ui.image(texture);
-                } else {
-                    ui.label("Loading camera feed...");
-                }
-            });
         });
 
         if open_clicked {

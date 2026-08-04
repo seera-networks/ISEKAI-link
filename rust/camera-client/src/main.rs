@@ -984,87 +984,103 @@ impl eframe::App for MyApp {
         let mut migrate_clicked = false;
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.heading("📷 Camera Stream");
+            // The window runs out of room long before the content does — a QR,
+            // a device list, an activity log and a video preview do not fit on a
+            // laptop screen at once — and what fell off the bottom simply could
+            // not be reached. `auto_shrink` off so the area still claims the
+            // whole panel when the content is short.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.heading("📷 Camera Stream");
 
-            ui.horizontal(|ui| {
-                ui.label("Mode:");
-                ui.add_enabled_ui(!self.connected, |ui| {
-                    ui.selectable_value(&mut self.mode, Mode::Direct, "Direct (legacy)");
-                    ui.selectable_value(&mut self.mode, Mode::P2p, "P2P");
-                });
-            });
-
-            match self.mode {
-                Mode::Direct => {
                     ui.horizontal(|ui| {
-                        ui.label("Server:");
-                        ui.add_enabled(
-                            !self.connected,
-                            egui::TextEdit::singleline(&mut self.server_addr),
-                        );
-                        ui.label("Port:");
-                        ui.add_enabled(
-                            !self.connected,
-                            egui::TextEdit::singleline(&mut self.server_port),
-                        );
+                        ui.label("Mode:");
+                        ui.add_enabled_ui(!self.connected, |ui| {
+                            ui.selectable_value(&mut self.mode, Mode::Direct, "Direct (legacy)");
+                            ui.selectable_value(&mut self.mode, Mode::P2p, "P2P");
+                        });
                     });
-                }
-                Mode::P2p => {
-                    self.p2p_settings_ui(ui);
-                }
-            }
 
-            ui.horizontal(|ui| {
-                if self.connected {
-                    if ui.button("Disconnect").clicked() {
-                        disconnect_clicked = true;
+                    match self.mode {
+                        Mode::Direct => {
+                            ui.horizontal(|ui| {
+                                ui.label("Server:");
+                                ui.add_enabled(
+                                    !self.connected,
+                                    egui::TextEdit::singleline(&mut self.server_addr),
+                                );
+                                ui.label("Port:");
+                                ui.add_enabled(
+                                    !self.connected,
+                                    egui::TextEdit::singleline(&mut self.server_port),
+                                );
+                            });
+                        }
+                        Mode::P2p => {
+                            self.p2p_settings_ui(ui);
+                        }
                     }
-                } else if ui.button("Connect").clicked() {
-                    connect_clicked = true;
-                }
 
-                // Path migration, in either mode: enabled once both the
-                // initial path and a validated direct path are known.
-                if ui
-                    .add_enabled(
-                        self.connected
-                            && self.isekai_link_path.is_some()
-                            && self.p2p_path.is_some(),
-                        egui::Button::new(if self.is_isekai_link {
-                            "Migrate to P2P"
-                        } else {
-                            "Migrate to Isekai Link"
-                        }),
-                    )
-                    .clicked()
-                {
-                    migrate_clicked = true;
-                }
-            });
+                    ui.horizontal(|ui| {
+                        if self.connected {
+                            if ui.button("Disconnect").clicked() {
+                                disconnect_clicked = true;
+                            }
+                        } else if ui.button("Connect").clicked() {
+                            connect_clicked = true;
+                        }
 
-            if self.mode == Mode::P2p {
-                self.p2p_status_ui(ui);
-            }
+                        // Path migration, in either mode: enabled once both the
+                        // initial path and a validated direct path are known.
+                        if ui
+                            .add_enabled(
+                                self.connected
+                                    && self.isekai_link_path.is_some()
+                                    && self.p2p_path.is_some(),
+                                egui::Button::new(if self.is_isekai_link {
+                                    "Migrate to P2P"
+                                } else {
+                                    "Migrate to Isekai Link"
+                                }),
+                            )
+                            .clicked()
+                        {
+                            migrate_clicked = true;
+                        }
+                    });
 
-            if self.connected {
-                self.path_status_ui(ui);
-            }
+                    if self.mode == Mode::P2p {
+                        self.p2p_status_ui(ui);
+                    }
 
-            ui.separator();
+                    if self.connected {
+                        self.path_status_ui(ui);
+                    }
 
-            show_rtt_plot(ui, &self.rtt_history);
+                    ui.separator();
 
-            ui.separator();
+                    show_rtt_plot(ui, &self.rtt_history);
 
-            egui::ScrollArea::both().show(ui, |ui| {
-                if let Some(texture) = &self.texture {
-                    ui.image(texture);
-                } else if self.connected {
-                    ui.label("Waiting for camera feed...");
-                } else {
-                    ui.label("Not connected.");
-                }
-            });
+                    ui.separator();
+
+                    // Drawn straight into the page, not in a scroll area of its
+                    // own. A nested one takes whatever height is left and
+                    // scrolls inside it, so the outer area believes the content
+                    // ends where the video starts — the page stops scrolling and
+                    // the picture is cut off at the window's edge with no way to
+                    // reach the rest of it.
+                    //
+                    // Fitting to the available width keeps the whole frame on
+                    // screen without a second axis to scroll.
+                    if let Some(texture) = &self.texture {
+                        ui.add(egui::Image::new(texture).max_width(ui.available_width()));
+                    } else if self.connected {
+                        ui.label("Waiting for camera feed...");
+                    } else {
+                        ui.label("Not connected.");
+                    }
+                });
         });
 
         if connect_clicked {
