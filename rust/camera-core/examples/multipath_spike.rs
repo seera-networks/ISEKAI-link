@@ -21,6 +21,7 @@
 //! | 3 | Does declaring a path backup reach the peer as `PathStatusChanged`? | yes |
 //! | 4 | **Does a multipath client still connect to a peer without it?** | yes |
 //! | 5 | Do both paths survive the window a validated path used to decay in, with the application silent? | yes |
+//! | 6 | **And the other way round — a plain client against a peer with it?** | yes |
 //!
 //! The two sides are set up the way the shipping code sets them up, because the
 //! answers are only worth having if they are about that arrangement: the viewer
@@ -29,9 +30,12 @@
 //! candidate — and the camera makes `apply_direct_path`'s two afterwards,
 //! claiming the leg's binding and advertising it.
 //!
-//! Question 4 is the one that decides the rollout. If a client with multipath
-//! cannot talk to a camera without it, the two have to ship together, and every
-//! mixed pair in between is broken video.
+//! Questions 4 and 6 are the ones that decide the rollout, and they are asked
+//! in both directions because both happen: cameras and viewers are updated
+//! separately, so a mixed pair that cannot talk means shipping both sides at
+//! once with every user in between on broken video. Question 6 is the order the
+//! video listener's own change lands in — the camera offering multipath to
+//! viewers that have never heard of it.
 //!
 //! Question 5 is the point of the exercise, and it turns on a setting neither
 //! side had: `KeepAliveIntervalMs` defaults to 0, which means no PING is ever
@@ -156,11 +160,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    match mixed_versions(&registration).await {
-        Ok(line) => println!("{line}"),
+    match mixed_versions(&registration, true, false).await {
+        Ok(()) => println!("PASS  4. a multipath client connects to a peer without it"),
         Err(e) => {
             println!("FAIL  question 4 (multipath client, plain peer): {e:#}");
             failures.push("4");
+        }
+    }
+
+    match mixed_versions(&registration, false, true).await {
+        Ok(()) => println!("PASS  6. a plain client connects to a peer with multipath"),
+        Err(e) => {
+            println!("FAIL  question 6 (plain client, multipath peer): {e:#}");
+            failures.push("6");
         }
     }
 
@@ -376,18 +388,28 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Question 4: a multipath client against a peer that has never heard of it.
+/// Questions 4 and 6: a mixed pair, in both directions.
 ///
 /// This is the rollout question. A camera and a viewer are updated separately,
 /// so every mixed pair has to keep working — and if it does not, both sides have
 /// to ship at once and every user in between has broken video.
-async fn mixed_versions(reg: &Arc<Registration>) -> anyhow::Result<String> {
-    let listener = start_listener(reg, false).await?;
+///
+/// Both directions are asked because both happen. Question 4 is the viewer
+/// updated first; question 6 is the camera updated first, which is the order the
+/// video listener's own change lands in, and neither is the other's answer:
+/// multipath is negotiated from what each side offers, and only a run says the
+/// negotiation actually degrades rather than fails.
+async fn mixed_versions(
+    reg: &Arc<Registration>,
+    client_multipath: bool,
+    server_multipath: bool,
+) -> anyhow::Result<()> {
+    let listener = start_listener(reg, server_multipath).await?;
     let bridge = Bridge::start(listener.addr).await?;
 
     let client = Connection::new(reg)?;
     client.set_share_binding(true)?;
-    let config = client_config(reg, true)?;
+    let config = client_config(reg, client_multipath)?;
 
     let (started, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
@@ -396,12 +418,12 @@ async fn mixed_versions(reg: &Arc<Registration>) -> anyhow::Result<String> {
         )
     })
     .await
-    .context("a multipath client could not connect to a peer without multipath within 10s")?;
-    started.context("start against a peer without multipath")?;
-    accepted.context("accept from a client with multipath")?;
+    .context("the handshake did not complete within 10s")?;
+    started.context("client start")?;
+    accepted.context("server accept")?;
 
     bridge.stop();
-    Ok("PASS  4. a multipath client connects to a peer without it".to_owned())
+    Ok(())
 }
 
 /// A connection on its own real-interface binding, shared and unconnected —
