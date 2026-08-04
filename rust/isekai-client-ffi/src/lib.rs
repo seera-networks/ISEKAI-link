@@ -528,6 +528,21 @@ pub fn pair_with_code(
     })
 }
 
+/// The pairing code in a scanned QR, or `None` when it is not one of ours.
+///
+/// A camera pointed at the world reads posters, wifi codes and links. Handing
+/// any of that to [`pair_with_code`] would spend a request to be told it is not
+/// a code, so a scanner should ask here first and keep looking when the answer
+/// is `None`. What counts is the `isekai://pair?code=...` a camera puts in its
+/// own QR, and the prefix is defined once, in the core.
+///
+/// A code someone read off the screen and typed goes straight to
+/// [`pair_with_code`], which takes bare codes as well.
+#[uniffi::export]
+pub fn pairing_code_in_scan(scanned: String) -> Option<String> {
+    camera_core::pairing_code_in_uri(&scanned).map(str::to_owned)
+}
+
 /// Generate a fresh Endpoint key, returned as a PKCS#8 PEM string.
 ///
 /// The caller (Swift) must persist this securely — the iOS Keychain, device-only

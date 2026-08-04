@@ -34,9 +34,9 @@ pub mod agent {
     pub use isekai_p2p_core::identity::EndpointToken;
     pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::proxy::{
-        pairing_code_from_input, pairing_uri, Candidate, CandidateType, Capability, CertBundle,
-        ConnectionStateFilter, Grant, ListenerConnections, PairingCode, PeerConnection,
-        ReachableListener,
+        pairing_code_from_input, pairing_code_in_uri, pairing_uri, Candidate, CandidateType,
+        Capability, CertBundle, ConnectionStateFilter, Grant, ListenerConnections, PairingCode,
+        PeerConnection, ReachableListener,
     };
     pub use isekai_p2p_core::transport::{drain_msquic, shutdown_msquic};
 }

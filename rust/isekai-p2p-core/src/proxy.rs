@@ -192,25 +192,34 @@ pub fn pairing_uri(code: &str) -> String {
     format!("{PAIRING_SCHEME}{code}")
 }
 
+/// The pairing code inside a scanned value, or `None` when it is not one of
+/// ours.
+///
+/// A camera pointed at the world reads whatever is in front of it — a poster, a
+/// wifi QR, a URL — and handing any of that to the proxy would spend a request
+/// to be told it is not a code. Only the scheme this project puts in its own QR
+/// counts, which is why that prefix is defined once, here.
+///
+/// A scanner may hand back more than was encoded, so the code runs to the first
+/// character that could not be part of one.
+pub fn pairing_code_in_uri(input: &str) -> Option<&str> {
+    let rest = input.trim().strip_prefix(PAIRING_SCHEME)?;
+    let code = rest.split(['&', '#']).next().unwrap_or(rest).trim();
+    (!code.is_empty()).then_some(code)
+}
+
 /// Recover a pairing code from whatever was scanned, pasted or typed.
 ///
 /// Accepts both the URI and the bare code, because those are the two things
 /// that end up in the field: one from a scanner, one from someone reading the
-/// screen. Neither is validated beyond the shape — the proxy decides whether a
-/// code is real, and this only has to stop the scheme prefix from being sent as
-/// part of it.
+/// screen. A bare value is not validated — the proxy decides whether a code is
+/// real, and this only has to stop the scheme prefix from being sent as part of
+/// it. A scan should go through [`pairing_code_in_uri`] instead, which says no
+/// to everything that is not ours.
 pub fn pairing_code_from_input(input: &str) -> String {
-    let trimmed = input.trim();
-    match trimmed.strip_prefix(PAIRING_SCHEME) {
-        // A scanner may append a fragment or further parameters; the code runs
-        // to the first thing that could not be part of one.
-        Some(rest) => rest
-            .split(['&', '#'])
-            .next()
-            .unwrap_or(rest)
-            .trim()
-            .to_owned(),
-        None => trimmed.to_owned(),
+    match pairing_code_in_uri(input) {
+        Some(code) => code.to_owned(),
+        None => input.trim().to_owned(),
     }
 }
 
@@ -1116,5 +1125,29 @@ mod tests {
             pairing_code_from_input("https://example.test/pair?code=K7M2-QX4P"),
             "https://example.test/pair?code=K7M2-QX4P"
         );
+    }
+
+    /// A scanner sees whatever is in front of it. Only this project's own QR
+    /// should turn into a request; everything else has to read as "keep
+    /// looking" rather than as a code the proxy will refuse.
+    #[test]
+    fn only_our_own_uri_counts_as_a_scan() {
+        assert_eq!(
+            pairing_code_in_uri(&pairing_uri("K7M2-QX4P")),
+            Some("K7M2-QX4P")
+        );
+        assert_eq!(
+            pairing_code_in_uri("isekai://pair?code=K7M2-QX4P&v=1"),
+            Some("K7M2-QX4P")
+        );
+        for other in [
+            "K7M2-QX4P",                                // a bare code is typed, not scanned
+            "https://example.test/pair?code=K7M2-QX4P", // someone else's link
+            "WIFI:S=cafe;T=WPA;P=hunter2;;",            // a wifi QR
+            "isekai://pair?code=",                      // ours, but carrying nothing
+            "",
+        ] {
+            assert_eq!(pairing_code_in_uri(other), None, "{other:?}");
+        }
     }
 }

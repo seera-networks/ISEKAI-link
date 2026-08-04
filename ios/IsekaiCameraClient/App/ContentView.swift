@@ -11,6 +11,7 @@ struct ContentView: View {
     @StateObject private var model = ViewerModel()
     @State private var signInError: String?
     @State private var pairingCode = ""
+    @State private var isScanning = false
 
     var body: some View {
         NavigationStack {
@@ -27,6 +28,18 @@ struct ContentView: View {
             .navigationTitle("ISEKAI Viewer")
         }
         .task { model.prepare() }
+        .sheet(isPresented: $isScanning) {
+            QRScannerView(
+                onCode: { code in
+                    isScanning = false
+                    // Straight to pairing. Retyping what the camera already
+                    // showed and the phone already read would be the one step
+                    // scanning exists to remove.
+                    model.pair(with: code)
+                },
+                onCancel: { isScanning = false }
+            )
+        }
     }
 
     private var streamSection: some View {
@@ -139,6 +152,13 @@ struct ContentView: View {
                 }
                 .disabled(pairingCode.trimmed.isEmpty || !model.canUseControlPlane)
             }
+
+            Button {
+                isScanning = true
+            } label: {
+                Label("Scan the code", systemImage: "qrcode.viewfinder")
+            }
+            .disabled(!model.canUseControlPlane)
 
             if let status = model.cameraStatus {
                 Text(status).font(.footnote).foregroundStyle(.secondary)

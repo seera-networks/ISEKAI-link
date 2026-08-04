@@ -53,6 +53,12 @@ targets:
         CFBundleDisplayName: ISEKAI Viewer
         # Standard TLS/ECDSA only; no proprietary cryptography to declare.
         ITSAppUsesNonExemptEncryption: false
+        # Shown when the pairing scanner first asks. Says what the camera is
+        # for, because "this app would like to use the camera" on an app whose
+        # whole purpose is watching a camera reads as something else entirely.
+        NSCameraUsageDescription: >-
+          Scanning the pairing code a camera displays. The camera is used for
+          nothing else.
         UILaunchScreen: {}
         # Auth0 redirects back to this scheme. It is a constant rather than the
         # bundle identifier because sideloading rewrites the identifier to
