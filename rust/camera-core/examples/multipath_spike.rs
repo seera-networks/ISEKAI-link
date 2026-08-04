@@ -111,11 +111,8 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
     // refused outright — which is also the first thing to check, because the
     // video connection does not set it today.
     client.set_share_binding(true).context("share binding")?;
-    // The connection's own address is left to msquic. Pinning it here and then
-    // sharing the binding is what `QUIC_STATUS_ADDRESS_IN_USE` came out of: the
-    // second path shares the connection's binding, so the address `add_path`
-    // takes is about which interface to leave from, not a port to reserve.
-    let pinned = local_interface_addr()?;
+    // The connection's own address is left to msquic. Pinning it and then
+    // sharing the binding is what `QUIC_STATUS_ADDRESS_IN_USE` came out of.
 
     let config = client_config(reg, true).context("client config")?;
     let (started, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -136,43 +133,34 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
 
     // What a camera does: tell the peer where else it can be reached. Here the
     // listener's own address stands in for the address a NAT would report.
-    // Only the advertisement. `add_bound_addr` claims a binding for the
-    // connection, and the listener already holds this one — which is the same
-    // ADDRESS_IN_USE the camera logs when its video connection and its relay leg
-    // do not share a binding.
+    // Exactly what the camera does: claim the binding, then advertise it. The
+    // claim is allowed to fail — on a device it does whenever the video
+    // connection and the relay leg are not sharing a binding, and the shipping
+    // code carries on relay-only from there.
+    if let Err(e) = server.add_bound_addr(direct_addr) {
+        println!("NOTE  the peer could not claim {direct_addr} as its own: {e}");
+    }
     server
         .add_observed_addr(direct_addr, direct_addr)
         .context("advertising the peer's second address")?;
-
-    // The client learns it as a remote address, and opens a path to it. This is
-    // the step that replaces waiting for a candidate to validate.
-    let learned = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match poll_fn(|cx| client.poll_event(cx)).await {
-                Ok(ConnectionEvent::NotifyRemoteAddressAdded { address, .. }) => {
-                    return Ok(address)
-                }
-                Ok(_) => continue,
-                Err(e) => return Err(anyhow::anyhow!("client event stream ended: {e}")),
-            }
-        }
-    })
-    .await
-    .context("the peer's second address was never reported")??;
-
+    // And what the viewer does: offer where it can be reached, so the peer
+    // probes it. No `add_path` — in this mode msquic opens the path itself once
+    // the probe validates.
     client
-        .add_path(pinned, learned)
-        .with_context(|| format!("add_path {pinned} -> {learned}"))?;
+        .add_candidate_addr(client.get_local_addr()?, client.get_local_addr()?)
+        .context("offering a candidate")?;
 
-    let (client_path, server_path) = tokio::time::timeout(Duration::from_secs(10), async {
+    // With multipath negotiated, a validated path is added rather than migrated
+    // onto, and `PathAdded` is what names it.
+    let (client_path, server_path) = tokio::time::timeout(Duration::from_secs(15), async {
         tokio::join!(path_added(&client), path_added(&server))
     })
     .await
-    .context("the path was not added on both ends within 10s")?;
+    .context("no path was added on either end within 15s")?;
     let client_path = client_path?;
     let server_path = server_path?;
     println!(
-        "PASS  2. add_path({pinned} -> {learned}) added on both ends \
+        "PASS  2. NAT traversal added a path on both ends without add_path \
          (client path {client_path}, server path {server_path})"
     );
 
@@ -274,14 +262,6 @@ async fn path_added(conn: &Connection) -> anyhow::Result<u32> {
     }
 }
 
-/// An address on a real interface. `add_path` refuses a wildcard, and a path
-/// leaving from `0.0.0.0` has no source the peer can answer.
-fn local_interface_addr() -> anyhow::Result<SocketAddr> {
-    // Loopback is a real interface for this spike's purposes, and it is the one
-    // the bridge and the listener are on.
-    Ok("127.0.0.1:0".parse()?)
-}
-
 fn client_config(reg: &Registration, multipath: bool) -> anyhow::Result<msquic::Configuration> {
     let alpn = [msquic::BufferRef::from(ALPN)];
     let settings = msquic::Settings::new()
@@ -289,16 +269,17 @@ fn client_config(reg: &Registration, multipath: bool) -> anyhow::Result<msquic::
         .set_PeerUnidiStreamCount(100)
         .set_DatagramReceiveEnabled()
         .set_ReceiveObservedAddressReports()
-        // `Manual`, not `NatTraversal`. The two are alternatives: in
-        // NAT-traversal mode msquic adds paths itself and does not raise
-        // `NotifyRemoteAddressAdded`, which is exactly the event an application
-        // driving its own `add_path` needs. Asking for both — as this spike did
-        // at first — gets the automatic behaviour and no event.
+        // NAT traversal stays. It is what opens a path between two peers that
+        // are both behind NATs — hole punching is the whole point — and an
+        // application adding paths by hand cannot do that. Multipath goes on
+        // top: the path NAT traversal validates becomes another active path
+        // rather than somewhere to migrate to.
         //
-        // That is also the shape of the change to the shipping path: the video
-        // connection uses NAT traversal today, and moving to multipath means
-        // taking the addresses back rather than adding to what is there.
-        .set_AddAddressMode(msquic::AddAddressMode::Manual);
+        // Which also settles why `NotifyRemoteAddressAdded` never arrived. That
+        // event is for the application that adds its own paths, and in this mode
+        // msquic adds them; asking for both gets the automatic behaviour and no
+        // event. There is nothing to aim `add_path` at because nothing needs to.
+        .set_AddAddressMode(msquic::AddAddressMode::NatTraversal);
     let settings = if multipath {
         settings.set_MultipathEnabled()
     } else {
@@ -326,7 +307,7 @@ async fn start_listener(reg: &Arc<Registration>, multipath: bool) -> anyhow::Res
         .set_PeerUnidiStreamCount(100)
         .set_DatagramReceiveEnabled()
         .set_ReceiveObservedAddressReports()
-        .set_AddAddressMode(msquic::AddAddressMode::Manual);
+        .set_AddAddressMode(msquic::AddAddressMode::NatTraversal);
     let settings = if multipath {
         settings.set_MultipathEnabled()
     } else {
