@@ -21,6 +21,11 @@
 //! | 4 | **Does a multipath client still connect to a peer without it?** | yes |
 //! | 5 | Do both paths still carry traffic after the window a validated path used to decay in? | records |
 //!
+//! **The harness is not finished.** The peer advertises the listener's own
+//! address, and it has to advertise a second socket standing in for the relay
+//! leg — shared and unconnected — because that is the only kind of address
+//! `add_bound_addr` takes. See the comment at the call.
+//!
 //! Question 4 is the one that decides the rollout. If a client with multipath
 //! cannot talk to a camera without it, the two have to ship together, and every
 //! mixed pair in between is broken video.
@@ -133,10 +138,24 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
 
     // What a camera does: tell the peer where else it can be reached. Here the
     // listener's own address stands in for the address a NAT would report.
-    // Exactly what the camera does: claim the binding, then advertise it. The
-    // claim is allowed to fail — on a device it does whenever the video
-    // connection and the relay leg are not sharing a binding, and the shipping
-    // code carries on relay-only from there.
+    // WRONG, and left here with the reason because it is what this harness has
+    // to be rebuilt around.
+    //
+    // `add_bound_addr` adds a binding to a connection that has only been bound
+    // to localhost. What it takes is a local address whose observed address is
+    // known — which means the local address of the connection to the proxy,
+    // because that is the one the proxy reports a public mapping for. For the
+    // video connection to be able to share it, the proxy connection has to be
+    // opened with a shared binding and an unconnected socket, which is what
+    // `RelayOptions::unconnected` already does in the shipping code.
+    //
+    // The listener's own address is neither of those things: nothing has told
+    // anyone how it is seen from outside, and it is already bound — hence the
+    // ADDRESS_IN_USE, which was never about a conflict to work around.
+    //
+    // So this harness needs a second socket standing in for the relay leg,
+    // shared and unconnected, and has to advertise that one. Reproducing it is
+    // the next step.
     if let Err(e) = server.add_bound_addr(direct_addr) {
         println!("NOTE  the peer could not claim {direct_addr} as its own: {e}");
     }
