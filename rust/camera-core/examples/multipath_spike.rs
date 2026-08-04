@@ -20,7 +20,7 @@
 //! | 2 | Does NAT traversal add a path on both ends, and does `PathAdded` name it? | yes |
 //! | 3 | Does declaring a path backup reach the peer as `PathStatusChanged`? | yes |
 //! | 4 | **Does a multipath client still connect to a peer without it?** | yes |
-//! | 5 | Do both paths still carry traffic after the window a validated path used to decay in? | records |
+//! | 5 | Do both paths survive the window a validated path used to decay in, with the application silent? | yes |
 //!
 //! The two sides are set up the way the shipping code sets them up, because the
 //! answers are only worth having if they are about that arrangement: the viewer
@@ -33,11 +33,19 @@
 //! cannot talk to a camera without it, the two have to ship together, and every
 //! mixed pair in between is broken video.
 //!
-//! Question 5 is the point of the exercise, and it is recorded rather than
-//! enforced: sixty seconds on a loopback bridge is not a NAT, so a pass here is
-//! necessary and not sufficient. What would fail on hardware and pass here is a
-//! mapping that lapses; what this can still catch is a path that msquic stops
-//! using on its own.
+//! Question 5 is the point of the exercise, and it turns on a setting neither
+//! side had: `KeepAliveIntervalMs` defaults to 0, which means no PING is ever
+//! sent. With multipath negotiated msquic marks *every* in-use path and sends a
+//! PING on each in its own datagram — exactly what a path nobody sends on needs
+//! — but only if the interval is set, and each connection's timer is driven by
+//! its own settings. So both sides set it, and `SPIKE_KEEPALIVE` is there to run
+//! the controls.
+//!
+//! The window is deliberately silent: the application sends nothing for sixty
+//! seconds, so the keepalive is the only thing holding either path up, and the
+//! 30s idle timeout is the detector. A pass is still necessary and not
+//! sufficient — a loopback bridge is not a NAT, so what would fail on hardware
+//! and pass here is a mapping that lapses.
 //!
 //! ```text
 //! cargo run --example multipath_spike -p camera-core
@@ -45,6 +53,7 @@
 
 use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -63,8 +72,60 @@ const ALPN: &str = "multipath-spike";
 /// later worked.
 const OBSERVE: Duration = Duration::from_secs(60);
 
-/// How often traffic is pushed while watching.
-const PUSH_INTERVAL: Duration = Duration::from_millis(200);
+/// How often each side sends a keepalive PING.
+///
+/// Load-bearing, and needed on **both** sides. The default is 0 — no PING is
+/// ever sent — and the timer is driven by each connection's own settings, so a
+/// camera that does not set it never pings whatever the viewer does. Multipath
+/// makes that worse rather than better: with it negotiated, msquic marks *every*
+/// in-use path and sends a PING on each in its own datagram, precisely because a
+/// path the peer stops hearing from is abandoned. Without the setting there is
+/// nothing to mark, and a path nobody sends on is exactly risk #24.
+///
+/// Below `IdleTimeoutMs` by design, so a run where the PINGs do not happen dies
+/// of the idle timeout rather than passing quietly. The shipping value is a
+/// separate decision — it has to sit under the shortest NAT mapping lifetime
+/// worth surviving, and every ping costs a wakeup on a battery-powered camera.
+const KEEP_ALIVE: Duration = Duration::from_secs(5);
+
+/// Which sides send keepalives: `SPIKE_KEEPALIVE=both` (the default), `client`,
+/// `server` or `none`. Question 5 reads the difference.
+///
+/// `none` is the control that makes the setting's absence visible: the
+/// connection dies of the idle timeout 30s into a silent window, which is the
+/// whole argument for setting it at all.
+///
+/// What the controls *cannot* settle is whether both sides are required. On
+/// loopback there is no mapping to lapse, and a PING is ack-eliciting, so one
+/// side pinging still pulls acknowledgements out of the other along the same
+/// paths — `client` and `server` pass here just as `both` does. Nor does the
+/// relay-path packet count separate them: a side's own PING and its
+/// acknowledgement of the peer's ride in the same datagram when the timers line
+/// up, so `both` is anywhere from the one-sided count to twice it. The reason to
+/// set it on both is structural rather than measured here — the timer is driven
+/// by each connection's own settings, so a camera that leaves it at 0 never
+/// originates anything and its side of the traffic is only ever a reply.
+fn keep_alive_ms(side: Side) -> u32 {
+    let setting = std::env::var("SPIKE_KEEPALIVE").unwrap_or_else(|_| "both".to_owned());
+    let on = match setting.as_str() {
+        "both" => true,
+        "client" => side == Side::Client,
+        "server" => side == Side::Server,
+        "none" => false,
+        other => panic!("SPIKE_KEEPALIVE must be both, client, server or none, not {other:?}"),
+    };
+    if on {
+        KEEP_ALIVE.as_millis() as u32
+    } else {
+        0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Client,
+    Server,
+}
 
 /// How long the teardown may take before it is reported as a failure of its own.
 ///
@@ -256,32 +317,58 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
         changed.0, changed.1
     );
 
-    // Question 5: keep sending, and see whether both paths are still there after
-    // the window a validated path used to decay in.
+    // Question 5, and the point of the exercise: nobody sends anything. An
+    // earlier version pushed a datagram every 200ms, which kept the paths warm
+    // with application traffic and so tested everything except the thing risk
+    // #24 is about — a path nobody sends on. The application is silent for the
+    // whole window instead, which leaves the keepalive PING as the only reason
+    // either path stays alive.
+    //
+    // That silence is what makes the window self-checking. `IdleTimeoutMs` is
+    // 30s, so a connection nothing was sent on dies halfway through and
+    // `poll_event` says so; surviving twice the idle timeout means PINGs went
+    // out. And because the bridge carries the relay path *alone* — the direct
+    // path runs leg to leg and bypasses it — packets crossing it while the
+    // application is silent say that the *backup* path is being kept warm, not
+    // just the one carrying data, which is the per-path keepalive doing its job.
+    // How many is not worth reading into: PINGs and acknowledgements coalesce.
     let started_watching = Instant::now();
+    let relayed_before = bridge.forwarded();
     let mut removed = Vec::new();
-    let mut pushes = 0u32;
-    let mut ticker = tokio::time::interval(PUSH_INTERVAL);
-    while started_watching.elapsed() < OBSERVE {
-        tokio::select! {
-            _ = ticker.tick() => {
-                // A datagram rather than a stream: the point is that packets keep
-                // leaving, not that anything is delivered in order.
-                if client.send_datagram(&bytes::Bytes::from_static(&[0u8; 512])).is_ok() {
-                    pushes += 1;
-                }
-            }
-            event = poll_fn(|cx| client.poll_event(cx)) => match event {
-                Ok(ConnectionEvent::PathRemoved { path_id, .. }) => removed.push(path_id),
-                Ok(_) => {}
-                Err(e) => anyhow::bail!("the connection ended while watching: {e}"),
-            },
+    loop {
+        let left = OBSERVE.saturating_sub(started_watching.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, poll_fn(|cx| client.poll_event(cx))).await {
+            Err(_) => break,
+            Ok(Ok(ConnectionEvent::PathRemoved { path_id, .. })) => removed.push(path_id),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => anyhow::bail!(
+                "the connection ended after {:?} with the application silent, so the \
+                 keepalive did not carry it: {e}",
+                started_watching.elapsed()
+            ),
         }
     }
-    let verdict = if removed.is_empty() { "PASS" } else { "NOTE" };
+    let relayed = bridge.forwarded() - relayed_before;
+    if !removed.is_empty() {
+        anyhow::bail!(
+            "paths {removed:?} were removed within {}s of silence, even though every \
+             path is supposed to be kept alive",
+            OBSERVE.as_secs()
+        );
+    }
+    if relayed == 0 {
+        anyhow::bail!(
+            "no packet crossed the relay path in {}s of silence, so the backup path \
+             was not being kept alive",
+            OBSERVE.as_secs()
+        );
+    }
     println!(
-        "{verdict}  5. after {}s and {pushes} pushes, paths removed: {removed:?} \
-         (loopback, so this cannot see a NAT mapping lapse)",
+        "PASS  5. {}s with the application silent: no path removed, {relayed} packets \
+         kept the backup path warm (loopback, so this still cannot see a NAT mapping lapse)",
         OBSERVE.as_secs()
     );
 
@@ -377,6 +464,8 @@ fn client_config(reg: &Registration, multipath: bool) -> anyhow::Result<msquic::
         .set_PeerUnidiStreamCount(100)
         .set_DatagramReceiveEnabled()
         .set_ReceiveObservedAddressReports()
+        // Both sides set it, and each only pings for itself. See `KEEP_ALIVE`.
+        .set_KeepAliveIntervalMs(keep_alive_ms(Side::Client))
         // NAT traversal stays. It is what opens a path between two peers that
         // are both behind NATs — hole punching is the whole point — and an
         // application adding paths by hand cannot do that. Multipath goes on
@@ -415,6 +504,8 @@ async fn start_listener(reg: &Arc<Registration>, multipath: bool) -> anyhow::Res
         .set_PeerUnidiStreamCount(100)
         .set_DatagramReceiveEnabled()
         .set_ReceiveObservedAddressReports()
+        // Both sides set it, and each only pings for itself. See `KEEP_ALIVE`.
+        .set_KeepAliveIntervalMs(keep_alive_ms(Side::Server))
         .set_AddAddressMode(msquic::AddAddressMode::NatTraversal);
     let settings = if multipath {
         settings.set_MultipathEnabled()
@@ -449,8 +540,14 @@ async fn start_listener(reg: &Arc<Registration>, multipath: bool) -> anyhow::Res
 }
 
 /// Two loopback sockets forwarding both ways, standing in for the relay chain.
+///
+/// It counts what it forwards, which is what makes question 5 an observation
+/// rather than an assumption: the relay path is the only one that goes through
+/// here, so a packet crossing it while the application sends nothing can only be
+/// a keepalive or its acknowledgement.
 struct Bridge {
     front_addr: SocketAddr,
+    forwarded: Arc<AtomicU64>,
     shutdown: CancellationToken,
 }
 
@@ -460,7 +557,9 @@ impl Bridge {
         let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let front_addr = front.local_addr()?;
         let shutdown = CancellationToken::new();
+        let forwarded = Arc::new(AtomicU64::new(0));
 
+        let counter = forwarded.clone();
         let token = shutdown.clone();
         tokio::spawn(async move {
             let mut client: Option<SocketAddr> = None;
@@ -473,6 +572,7 @@ impl Bridge {
                         Ok((n, src)) => {
                             client = Some(src);
                             let _ = back.send_to(&up[..n], target).await;
+                            counter.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(_) => break,
                     },
@@ -480,6 +580,7 @@ impl Bridge {
                         Ok((n, _)) => {
                             if let Some(dst) = client {
                                 let _ = front.send_to(&down[..n], dst).await;
+                                counter.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Err(_) => break,
@@ -489,8 +590,14 @@ impl Bridge {
         });
         Ok(Self {
             front_addr,
+            forwarded,
             shutdown,
         })
+    }
+
+    /// Packets forwarded in either direction since the bridge started.
+    fn forwarded(&self) -> u64 {
+        self.forwarded.load(Ordering::Relaxed)
     }
 
     fn stop(self) {
