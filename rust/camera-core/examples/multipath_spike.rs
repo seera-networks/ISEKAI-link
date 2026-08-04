@@ -102,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
 
 /// Questions 1, 2, 3 and 5.
 async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
+    // Somewhere for the legs to be connected to, standing in for the proxy.
+    let proxy = start_listener(reg, false).await.context("proxy stand-in")?;
     let listener = start_listener(reg, true)
         .await
         .context("multipath listener")?;
@@ -138,36 +140,39 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
 
     // What a camera does: tell the peer where else it can be reached. Here the
     // listener's own address stands in for the address a NAT would report.
-    // WRONG, and left here with the reason because it is what this harness has
-    // to be rebuilt around.
+    // The camera's side of the advertisement, built the way the shipping code
+    // builds it.
     //
     // `add_bound_addr` adds a binding to a connection that has only been bound
-    // to localhost. What it takes is a local address whose observed address is
-    // known — which means the local address of the connection to the proxy,
-    // because that is the one the proxy reports a public mapping for. For the
-    // video connection to be able to share it, the proxy connection has to be
-    // opened with a shared binding and an unconnected socket, which is what
-    // `RelayOptions::unconnected` already does in the shipping code.
+    // to localhost, and the address it takes is a local one whose observed
+    // address is known — which means the local address of the connection to the
+    // proxy, since that is the one a public mapping has been reported for. For
+    // the video connection to share it, that connection has to have been opened
+    // with a shared binding and an unconnected socket, which is exactly what
+    // `RelayOptions::unconnected` does.
     //
-    // The listener's own address is neither of those things: nothing has told
-    // anyone how it is seen from outside, and it is already bound — hence the
-    // ADDRESS_IN_USE, which was never about a conflict to work around.
-    //
-    // So this harness needs a second socket standing in for the relay leg,
-    // shared and unconnected, and has to advertise that one. Reproducing it is
-    // the next step.
-    if let Err(e) = server.add_bound_addr(direct_addr) {
-        println!("NOTE  the peer could not claim {direct_addr} as its own: {e}");
-    }
+    // So the leg comes first, and its address is what is claimed and advertised.
+    // Passing the listener's own address instead — as an earlier version of this
+    // did — is refused with ADDRESS_IN_USE, because it is neither of those
+    // things: already bound, and nothing has said how it looks from outside.
+    let server_leg = relay_leg(reg, &proxy).await.context("the camera's leg")?;
     server
-        .add_observed_addr(direct_addr, direct_addr)
-        .context("advertising the peer's second address")?;
-    // And what the viewer does: offer where it can be reached, so the peer
-    // probes it. No `add_path` — in this mode msquic opens the path itself once
-    // the probe validates.
+        .add_bound_addr(server_leg)
+        .with_context(|| format!("adding the leg binding {server_leg} to the video connection"))?;
+    // On loopback the address is its own observed address; a real proxy reports
+    // the public mapping instead.
+    server
+        .add_observed_addr(server_leg, server_leg)
+        .context("advertising the leg's address")?;
+
+    // The viewer's side: its own leg's binding, offered as a candidate so the
+    // peer probes it. No `add_path` — in NAT-traversal mode msquic opens the
+    // path itself once the probe validates, and that is the mode this has to
+    // stay in, since it is the only one that can hole-punch.
+    let client_leg = relay_leg(reg, &proxy).await.context("the viewer's leg")?;
     client
-        .add_candidate_addr(client.get_local_addr()?, client.get_local_addr()?)
-        .context("offering a candidate")?;
+        .add_candidate_addr(client_leg, client_leg)
+        .context("offering the viewer's leg as a candidate")?;
 
     // With multipath negotiated, a validated path is added rather than migrated
     // onto, and `PathAdded` is what names it.
@@ -269,6 +274,40 @@ async fn mixed_versions(reg: &Arc<Registration>) -> anyhow::Result<String> {
 
     bridge.stop();
     Ok("PASS  4. a multipath client connects to a peer without it".to_owned())
+}
+
+/// A connection on its own real-interface binding, shared and unconnected —
+/// the relay leg, as `RelayOptions::unconnected` opens it.
+///
+/// Its only job is to exist: its local address is the one with a known observed
+/// address, so it is the one the video connection can claim and advertise.
+async fn relay_leg(reg: &Arc<Registration>, proxy: &SpikeListener) -> anyhow::Result<SocketAddr> {
+    let local = probe_local_addr()?;
+    let conn = Connection::new(reg)?;
+    conn.set_share_binding(true)?;
+    conn.set_unconnected_socket(true)?;
+    conn.set_local_addr(local)?;
+    let host = proxy.addr.ip().to_string();
+    conn.start(&client_config(reg, true)?, &host, proxy.addr.port())
+        .await
+        .with_context(|| format!("the leg could not reach the proxy stand-in from {local}"))?;
+    let addr = conn.get_local_addr()?;
+    // Held for the run: dropping it takes the binding with it, and the binding
+    // is the whole point.
+    std::mem::forget(conn);
+    Ok(addr)
+}
+
+/// A source address on a real interface, as the shipping code picks one.
+fn probe_local_addr() -> anyhow::Result<SocketAddr> {
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").context("bind the probe socket")?;
+    // Never contacted; `connect` only resolves the route and picks a source.
+    probe
+        .connect("8.8.8.8:53")
+        .context("no default route to pick a source address from")?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+    Ok(addr)
 }
 
 async fn path_added(conn: &Connection) -> anyhow::Result<u32> {
