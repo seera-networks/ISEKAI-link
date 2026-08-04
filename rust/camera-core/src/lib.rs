@@ -17,7 +17,7 @@ pub mod shutdown;
 pub mod tls;
 pub mod video;
 
-pub use cameras::{display_name, one_per_camera};
+pub use cameras::{connects_on_grant, display_name, one_per_camera};
 pub use isekai_p2p::agent::{
     pairing_code_from_input, pairing_uri, Grant, PairingCode, ReachableListener,
 };

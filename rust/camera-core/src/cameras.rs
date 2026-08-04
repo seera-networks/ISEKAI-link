@@ -1,9 +1,10 @@
-//! Turning what the proxy lists into what an operator picks from.
+//! The decisions every viewer makes the same way.
 //!
-//! Every app that offers a camera to connect to needs the same two answers —
-//! which rows to show and what to call them — and getting either wrong shows up
-//! as a row that will not connect or one nobody recognises. They live here so
-//! the desktop client and the iOS one cannot drift apart on it.
+//! Which rows to show, what to call them, and which instrument authorizes a
+//! connect. Getting any of them wrong shows up as a row that will not connect,
+//! one nobody recognises, or a capability carried where a grant was meant — and
+//! each is the kind of thing that gets written twice and then diverges. They
+//! live here so the desktop client and the iOS one cannot.
 
 use isekai_p2p::agent::ReachableListener;
 
@@ -38,6 +39,16 @@ pub fn one_per_camera(mut listeners: Vec<ReachableListener>) -> Vec<ReachableLis
     let mut seen = std::collections::HashSet::new();
     listeners.retain(|l| seen.insert(l.owner_endpoint.clone()));
     listeners
+}
+
+/// Whether a connect should use a standing grant rather than a capability.
+///
+/// An empty capability is not a missing value to complain about: it is how a
+/// caller says "the proxy already holds the authorization" (spec §8.4). Blank
+/// counts as empty, because the field is typed into by hand and a stray space
+/// would otherwise send a capability of one space and be refused.
+pub fn connects_on_grant(capability: &str) -> bool {
+    capability.trim().is_empty()
 }
 
 /// What to call a camera on screen: the name its owner gave it, falling back to
@@ -97,6 +108,16 @@ mod tests {
         ]);
         assert_eq!(first[0].listener_id, "pl_a");
         assert_eq!(first[0].listener_id, second[0].listener_id);
+    }
+
+    /// The two clients have to agree on what an empty capability means, or one
+    /// of them refuses a connect the other makes.
+    #[test]
+    fn a_blank_capability_means_connect_on_the_grant() {
+        assert!(connects_on_grant(""));
+        assert!(connects_on_grant("   "));
+        assert!(!connects_on_grant("cap_abc"));
+        assert!(!connects_on_grant("  cap_abc  "));
     }
 
     /// The label an owner gave a camera is what a person recognises; without

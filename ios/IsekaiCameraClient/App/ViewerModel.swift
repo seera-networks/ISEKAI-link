@@ -90,9 +90,12 @@ final class ViewerModel: ObservableObject {
             return { model in
                 model.cameras = found
                 model.cameraStatus = found.isEmpty ? "No cameras yet — pair with one below." : nil
-                // A camera that has gone is not one to still be pointing at.
+                // A camera that has gone is not one to still be pointing at —
+                // and the clearing has to be saved, or the next launch restores
+                // a selection that is not on the list.
                 if !found.contains(where: { $0.listenerId == model.settings.listenerID }) {
                     model.settings.listenerID = ""
+                    model.settings.save()
                 }
             }
         }
@@ -104,6 +107,8 @@ final class ViewerModel: ObservableObject {
         let code = code.trimmed
         guard !code.isEmpty else { return }
         runControlPlane { config, pem, token in
+            // Pairing answers with the list as well, so there is no second
+            // round trip to read back what it just changed.
             let paired = try pairWithCode(
                 config: config,
                 endpointKeyPem: pem,
@@ -111,14 +116,22 @@ final class ViewerModel: ObservableObject {
                 code: code,
                 label: UIDevice.current.name
             )
-            let found = try listCameras(config: config, endpointKeyPem: pem, auth0Token: token)
             return { model in
-                model.cameras = found
-                model.cameraStatus = "Paired with \(paired.label)."
+                model.cameras = paired.cameras
+                guard let camera = paired.camera else {
+                    // Paired with a camera that is not running. The code is
+                    // spent and the grant stands; it appears here when it is
+                    // next up. Saying "failed" would invite trying the code
+                    // again, and a code works once.
+                    model.cameraStatus = "Paired with \(paired.ownerEndpoint), which is not "
+                        + "running right now. It will appear here when it is."
+                    return
+                }
+                model.cameraStatus = "Paired with \(camera.label)."
                 // Select it, and clear any capability: a grant is what
                 // authorizes this now, and a stale capability would be carried
                 // instead of it.
-                model.settings.listenerID = paired.listenerId
+                model.settings.listenerID = camera.listenerId
                 model.settings.capability = ""
                 model.settings.save()
             }

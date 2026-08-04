@@ -486,7 +486,7 @@ impl MyApp {
             // the point of a grant: the proxy already holds the authorization,
             // so only the listener's id is needed. Leaving the field filled
             // still uses the capability, so the old flow is unchanged.
-            let connect = if capability.is_empty() {
+            let connect = if camera_core::connects_on_grant(&capability) {
                 // Over the control plane that listed this camera, so acting on
                 // the answer does not cost a second Endpoint Token and a second
                 // QUIC connection to the proxy. The lock is held only for as

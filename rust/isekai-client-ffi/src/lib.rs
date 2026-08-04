@@ -369,15 +369,50 @@ impl From<camera_core::ReachableListener> for Camera {
     }
 }
 
+/// What one pairing produced.
+///
+/// The list comes back with it because the caller needs it either way, and
+/// asking for it separately would mean a second Endpoint Token and a second
+/// QUIC connection to the proxy for one action.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Paired {
+    /// The camera to select — `None` when its owner is not running a listener
+    /// at the moment. **That is a success, not a failure**: the code has been
+    /// spent and the grant stands, so the camera appears and connects as soon
+    /// as it is running again (spec §8.9.1).
+    pub camera: Option<Camera>,
+    /// The Endpoint the grant is against. Known whether or not it is listening.
+    pub owner_endpoint: String,
+    /// Everything reachable as of the pairing, this one included.
+    pub cameras: Vec<Camera>,
+}
+
+/// Turn on dev-only certificate acceptance, at most once in a process.
+///
+/// `std::env::set_var` is unsafe because another thread reading the environment
+/// while it is written is undefined behaviour, and by the time a session is
+/// streaming there are threads doing exactly that. Writing once removes the
+/// repeat; what it cannot do is order that write against a session that already
+/// exists, so the flag takes effect from the first call that asks for it and
+/// turning it off afterwards needs a restart. It is a development switch and
+/// production never sets it.
+fn apply_insecure_skip_verify(enabled: bool) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if enabled {
+        ONCE.call_once(|| {
+            // SAFETY: runs at most once per process, and no earlier than the
+            // first call that asks for it.
+            unsafe { std::env::set_var("ISEKAI_INSECURE_SKIP_VERIFY", "1") };
+        });
+    }
+}
+
 /// The control-plane settings shared by the calls that do not stream.
 fn directory_config(
     config: &ClientConfig,
     endpoint_key_pem: &str,
 ) -> Result<P2pConfig, ClientError> {
-    if config.insecure_skip_verify {
-        // SAFETY: set before any transport connects; process-wide by design.
-        unsafe { std::env::set_var("ISEKAI_INSECURE_SKIP_VERIFY", "1") };
-    }
+    apply_insecure_skip_verify(config.insecure_skip_verify);
     Ok(P2pConfig {
         identity_url: config.identity_url.clone(),
         identity_http3: false,
@@ -444,7 +479,10 @@ pub fn list_cameras(
 ///
 /// The camera does not have to be running. A code grants access to the Endpoint
 /// behind it, so pairing with one that has just been switched off works, and
-/// connecting succeeds when it comes back.
+/// connecting succeeds when it comes back — which is why a camera that is not
+/// listening comes back as [`Paired::camera`] being `None` rather than as an
+/// error. Reporting it as a failure would invite the caller to try the code
+/// again, and a code works once.
 #[uniffi::export]
 pub fn pair_with_code(
     config: ClientConfig,
@@ -452,7 +490,7 @@ pub fn pair_with_code(
     auth0_token: String,
     code: String,
     label: String,
-) -> Result<Camera, ClientError> {
+) -> Result<Paired, ClientError> {
     let mut cfg = directory_config(&config, &endpoint_key_pem)?;
     cfg.auth0_token = auth0_token;
     let code = camera_core::pairing_code_from_input(&code);
@@ -469,23 +507,24 @@ pub fn pair_with_code(
             .await
             .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
         // The grant names the Endpoint, not a listener, so the camera to offer
-        // comes from reading the list back — which is also where its name is.
+        // comes from reading the list back — which is also where its name is,
+        // and which the caller wants anyway.
         let found = directory
             .reachable()
             .await
             .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
-        camera_core::one_per_camera(found)
+        let cameras: Vec<Camera> = camera_core::one_per_camera(found)
             .into_iter()
-            .find(|c| c.owner_endpoint == grant.owner_endpoint)
             .map(Camera::from)
-            .ok_or_else(|| {
-                // Paired, but the camera is not listening. The grant stands and
-                // it will appear once it is.
-                ClientError::Connect(format!(
-                    "paired with {}, which is not running a listener right now",
-                    grant.owner_endpoint
-                ))
-            })
+            .collect();
+        Ok(Paired {
+            camera: cameras
+                .iter()
+                .find(|c| c.owner_endpoint == grant.owner_endpoint)
+                .cloned(),
+            owner_endpoint: grant.owner_endpoint,
+            cameras,
+        })
     })
 }
 
@@ -530,10 +569,7 @@ pub fn connect(
 
     // Dev-only self-signed acceptance is read from this env var by the transport
     // layer. Production leaves it unset so real certificates are validated.
-    if config.insecure_skip_verify {
-        // SAFETY: set once, before any transport connects; process-wide by design.
-        unsafe { std::env::set_var("ISEKAI_INSECURE_SKIP_VERIFY", "1") };
-    }
+    apply_insecure_skip_verify(config.insecure_skip_verify);
 
     let key = EndpointKey::from_pkcs8_pem(&endpoint_key_pem)
         .map_err(|e| ClientError::InvalidKey(e.to_string()))?;
@@ -586,7 +622,7 @@ pub fn connect(
     // so the hand-carried flow is unchanged.
     let session = runtime
         .block_on(async {
-            if config.capability.trim().is_empty() {
+            if camera_core::connects_on_grant(&config.capability) {
                 InitiatorSession::connect_with_grant(
                     &cfg,
                     &config.listener_id,
