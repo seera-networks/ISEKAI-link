@@ -7,24 +7,27 @@
 //! PATH_RESPONSE, NEW_CONNECTION_ID and PADDING. Multipath removes the problem
 //! rather than solving it: both paths are active, so both carry traffic.
 //!
-//! Before any of that reaches the shipping path, four questions decide whether
+//! Before any of that reaches the shipping path, five questions decide whether
 //! the shape works and whether it can be rolled out one side at a time. This
 //! reproduces the relay topology on one host — a loopback bridge standing in for
-//! the client's CONNECT-UDP leg, the proxy and the server's bind leg — so every
+//! the client's CONNECT-UDP leg, the proxy and the server's bind leg, and a
+//! relay leg on each side for the addresses that get advertised — so every
 //! answer comes without a proxy, a relay or a NAT.
 //!
 //! | # | Question | Fails the run |
 //! | --- | --- | --- |
 //! | 1 | Does a multipath handshake complete through the bridge? | yes |
-//! | 2 | Does the client learn the peer's second address, and does `add_path` on it produce `PathAdded` on both ends? | yes |
+//! | 2 | Does NAT traversal add a path on both ends, and does `PathAdded` name it? | yes |
 //! | 3 | Does declaring a path backup reach the peer as `PathStatusChanged`? | yes |
 //! | 4 | **Does a multipath client still connect to a peer without it?** | yes |
 //! | 5 | Do both paths still carry traffic after the window a validated path used to decay in? | records |
 //!
-//! **The harness is not finished.** The peer advertises the listener's own
-//! address, and it has to advertise a second socket standing in for the relay
-//! leg — shared and unconnected — because that is the only kind of address
-//! `add_bound_addr` takes. See the comment at the call.
+//! The two sides are set up the way the shipping code sets them up, because the
+//! answers are only worth having if they are about that arrangement: the viewer
+//! makes `prepare_for_migration`'s four calls before `start` — shared binding,
+//! unconnected socket, a *loopback* local address, and the leg's address as a
+//! candidate — and the camera makes `apply_direct_path`'s two afterwards,
+//! claiming the leg's binding and advertising it.
 //!
 //! Question 4 is the one that decides the rollout. If a client with multipath
 //! cannot talk to a camera without it, the two have to ship together, and every
@@ -41,7 +44,7 @@
 //! ```
 
 use std::io::Write as _;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -112,14 +115,34 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
     // in for the CONNECT-UDP leg, the proxy and the bind leg all at once.
     let bridge = Bridge::start(direct_addr).await.context("bridge")?;
 
+    // The viewer's leg comes first, because what it is for is to be named as a
+    // candidate — and a candidate has to be offered before `start`, which is
+    // also the order `prepare_for_migration` fixes in the shipping code.
+    let client_leg = relay_leg(reg, &proxy).await.context("the viewer's leg")?;
+
     let client = Connection::new(reg).context("client connection")?;
-    // Multipath identifies a connection by its source connection id, which only a
-    // shared binding gives a non-zero length. Without this the handshake is
-    // refused outright — which is also the first thing to check, because the
-    // video connection does not set it today.
+    // The same four calls `prepare_for_migration` makes, in the order it makes
+    // them. Multipath adds a reason for the first one: it identifies a
+    // connection by its source connection id, which only a shared binding gives
+    // a non-zero length.
     client.set_share_binding(true).context("share binding")?;
-    // The connection's own address is left to msquic. Pinning it and then
-    // sharing the binding is what `QUIC_STATUS_ADDRESS_IN_USE` came out of.
+    client
+        .set_unconnected_socket(true)
+        .context("unconnected socket")?;
+    // Loopback, not the leg's address: this connection's own traffic goes to the
+    // bridge on 127.0.0.1, and pinning it to the leg's address is what
+    // `QUIC_STATUS_ADDRESS_IN_USE` came out of. The direct path does not need it
+    // — `add_candidate_addr` names an address bound elsewhere, and msquic opens
+    // the path from the leg's binding once the peer's ADD_ADDRESS arrives.
+    client
+        .set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .context("pinning the client to loopback")?;
+    // No `add_path`: in NAT-traversal mode msquic opens the path itself once the
+    // probe validates, and that is the mode this has to stay in, since it is the
+    // only one that can hole-punch.
+    client
+        .add_candidate_addr(client_leg, client_leg)
+        .context("offering the viewer's leg as a candidate")?;
 
     let config = client_config(reg, true).context("client config")?;
     let (started, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -164,15 +187,6 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
     server
         .add_observed_addr(server_leg, server_leg)
         .context("advertising the leg's address")?;
-
-    // The viewer's side: its own leg's binding, offered as a candidate so the
-    // peer probes it. No `add_path` — in NAT-traversal mode msquic opens the
-    // path itself once the probe validates, and that is the mode this has to
-    // stay in, since it is the only one that can hole-punch.
-    let client_leg = relay_leg(reg, &proxy).await.context("the viewer's leg")?;
-    client
-        .add_candidate_addr(client_leg, client_leg)
-        .context("offering the viewer's leg as a candidate")?;
 
     // With multipath negotiated, a validated path is added rather than migrated
     // onto, and `PathAdded` is what names it.
@@ -283,10 +297,12 @@ async fn mixed_versions(reg: &Arc<Registration>) -> anyhow::Result<String> {
 /// address, so it is the one the video connection can claim and advertise.
 async fn relay_leg(reg: &Arc<Registration>, proxy: &SpikeListener) -> anyhow::Result<SocketAddr> {
     let local = probe_local_addr()?;
-    let conn = Connection::new(reg)?;
-    conn.set_share_binding(true)?;
-    conn.set_unconnected_socket(true)?;
-    conn.set_local_addr(local)?;
+    let conn = Connection::new(reg).context("leg connection")?;
+    conn.set_share_binding(true).context("leg share binding")?;
+    conn.set_unconnected_socket(true)
+        .context("leg unconnected socket")?;
+    conn.set_local_addr(local)
+        .with_context(|| format!("leg local addr {local}"))?;
     let host = proxy.addr.ip().to_string();
     conn.start(&client_config(reg, true)?, &host, proxy.addr.port())
         .await
