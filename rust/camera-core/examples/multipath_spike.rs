@@ -66,6 +66,14 @@ const OBSERVE: Duration = Duration::from_secs(60);
 /// How often traffic is pushed while watching.
 const PUSH_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How long the teardown may take before it is reported as a failure of its own.
+///
+/// `RegistrationClose` is a synchronous, uninterruptible wait, so a handle this
+/// spike forgot to drop does not surface as an error — it surfaces as a process
+/// that prints every answer and then never exits. Waiting here instead means the
+/// harness says so.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -95,6 +103,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The teardown `docs/registration-wait-idle-design.md` §8 asks for: ask the
+    // connections to go away, wait until every handle derived from the
+    // registration has actually been closed, and only then let it drop. Nothing
+    // above may outlive this — which is why the relay legs are returned and held
+    // rather than leaked, and it is the reason the harness now ends.
+    registration.shutdown();
+    if tokio::time::timeout(TEARDOWN_TIMEOUT, registration.wait_idle())
+        .await
+        .is_err()
+    {
+        println!(
+            "FAIL  teardown: a handle was still open {}s after shutdown",
+            TEARDOWN_TIMEOUT.as_secs()
+        );
+        failures.push("teardown");
+    }
+
     if failures.is_empty() {
         println!("\nall load-bearing questions answered");
         Ok(())
@@ -119,6 +144,7 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
     // candidate — and a candidate has to be offered before `start`, which is
     // also the order `prepare_for_migration` fixes in the shipping code.
     let client_leg = relay_leg(reg, &proxy).await.context("the viewer's leg")?;
+    let client_leg_addr = client_leg.addr;
 
     let client = Connection::new(reg).context("client connection")?;
     // The same four calls `prepare_for_migration` makes, in the order it makes
@@ -141,7 +167,7 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
     // probe validates, and that is the mode this has to stay in, since it is the
     // only one that can hole-punch.
     client
-        .add_candidate_addr(client_leg, client_leg)
+        .add_candidate_addr(client_leg_addr, client_leg_addr)
         .context("offering the viewer's leg as a candidate")?;
 
     let config = client_config(reg, true).context("client config")?;
@@ -179,13 +205,14 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
     // did — is refused with ADDRESS_IN_USE, because it is neither of those
     // things: already bound, and nothing has said how it looks from outside.
     let server_leg = relay_leg(reg, &proxy).await.context("the camera's leg")?;
-    server
-        .add_bound_addr(server_leg)
-        .with_context(|| format!("adding the leg binding {server_leg} to the video connection"))?;
+    let server_leg_addr = server_leg.addr;
+    server.add_bound_addr(server_leg_addr).with_context(|| {
+        format!("adding the leg binding {server_leg_addr} to the video connection")
+    })?;
     // On loopback the address is its own observed address; a real proxy reports
     // the public mapping instead.
     server
-        .add_observed_addr(server_leg, server_leg)
+        .add_observed_addr(server_leg_addr, server_leg_addr)
         .context("advertising the leg's address")?;
 
     // With multipath negotiated, a validated path is added rather than migrated
@@ -295,7 +322,17 @@ async fn mixed_versions(reg: &Arc<Registration>) -> anyhow::Result<String> {
 ///
 /// Its only job is to exist: its local address is the one with a known observed
 /// address, so it is the one the video connection can claim and advertise.
-async fn relay_leg(reg: &Arc<Registration>, proxy: &SpikeListener) -> anyhow::Result<SocketAddr> {
+struct RelayLeg {
+    addr: SocketAddr,
+    /// Held for the run, and dropped with it. Dropping it early takes the
+    /// binding with it and the binding is the whole point; never dropping it —
+    /// which an earlier version arranged with `mem::forget` — keeps the
+    /// registration's rundown held, so the process prints every answer and then
+    /// hangs in `RegistrationClose`.
+    _conn: Connection,
+}
+
+async fn relay_leg(reg: &Arc<Registration>, proxy: &SpikeListener) -> anyhow::Result<RelayLeg> {
     let local = probe_local_addr()?;
     let conn = Connection::new(reg).context("leg connection")?;
     conn.set_share_binding(true).context("leg share binding")?;
@@ -308,10 +345,7 @@ async fn relay_leg(reg: &Arc<Registration>, proxy: &SpikeListener) -> anyhow::Re
         .await
         .with_context(|| format!("the leg could not reach the proxy stand-in from {local}"))?;
     let addr = conn.get_local_addr()?;
-    // Held for the run: dropping it takes the binding with it, and the binding
-    // is the whole point.
-    std::mem::forget(conn);
-    Ok(addr)
+    Ok(RelayLeg { addr, _conn: conn })
 }
 
 /// A source address on a real interface, as the shipping code picks one.
