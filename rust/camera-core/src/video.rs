@@ -433,11 +433,19 @@ const RELAY_PATH_ID: u32 = 0;
 /// a viewer that has been updated still talks to cameras that have not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathPreference {
-    /// Multipath: say which path is preferred and leave every path active.
+    /// Multipath: say which path carries traffic, and keep the rest warm.
     ///
-    /// This is the operation that replaces switching. A path declared backup is
-    /// still carried and still kept alive, so the direct path no longer decays
-    /// while it waits to be used — which is the whole of risk #24.
+    /// This is the operation that replaces switching, and it does two things at
+    /// once. To the peer it sends PATH_AVAILABLE / PATH_BACKUP; locally it flips
+    /// `Path->IsActive`, and `QuicConnChoosePath` picks at random among the
+    /// active paths — so a path left available is a path this side really does
+    /// send on. Declaring exactly one available is what makes "which path are we
+    /// using" answerable.
+    ///
+    /// A path declared backup is still bound, still validated and still pinged
+    /// by the path keepalive, so it does not decay while it waits — which is the
+    /// whole of risk #24. That is the difference from switching: nothing is torn
+    /// down, so coming back costs nothing.
     Declare { available: u32, backup: Vec<u32> },
     /// The peer never sent a `PathAdded`, so it has no multipath and the only
     /// operation available is the old switch.
@@ -689,10 +697,23 @@ pub async fn receive_frames_with(
                 // against the pair the caller will ask for.
                 Ok(ConnectionEvent::PathAdded { path_id, local_address, peer_address }) => {
                     if (local_address, peer_address) != relay_path {
+                        // Held as backup until somebody asks for it. msquic makes
+                        // a path active the moment it is added, and
+                        // `QuicConnChoosePath` picks at random among the active
+                        // ones — so without this the direct path starts carrying
+                        // traffic as soon as it validates, while the caller still
+                        // believes it is on the relay and has not chosen anything.
+                        if let Err(e) = conn.set_path_status(path_id, false) {
+                            tracing::warn!(
+                                path_id,
+                                "could not hold the new path as backup; it will carry \
+                                 traffic before it is asked to: {e}",
+                            );
+                        }
                         tracing::info!(
                             path_id, local = %local_address, remote = %peer_address,
-                            "the peer has multipath; the direct path is active rather than \
-                             waiting to be migrated onto",
+                            "the peer has multipath; the direct path is kept alive as a \
+                             backup rather than waiting to be migrated onto",
                         );
                         direct_paths.insert((local_address, peer_address), path_id);
                     }
@@ -836,9 +857,12 @@ fn prefer_path(
     let (local, remote) = wanted;
     match preference_for(wanted, relay_path, direct_paths) {
         PathPreference::Declare { available, backup } => {
-            // Demote first: declaring the preferred path available before the
-            // others are backup would leave a moment with two available paths,
-            // and the peer acts on each declaration as it arrives.
+            // Demote first. Promoting first would leave a window with two
+            // active paths, and msquic picks among them at random — so traffic
+            // would split across both, which is the state this whole call
+            // exists to avoid. The other order leaves a window with none, and
+            // `QuicConnChoosePath` falls back to `Paths[0]`, the relay: still a
+            // working path, which is the safe side to be wrong on.
             for id in &backup {
                 if let Err(e) = conn.set_path_status(*id, false) {
                     tracing::warn!(path_id = id, "could not declare a path backup: {e}");
