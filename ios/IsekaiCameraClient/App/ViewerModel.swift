@@ -163,6 +163,11 @@ final class ViewerModel: ObservableObject {
         let config = clientConfig()
         isBusyWithCameras = true
         cameraStatus = nil
+        // Each of these calls builds a tokio runtime and a msquic registration
+        // and drops them, without the drain this workspace does at exit. The
+        // numbers on either side are how anyone without a Mac can see whether
+        // that comes back down — press Refresh twenty times and read the log.
+        let before = ProcessStats.sample()
         Task {
             do {
                 let token = try await self.currentToken()
@@ -174,6 +179,17 @@ final class ViewerModel: ObservableObject {
                 self.cameraStatus = error.localizedDescription
             }
             self.isBusyWithCameras = false
+            self.append(log: "control plane: before \(before.summary), "
+                + "after \(ProcessStats.sample().summary)")
+            // Reclaiming is not instant, and "did it come back down" is the
+            // whole question — a reading taken the moment the call returns
+            // cannot answer it. Three seconds turned out to be too short on a
+            // device: the count was still at its peak then and had dropped by
+            // the time the next call started.
+            Task {
+                try? await Task.sleep(for: .seconds(10))
+                self.append(log: "control plane: settled \(ProcessStats.sample().summary)")
+            }
         }
     }
 
