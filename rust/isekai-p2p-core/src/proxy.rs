@@ -46,6 +46,13 @@ pub trait EventStreamTransport {
     > + Send;
 }
 
+/// The longest a single event line may be before the stream is abandoned.
+///
+/// Generous next to anything §8.11 defines — the largest event carries a few
+/// identifiers and a label — so reaching it means the other end is not sending
+/// what this expects, which is not a thing to keep buffering for.
+const MAX_EVENT_LINE: usize = 64 * 1024;
+
 /// Something that happened to a listener (spec §8.11).
 ///
 /// Deserialized from the stream's lines. An unrecognised `type` is
@@ -625,10 +632,18 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             .await
             .map_err(ProxyError::Transport)?;
         if status != 200 {
-            return Err(ProxyError::Problem {
-                status,
-                problem: None,
-            });
+            // Read what it said, within reason. A refusal tells the caller
+            // whether this proxy has no such route at all or is refusing this
+            // listener, and those want different responses — one is permanent
+            // and one is not.
+            let mut body = Vec::new();
+            while body.len() < MAX_EVENT_LINE {
+                match chunks.recv().await {
+                    Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+                    _ => break,
+                }
+            }
+            return Err(problem_error(&HttpResponse { status, body }));
         }
 
         let (events, receiver) = mpsc::channel(32);
@@ -644,6 +659,17 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
                     }
                 }
                 Self::drain_lines(&mut buffer, &mut ready);
+                // A line that never ends would grow this without limit. The
+                // proxy sends one event per line, but nothing here should
+                // depend on the other end being well behaved — and ending the
+                // stream is what every other failure does, so the caller
+                // already knows how to recover from it.
+                if buffer.len() > MAX_EVENT_LINE {
+                    tracing::warn!(
+                        "listener event line exceeded {MAX_EVENT_LINE} bytes; ending the stream"
+                    );
+                    break;
+                }
                 for event in ready.drain(..) {
                     if events.send(event).await.is_err() {
                         return;
@@ -1072,6 +1098,22 @@ mod tests {
             out.as_slice(),
             [ListenerEvent::Unknown, ListenerEvent::Keepalive]
         ));
+    }
+
+    /// A line that never ends must not grow the buffer without limit. The
+    /// proxy sends one event per line; nothing here should depend on the other
+    /// end being well behaved.
+    #[test]
+    fn an_endless_line_is_not_buffered_without_limit() {
+        type Client = ProxyClient<MockTransport>;
+        let mut buffer = vec![b'x'; MAX_EVENT_LINE + 1];
+        let mut out = Vec::new();
+        Client::drain_lines(&mut buffer, &mut out);
+        assert!(out.is_empty(), "there is no complete line in it");
+        assert!(
+            buffer.len() > MAX_EVENT_LINE,
+            "the caller is the one that notices and ends the stream"
+        );
     }
 
     /// A keepalive says nothing about the connection — no state and no

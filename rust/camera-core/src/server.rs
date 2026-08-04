@@ -225,9 +225,17 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 ///
 /// Ending is ordinary — the proxy restarting, a connection dropping, a
 /// subscriber cut off for falling behind — and the listener keeps working from
-/// the poll while it is away. Short enough not to matter, long enough that a
-/// proxy which is refusing does not get hammered.
+/// the poll while it is away, so this only has to be short enough not to
+/// matter.
 const RESUBSCRIBE_DELAY: Duration = Duration::from_secs(3);
+
+/// The longest gap between attempts once they keep failing.
+///
+/// A proxy that does not serve this route refuses every time, and retrying it
+/// every few seconds would double this camera's request rate forever and burn a
+/// nonce on the proxy for each attempt — the store those go in is capped. So
+/// the gap grows until it reaches this, and drops back the moment one succeeds.
+const RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(300);
 
 async fn command_loop(
     mut session: ListenerSession,
@@ -245,26 +253,40 @@ async fn command_loop(
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut renew = tokio::time::interval(CONNECTION_RENEW_INTERVAL);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Opened below rather than here, so a proxy that has not learned to stream
-    // costs one refused request at startup and nothing after it.
+    // Opened below rather than here, so a proxy that cannot stream costs a
+    // refused request rather than a failed startup.
     let mut stream: Option<mpsc::Receiver<ListenerEvent>> = None;
-    let mut resubscribe = tokio::time::interval(RESUBSCRIBE_DELAY);
-    resubscribe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut resubscribe_delay = RESUBSCRIBE_DELAY;
+    let mut resubscribe_at = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             // Open, or re-open, the event stream. Nothing else waits on this:
             // the poll keeps the listener working while there is no stream, so
             // failing here is a slower camera and not a stopped one.
-            _ = resubscribe.tick(), if stream.is_none() && policy != AcceptPolicy::Manual => {
+            _ = tokio::time::sleep_until(resubscribe_at),
+                    if stream.is_none() && policy != AcceptPolicy::Manual => {
                 match session.subscribe().await {
                     Ok(events) => {
                         tracing::info!("signaling: event stream open");
                         stream = Some(events);
+                        resubscribe_delay = RESUBSCRIBE_DELAY;
+                        // Rebuilding the interval is what makes the next line
+                        // matter: `interval` completes its first tick at once,
+                        // so a reconcile runs now and picks up anything that
+                        // happened before the stream was listening. Anyone
+                        // changing this to `interval_at(now + period, ..)`
+                        // opens a gap of one whole period right here.
                         poll = tokio::time::interval(RECONCILE_INTERVAL);
                         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     }
-                    Err(e) => tracing::debug!("no event stream, polling instead: {e:#}"),
+                    Err(e) => {
+                        tracing::debug!(
+                            "no event stream, polling instead (retrying in {resubscribe_delay:?}): {e:#}"
+                        );
+                        resubscribe_delay = (resubscribe_delay * 2).min(RESUBSCRIBE_MAX_DELAY);
+                        resubscribe_at = tokio::time::Instant::now() + resubscribe_delay;
+                    }
                 }
             }
             // An event says something changed; the listing says what. Keeping
@@ -279,6 +301,13 @@ async fn command_loop(
                     None => {
                         tracing::info!("signaling: event stream ended; polling until it returns");
                         stream = None;
+                        // A stream that worked and then ended is worth trying
+                        // again straight away — the usual reason is the proxy
+                        // restarting. Only repeated failures back off.
+                        resubscribe_at = tokio::time::Instant::now();
+                        // And, as above, the first tick of a fresh interval is
+                        // immediate: the listener goes back to reading rather
+                        // than waiting out a period it has no reason to.
                         poll = tokio::time::interval(SIGNALING_POLL_INTERVAL);
                         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     }
