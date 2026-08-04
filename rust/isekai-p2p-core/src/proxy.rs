@@ -12,6 +12,7 @@
 //! stack.
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::endpoint::EndpointKey;
 use crate::pop;
@@ -21,6 +22,55 @@ use crate::pop;
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+}
+
+/// Opens a long-lived response and hands its body back in pieces.
+///
+/// Separate from [`ControlPlaneTransport`] because it is a different shape, not
+/// a different endpoint: everything else here is one request and one buffered
+/// answer, and an event stream is one request whose answer never ends. A
+/// transport that cannot do this simply does not implement it.
+pub trait EventStreamTransport {
+    /// Send the request and return its status with a channel of body chunks.
+    ///
+    /// Chunks arrive as the peer sends them and stop when the response ends.
+    /// Dropping the receiver is what tells the transport to give up on the
+    /// request, which is how a caller cancels one.
+    fn open_stream(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> impl std::future::Future<
+        Output = anyhow::Result<(u16, tokio::sync::mpsc::Receiver<anyhow::Result<Vec<u8>>>)>,
+    > + Send;
+}
+
+/// Something that happened to a listener (spec §8.11).
+///
+/// Deserialized from the stream's lines. An unrecognised `type` is
+/// [`Unknown`](Self::Unknown) rather than an error: the proxy may learn to say
+/// more than this client knows about, and a listener that fell over on the
+/// first unfamiliar line would be worse off than one that ignored it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum ListenerEvent {
+    #[serde(rename = "peer.connect.created")]
+    ConnectCreated {
+        connection_id: String,
+        #[serde(default)]
+        initiator_endpoint: Option<String>,
+    },
+    #[serde(rename = "peer.connect.closed")]
+    ConnectClosed { connection_id: String },
+    #[serde(rename = "grant.created")]
+    GrantCreated { grant_id: String },
+    #[serde(rename = "grant.revoked")]
+    GrantRevoked { grant_id: String },
+    #[serde(rename = "keepalive")]
+    Keepalive,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Performs a single HTTP request/response against the proxy control plane.
@@ -548,6 +598,62 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             .await
     }
 
+    /// `GET /v1/peer-listeners/{id}/events` (spec §8.11) — what happened, as it
+    /// happens.
+    ///
+    /// The channel carries one event per line for as long as the stream lives,
+    /// and ends when it does: the proxy closing it, the connection dropping, a
+    /// subscriber that fell behind being cut off. Ending is not an error to
+    /// report so much as a signal to reconnect and re-read the listing, which
+    /// is what the caller does after any disconnection.
+    ///
+    /// **This is the fast path and not the record.** Nothing is replayed, so
+    /// nothing here should be treated as the whole truth about anything — it
+    /// says when to look, and §8.5.3 says what is there.
+    pub async fn listener_events(
+        &self,
+        listener_id: &str,
+    ) -> Result<mpsc::Receiver<ListenerEvent>, ProxyError>
+    where
+        T: EventStreamTransport,
+    {
+        let path = format!("/v1/peer-listeners/{listener_id}/events");
+        let headers = self.auth_headers("GET", &path, &[]);
+        let (status, mut chunks) = self
+            .transport
+            .open_stream("GET", &path, &headers)
+            .await
+            .map_err(ProxyError::Transport)?;
+        if status != 200 {
+            return Err(ProxyError::Problem {
+                status,
+                problem: None,
+            });
+        }
+
+        let (events, receiver) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            let mut ready = Vec::new();
+            while let Some(chunk) = chunks.recv().await {
+                match chunk {
+                    Ok(bytes) => buffer.extend_from_slice(&bytes),
+                    Err(e) => {
+                        tracing::debug!("listener event stream ended: {e}");
+                        break;
+                    }
+                }
+                Self::drain_lines(&mut buffer, &mut ready);
+                for event in ready.drain(..) {
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
+
     /// `GET /v1/peer-listeners/{id}/connections` (spec §8.5.3).
     ///
     /// How a listener finds out someone is waiting for it. `state` filters to
@@ -674,6 +780,28 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             .send(method, path, &headers, body)
             .await
             .map_err(ProxyError::Transport)
+    }
+
+    /// Read one NDJSON line off a chunked body, assembling across chunks.
+    ///
+    /// A line is not a chunk: one read can carry half an event or three of
+    /// them, and treating chunk boundaries as record boundaries works right up
+    /// until the network splits one somewhere else.
+    fn drain_lines(buffer: &mut Vec<u8>, out: &mut Vec<ListenerEvent>) {
+        while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = buffer.drain(..=end).collect();
+            let line = &line[..line.len() - 1];
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<ListenerEvent>(line) {
+                Ok(event) => out.push(event),
+                // One unreadable line is not a reason to abandon the stream:
+                // the next one may be fine, and the listing is what this is
+                // checked against anyway.
+                Err(e) => tracing::debug!("ignoring an unreadable listener event: {e}"),
+            }
+        }
     }
 
     async fn request_json<R: for<'de> Deserialize<'de>>(
@@ -893,6 +1021,57 @@ mod tests {
         assert_eq!(sent["allowed_endpoint"], "ep:A");
         assert_eq!(sent["protocol"], "mjpeg");
         assert!(sent["ttl"].is_null(), "no ttl means until revoked");
+    }
+
+    /// A line is not a chunk. The network splits the body wherever it likes, so
+    /// an event can arrive in pieces and three can arrive together — reading a
+    /// chunk as a record works until it does not, and then silently.
+    #[test]
+    fn events_are_assembled_across_whatever_the_chunks_are() {
+        type Client = ProxyClient<MockTransport>;
+        let mut buffer = Vec::new();
+        let mut out = Vec::new();
+
+        // Half an event.
+        buffer.extend_from_slice(br#"{"type":"peer.connect.crea"#);
+        Client::drain_lines(&mut buffer, &mut out);
+        assert!(out.is_empty(), "half a line is not a line");
+
+        // Its other half, then two whole ones in a single chunk.
+        buffer.extend_from_slice(
+            br#"ted","connection_id":"conn_1"}
+{"type":"keepalive"}
+{"type":"grant.revoked","grant_id":"gr_1"}
+"#,
+        );
+        Client::drain_lines(&mut buffer, &mut out);
+        assert!(buffer.is_empty(), "a complete line leaves nothing behind");
+        assert!(matches!(
+            out.as_slice(),
+            [
+                ListenerEvent::ConnectCreated { .. },
+                ListenerEvent::Keepalive,
+                ListenerEvent::GrantRevoked { .. }
+            ]
+        ));
+    }
+
+    /// The proxy may learn to say more than this client knows about, and a
+    /// listener that fell over on the first unfamiliar line would be worse off
+    /// than one that ignored it. Neither may take the stream down.
+    #[test]
+    fn an_unknown_or_unreadable_line_does_not_end_the_stream() {
+        type Client = ProxyClient<MockTransport>;
+        let mut buffer = Vec::new();
+        let mut out = Vec::new();
+        buffer.extend_from_slice(
+            b"{\"type\":\"something.new\",\"whatever\":1}\nnot json at all\n\n{\"type\":\"keepalive\"}\n",
+        );
+        Client::drain_lines(&mut buffer, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [ListenerEvent::Unknown, ListenerEvent::Keepalive]
+        ));
     }
 
     /// A keepalive says nothing about the connection — no state and no

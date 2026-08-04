@@ -25,10 +25,11 @@ use isekai_p2p_core::bind::{open_bind_session, BindSession, RelayOptions};
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
 use isekai_p2p_core::proxy::{
-    Capability, ConnectionStateFilter, Grant, PairingCode, PeerConnection, ProxyClient,
+    Capability, ConnectionStateFilter, Grant, ListenerEvent, PairingCode, PeerConnection,
+    ProxyClient,
 };
 use isekai_p2p_core::transport::MasqueH3Transport;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::{issue_endpoint_token, P2pConfig};
 
@@ -453,6 +454,22 @@ impl ListenerSession {
             }
         }
         Ok(events)
+    }
+
+    /// Subscribe to what happens to this listener (spec §8.11).
+    ///
+    /// The channel says **when to look**, not what is true. Every event is a
+    /// reason to run [`poll_signaling`](Self::poll_signaling), which reads the
+    /// listing and acts on it — so there is one place that decides what to
+    /// bind, and the stream only decides how soon. A missed event costs
+    /// latency until the next poll and nothing else, which is the property the
+    /// proxy's design leans on and the reason it is safe to lean on it here.
+    ///
+    /// The channel ends when the stream does. That is not a failure to report:
+    /// reconnect, and poll once on the way back, which is the same thing the
+    /// listener does after any disconnection.
+    pub async fn subscribe(&self) -> anyhow::Result<mpsc::Receiver<ListenerEvent>> {
+        Ok(self.proxy.listener_events(&self.listener_id).await?)
     }
 
     /// Tell the proxy that every peer this listener is serving is still being

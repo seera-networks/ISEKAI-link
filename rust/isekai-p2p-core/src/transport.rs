@@ -28,26 +28,15 @@ pub struct MasqueH3Transport {
 }
 
 impl MasqueH3Transport {
-    /// Connect to the proxy at `target` (e.g. `https://proxy.isekai.link:8443`).
-    pub fn connect(target: &str) -> anyhow::Result<Self> {
-        let uri: Uri = target.parse().context("invalid proxy target URI")?;
-        let (registration, config) = make_client_config(None, false)?;
-        let (registration, config_qmux) = make_client_config(Some(registration), true)?;
-        let connector =
-            H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), false, registration);
-        let channel = H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
-        Ok(Self { channel, uri })
-    }
-}
-
-impl ControlPlaneTransport for MasqueH3Transport {
-    async fn send(
+    /// Build one request against the proxy, shared by the buffered and the
+    /// streaming paths so they cannot address it differently.
+    fn build_request(
         &self,
         method: &str,
         path: &str,
         headers: &[(String, String)],
         body: Vec<u8>,
-    ) -> anyhow::Result<HttpResponse> {
+    ) -> anyhow::Result<Request<Full<Bytes>>> {
         let uri = Uri::builder()
             .scheme(
                 self.uri
@@ -71,9 +60,37 @@ impl ControlPlaneTransport for MasqueH3Transport {
         for (name, value) in headers {
             builder = builder.header(name, value);
         }
-        let request = builder
+        builder
             .body(Full::new(Bytes::from(body)))
-            .context("failed to build request")?;
+            .context("failed to build request")
+    }
+
+    /// Connect to the proxy at `target` (e.g. `https://proxy.isekai.link:8443`).
+    pub fn connect(target: &str) -> anyhow::Result<Self> {
+        let uri: Uri = target.parse().context("invalid proxy target URI")?;
+        let (registration, config) = make_client_config(None, false)?;
+        let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+        let connector = H3MsQuicAsyncConnector::new(
+            uri.clone(),
+            config,
+            Some(config_qmux),
+            false,
+            registration,
+        );
+        let channel = H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
+        Ok(Self { channel, uri })
+    }
+}
+
+impl ControlPlaneTransport for MasqueH3Transport {
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+    ) -> anyhow::Result<HttpResponse> {
+        let request = self.build_request(method, path, headers, body)?;
 
         // H3Channel is a cloneable, multiplexing tower Service.
         let mut channel = self.channel.clone();
@@ -94,6 +111,57 @@ impl ControlPlaneTransport for MasqueH3Transport {
             .to_bytes()
             .to_vec();
         Ok(HttpResponse { status, body })
+    }
+}
+
+impl crate::proxy::EventStreamTransport for MasqueH3Transport {
+    async fn open_stream(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> anyhow::Result<(u16, tokio::sync::mpsc::Receiver<anyhow::Result<Vec<u8>>>)> {
+        let request = self.build_request(method, path, headers, Vec::new())?;
+        let mut channel = self.channel.clone();
+        let response = channel
+            .ready()
+            .await
+            .map_err(|e| anyhow::anyhow!("H3 channel not ready: {e}"))?
+            .call(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("H3 request failed: {e}"))?;
+        let status = response.status().as_u16();
+
+        // One chunk at a time. A depth of one is deliberate: the reader is a
+        // listener reacting to each event, and buffering ahead of it would only
+        // hide that it had stopped keeping up.
+        let (chunks, receiver) = tokio::sync::mpsc::channel(1);
+        let mut body = response.into_body();
+        tokio::spawn(async move {
+            loop {
+                let frame = match body.frame().await {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(e)) => {
+                        let _ = chunks.send(Err(anyhow::anyhow!("{e:?}"))).await;
+                        return;
+                    }
+                    // The response ended. Dropping the sender is how the reader
+                    // finds out, and it means the same thing either way: the
+                    // stream is over and it is time to reconnect.
+                    None => return,
+                };
+                // Trailers carry nothing this stream uses.
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                if chunks.send(Ok(data.to_vec())).await.is_err() {
+                    // Nobody is reading any more, so stop pulling the body —
+                    // which also ends the request.
+                    return;
+                }
+            }
+        });
+        Ok((status, receiver))
     }
 }
 
