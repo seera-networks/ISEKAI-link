@@ -125,14 +125,56 @@ jobs:
           export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig"
           pkg-config --modversion opencv4
 
-      - name: Install OpenCV (macOS)
+      # Built from source here for the same reason as on Linux, plus one of its
+      # own: `brew install opencv` is the whole of OpenCV including contrib, and
+      # its `opencv4.pc` lists every module — so the apps link against gapi,
+      # stitching, aruco and the rest, and bundling then walks into protobuf,
+      # abseil and VTK. Four modules keeps the bundle to what is actually used.
+      - name: Cache OpenCV (macOS)
+        if: runner.os == 'macOS'
+        id: opencv-macos-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/opencv-install
+          key: opencv-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+      - name: Install the build tools (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install opencv pkg-config llvm
+          set -euo pipefail
+          brew install pkg-config llvm
           # bindgen needs libclang, and the one in the Xcode toolchain is not on
           # a path it looks in.
           echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
-          pkg-config --modversion opencv4
+      - name: Build OpenCV (macOS)
+        if: runner.os == 'macOS' && steps.opencv-macos-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.tar.gz" \
+            | tar -xz
+          # `WITH_FFMPEG=OFF`: videoio captures through AVFoundation here, and
+          # the ffmpeg backend would pull a codec tree into the bundle for
+          # nothing. The bundled third-party image libraries keep imgcodecs from
+          # reaching into Homebrew for the same reason.
+          cmake -S "opencv-${OPENCV_VERSION}" -B opencv-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/opencv-install" \
+            -DBUILD_LIST=core,imgproc,imgcodecs,videoio \
+            -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+            -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF \
+            -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
+            -DOPENCV_GENERATE_PKGCONFIG=ON \
+            -DWITH_FFMPEG=OFF -DWITH_IPP=OFF -DWITH_TBB=OFF \
+            -DBUILD_ZLIB=ON -DBUILD_JPEG=ON -DBUILD_PNG=ON
+          cmake --build opencv-build --parallel "$(sysctl -n hw.ncpu)"
+          cmake --install opencv-build
+      - name: Point at the OpenCV that was built (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          prefix="${{ github.workspace }}/opencv-install"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+          PKG_CONFIG_PATH="$prefix/lib/pkgconfig" pkg-config --modversion opencv4
 
       # `docs/Build.md` is explicit that the crate's automatic vcpkg probe did
       # not reliably emit the link flags, and picked the debug import libraries

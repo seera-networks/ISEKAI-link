@@ -117,6 +117,19 @@ Darwin)
         return 1
     }
 
+    # A dependency can be recorded as `@rpath/…`, `@loader_path/…` or
+    # `@executable_path/…` rather than a path — resolving those means replaying
+    # the referring binary's own rpaths, which is more machinery than this
+    # needs. Skipped with a warning instead: the alternative, found the hard
+    # way, is `cp: @rpath/libvtk….dylib: No such file or directory` taking the
+    # whole job down over a library nothing here uses.
+    is_unresolvable() {
+        case "$1" in
+            @*) return 0;;
+        esac
+        return 1
+    }
+
     # Dependencies pull in dependencies — Homebrew's OpenCV on ffmpeg on a dozen
     # codecs — so this walks until nothing new turns up.
     pending=()
@@ -129,6 +142,10 @@ Darwin)
         # Skip the first line, which is the file's own install name.
         while read -r dep; do
             if is_host_library "${dep}"; then
+                continue
+            fi
+            if is_unresolvable "${dep}"; then
+                echo "warning: leaving ${dep} (referenced by ${current}) to the host" >&2
                 continue
             fi
             base=$(basename "${dep}")
