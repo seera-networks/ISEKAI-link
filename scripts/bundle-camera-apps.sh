@@ -67,8 +67,16 @@ Linux)
         return 1
     }
 
+    # **Prepended, not assigned.** Replacing `LD_LIBRARY_PATH` hides exactly the
+    # libraries this exists to collect: an OpenCV installed somewhere the loader
+    # does not search by default — which is how CI installs it — then resolves
+    # to "not found", and a walk that only reads resolved paths skips it in
+    # silence. The bundle then builds, passes, and fails on the first machine
+    # that is not the one that built it.
+    search="${stage}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
     for app in "${apps[@]}"; do
-        LD_LIBRARY_PATH="${stage}/lib" ldd "${stage}/bin/${app}" \
+        LD_LIBRARY_PATH="${search}" ldd "${stage}/bin/${app}" \
             | awk '/=> \//{print $3}' \
             | while read -r so; do
                 base=$(basename "${so}")
@@ -77,6 +85,25 @@ Linux)
                 fi
                 [ -e "${stage}/lib/${base}" ] || cp -aL "${so}" "${stage}/lib/"
               done
+    done
+
+    # Copying a library can pull in another that the binary itself does not
+    # name, so keep going until a pass adds nothing.
+    while :; do
+        before=$(find "${stage}/lib" -type f | wc -l)
+        find "${stage}/lib" -name '*.so*' -type f -print0 \
+            | while IFS= read -r -d '' lib; do
+                LD_LIBRARY_PATH="${search}" ldd "${lib}" 2>/dev/null \
+                    | awk '/=> \//{print $3}' \
+                    | while read -r so; do
+                        base=$(basename "${so}")
+                        if is_host_library "${base}"; then
+                            continue
+                        fi
+                        [ -e "${stage}/lib/${base}" ] || cp -aL "${so}" "${stage}/lib/"
+                      done
+              done
+        [ "$(find "${stage}/lib" -type f | wc -l)" -eq "${before}" ] && break
     done
 
     # Symbols are most of what a Rust release binary weighs, and a bundle that
@@ -196,6 +223,65 @@ LAUNCHER
     ;;
 esac
 
+# ------------------------------------------------------------------ Verify
+#
+# The point of the bundle is that it runs somewhere other than here, and every
+# way of getting that wrong looks fine on the machine that built it — the
+# libraries are installed here, so anything missed resolves anyway. So the
+# check deliberately does *not* let the build machine answer: `LD_LIBRARY_PATH`
+# is the bundle and nothing else.
+#
+# This is not hypothetical. The first bundle this produced was missing every
+# OpenCV library, passed CI, and failed on the first plain Ubuntu it met with
+# `libopencv_videoio.so.411: cannot open shared object file`.
+case "$(uname -s)" in
+Linux)
+    # Read the `NEEDED` entries rather than asking the loader. `ldd` answers
+    # from whatever is installed here — on a machine with OpenCV in
+    # `/usr/lib`, a bundle missing every OpenCV library resolves perfectly and
+    # the check passes. This asks a different question: is each name either in
+    # the bundle, or on the short list the host is expected to provide? The
+    # answer does not depend on the machine, which is the whole point.
+    missing=0
+    while IFS= read -r -d '' f; do
+        while read -r soname; do
+            if is_host_library "${soname}"; then
+                continue
+            fi
+            if [ -e "${stage}/lib/${soname}" ]; then
+                continue
+            fi
+            echo "missing from the bundle: ${soname} (needed by $(basename "${f}"))" >&2
+            missing=1
+        done < <(readelf -d "${f}" 2>/dev/null \
+                    | awk -F'[][]' '/NEEDED/{print $2}')
+    done < <(find "${stage}/bin" "${stage}/lib" -type f -print0)
+    if [ "${missing}" -ne 0 ]; then
+        echo "the bundle does not carry what it needs; it would fail to start elsewhere" >&2
+        exit 1
+    fi
+    ;;
+Darwin)
+    # Nothing outside the bundle, the system, or `@rpath` — an absolute path
+    # into Homebrew or the build tree is a library that will not be there.
+    missing=0
+    for f in "${stage}"/bin/* "${stage}"/lib/*.dylib; do
+        while read -r dep; do
+            case "${dep}" in
+                @*|/usr/lib/*|/System/*) continue;;
+            esac
+            echo "points outside the bundle: $(basename "${f}") -> ${dep}" >&2
+            missing=1
+        done < <(otool -L "${f}" | tail -n +2 | awk '{print $1}')
+    done
+    if [ "${missing}" -ne 0 ]; then
+        echo "the bundle references libraries it does not carry" >&2
+        exit 1
+    fi
+    ;;
+esac
+
 echo "bundled into ${stage}:"
 ls -l "${stage}" "${stage}/bin"
 echo "libraries: $(find "${stage}/lib" -type f | wc -l)"
+echo "verified: every library it needs is either carried or expected from the host"
