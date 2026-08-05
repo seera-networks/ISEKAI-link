@@ -5,7 +5,7 @@ import Foundation
 /// fields; the defaults match the desktop `camera-client`.
 struct ViewerSettings: Codable, Equatable {
     var identityURL = "https://identity.isekai.tools:9443"
-    var proxyURL = "https://link.isekai.tools:8443"
+    var proxyURL = "https://tokyo.link.isekai.tools:8443"
     var protocolName = "isekai-validator-v1"
     /// Issued by the camera server for this viewer's Endpoint ID.
     var capability = ""
