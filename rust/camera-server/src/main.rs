@@ -342,8 +342,13 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Stream App",
         options,
-        Box::new(|_cc| {
+        // Before the first frame: egui ships no CJK faces, so without this
+        // every Japanese character in the interface — the privacy policy above
+        // all — draws as a blank box.
+        Box::new(|cc| {
+            let japanese = camera_ui::install_japanese(&cc.egui_ctx);
             Ok(Box::new(MyApp::new(
+                japanese,
                 Arc::clone(&reg),
                 rx,
                 is_streaming,
@@ -604,6 +609,7 @@ use camera_core::auth0::SignInState as Auth0State;
 
 impl MyApp {
     fn new(
+        japanese: bool,
         reg: Arc<msquic_async::Registration>,
         rx: mpsc::Receiver<([usize; 2], Bytes)>,
         is_streaming: Arc<AtomicBool>,
@@ -641,7 +647,7 @@ impl MyApp {
             texture: None,
             is_streaming,
             log: "Ready.".to_string(),
-            consent: camera_ui::ConsentGate::new("camera-server"),
+            consent: camera_ui::ConsentGate::new("camera-server", japanese),
         }
         .with_stored_auth0()
     }

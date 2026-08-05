@@ -1,5 +1,9 @@
 //! Screens both desktop apps show.
 
+mod fonts;
+
+pub use fonts::install_japanese;
+
 use camera_core::privacy::{self, Language};
 
 /// The privacy policy, shown until it is agreed to.
@@ -17,6 +21,9 @@ pub struct ConsentGate {
     /// separately — they are separate installations to the person using them.
     app: &'static str,
     language: Language,
+    /// Whether a Japanese face was found. When it was not, the Japanese text
+    /// would be blank boxes, so it is neither shown nor offered.
+    japanese_available: bool,
     /// `false` until this build's policy version has been agreed to.
     satisfied: bool,
     /// Set when the answer could not be written down. Agreeing again every
@@ -27,11 +34,21 @@ pub struct ConsentGate {
 
 impl ConsentGate {
     /// Read what this user has already agreed to.
-    pub fn new(app: &'static str) -> Self {
+    ///
+    /// `japanese_available` is what [`install_japanese`] returned. Without a
+    /// Japanese face every character of the Japanese text draws as a blank box,
+    /// so this shows the English one and does not offer a language it cannot
+    /// draw — a policy rendered as boxes is not a policy anyone can agree to.
+    pub fn new(app: &'static str, japanese_available: bool) -> Self {
         let recorded = privacy::load(app);
         Self {
             app,
-            language: Language::preferred(),
+            language: if japanese_available {
+                Language::preferred()
+            } else {
+                Language::English
+            },
+            japanese_available,
             satisfied: !privacy::needs_agreement(recorded.as_ref()),
             error: None,
         }
@@ -45,23 +62,49 @@ impl ConsentGate {
         if self.satisfied {
             return true;
         }
+        // Every label here is bilingual, and every one of them is blank boxes
+        // without a Japanese face — so the whole screen drops to English, not
+        // just the policy text.
+        let bilingual = |ja: &'static str, en: &'static str| -> String {
+            if self.japanese_available {
+                format!("{ja} / {en}")
+            } else {
+                en.to_owned()
+            }
+        };
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
-                ui.heading("プライバシーポリシー / Privacy Policy");
+                ui.heading(bilingual("プライバシーポリシー", "Privacy Policy"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(self.language.other_label()).clicked() {
+                    // Nothing to switch to when the other language cannot be
+                    // drawn; a button that produces blank boxes is worse than
+                    // no button.
+                    if self.japanese_available && ui.button(self.language.other_label()).clicked() {
                         self.language = self.language.toggled();
                     }
                 });
             });
             ui.label(
-                egui::RichText::new(
+                egui::RichText::new(bilingual(
                     "ISEKAI link の利用にはアカウント登録が必要で、個人情報を取得します。\
-                     続けるには以下に同意してください。 / Using ISEKAI link requires an \
-                     account and collects personal information. Please agree to continue.",
-                )
+                     続けるには以下に同意してください。",
+                    "Using ISEKAI link requires an account and collects personal \
+                     information. Please agree to continue.",
+                ))
                 .small(),
             );
+            if !self.japanese_available {
+                // Said plainly, because the alternative is a person wondering
+                // why the policy is only in a language they may not read.
+                ui.label(
+                    egui::RichText::new(
+                        "The Japanese text needs a CJK font installed on this machine; \
+                         it is also at the link below.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
             ui.hyperlink_to(privacy::URL, privacy::URL);
             ui.separator();
 
@@ -82,12 +125,15 @@ impl ConsentGate {
             if let Some(error) = &self.error {
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
-                    format!("同意を記録できませんでした / could not record consent: {error}"),
+                    format!(
+                        "{}: {error}",
+                        bilingual("同意を記録できませんでした", "could not record consent")
+                    ),
                 );
             }
             ui.horizontal(|ui| {
                 if ui
-                    .button(egui::RichText::new("同意する / Agree").strong())
+                    .button(egui::RichText::new(bilingual("同意する", "Agree")).strong())
                     .clicked()
                 {
                     match privacy::save(self.app, self.language) {
@@ -104,7 +150,10 @@ impl ConsentGate {
                         Err(e) => self.error = Some(format!("{e:#}")),
                     }
                 }
-                if ui.button("同意しない（終了） / Decline (quit)").clicked() {
+                if ui
+                    .button(bilingual("同意しない（終了）", "Decline (quit)"))
+                    .clicked()
+                {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });

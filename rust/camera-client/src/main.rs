@@ -74,7 +74,13 @@ async fn main() -> eframe::Result<()> {
     let res = eframe::run_native(
         "Camera Client App",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::new(Arc::clone(&reg))))),
+        // Before the first frame: egui ships no CJK faces, so without this
+        // every Japanese character in the interface — the privacy policy above
+        // all — draws as a blank box.
+        Box::new(|cc| {
+            let japanese = camera_ui::install_japanese(&cc.egui_ctx);
+            Ok(Box::new(MyApp::new(Arc::clone(&reg), japanese)))
+        }),
     );
 
     // `run_native` has returned, so the app — and with it every connection it
@@ -240,7 +246,7 @@ struct MyApp {
 }
 
 impl MyApp {
-    fn new(reg: Arc<msquic_async::Registration>) -> Self {
+    fn new(reg: Arc<msquic_async::Registration>, japanese: bool) -> Self {
         Self {
             reg,
             mode: Mode::Direct,
@@ -278,7 +284,7 @@ impl MyApp {
             p2p_path: None,
             path_rx: None,
             migrate_tx: None,
-            consent: camera_ui::ConsentGate::new("camera-client"),
+            consent: camera_ui::ConsentGate::new("camera-client", japanese),
         }
         .with_stored_auth0()
     }
