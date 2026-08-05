@@ -1,0 +1,234 @@
+name: Camera apps
+
+# Release builds of `camera-server` and `camera-client`, on the three desktops
+# they run on.
+#
+# These two crates were the only ones no job built. They are also the only ones
+# that need OpenCV and libclang, which is why: a change that breaks nothing else
+# breaks them, and until now nothing said so until somebody built locally.
+#
+# **OpenCV is the expensive part, and it differs on every platform.** The steps
+# below follow `docs/Build.md`, which records what was actually made to work
+# rather than what ought to:
+#
+# | | how | first run |
+# | --- | --- | --- |
+# | Linux | built from source — Ubuntu packages 4.6, the crate wants 4.11+ | slow |
+# | Windows | vcpkg, with the `OPENCV_*` variables set explicitly | slow |
+# | macOS | Homebrew | quick |
+#
+# Each caches what it can, so the cost lands on the first run after a change to
+# the version pinned here and not on every push.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'rust/**'
+      - 'submodules/**'
+      - '.github/workflows/camera-apps.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - 'submodules/**'
+      - '.github/workflows/camera-apps.yml'
+  workflow_dispatch:
+
+env:
+  # The floor `docs/Build.md` states for the `opencv` crate. Pinned rather than
+  # "latest" so a rebuild is something this file asks for, not something that
+  # happens on its own.
+  OPENCV_VERSION: 4.11.0
+
+jobs:
+  build:
+    name: camera apps (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The first Windows run builds OpenCV through vcpkg, which `docs/Build.md`
+    # measures at about an hour. Later runs come out of the binary cache.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Same bootstrap the other workflows use; seera-msquic needs its build
+      # dependencies present before cargo drives its CMake build.
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+
+      # ---- OpenCV, one way per platform ----
+
+      - name: Install libclang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+
+      # Ubuntu packages OpenCV 4.6 and the crate wants 4.11+, so it is built
+      # here. `opencv-extra-modules: false` matters: the camera apps use
+      # core/imgproc/imgcodecs/videoio only, and contrib roughly doubles the
+      # build.
+      # Into a directory of its own rather than /usr/local, which on this image
+      # already holds most of the preinstalled toolchains — caching that would
+      # mean carrying gigabytes of unrelated software to save one build.
+      - name: Cache OpenCV (Linux)
+        if: runner.os == 'Linux'
+        id: opencv-linux-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/opencv-install
+          key: opencv-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+      - name: Build OpenCV (Linux)
+        if: runner.os == 'Linux' && steps.opencv-linux-cache.outputs.cache-hit != 'true'
+        uses: Dovyski/setup-opencv-action@v1.1
+        with:
+          opencv-version: ${{ env.OPENCV_VERSION }}
+          opencv-extra-modules: 'false'
+          CMAKE_INSTALL_PREFIX: ${{ github.workspace }}/opencv-install
+          BUILD_EXAMPLES: 'OFF'
+          BUILD_NEW_PYTHON_SUPPORT: 'OFF'
+          GENERATE_PKGCONFIG: 'ON'
+      - name: Point at the OpenCV that was built (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          prefix="${{ github.workspace }}/opencv-install"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$prefix/lib:$prefix/lib64" >> "$GITHUB_ENV"
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig"
+          pkg-config --modversion opencv4
+
+      - name: Install OpenCV (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install opencv pkg-config llvm
+          # bindgen needs libclang, and the one in the Xcode toolchain is not on
+          # a path it looks in.
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          pkg-config --modversion opencv4
+
+      # `docs/Build.md` is explicit that the crate's automatic vcpkg probe did
+      # not reliably emit the link flags, and picked the debug import libraries
+      # — whose CRT mismatches Rust's release CRT and fails at link. Hence the
+      # variables set by hand below, pointing at the release libraries.
+      - name: Cache the vcpkg binaries (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg-cache
+          key: vcpkg-opencv4-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+      - name: Install OpenCV via vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg-cache" | Out-Null
+          $env:VCPKG_BINARY_SOURCES = "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install opencv4:x64-windows
+      # `docs/Build.md`: the binding generator needs libclang 19 or newer
+      # against MSVC 14.4x, or it stops at "STL1000: Unexpected compiler
+      # version". Installed rather than taken from the image, whose LLVM is
+      # whatever it happens to ship and has been older than that.
+      - name: Install a new enough LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco upgrade llvm -y --no-progress
+
+      - name: Point at the vcpkg OpenCV and that libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
+          $llvm = "C:/Program Files/LLVM/bin"
+          "OPENCV_INCLUDE_PATHS=$root/include/opencv4"       | Out-File -Append $env:GITHUB_ENV
+          "OPENCV_LINK_PATHS=$root/lib"                      | Out-File -Append $env:GITHUB_ENV
+          "OPENCV_LINK_LIBS=opencv_core4,opencv_imgproc4,opencv_imgcodecs4,opencv_videoio4" |
+            Out-File -Append $env:GITHUB_ENV
+          # x64-windows is a dynamic triplet; the crate has to be told which.
+          "OPENCV_MSVC_CRT=dynamic"                          | Out-File -Append $env:GITHUB_ENV
+          # The OpenCV DLLs have to be findable when the binaries run.
+          "$root/bin"                                        | Out-File -Append $env:GITHUB_PATH
+          $llvm                                              | Out-File -Append $env:GITHUB_PATH
+          "LIBCLANG_PATH=$llvm"                              | Out-File -Append $env:GITHUB_ENV
+          & "$llvm/clang.exe" --version
+
+      # ---- Build ----
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build the camera apps
+        run: cargo build --release -p camera-server -p camera-client
+        working-directory: rust
+
+      # Named per platform so the three do not overwrite one another, and so a
+      # download says what it is.
+      - name: Collect the binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for app in camera-server camera-client; do
+            # One of the two exists per platform. `if` rather than `&&`, which
+            # would return non-zero on the name that does not and — under the
+            # `-e` this shell runs with — fail the step on every platform.
+            for candidate in "rust/target/release/$app" "rust/target/release/$app.exe"; do
+              if [ -f "$candidate" ]; then
+                cp "$candidate" dist/
+              fi
+            done
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: camera-apps-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+
+  # Only for tags. Every other run has its binaries on the run itself, which is
+  # what makes a failure quick to look at; a Release is for the ones meant to be
+  # handed to somebody.
+  release:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # One archive per platform rather than loose binaries, so what is attached
+      # says which platform it came from after it has been downloaded.
+      - name: Package each platform
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name="$(basename "$dir")"
+            (cd "$dir" && zip -r "$GITHUB_WORKSPACE/release/$name.zip" .)
+          done
+          ls -l release
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            release/*.zip
