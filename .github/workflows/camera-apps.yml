@@ -40,6 +40,18 @@ env:
   # "latest" so a rebuild is something this file asks for, not something that
   # happens on its own.
   OPENCV_VERSION: 4.11.0
+  # OpenCV 4.11 still has `cmake_minimum_required` below 3.5 in places —
+  # `OpenCVGenPkgconfig.cmake` among them — and CMake 4, which the macOS runner
+  # now carries, refuses those outright:
+  #
+  #   Compatibility with CMake < 3.5 has been removed from CMake.
+  #   Or, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway.
+  #
+  # Set for the whole job rather than only on the configure line, because the
+  # one that failed is a nested script-mode `cmake -P` run during the build,
+  # which a `-D` on the outer invocation never reaches. Harmless where CMake is
+  # still 3.x, and there before that runner is upgraded too.
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 
 jobs:
   build:
