@@ -86,16 +86,35 @@ jobs:
         with:
           path: ${{ github.workspace }}/opencv-install
           key: opencv-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+      # Built here rather than through `Dovyski/setup-opencv-action`, which was
+      # the obvious choice and does not work: its dependency install adds an
+      # Ubuntu Xenial repository — the action still targets 18.04 — and on a
+      # current runner `apt-get` stops at `NO_PUBKEY … exit code 100` before any
+      # compiling starts.
+      #
+      # Doing it directly also allows `BUILD_LIST`, which the action does not
+      # expose. The camera apps use four modules; building those rather than all
+      # of OpenCV is the difference between minutes and half an hour on every
+      # cache miss.
       - name: Build OpenCV (Linux)
         if: runner.os == 'Linux' && steps.opencv-linux-cache.outputs.cache-hit != 'true'
-        uses: Dovyski/setup-opencv-action@v1.1
-        with:
-          opencv-version: ${{ env.OPENCV_VERSION }}
-          opencv-extra-modules: 'false'
-          CMAKE_INSTALL_PREFIX: ${{ github.workspace }}/opencv-install
-          BUILD_EXAMPLES: 'OFF'
-          BUILD_NEW_PYTHON_SUPPORT: 'OFF'
-          GENERATE_PKGCONFIG: 'ON'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y build-essential cmake pkg-config \
+            libavcodec-dev libavformat-dev libswscale-dev libv4l-dev
+          curl -fsSL "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.tar.gz" \
+            | tar -xz
+          cmake -S "opencv-${OPENCV_VERSION}" -B opencv-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/opencv-install" \
+            -DBUILD_LIST=core,imgproc,imgcodecs,videoio \
+            -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+            -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF \
+            -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
+            -DOPENCV_GENERATE_PKGCONFIG=ON \
+            -DWITH_IPP=OFF -DWITH_TBB=OFF
+          cmake --build opencv-build --parallel "$(nproc)"
+          cmake --install opencv-build
       - name: Point at the OpenCV that was built (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -170,24 +189,33 @@ jobs:
         run: cargo build --release -p camera-server -p camera-client
         working-directory: rust
 
-      # Named per platform so the three do not overwrite one another, and so a
-      # download says what it is.
-      - name: Collect the binaries
-        shell: bash
+      # A binary on its own runs on the machine that built it and nowhere else:
+      # it wants OpenCV 4.11+, which no current Ubuntu packages, and
+      # `libmsquic`, which exists only inside cargo's build-script output. So
+      # each platform ships the libraries with it.
+      - name: Bundle with the libraries (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: scripts/bundle-camera-apps.sh rust/target/release dist camera-apps-${{ matrix.os }}
+
+      # Windows resolves a DLL from the directory the executable is in before
+      # anywhere else, so beside the binaries is all this needs — no launcher
+      # and no load-command rewriting.
+      - name: Bundle with the DLLs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          set -euo pipefail
-          mkdir -p dist
-          for app in camera-server camera-client; do
-            # One of the two exists per platform. `if` rather than `&&`, which
-            # would return non-zero on the name that does not and — under the
-            # `-e` this shell runs with — fail the step on every platform.
-            for candidate in "rust/target/release/$app" "rust/target/release/$app.exe"; do
-              if [ -f "$candidate" ]; then
-                cp "$candidate" dist/
-              fi
-            done
-          done
-          ls -l dist
+          $stage = "dist/camera-apps-${{ matrix.os }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item rust/target/release/camera-server.exe, rust/target/release/camera-client.exe $stage
+          # OpenCV's own DLLs and everything vcpkg built them against.
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" $stage
+          # libmsquic is built by seera-msquic's build script and never
+          # installed, so it is found by searching cargo's output.
+          $msquic = Get-ChildItem -Path rust/target/release/build -Recurse -Filter msquic.dll `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msquic) { throw "msquic.dll not found under rust/target/release/build" }
+          Copy-Item $msquic.FullName $stage
+          Get-ChildItem $stage | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
         with:

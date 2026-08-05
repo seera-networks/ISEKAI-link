@@ -26,3 +26,8 @@ e2e-client.pem
 # apps. Generated on demand; never committed.
 quic.etl
 quic.txt
+
+# Release bundles built by `scripts/bundle-camera-apps.sh` (and by the
+# camera-apps workflow, which runs it). Hundreds of megabytes of copied
+# libraries; regenerated from a build.
+/dist
