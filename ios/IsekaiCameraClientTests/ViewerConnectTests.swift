@@ -55,6 +55,9 @@ final class ViewerConnectTests: XCTestCase {
             config: config,
             endpointKeyPem: pem,
             auth0Token: try XCTUnwrap(peer["token"], "hello: \(hello)"),
+            // The token the harness supplies is fixed and the run is far shorter
+            // than its lifetime, so there is nothing to renew from.
+            auth0Provider: nil,
             sink: sink
         )
         addTeardownBlock { session.disconnect() }

@@ -188,6 +188,51 @@ pub trait FrameSink: Send + Sync {
     fn on_log(&self, line: String);
 }
 
+/// Where the core gets a *current* Auth0 access token.
+///
+/// The one handed to [`connect`] is a snapshot, and it stops working after a few
+/// hours. That matters because the Endpoint Token behind every proxy call lasts
+/// minutes and is reissued for the life of the session — and the Identity API
+/// requires Auth0 authentication state on each issue, not just the first. Once
+/// the snapshot lapses, renewal stops, and with it the ability to open anything
+/// new on the connection.
+///
+/// So a session that outlives one access token has to be able to ask for
+/// another. Swift already knows how — `AuthStore` refreshes against Auth0 — and
+/// this is where the core asks.
+#[uniffi::export(callback_interface)]
+pub trait Auth0TokenProvider: Send + Sync {
+    /// The access token to use right now.
+    ///
+    /// Called every few minutes for the life of the session, from a core worker
+    /// thread. **Return what is cached and refresh in the background** rather
+    /// than blocking here on the network. A token that is briefly stale costs
+    /// one failed renewal, retried within the minute, while the video keeps
+    /// flowing — whereas a blocked worker stalls the session itself.
+    ///
+    /// Return the last token known when there is nothing better; an empty
+    /// string is treated as "no token" and reported as a failed renewal.
+    fn current_token(&self) -> String;
+}
+
+/// Adapts the Swift callback to the core's token source.
+struct SwiftAuth0Tokens(Box<dyn Auth0TokenProvider>);
+
+impl camera_core::Auth0TokenSource for SwiftAuth0Tokens {
+    fn auth0_token(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        let token = self.0.current_token();
+        Box::pin(async move {
+            if token.is_empty() {
+                anyhow::bail!("the app has no Auth0 token to renew with; sign in again");
+            }
+            Ok(token)
+        })
+    }
+}
+
 /// A live viewer session. Hold it for the duration of viewing; drop or
 /// [`ViewerSession::disconnect`] to tear down the relay leg and tasks.
 #[derive(uniffi::Object)]
@@ -584,11 +629,16 @@ pub fn endpoint_id_of(pem: String) -> Result<String, ClientError> {
 ///
 /// `auth0_token` is the user's Auth0 access token (obtained via the app's
 /// login); `endpoint_key_pem` is the PKCS#8 PEM from the Keychain.
+///
+/// `auth0_provider` is what keeps the session alive past that token's few hours —
+/// see [`Auth0TokenProvider`]. Passing `None` keeps the old behaviour, where the
+/// session works until the snapshot expires and then cannot renew.
 #[uniffi::export]
 pub fn connect(
     config: ClientConfig,
     endpoint_key_pem: String,
     auth0_token: String,
+    auth0_provider: Option<Box<dyn Auth0TokenProvider>>,
     sink: Box<dyn FrameSink>,
 ) -> Result<Arc<ViewerSession>, ClientError> {
     let sink: Arc<dyn FrameSink> = Arc::from(sink);
@@ -624,7 +674,10 @@ pub fn connect(
         register: config.register,
         device_name: Some("ios-camera-client".to_owned()),
         token_ttl: None,
-        auth0: None,
+        // What makes the session survive its own access token: every Endpoint
+        // Token renewal asks the app for a current one.
+        auth0: auth0_provider
+            .map(|t| Arc::new(SwiftAuth0Tokens(t)) as Arc<dyn camera_core::Auth0TokenSource>),
         key,
     };
 

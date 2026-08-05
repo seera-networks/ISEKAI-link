@@ -249,7 +249,19 @@ final class ViewerModel: ObservableObject {
         Task {
             do {
                 let token = try await self.currentToken()
-                self.startConnecting(config: config, endpointKeyPem: pem, token: token, sink: sink)
+                // Only a signed-in session can renew. A hand-pasted token has
+                // nothing behind it, so the core keeps using it and the session
+                // ends with it, as it always did.
+                let provider = self.auth.isSignedIn
+                    ? Auth0TokenBridge(auth: self.auth, initial: token)
+                    : nil
+                self.startConnecting(
+                    config: config,
+                    endpointKeyPem: pem,
+                    token: token,
+                    provider: provider,
+                    sink: sink
+                )
             } catch {
                 self.fail(error.localizedDescription)
             }
@@ -290,6 +302,7 @@ final class ViewerModel: ObservableObject {
         config: ClientConfig,
         endpointKeyPem pem: String,
         token: String,
+        provider: Auth0TokenProvider?,
         sink: ViewerSink
     ) {
         // The core blocks for the control-plane exchange and the relay-leg
@@ -300,6 +313,7 @@ final class ViewerModel: ObservableObject {
                     config: config,
                     endpointKeyPem: pem,
                     auth0Token: token,
+                    auth0Provider: provider,
                     sink: sink
                 )
             }
@@ -434,9 +448,16 @@ private func startSession(
     config: ClientConfig,
     endpointKeyPem: String,
     auth0Token: String,
+    auth0Provider: Auth0TokenProvider?,
     sink: FrameSink
 ) throws -> ViewerSession {
-    try connect(config: config, endpointKeyPem: endpointKeyPem, auth0Token: auth0Token, sink: sink)
+    try connect(
+        config: config,
+        endpointKeyPem: endpointKeyPem,
+        auth0Token: auth0Token,
+        auth0Provider: auth0Provider,
+        sink: sink
+    )
 }
 
 extension String {
