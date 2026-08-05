@@ -291,6 +291,96 @@ fn describe(body: &[u8], status: reqwest::StatusCode) -> String {
     }
 }
 
+/// A device sign-in in progress, as an app's UI sees it.
+///
+/// The flow is two awaits and a poll loop, but an app drawing a window at 60fps
+/// cannot await anything — so this runs it on a task and leaves the answer
+/// somewhere the UI thread can read on its next frame. Both desktop apps drive
+/// it the same way, and neither has to know what the flow does.
+#[derive(Debug, Default, Clone)]
+pub enum SignInState {
+    #[default]
+    SignedOut,
+    /// Show the operator `user_code`, and `url` to type it into.
+    Waiting {
+        user_code: String,
+        url: String,
+    },
+    SignedIn,
+    Failed(String),
+}
+
+#[derive(Default)]
+struct SignIn {
+    state: SignInState,
+    /// Left by the task for the UI thread to pick up, since only the UI thread
+    /// owns the place a token source is kept.
+    tokens: Option<Auth0Tokens>,
+}
+
+/// Drives [`start_device_login`] and [`poll_device_login`] behind a UI.
+#[derive(Clone, Default)]
+pub struct DeviceSignIn(Arc<std::sync::Mutex<SignIn>>);
+
+impl DeviceSignIn {
+    /// A sign-in that has already happened — restoring stored tokens, so the UI
+    /// does not offer to sign in again.
+    pub fn restored() -> Self {
+        let this = Self::default();
+        this.0.lock().expect("sign-in lock poisoned").state = SignInState::SignedIn;
+        this
+    }
+
+    pub fn state(&self) -> SignInState {
+        self.0.lock().expect("sign-in lock poisoned").state.clone()
+    }
+
+    /// Forget the sign-in. The caller drops its token source and any stored
+    /// tokens; this is only what the UI shows.
+    pub fn sign_out(&self) {
+        self.0.lock().expect("sign-in lock poisoned").state = SignInState::SignedOut;
+    }
+
+    /// Whatever a finished sign-in produced, once.
+    ///
+    /// Returns `None` on every call but the first after a sign-in, so a UI can
+    /// call it every frame.
+    pub fn take_tokens(&self) -> Option<Auth0Tokens> {
+        self.0.lock().expect("sign-in lock poisoned").tokens.take()
+    }
+
+    /// Begin. Needs a tokio runtime, and persists to `store` when given one.
+    pub fn start(&self, cfg: Auth0Config, store: Option<PathBuf>) {
+        let shared = self.0.clone();
+        tokio::spawn(async move {
+            let set = |state| shared.lock().expect("sign-in lock poisoned").state = state;
+            let started = match start_device_login(&cfg).await {
+                Ok(started) => started,
+                Err(e) => return set(SignInState::Failed(format!("{e:#}"))),
+            };
+            set(SignInState::Waiting {
+                user_code: started.user_code.clone(),
+                url: started.verification_uri_complete.clone(),
+            });
+            match poll_device_login(&cfg, &started).await {
+                Ok(tokens) => {
+                    if let Some(store) = &store {
+                        if let Err(e) = RefreshingAuth0Token::save(store, &tokens) {
+                            // The sign-in worked; only the "still signed in
+                            // after a restart" part is lost.
+                            tracing::warn!("could not persist the Auth0 tokens: {e:#}");
+                        }
+                    }
+                    let mut shared = shared.lock().expect("sign-in lock poisoned");
+                    shared.tokens = Some(tokens);
+                    shared.state = SignInState::SignedIn;
+                }
+                Err(e) => set(SignInState::Failed(format!("{e:#}"))),
+            }
+        });
+    }
+}
+
 /// An [`Auth0TokenSource`] that refreshes rather than expiring.
 ///
 /// This is what turns a single sign-in into a session that lasts: the Endpoint

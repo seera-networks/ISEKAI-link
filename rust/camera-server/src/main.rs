@@ -555,7 +555,7 @@ struct MyApp {
     /// another one. Beside the Endpoint key and guarded the same way.
     auth0_store_path: String,
     /// The device sign-in, and what to show the operator while it runs.
-    auth0_login: Arc<Mutex<Auth0Login>>,
+    auth0_login: camera_core::auth0::DeviceSignIn,
     /// Set once tokens exist, from a sign-in or from `auth0_store_path`. This is
     /// what keeps the session alive past the access token's few hours: the
     /// Endpoint Token is reissued every few minutes and each issue needs a
@@ -596,27 +596,7 @@ struct MyApp {
     log: String,
 }
 
-/// The device sign-in as the UI sees it.
-#[derive(Default)]
-struct Auth0Login {
-    state: Auth0State,
-    /// Left here by the polling task for the UI thread to pick up — see
-    /// [`MyApp::take_finished_sign_in`].
-    tokens: Option<camera_core::auth0::Auth0Tokens>,
-}
-
-#[derive(Default, Clone)]
-enum Auth0State {
-    #[default]
-    SignedOut,
-    /// Showing the operator what to type, and where.
-    Waiting {
-        user_code: String,
-        url: String,
-    },
-    SignedIn,
-    Failed(String),
-}
+use camera_core::auth0::SignInState as Auth0State;
 
 impl MyApp {
     fn new(
@@ -636,7 +616,7 @@ impl MyApp {
             proxy_url: "https://tokyo.link.isekai.tools:8443".to_string(),
             auth0_token: String::new(),
             auth0_store_path: "camera-server-auth0.json".to_string(),
-            auth0_login: Arc::new(Mutex::new(Auth0Login::default())),
+            auth0_login: camera_core::auth0::DeviceSignIn::default(),
             // Filled in below from whatever a previous sign-in left behind.
             auth0_source: None,
             key_path: "camera-server-endpoint.pem".to_string(),
@@ -674,7 +654,7 @@ impl MyApp {
                 tokens,
                 Some(path.to_path_buf()),
             ));
-            self.auth0_login.lock().unwrap().state = Auth0State::SignedIn;
+            self.auth0_login = camera_core::auth0::DeviceSignIn::restored();
         }
         self
     }
@@ -685,34 +665,10 @@ impl MyApp {
     /// until that lands. What comes back includes a refresh token, which is what
     /// makes the sign-in last beyond the access token's few hours.
     fn sign_in_to_auth0(&mut self) {
-        let login = Arc::clone(&self.auth0_login);
-        let store = std::path::PathBuf::from(&self.auth0_store_path);
-        tokio::spawn(async move {
-            let cfg = camera_core::auth0::Auth0Config::default();
-            let started = match camera_core::auth0::start_device_login(&cfg).await {
-                Ok(started) => started,
-                Err(e) => {
-                    login.lock().unwrap().state = Auth0State::Failed(format!("{e:#}"));
-                    return;
-                }
-            };
-            login.lock().unwrap().state = Auth0State::Waiting {
-                user_code: started.user_code.clone(),
-                url: started.verification_uri_complete.clone(),
-            };
-            match camera_core::auth0::poll_device_login(&cfg, &started).await {
-                Ok(tokens) => {
-                    if let Err(e) = camera_core::auth0::RefreshingAuth0Token::save(&store, &tokens)
-                    {
-                        tracing::warn!("could not persist the Auth0 tokens: {e:#}");
-                    }
-                    let mut login = login.lock().unwrap();
-                    login.tokens = Some(tokens);
-                    login.state = Auth0State::SignedIn;
-                }
-                Err(e) => login.lock().unwrap().state = Auth0State::Failed(format!("{e:#}")),
-            }
-        });
+        self.auth0_login.start(
+            camera_core::auth0::Auth0Config::default(),
+            Some(std::path::PathBuf::from(&self.auth0_store_path)),
+        );
     }
 
     /// Move a finished sign-in onto `self`, which the UI thread owns.
@@ -720,8 +676,7 @@ impl MyApp {
     /// The polling task cannot build the source itself — it has no `&mut self` —
     /// so it leaves the tokens behind and this picks them up on the next frame.
     fn take_finished_sign_in(&mut self) {
-        let tokens = self.auth0_login.lock().unwrap().tokens.take();
-        if let Some(tokens) = tokens {
+        if let Some(tokens) = self.auth0_login.take_tokens() {
             self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::new(
                 camera_core::auth0::Auth0Config::default(),
                 tokens,
@@ -1071,7 +1026,7 @@ impl MyApp {
     /// Signing in is what makes that stop happening.
     fn auth0_ui(&mut self, ui: &mut egui::Ui, enabled: bool) {
         self.take_finished_sign_in();
-        let state = self.auth0_login.lock().unwrap().state.clone();
+        let state = self.auth0_login.state();
         ui.horizontal(|ui| {
             ui.label("Auth0:       ");
             match &state {
@@ -1083,7 +1038,7 @@ impl MyApp {
                     {
                         let _ = std::fs::remove_file(&self.auth0_store_path);
                         self.auth0_source = None;
-                        self.auth0_login.lock().unwrap().state = Auth0State::SignedOut;
+                        self.auth0_login.sign_out();
                     }
                 }
                 Auth0State::Waiting { user_code, url } => {
