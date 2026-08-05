@@ -27,11 +27,19 @@ use serde::{Deserialize, Serialize};
 /// about. A test keeps it in step with what the documents themselves say.
 pub const VERSION: &str = "2026-08-05";
 
-/// Where the authoritative, publishable copy lives.
+/// Where the authoritative copy of the Japanese text lives.
 ///
 /// Shown beside the bundled text: the bundled copy is what was agreed to and
 /// works with no network, and this is the one that stays current.
-pub const URL: &str = "https://isekai.tools/privacy";
+///
+/// `main` rather than a tag, deliberately — the point of the link is to be the
+/// current wording, while the version that was *agreed to* is recorded with the
+/// answer and is the bundled text.
+pub const URL_JA: &str =
+    "https://github.com/seera-networks/ISEKAI-link/blob/main/docs/privacy-policy.ja.md";
+/// The same for the English text.
+pub const URL_EN: &str =
+    "https://github.com/seera-networks/ISEKAI-link/blob/main/docs/privacy-policy.en.md";
 
 /// The policy in Japanese.
 pub const TEXT_JA: &str = include_str!("../../../docs/privacy-policy.ja.md");
@@ -51,6 +59,17 @@ impl Language {
         match self {
             Self::Japanese => TEXT_JA,
             Self::English => TEXT_EN,
+        }
+    }
+
+    /// Where the current copy of *this* rendering lives.
+    ///
+    /// Per language, so following the link does not land on a document in the
+    /// language the reader just switched away from.
+    pub fn url(self) -> &'static str {
+        match self {
+            Self::Japanese => URL_JA,
+            Self::English => URL_EN,
         }
     }
 

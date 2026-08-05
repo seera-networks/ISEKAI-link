@@ -105,7 +105,9 @@ impl ConsentGate {
                     .weak(),
                 );
             }
-            ui.hyperlink_to(privacy::URL, privacy::URL);
+            // The link follows the language on screen, so it does not land
+            // on the document the reader has just switched away from.
+            ui.hyperlink_to(self.language.url(), self.language.url());
             ui.separator();
 
             // The buttons are laid out before the text so they keep their place

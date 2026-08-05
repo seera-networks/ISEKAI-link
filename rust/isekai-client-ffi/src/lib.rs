@@ -200,9 +200,11 @@ pub struct PrivacyPolicy {
     /// not agreement to the next, and comparing this is how a revised policy
     /// gets asked again.
     pub version: String,
-    /// The canonical, always-current copy. The text below is what is shown and
-    /// what works with no network.
-    pub url: String,
+    /// The canonical, always-current copy of each rendering. The text below is
+    /// what is shown and what works with no network; these stay current, and
+    /// are per language so the link matches what is on screen.
+    pub url_ja: String,
+    pub url_en: String,
     pub text_ja: String,
     pub text_en: String,
 }
@@ -212,7 +214,8 @@ pub struct PrivacyPolicy {
 pub fn privacy_policy() -> PrivacyPolicy {
     PrivacyPolicy {
         version: camera_core::privacy::VERSION.to_owned(),
-        url: camera_core::privacy::URL.to_owned(),
+        url_ja: camera_core::privacy::URL_JA.to_owned(),
+        url_en: camera_core::privacy::URL_EN.to_owned(),
         text_ja: camera_core::privacy::TEXT_JA.to_owned(),
         text_en: camera_core::privacy::TEXT_EN.to_owned(),
     }

@@ -49,6 +49,12 @@ struct PrivacyConsentView: View {
         showJapanese ? store.policy.textJa : store.policy.textEn
     }
 
+    /// Follows the language on screen, so the link does not lead to the
+    /// document the reader has just switched away from.
+    private var link: String {
+        showJapanese ? store.policy.urlJa : store.policy.urlEn
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -68,8 +74,8 @@ struct PrivacyConsentView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
 
-            if let url = URL(string: store.policy.url) {
-                Link(store.policy.url, destination: url).font(.caption)
+            if let url = URL(string: link) {
+                Link(link, destination: url).font(.caption)
             }
 
             Divider()
