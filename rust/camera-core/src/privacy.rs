@@ -249,14 +249,38 @@ mod tests {
         assert!(TEXT_EN.contains("Privacy Policy"));
     }
 
-    /// The thing the operator most needs to know before publishing: the draft
-    /// still has fields only they can fill in.
+    /// Nothing is still waiting to be filled in.
+    ///
+    /// This replaces a check that the placeholders were *present*, which passed
+    /// for the wrong reason: the note at the top of the draft mentioned `{{...}}`
+    /// itself, so the check matched the note rather than any unfilled field and
+    /// would have kept passing after every field was filled. Reading the two
+    /// documents as they will be published is the useful direction.
     #[test]
-    fn the_placeholders_are_findable() {
-        assert!(
-            TEXT_JA.contains("{{") && TEXT_EN.contains("{{"),
-            "if the placeholders are gone the review note should be too",
-        );
+    fn nothing_is_left_to_fill_in() {
+        for (name, text) in [("ja", TEXT_JA), ("en", TEXT_EN)] {
+            assert!(
+                !text.contains("{{"),
+                "privacy-policy.{name}.md still has a placeholder in it",
+            );
+        }
+    }
+
+    /// The two renderings have to name the same operator and the same contact.
+    ///
+    /// They are edited separately and by different people, which is exactly how
+    /// one ends up telling a reader to write to an address the other does not
+    /// mention.
+    #[test]
+    fn both_documents_name_the_same_operator() {
+        for (name, text) in [("ja", TEXT_JA), ("en", TEXT_EN)] {
+            assert!(
+                text.contains("info@seera-networks.com"),
+                "privacy-policy.{name}.md does not give the contact address",
+            );
+        }
+        assert!(TEXT_JA.contains("セーラ・ネットワークス株式会社"));
+        assert!(TEXT_EN.contains("SEERA Networks Corporation"));
     }
 
     #[test]

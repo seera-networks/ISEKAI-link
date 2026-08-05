@@ -4,18 +4,17 @@ Version: 2026-08-05
 
 > **Note — remove before publishing.**
 > This was drafted from what the ISEKAI link client code actually sends and
-> stores, and has **not been reviewed by a lawyer**. The `{{...}}` fields can
-> only be filled in by the operator. Have it reviewed against the applicable
-> data-protection law before publishing.
+> stores, and has **not been reviewed by a lawyer**. Have it reviewed against
+> the applicable data-protection law before publishing.
 
 ## 1. Who we are
 
 | | |
 | --- | --- |
-| Operator | {{legal entity}} |
-| Address | {{address}} |
-| Data protection contact | {{role or team}} |
-| Contact | {{email}} |
+| Operator | SEERA Networks Corporation |
+| Address | 6-23-4 2F Jingumae, Shibuya-ku, Tokyo, Japan |
+| Data protection officer | Makiko Kozuka |
+| Contact | info@seera-networks.com |
 
 Referred to below as "we".
 
@@ -99,7 +98,6 @@ and we would rather say so than imply otherwise.
   section 3.1.
 - Otherwise we do not disclose personal information to third parties without
   your consent, except where the law requires it.
-- {{state any international transfer, the destination and its legal basis}}
 
 ## 7. How long we keep it
 
@@ -107,7 +105,7 @@ and we would rather say so than imply otherwise.
 | --- | --- |
 | Account information | until you close your account |
 | Device registrations | until you remove the device |
-| Connection logs | {{retention period}} |
+| Connection logs | for as long as providing the service requires |
 | Video | not retained — relayed only |
 
 ## 8. What stays on your device
@@ -131,11 +129,11 @@ section 1.
 - Traffic between your device and our servers is encrypted with TLS.
 - Device private keys and authentication tokens are stored readable only by
   their owner.
-- {{describe organisational and personnel safeguards}}
 
-## 11. Children
+## 11. Minors
 
-{{state the age limit and any parental-consent requirement}}
+A minor may use the service only with the appropriate involvement of a parent
+or guardian.
 
 ## 12. Changes
 
@@ -145,4 +143,4 @@ significant changes by other means as well.
 
 ## 13. Contact
 
-{{email}}
+info@seera-networks.com
