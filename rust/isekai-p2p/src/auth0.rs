@@ -233,12 +233,58 @@ pub async fn poll_device_login(
     }
 }
 
+/// Why a refresh failed, and whether trying again can help.
+///
+/// The distinction is the difference between backing off and giving up. A
+/// revoked refresh token is never going to work, so retrying it every half
+/// minute is a request Auth0 can only keep refusing — and, worse, it keeps the
+/// operator from being told the one thing they can act on.
+#[derive(Debug)]
+pub enum RefreshError {
+    /// Auth0 rejected the refresh token itself: spent, revoked or expired.
+    /// Only signing in again gets past this.
+    SignInRequired(String),
+    /// Anything else — the network, a 5xx, a body that did not parse. Worth
+    /// trying again.
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SignInRequired(detail) => {
+                write!(f, "the Auth0 session has ended, sign in again: {detail}")
+            }
+            Self::Transient(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
+/// What Auth0 says when the grant itself is the problem rather than the
+/// request. Anything else is treated as worth retrying.
+fn is_terminal(error: &str) -> bool {
+    matches!(
+        error,
+        "invalid_grant" | "unauthorized_client" | "access_denied" | "invalid_client"
+    )
+}
+
 /// Exchange a refresh token for a fresh access token.
 ///
 /// Auth0 returns a new refresh token only when rotation is enabled; the caller
 /// keeps the one it has when this comes back `None`.
-pub async fn refresh(cfg: &Auth0Config, refresh_token: &str) -> anyhow::Result<Auth0Tokens> {
-    let http = client()?;
+pub async fn refresh(cfg: &Auth0Config, refresh_token: &str) -> Result<Auth0Tokens, RefreshError> {
+    let http = client().map_err(RefreshError::Transient)?;
+    refresh_with(&http, cfg, refresh_token).await
+}
+
+async fn refresh_with(
+    http: &reqwest::Client,
+    cfg: &Auth0Config,
+    refresh_token: &str,
+) -> Result<Auth0Tokens, RefreshError> {
     let resp = http
         .post(cfg.url("/oauth/token"))
         .form(&[
@@ -248,18 +294,29 @@ pub async fn refresh(cfg: &Auth0Config, refresh_token: &str) -> anyhow::Result<A
         ])
         .send()
         .await
-        .context("could not reach Auth0 to refresh the access token")?;
+        .context("could not reach Auth0 to refresh the access token")
+        .map_err(RefreshError::Transient)?;
     let status = resp.status();
-    let body = resp.bytes().await.context("refresh response")?;
+    let body = resp
+        .bytes()
+        .await
+        .context("refresh response")
+        .map_err(RefreshError::Transient)?;
     if !status.is_success() {
-        anyhow::bail!(
-            "Auth0 rejected the refresh token, so signing in again is the only way on: {}",
-            describe(&body, status)
-        );
+        return Err(match serde_json::from_slice::<ErrorResponse>(&body) {
+            Ok(e) if is_terminal(&e.error) => {
+                RefreshError::SignInRequired(e.error_description.unwrap_or(e.error))
+            }
+            _ => RefreshError::Transient(anyhow::anyhow!(
+                "Auth0 could not refresh the access token: {}",
+                describe(&body, status)
+            )),
+        });
     }
-    Ok(tokens_from(
-        serde_json::from_slice(&body).context("could not read the refresh response")?,
-    ))
+    serde_json::from_slice(&body)
+        .map(tokens_from)
+        .context("could not read the refresh response")
+        .map_err(RefreshError::Transient)
 }
 
 fn tokens_from(body: TokenResponse) -> Auth0Tokens {
@@ -277,8 +334,21 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// How long any one Auth0 request may take.
+///
+/// Bounded because a caller waits behind it. `RefreshingAuth0Token` holds its
+/// lock across the refresh — deliberately, so two renewals arriving together
+/// produce one refresh — and without a limit a blackholed route to Auth0 would
+/// park every caller on the OS TCP timeout, which is minutes.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// And how long just to get a connection, which fails faster than the whole
+/// request when the network is the problem.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .context("failed to build the Auth0 HTTPS client")
 }
@@ -341,6 +411,12 @@ impl DeviceSignIn {
         self.0.lock().expect("sign-in lock poisoned").state = SignInState::SignedOut;
     }
 
+    /// Report that the session has ended for a reason the operator has to act
+    /// on — a revoked refresh token, say. Offers signing in again, and says why.
+    pub fn failed(&self, reason: impl Into<String>) {
+        self.0.lock().expect("sign-in lock poisoned").state = SignInState::Failed(reason.into());
+    }
+
     /// Whatever a finished sign-in produced, once.
     ///
     /// Returns `None` on every call but the first after a sign-in, so a UI can
@@ -394,15 +470,58 @@ pub struct RefreshingAuth0Token {
     /// Where to write tokens as they change, so a restart does not need another
     /// sign-in.
     store: Option<PathBuf>,
+    /// One client for the life of the source, so refreshes reuse the connection
+    /// instead of building a TLS session every few hours.
+    http: reqwest::Client,
+    /// Set when Auth0 has rejected the refresh token. Every later call fails on
+    /// this without touching the network: the answer cannot change until
+    /// somebody signs in, and the caller retries on a timer.
+    spent: std::sync::atomic::AtomicBool,
+    /// The app's sign-in state, so "sign in again" reaches a person rather than
+    /// only a log line.
+    sign_in: Option<DeviceSignIn>,
 }
 
 impl RefreshingAuth0Token {
     pub fn new(cfg: Auth0Config, tokens: Auth0Tokens, store: Option<PathBuf>) -> Arc<Self> {
+        Self::with_sign_in(cfg, tokens, store, None)
+    }
+
+    /// As [`new`](Self::new), reporting a session that has ended into `sign_in`
+    /// so the UI can offer to sign in again.
+    ///
+    /// Without this the only sign is a warning every renewal, and the first
+    /// thing an operator notices is a camera that has quietly stopped accepting
+    /// viewers — which is the failure this whole change is about.
+    pub fn with_sign_in(
+        cfg: Auth0Config,
+        tokens: Auth0Tokens,
+        store: Option<PathBuf>,
+        sign_in: Option<DeviceSignIn>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             tokens: tokio::sync::Mutex::new(tokens),
             store,
+            http: client().unwrap_or_else(|e| {
+                // Building a client only fails on a broken TLS backend, and the
+                // fallback loses the timeouts — so say which one is in use
+                // rather than leave a hang unexplained later.
+                tracing::warn!("Auth0 client built without timeouts: {e:#}");
+                reqwest::Client::new()
+            }),
+            spent: std::sync::atomic::AtomicBool::new(false),
+            sign_in,
         })
+    }
+
+    /// Record that the session is over: fail fast from now on, and say so where
+    /// the UI will see it.
+    fn give_up(&self, detail: &str) {
+        self.spent.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(sign_in) = &self.sign_in {
+            sign_in.failed(format!("signed out: {detail}"));
+        }
     }
 
     /// Load tokens a previous sign-in persisted.
@@ -420,31 +539,38 @@ impl RefreshingAuth0Token {
     /// as the Endpoint key beside it.
     pub fn save(path: &Path, tokens: &Auth0Tokens) -> anyhow::Result<()> {
         let json = serde_json::to_vec_pretty(tokens)?;
-        std::fs::write(path, json)
-            .with_context(|| format!("failed to write Auth0 tokens at {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        crate::secret::write_secret(path, &json)
+            .with_context(|| format!("failed to write Auth0 tokens at {}", path.display()))
     }
 }
 
 impl Auth0TokenSource for RefreshingAuth0Token {
     fn auth0_token(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + '_>> {
         Box::pin(async move {
+            // Before the lock: once the session is over, every caller can be
+            // told so without queueing behind a refresh that cannot succeed.
+            if self.spent.load(std::sync::atomic::Ordering::Relaxed) {
+                anyhow::bail!("the Auth0 session has ended; sign in again");
+            }
             let mut tokens = self.tokens.lock().await;
             if !tokens.is_stale() {
                 return Ok(tokens.access_token.clone());
             }
             let Some(refresh_token) = tokens.refresh_token.clone() else {
+                self.give_up("the sign-in did not grant `offline_access`");
                 anyhow::bail!(
                     "the Auth0 access token has expired and there is no refresh token \
                      (the login did not grant `offline_access`); sign in again"
                 );
             };
-            let mut renewed = refresh(&self.cfg, &refresh_token).await?;
+            let mut renewed = match refresh_with(&self.http, &self.cfg, &refresh_token).await {
+                Ok(renewed) => renewed,
+                Err(e @ RefreshError::SignInRequired(_)) => {
+                    self.give_up(&e.to_string());
+                    return Err(anyhow::anyhow!(e));
+                }
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            };
             // Auth0 only returns a new refresh token when rotation is enabled;
             // keeping the old one is what makes the next refresh possible.
             if renewed.refresh_token.is_none() {

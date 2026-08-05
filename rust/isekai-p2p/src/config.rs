@@ -150,24 +150,42 @@ async fn issue<T: ControlPlaneTransport>(
 const RENEW_MARGIN: Duration = Duration::from_secs(60);
 /// Never renew more often than this, whatever a server says the TTL is.
 const RENEW_MIN: Duration = Duration::from_secs(30);
-/// Nor less often than this, which is under the shortest TTL the spec
-/// recommends (§5.3 says 5–15 minutes) — so a token of unknown lifetime is
-/// still replaced before the earliest moment it could expire.
-const RENEW_MAX: Duration = Duration::from_secs(240);
+/// How often to renew a token whose lifetime is **not** known.
+///
+/// Under the shortest TTL the spec recommends (§5.3 says 5–15 minutes), so a
+/// token that might be a five-minute one is still replaced before the earliest
+/// moment it could expire. This is a floor for ignorance and nothing else — a
+/// token that *states* its lifetime is renewed against that instead, or a camera
+/// running for weeks would reissue a fifteen-minute token every four minutes for
+/// no reason.
+const RENEW_UNKNOWN: Duration = Duration::from_secs(240);
 
 /// When to renew, given what the Identity API said the token's lifetime is.
 ///
-/// `None` — the caller supplied a token rather than issuing one, so its
-/// lifetime is not known here — takes the longest interval that is still safe
-/// rather than guessing.
+/// `None` — the caller supplied a token rather than issuing one, so its lifetime
+/// is not known here — takes the interval that is safe without knowing.
 fn renew_delay(expires_in: Option<i64>) -> Duration {
     let Some(expires_in) = expires_in else {
-        return RENEW_MAX;
+        return RENEW_UNKNOWN;
     };
     let lifetime = Duration::from_secs(expires_in.max(0) as u64);
-    lifetime
-        .saturating_sub(RENEW_MARGIN)
-        .clamp(RENEW_MIN, RENEW_MAX)
+    // No upper bound: the peer said how long it is good for, and renewing more
+    // often than that is traffic nobody asked for. The lower bound stops a
+    // lapsed or absurdly short TTL turning into a busy loop.
+    lifetime.saturating_sub(RENEW_MARGIN).max(RENEW_MIN)
+}
+
+/// How long to wait after `failures` consecutive renewal failures.
+///
+/// Doubling from [`RENEW_MIN`], capped at [`RENEW_UNKNOWN`]. Some failures never
+/// stop being failures — a revoked refresh token means "sign in again", and
+/// nothing this loop does will change that — so retrying every thirty seconds
+/// forever is a request the Identity API can never satisfy, repeated for as long
+/// as the camera is on. Backing off keeps the transient case fast and stops the
+/// permanent one being a stream of traffic.
+fn retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(8);
+    (RENEW_MIN * 2u32.saturating_pow(doublings)).min(RENEW_UNKNOWN)
 }
 
 /// Keep `proxy`'s Endpoint Token current for as long as the returned guard
@@ -184,12 +202,14 @@ pub fn spawn_token_renewal(
     expires_in: Option<i64>,
 ) -> TokenRenewal {
     let mut delay = renew_delay(expires_in);
+    let mut failures = 0u32;
     TokenRenewal(tokio::spawn(async move {
         loop {
             tokio::time::sleep(delay).await;
             match issue_endpoint_token(&cfg).await {
                 Ok(token) => {
                     proxy.set_endpoint_token(&token.endpoint_token);
+                    failures = 0;
                     delay = renew_delay(Some(token.expires_in));
                     tracing::debug!(
                         expires_in = token.expires_in,
@@ -198,8 +218,18 @@ pub fn spawn_token_renewal(
                     );
                 }
                 Err(e) => {
-                    delay = RENEW_MIN;
+                    failures += 1;
+                    delay = retry_delay(failures);
+                    // A failure here is not the end of the session — the token
+                    // in force keeps working until it expires — but it is the
+                    // beginning of one, so it is worth saying loudly once the
+                    // retries start piling up. Where the cause is "sign in
+                    // again", the source says so and the app's sign-in state has
+                    // already been marked (see `auth0::RefreshingAuth0Token`);
+                    // there is nothing this loop can do about it but keep asking
+                    // more and more slowly.
                     tracing::warn!(
+                        failures,
                         retry_in = ?delay,
                         "could not renew the endpoint token; the session keeps working \
                          until the current one expires: {e:#}",
@@ -223,14 +253,8 @@ impl Drop for TokenRenewal {
 }
 
 fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
-    std::fs::write(path, contents)
-        .with_context(|| format!("failed to write key at {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::secret::write_secret(path, contents.as_bytes())
+        .with_context(|| format!("failed to write key at {}", path.display()))
 }
 
 #[cfg(test)]
@@ -256,15 +280,24 @@ mod tests {
         assert!(renew_delay(None) < Duration::from_secs(300));
     }
 
-    /// A short or already-lapsed TTL must not turn into a busy loop against the
-    /// Identity API, and a long one must not push the renewal past the point
-    /// where an unknown lifetime would have been renewed anyway.
+    /// A stated lifetime is believed, however long. Clamping it to the
+    /// unknown-lifetime interval would have a camera running for weeks reissue
+    /// a fifteen-minute token every four minutes — four times the traffic the
+    /// token's own expiry asks for, forever.
     #[test]
-    fn the_interval_stays_between_its_bounds() {
+    fn a_stated_lifetime_is_not_shortened_to_the_unknown_one() {
+        assert_eq!(renew_delay(Some(900)), Duration::from_secs(840));
+        assert_eq!(renew_delay(Some(86_400)), Duration::from_secs(86_340));
+        assert!(renew_delay(Some(900)) > RENEW_UNKNOWN);
+    }
+
+    /// A lapsed or absurdly short TTL must not turn into a busy loop against
+    /// the Identity API.
+    #[test]
+    fn a_short_lifetime_still_has_a_floor() {
         assert_eq!(renew_delay(Some(0)), RENEW_MIN);
         assert_eq!(renew_delay(Some(-1)), RENEW_MIN);
         assert_eq!(renew_delay(Some(60)), RENEW_MIN);
-        assert_eq!(renew_delay(Some(86_400)), RENEW_MAX);
     }
 
     #[test]

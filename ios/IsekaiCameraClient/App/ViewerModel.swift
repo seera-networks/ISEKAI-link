@@ -253,7 +253,11 @@ final class ViewerModel: ObservableObject {
                 // nothing behind it, so the core keeps using it and the session
                 // ends with it, as it always did.
                 let provider = self.auth.isSignedIn
-                    ? Auth0TokenBridge(auth: self.auth, initial: token)
+                    ? Auth0TokenBridge(
+                        auth: self.auth,
+                        initial: token,
+                        expiresAt: self.auth.expiresAt
+                    )
                     : nil
                 self.startConnecting(
                     config: config,

@@ -286,12 +286,15 @@ impl MyApp {
     fn with_stored_auth0(mut self) -> Self {
         let path = std::path::Path::new(&self.auth0_store_path);
         if let Ok(tokens) = camera_core::auth0::RefreshingAuth0Token::load(path) {
-            self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::new(
+            self.auth0_login = camera_core::auth0::DeviceSignIn::restored();
+            self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::with_sign_in(
                 camera_core::auth0::Auth0Config::default(),
                 tokens,
                 Some(path.to_path_buf()),
+                // So a refresh token that has been revoked since shows up as
+                // "sign in again" rather than only as a warning every renewal.
+                Some(self.auth0_login.clone()),
             ));
-            self.auth0_login = camera_core::auth0::DeviceSignIn::restored();
         }
         self
     }
@@ -299,10 +302,11 @@ impl MyApp {
     /// Move a finished sign-in onto `self`, which the UI thread owns.
     fn take_finished_sign_in(&mut self) {
         if let Some(tokens) = self.auth0_login.take_tokens() {
-            self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::new(
+            self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::with_sign_in(
                 camera_core::auth0::Auth0Config::default(),
                 tokens,
                 Some(std::path::PathBuf::from(&self.auth0_store_path)),
+                Some(self.auth0_login.clone()),
             ));
         }
     }

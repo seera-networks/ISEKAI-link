@@ -7,6 +7,12 @@
 e2e-server.pem
 e2e-client.pem
 
+# Auth0 tokens the camera apps store after a device sign-in. The refresh token
+# in here mints access tokens for the signed-in account until it is revoked, so
+# it is the same kind of secret as the key above and is written the same way
+# (0600, beside the key). Never commit.
+*-auth0.json
+
 # iOS build outputs. `ios/build-rust.sh` writes the bindings and the
 # xcframework; `xcodegen generate` writes the project and its Info.plist. Only
 # ios/project.yml and ios/IsekaiCameraClient/App are tracked.

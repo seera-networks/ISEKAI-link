@@ -226,7 +226,14 @@ impl camera_core::Auth0TokenSource for SwiftAuth0Tokens {
         let token = self.0.current_token();
         Box::pin(async move {
             if token.is_empty() {
-                anyhow::bail!("the app has no Auth0 token to renew with; sign in again");
+                // Expected once per access-token expiry: the app withholds a
+                // token it knows is spent and refreshes behind this call, so
+                // the retry a few seconds later gets the new one. Worth saying
+                // plainly, because the alternative — handing over the expired
+                // token — turns this into an opaque 401 from the Identity API.
+                anyhow::bail!(
+                    "the app is refreshing its Auth0 token; the next renewal will use it"
+                );
             }
             Ok(token)
         })

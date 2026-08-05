@@ -23,16 +23,26 @@ final class Auth0TokenBridge: Auth0TokenProvider, @unchecked Sendable {
     /// rather than one each.
     private var refreshing = false
 
+    /// When `cached` stops being usable. Tracked so an expired token is
+    /// withheld rather than handed over: sending one the Identity API is
+    /// certain to reject turns every expiry into an opaque 401 in the logs,
+    /// whereas saying "not yet" produces one clear line and the same retry.
+    private var expiresAt: Date?
+
     /// `initial` is the token the connect itself used, so the first renewal has
     /// something to work with before any refresh has run.
-    init(auth: AuthStore, initial: String) {
+    init(auth: AuthStore, initial: String, expiresAt: Date?) {
         self.auth = auth
         cached = initial
+        self.expiresAt = expiresAt
     }
 
     func currentToken() -> String {
         lock.lock()
-        let token = cached
+        // An expired token is worth less than nothing — it guarantees a failed
+        // renewal — so hand back a token only while it is still good.
+        let usable = expiresAt.map { Date() < $0 } ?? true
+        let token = usable ? cached : ""
         let alreadyRefreshing = refreshing
         if !alreadyRefreshing {
             refreshing = true
@@ -46,9 +56,11 @@ final class Auth0TokenBridge: Auth0TokenProvider, @unchecked Sendable {
                 // so this is cheap in the common case and only reaches Auth0
                 // when the token has actually gone stale.
                 let renewed = try? await self.auth.accessToken()
+                let renewedExpiry = await self.auth.expiresAt
                 self.lock.lock()
                 if let renewed, !renewed.isEmpty {
                     self.cached = renewed
+                    self.expiresAt = renewedExpiry
                 }
                 self.refreshing = false
                 self.lock.unlock()

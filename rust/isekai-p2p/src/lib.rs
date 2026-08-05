@@ -22,6 +22,7 @@ pub mod auth0;
 pub mod config;
 pub mod initiator;
 pub mod listener;
+mod secret;
 
 pub use auth::{Auth0TokenSource, StaticAuth0Token};
 pub use config::{fetch_relay_certificate, issue_endpoint_token, load_or_generate_key, P2pConfig};
