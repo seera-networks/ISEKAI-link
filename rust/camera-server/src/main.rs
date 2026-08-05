@@ -594,6 +594,10 @@ struct MyApp {
 
     // ログ表示用ローカルコピー
     log: String,
+
+    /// The privacy policy, until it has been agreed to. Nothing else in the
+    /// window is reachable while it has not been.
+    consent: camera_ui::ConsentGate,
 }
 
 use camera_core::auth0::SignInState as Auth0State;
@@ -637,6 +641,7 @@ impl MyApp {
             texture: None,
             is_streaming,
             log: "Ready.".to_string(),
+            consent: camera_ui::ConsentGate::new("camera-server"),
         }
         .with_stored_auth0()
     }
@@ -1286,6 +1291,12 @@ impl Drop for MyApp {
 
 impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Before anything else, including the frame plumbing below: using the
+        // service means an account and personal information, so this is the
+        // first thing a new installation sees and the only thing it can act on.
+        if !self.consent.show(ui) {
+            return;
+        }
         let ctx = ui.ctx().clone();
         // ✅ 新しいフレーム受信（最新のみ使う）
         // Drain first, convert once: converting inside the drain loop livelocks

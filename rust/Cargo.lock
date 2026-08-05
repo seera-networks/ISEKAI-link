@@ -1044,6 +1044,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "camera-core",
+ "camera-ui",
  "eframe",
  "egui",
  "egui_plot",
@@ -1068,8 +1069,10 @@ dependencies = [
  "msquic-async",
  "openssl",
  "rcgen",
+ "serde",
  "serde_json",
  "tempfile",
+ "time",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1083,6 +1086,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "camera-core",
+ "camera-ui",
  "channel-masque",
  "eframe",
  "egui",
@@ -1105,6 +1109,15 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "camera-ui"
+version = "0.1.0"
+dependencies = [
+ "camera-core",
+ "egui",
+ "tracing",
 ]
 
 [[package]]

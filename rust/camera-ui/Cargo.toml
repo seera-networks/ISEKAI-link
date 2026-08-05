@@ -1,0 +1,13 @@
+[package]
+name = "camera-ui"
+version = "0.1.0"
+edition = "2021"
+
+# The pieces of interface both desktop apps show. `camera-core` is deliberately
+# free of egui so it builds and tests on its own, and the two GUIs should not
+# each carry their own copy of a screen that has to say the same thing — this is
+# where that kind of screen lives.
+[dependencies]
+camera-core = { workspace = true }
+egui = { workspace = true }
+tracing = { workspace = true }

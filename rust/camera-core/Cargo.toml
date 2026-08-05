@@ -17,6 +17,10 @@ isekai-link-utils = { workspace = true }
 isekai-p2p = { workspace = true }
 # Dev self-signed certificate for the video ("sample" ALPN) QUIC listener.
 rcgen = { workspace = true }
+# The privacy policy and the record of agreeing to it (`privacy`).
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
 
 # Windows only, and only to package that dev certificate as PKCS#12: msquic's
 # Windows credential path imports a PFX blob, and its no-PFX fallback goes
