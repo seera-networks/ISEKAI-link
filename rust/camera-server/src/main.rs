@@ -708,6 +708,7 @@ impl MyApp {
                 register,
                 device_name: Some("camera-server".to_string()),
                 token_ttl: None,
+                auth0: None,
                 key,
             };
             // Automatic, since the proxy has already checked that a grant

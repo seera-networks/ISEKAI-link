@@ -658,6 +658,7 @@ impl MyApp {
             register: self.register,
             device_name: Some("camera-client".to_string()),
             token_ttl: None,
+            auth0: None,
             key,
         })
     }

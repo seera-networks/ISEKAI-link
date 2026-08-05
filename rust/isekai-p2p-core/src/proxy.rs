@@ -12,6 +12,7 @@
 //! stack.
 
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 use crate::endpoint::EndpointKey;
@@ -414,7 +415,16 @@ pub struct PeerConnection {
 pub struct ProxyClient<T> {
     transport: T,
     key: EndpointKey,
-    endpoint_token: String,
+    /// Shared so it can be replaced under a live client.
+    ///
+    /// An Endpoint Token lasts minutes (spec §5.3 recommends 5–15), while the
+    /// client outlives it by hours — so it has to be renewed in place. Rebuilding
+    /// the client instead would rebuild `transport`, and for the MASQUE transport
+    /// that means tearing down the tunnel every relay leg is running over.
+    ///
+    /// Every clone of this client sees a replacement, which is the point: the
+    /// sessions hand clones around and there is only ever one current token.
+    endpoint_token: Arc<RwLock<String>>,
 }
 
 impl<T: ControlPlaneTransport> ProxyClient<T> {
@@ -424,8 +434,31 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         Self {
             transport,
             key,
-            endpoint_token: endpoint_token.into(),
+            endpoint_token: Arc::new(RwLock::new(endpoint_token.into())),
         }
+    }
+
+    /// The Endpoint Token in force right now.
+    ///
+    /// The one source of truth for it: a relay leg opened later has to carry the
+    /// current token, not the one the session started with.
+    pub fn endpoint_token(&self) -> String {
+        self.endpoint_token
+            .read()
+            .expect("endpoint token lock poisoned")
+            .clone()
+    }
+
+    /// Use `endpoint_token` from now on, on this client and every clone of it.
+    ///
+    /// The next request carries it; requests already in flight carry the old one
+    /// and are not retried, which is why renewal happens before expiry rather
+    /// than in response to a 401.
+    pub fn set_endpoint_token(&self, endpoint_token: impl Into<String>) {
+        *self
+            .endpoint_token
+            .write()
+            .expect("endpoint token lock poisoned") = endpoint_token.into();
     }
 
     /// `POST /v1/peer-listeners` (spec §8.3.1).
@@ -782,11 +815,13 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
 
     fn auth_headers(&self, method: &str, path: &str, body: &[u8]) -> Vec<(String, String)> {
         let pop = pop::sign_request(&self.key, method, path, body);
+        let token = self
+            .endpoint_token
+            .read()
+            .expect("endpoint token lock poisoned")
+            .clone();
         let mut headers = vec![
-            (
-                "authorization".to_owned(),
-                format!("Bearer {}", self.endpoint_token),
-            ),
+            ("authorization".to_owned(), format!("Bearer {token}")),
             ("content-type".to_owned(), "application/json".to_owned()),
         ];
         for (name, value) in pop.as_pairs() {

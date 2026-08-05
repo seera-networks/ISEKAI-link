@@ -433,6 +433,7 @@ fn directory_config(
         register: config.register,
         device_name: Some("ios-camera-client".to_owned()),
         token_ttl: None,
+        auth0: None,
         key: EndpointKey::from_pkcs8_pem(endpoint_key_pem)
             .map_err(|e| ClientError::InvalidKey(e.to_string()))?,
     })
@@ -623,6 +624,7 @@ pub fn connect(
         register: config.register,
         device_name: Some("ios-camera-client".to_owned()),
         token_ttl: None,
+        auth0: None,
         key,
     };
 

@@ -31,7 +31,7 @@ use isekai_p2p_core::proxy::{
 use isekai_p2p_core::transport::MasqueH3Transport;
 use tokio::sync::{mpsc, watch};
 
-use crate::config::{issue_endpoint_token, P2pConfig};
+use crate::config::{issue_endpoint_token, spawn_token_renewal, P2pConfig, TokenRenewal};
 
 /// How long [`ListenerSession::close`] waits for the proxy to take the listener
 /// down before giving up and letting the lease do it.
@@ -49,7 +49,6 @@ pub struct ListenerSession {
     /// This Endpoint's id.
     pub endpoint_id: String,
     proxy_url: String,
-    endpoint_token: String,
     key: EndpointKey,
     forward_to: SocketAddr,
     proxy: ProxyClient<MasqueH3Transport>,
@@ -65,6 +64,9 @@ pub struct ListenerSession {
     /// hand — must keep seeing updates across rebinds. So the leg's watch is
     /// forwarded into this one rather than handed out directly.
     observed_tx: watch::Sender<Option<ObservedAddress>>,
+    /// Replaces the Endpoint Token before it expires, for as long as this
+    /// session lives. Held, not read.
+    _renewal: TokenRenewal,
 }
 
 /// What a listener does when a connection is waiting for it.
@@ -237,18 +239,21 @@ impl ListenerSession {
         ttl: Option<u64>,
         opts: RelayOptions,
     ) -> anyhow::Result<Self> {
-        let endpoint_token = endpoint_token.to_owned();
         let proxy = ProxyClient::new(
             MasqueH3Transport::connect(&cfg.proxy_url)?,
             cfg.key.clone(),
-            endpoint_token.clone(),
+            endpoint_token,
         );
         let listener = proxy.create_peer_listener(&cfg.protocol, ttl).await?;
+        // A listener outlives its Endpoint Token by hours. Without this the
+        // token lapses after minutes and every proxy call fails — the signaling
+        // poll first, and then the bind that would have admitted a new viewer.
+        // The caller's token has no stated lifetime here, hence `None`.
+        let renewal = spawn_token_renewal(cfg.clone(), proxy.clone(), None);
         Ok(Self {
             listener_id: listener.listener_id,
             endpoint_id: cfg.endpoint_id(),
             proxy_url: cfg.proxy_url.clone(),
-            endpoint_token,
             key: cfg.key.clone(),
             forward_to,
             proxy,
@@ -256,6 +261,7 @@ impl ListenerSession {
             binds: std::collections::HashMap::new(),
             opts,
             observed_tx: watch::channel(None).0,
+            _renewal: renewal,
         })
     }
 
@@ -307,7 +313,9 @@ impl ListenerSession {
         }
         let session = open_bind_session(
             &self.proxy_url,
-            &self.endpoint_token,
+            // The current one, not the one the session started with: a leg
+            // opened an hour in carries a token issued minutes ago.
+            &self.proxy.endpoint_token(),
             &self.key,
             connection_id,
             self.forward_to,

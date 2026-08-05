@@ -17,10 +17,12 @@
 //! For convenience the `isekai-p2p-core` types these APIs hand back or take are
 //! re-exported under [`agent`].
 
+pub mod auth;
 pub mod config;
 pub mod initiator;
 pub mod listener;
 
+pub use auth::{Auth0TokenSource, StaticAuth0Token};
 pub use config::{fetch_relay_certificate, issue_endpoint_token, load_or_generate_key, P2pConfig};
 pub use initiator::{InitiatorSession, PeerDirectory};
 pub use listener::{

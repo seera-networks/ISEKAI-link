@@ -63,6 +63,7 @@ fn config(identity_url: String, register: bool) -> P2pConfig {
         register,
         device_name: Some("test-device".into()),
         token_ttl: Some(900),
+        auth0: None,
         key: EndpointKey::generate(),
     }
 }

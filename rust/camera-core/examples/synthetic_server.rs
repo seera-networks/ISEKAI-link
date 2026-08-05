@@ -249,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
         register,
         device_name: Some("synthetic-server".to_owned()),
         token_ttl: None,
+        auth0: None,
         key: load_or_generate_key(key_path)?,
     };
 

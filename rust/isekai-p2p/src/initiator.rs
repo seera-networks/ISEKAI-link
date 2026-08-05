@@ -6,6 +6,7 @@
 //! carries it to the target's bound socket.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -14,7 +15,7 @@ use isekai_p2p_core::observed::ObservedAddressWatch;
 use isekai_p2p_core::proxy::{Candidate, Grant, PeerConnection, ProxyClient, ReachableListener};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
-use crate::config::{issue_endpoint_token, P2pConfig};
+use crate::config::{issue_endpoint_token, spawn_token_renewal, P2pConfig, TokenRenewal};
 
 /// An initiator-side P2P session. Holds the relay connect leg open until dropped
 /// or [`close`](InitiatorSession::close)d.
@@ -28,6 +29,10 @@ pub struct InitiatorSession {
     /// Kept so [`close`](Self::close) can tell the proxy the connection is
     /// over. Nothing else here needs the control plane once the leg is up.
     proxy: ProxyClient<MasqueH3Transport>,
+    /// Replaces the Endpoint Token before it expires. Shared with the
+    /// [`PeerDirectory`] this was opened over, when there was one, so there is
+    /// one renewal loop however many handles are holding the same client.
+    _renewal: Arc<TokenRenewal>,
 }
 
 /// How long [`InitiatorSession::close`] waits to report the connection closed.
@@ -55,7 +60,9 @@ enum Authorization<'a> {
 /// id and a capability off someone else's screen.
 pub struct PeerDirectory {
     proxy: ProxyClient<MasqueH3Transport>,
-    endpoint_token: String,
+    /// Handed to a session opened over this directory, so the two share one
+    /// renewal rather than running one each against the same client.
+    renewal: Arc<TokenRenewal>,
 }
 
 impl PeerDirectory {
@@ -67,20 +74,23 @@ impl PeerDirectory {
 
     /// Open with a token already in hand.
     pub fn open_with_token(cfg: &P2pConfig, endpoint_token: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            proxy: ProxyClient::new(
-                MasqueH3Transport::connect(&cfg.proxy_url)?,
-                cfg.key.clone(),
-                endpoint_token,
-            ),
-            endpoint_token: endpoint_token.to_owned(),
-        })
+        let proxy = ProxyClient::new(
+            MasqueH3Transport::connect(&cfg.proxy_url)?,
+            cfg.key.clone(),
+            endpoint_token,
+        );
+        let renewal = Arc::new(spawn_token_renewal(cfg.clone(), proxy.clone(), None));
+        Ok(Self { proxy, renewal })
     }
 
-    /// The token this was opened with, to pass to a connect so the app does not
+    /// The Endpoint Token in force, to pass to a connect so the app does not
     /// issue a second one.
-    pub fn endpoint_token(&self) -> &str {
-        &self.endpoint_token
+    ///
+    /// A `String` rather than a borrow because it is replaced as it expires —
+    /// what this returns is a snapshot, and a caller holding it for minutes is
+    /// holding a stale token.
+    pub fn endpoint_token(&self) -> String {
+        self.proxy.endpoint_token()
     }
 
     /// Listeners this Endpoint may connect to now (spec §8.10).
@@ -125,7 +135,8 @@ impl PeerDirectory {
         InitiatorSession::connect_over(
             cfg,
             &self.proxy,
-            &self.endpoint_token,
+            &self.endpoint_token(),
+            Some(Arc::clone(&self.renewal)),
             Authorization::Grant,
             listener_id,
             candidates,
@@ -305,6 +316,8 @@ impl InitiatorSession {
             cfg,
             &proxy,
             endpoint_token,
+            // This opened the client, so nothing else is renewing its token.
+            None,
             auth,
             listener_id,
             candidates,
@@ -323,6 +336,9 @@ impl InitiatorSession {
         cfg: &P2pConfig,
         proxy: &ProxyClient<MasqueH3Transport>,
         endpoint_token: &str,
+        // The caller's renewal when it has one, so `proxy`'s token is not being
+        // replaced by two loops at once. `None` starts one here.
+        renewal: Option<Arc<TokenRenewal>>,
         auth: Authorization<'_>,
         listener_id: &str,
         candidates: &[Candidate],
@@ -354,11 +370,14 @@ impl InitiatorSession {
             opts,
         )
         .await?;
+        let renewal = renewal
+            .unwrap_or_else(|| Arc::new(spawn_token_renewal(cfg.clone(), proxy.clone(), None)));
         Ok(Self {
             local_addr: handle.local_addr,
             connection,
             relay: handle,
             proxy: proxy.clone(),
+            _renewal: renewal,
         })
     }
 

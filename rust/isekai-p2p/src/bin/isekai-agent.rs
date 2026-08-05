@@ -347,6 +347,7 @@ async fn token(a: Token) -> anyhow::Result<()> {
         register: a.register,
         device_name: a.device_name,
         token_ttl: a.ttl,
+        auth0: None,
         key: load_key(&a.key)?,
     };
     let token = issue_endpoint_token(&cfg).await?;
@@ -388,6 +389,7 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
         register: false,
         device_name: None,
         token_ttl: None,
+        auth0: None,
         key: load_key(&a.key)?,
     };
     let candidates = parse_candidates(&a.candidate)?;
