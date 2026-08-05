@@ -79,6 +79,14 @@ Linux)
               done
     done
 
+    # Symbols are most of what a Rust release binary weighs, and a bundle that
+    # already carries a hundred libraries does not need them too. What is
+    # stripped here is still in `target/release` on the machine that built it.
+    strip --strip-all "${stage}"/bin/* 2>/dev/null || true
+    # `--strip-unneeded` on the libraries: `--strip-all` on a shared object
+    # removes the dynamic symbols it is loaded by.
+    find "${stage}/lib" -type f -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true
+
     for app in "${apps[@]}"; do
         cat > "${stage}/${app}" <<LAUNCHER
 #!/bin/sh
@@ -138,6 +146,22 @@ Darwin)
         # `@executable_path` is the binary's own directory, so this resolves to
         # the bundle's lib/ wherever the bundle is unpacked.
         install_name_tool -add_rpath "@executable_path/../lib" "${stage}/bin/${app}" 2>/dev/null || true
+    done
+
+    # `-x` keeps the globally visible symbols, which a dylib is loaded by;
+    # anything stronger makes the bundle unloadable rather than smaller.
+    strip -x "${stage}"/bin/* "${stage}"/lib/*.dylib 2>/dev/null || true
+
+    # Last, and not optional on Apple silicon: editing a Mach-O invalidates its
+    # signature, and an arm64 binary with a broken signature is killed on
+    # launch rather than run. `install_name_tool` and `strip` both edit, so
+    # everything touched above is signed again here — ad-hoc, which is what an
+    # unsigned local build carries anyway.
+    for f in "${stage}"/bin/* "${stage}"/lib/*.dylib; do
+        codesign --force --sign - "${f}" >/dev/null 2>&1 || true
+    done
+
+    for app in "${apps[@]}"; do
         # A one-line launcher only so the bundle is started the same way on both
         # platforms; nothing has to be set for it to work.
         cat > "${stage}/${app}" <<LAUNCHER
