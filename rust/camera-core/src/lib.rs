@@ -33,6 +33,9 @@ pub use video::{
 /// Re-exports of the P2P types the camera apps build on.
 pub use isekai_p2p::agent::{CertBundle, EndpointToken, ObservedAddressWatch, RelayOptions};
 pub use isekai_p2p::{issue_endpoint_token, load_or_generate_key, InitiatorSession, P2pConfig};
+/// Signing in to Auth0 and staying signed in — what keeps a camera's Endpoint
+/// Token renewable for longer than one access token's lifetime.
+pub use isekai_p2p::{auth0, Auth0TokenSource, StaticAuth0Token};
 
 /// Open the msquic registration an application should run everything on.
 ///

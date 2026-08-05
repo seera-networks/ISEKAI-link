@@ -3039,6 +3039,7 @@ dependencies = [
  "base64",
  "isekai-p2p-core",
  "p256",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

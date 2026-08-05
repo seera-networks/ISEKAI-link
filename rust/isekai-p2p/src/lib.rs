@@ -18,6 +18,7 @@
 //! re-exported under [`agent`].
 
 pub mod auth;
+pub mod auth0;
 pub mod config;
 pub mod initiator;
 pub mod listener;

@@ -20,6 +20,8 @@ isekai-p2p-core = { workspace = true, features = ["msquic"] }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# The Auth0 device-authorization flow and refresh (`auth`).
+reqwest = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }

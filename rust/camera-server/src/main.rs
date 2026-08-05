@@ -551,6 +551,16 @@ struct MyApp {
     identity_url: String,
     proxy_url: String,
     auth0_token: String,
+    /// Where a device sign-in's tokens are kept, so a restart does not need
+    /// another one. Beside the Endpoint key and guarded the same way.
+    auth0_store_path: String,
+    /// The device sign-in, and what to show the operator while it runs.
+    auth0_login: Arc<Mutex<Auth0Login>>,
+    /// Set once tokens exist, from a sign-in or from `auth0_store_path`. This is
+    /// what keeps the session alive past the access token's few hours: the
+    /// Endpoint Token is reissued every few minutes and each issue needs a
+    /// current Auth0 token.
+    auth0_source: Option<Arc<camera_core::auth0::RefreshingAuth0Token>>,
     key_path: String,
     protocol: String,
     register: bool,
@@ -586,6 +596,28 @@ struct MyApp {
     log: String,
 }
 
+/// The device sign-in as the UI sees it.
+#[derive(Default)]
+struct Auth0Login {
+    state: Auth0State,
+    /// Left here by the polling task for the UI thread to pick up — see
+    /// [`MyApp::take_finished_sign_in`].
+    tokens: Option<camera_core::auth0::Auth0Tokens>,
+}
+
+#[derive(Default, Clone)]
+enum Auth0State {
+    #[default]
+    SignedOut,
+    /// Showing the operator what to type, and where.
+    Waiting {
+        user_code: String,
+        url: String,
+    },
+    SignedIn,
+    Failed(String),
+}
+
 impl MyApp {
     fn new(
         reg: Arc<msquic_async::Registration>,
@@ -603,6 +635,10 @@ impl MyApp {
             identity_url: "https://identity.isekai.tools:9443".to_string(),
             proxy_url: "https://tokyo.link.isekai.tools:8443".to_string(),
             auth0_token: String::new(),
+            auth0_store_path: "camera-server-auth0.json".to_string(),
+            auth0_login: Arc::new(Mutex::new(Auth0Login::default())),
+            // Filled in below from whatever a previous sign-in left behind.
+            auth0_source: None,
             key_path: "camera-server-endpoint.pem".to_string(),
             protocol: "isekai-validator-v1".to_string(),
             register: true,
@@ -621,6 +657,76 @@ impl MyApp {
             texture: None,
             is_streaming,
             log: "Ready.".to_string(),
+        }
+        .with_stored_auth0()
+    }
+
+    /// Pick up the tokens a previous sign-in left, so a camera that has been
+    /// signed in once comes back up signed in.
+    ///
+    /// A missing or unreadable file is the normal first-run state, not an error
+    /// to report: the operator signs in and it appears.
+    fn with_stored_auth0(mut self) -> Self {
+        let path = std::path::Path::new(&self.auth0_store_path);
+        if let Ok(tokens) = camera_core::auth0::RefreshingAuth0Token::load(path) {
+            self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::new(
+                camera_core::auth0::Auth0Config::default(),
+                tokens,
+                Some(path.to_path_buf()),
+            ));
+            self.auth0_login.lock().unwrap().state = Auth0State::SignedIn;
+        }
+        self
+    }
+
+    /// Start the device authorization grant, and keep the UI told about it.
+    ///
+    /// The operator types a short code into a browser on any device; this polls
+    /// until that lands. What comes back includes a refresh token, which is what
+    /// makes the sign-in last beyond the access token's few hours.
+    fn sign_in_to_auth0(&mut self) {
+        let login = Arc::clone(&self.auth0_login);
+        let store = std::path::PathBuf::from(&self.auth0_store_path);
+        tokio::spawn(async move {
+            let cfg = camera_core::auth0::Auth0Config::default();
+            let started = match camera_core::auth0::start_device_login(&cfg).await {
+                Ok(started) => started,
+                Err(e) => {
+                    login.lock().unwrap().state = Auth0State::Failed(format!("{e:#}"));
+                    return;
+                }
+            };
+            login.lock().unwrap().state = Auth0State::Waiting {
+                user_code: started.user_code.clone(),
+                url: started.verification_uri_complete.clone(),
+            };
+            match camera_core::auth0::poll_device_login(&cfg, &started).await {
+                Ok(tokens) => {
+                    if let Err(e) = camera_core::auth0::RefreshingAuth0Token::save(&store, &tokens)
+                    {
+                        tracing::warn!("could not persist the Auth0 tokens: {e:#}");
+                    }
+                    let mut login = login.lock().unwrap();
+                    login.tokens = Some(tokens);
+                    login.state = Auth0State::SignedIn;
+                }
+                Err(e) => login.lock().unwrap().state = Auth0State::Failed(format!("{e:#}")),
+            }
+        });
+    }
+
+    /// Move a finished sign-in onto `self`, which the UI thread owns.
+    ///
+    /// The polling task cannot build the source itself — it has no `&mut self` —
+    /// so it leaves the tokens behind and this picks them up on the next frame.
+    fn take_finished_sign_in(&mut self) {
+        let tokens = self.auth0_login.lock().unwrap().tokens.take();
+        if let Some(tokens) = tokens {
+            self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::new(
+                camera_core::auth0::Auth0Config::default(),
+                tokens,
+                Some(std::path::PathBuf::from(&self.auth0_store_path)),
+            ));
         }
     }
 
@@ -687,6 +793,13 @@ impl MyApp {
         let identity_url = self.identity_url.clone();
         let proxy_url = self.proxy_url.clone();
         let auth0_token = self.auth0_token.clone();
+        // The refreshing source when the operator has signed in, which is what
+        // lets the session outlive one access token. Without it the pasted token
+        // is all there is, and renewal stops when it expires.
+        let auth0 = self
+            .auth0_source
+            .clone()
+            .map(|s| s as Arc<dyn camera_core::Auth0TokenSource>);
         let protocol = self.protocol.clone();
         let register = self.register;
         let key_path = self.key_path.clone();
@@ -708,7 +821,7 @@ impl MyApp {
                 register,
                 device_name: Some("camera-server".to_string()),
                 token_ttl: None,
-                auth0: None,
+                auth0,
                 key,
             };
             // Automatic, since the proxy has already checked that a grant
@@ -940,13 +1053,69 @@ impl MyApp {
         };
         field(ui, "Identity URL:", &mut self.identity_url, false);
         field(ui, "Proxy URL:   ", &mut self.proxy_url, false);
-        field(ui, "Auth0 token: ", &mut self.auth0_token, true);
+        self.auth0_ui(ui, enabled);
         field(ui, "Key path:    ", &mut self.key_path, false);
         field(ui, "Protocol:    ", &mut self.protocol, false);
         ui.add_enabled(
             enabled,
             egui::Checkbox::new(&mut self.register, "Register endpoint on open"),
         );
+    }
+
+    /// Signing in, and the pasted token that used to be the only way.
+    ///
+    /// The paste is kept because it is the only thing that works without a
+    /// browser anywhere in reach — but it is the short-lived option now: an
+    /// access token lasts hours and the Endpoint Token it issues lasts minutes,
+    /// so a pasted token stops the camera admitting new viewers when it expires.
+    /// Signing in is what makes that stop happening.
+    fn auth0_ui(&mut self, ui: &mut egui::Ui, enabled: bool) {
+        self.take_finished_sign_in();
+        let state = self.auth0_login.lock().unwrap().state.clone();
+        ui.horizontal(|ui| {
+            ui.label("Auth0:       ");
+            match &state {
+                Auth0State::SignedIn => {
+                    ui.label("signed in — the token renews itself");
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Sign out"))
+                        .clicked()
+                    {
+                        let _ = std::fs::remove_file(&self.auth0_store_path);
+                        self.auth0_source = None;
+                        self.auth0_login.lock().unwrap().state = Auth0State::SignedOut;
+                    }
+                }
+                Auth0State::Waiting { user_code, url } => {
+                    ui.label("enter this code:");
+                    ui.monospace(user_code);
+                    ui.hyperlink_to("open the page", url);
+                }
+                Auth0State::SignedOut | Auth0State::Failed(_) => {
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Sign in"))
+                        .clicked()
+                    {
+                        self.sign_in_to_auth0();
+                    }
+                }
+            }
+        });
+        if let Auth0State::Failed(e) = &state {
+            ui.colored_label(egui::Color32::LIGHT_RED, format!("sign-in failed: {e}"));
+        }
+        if !matches!(state, Auth0State::SignedIn) {
+            ui.horizontal(|ui| {
+                ui.label("Auth0 token: ");
+                ui.add_enabled(
+                    enabled,
+                    egui::TextEdit::singleline(&mut self.auth0_token)
+                        .desired_width(320.0)
+                        .password(true),
+                );
+                ui.label("(expires; sign in instead)");
+            });
+        }
     }
 
     fn p2p_status_ui(&mut self, ui: &mut egui::Ui) {
