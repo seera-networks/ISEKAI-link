@@ -78,11 +78,17 @@ jobs:
 
       # ---- OpenCV, one way per platform ----
 
-      - name: Install libclang (Linux)
+      # Unconditional, and that is the point: these are what the *cached*
+      # OpenCV was built against as much as what builds it. Installing them
+      # inside the build step meant a cache hit skipped them, `ldd` then
+      # reported libavcodec and friends as "not found", and the bundle came out
+      # without the ffmpeg libraries `libopencv_videoio` needs.
+      - name: Install the build and runtime dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev
+          sudo apt-get install -y clang libclang-dev build-essential cmake pkg-config \
+            libavcodec-dev libavformat-dev libswscale-dev libv4l-dev
 
       # Ubuntu packages OpenCV 4.6 and the crate wants 4.11+, so it is built
       # here. `opencv-extra-modules: false` matters: the camera apps use
@@ -112,8 +118,6 @@ jobs:
         if: runner.os == 'Linux' && steps.opencv-linux-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          sudo apt-get install -y build-essential cmake pkg-config \
-            libavcodec-dev libavformat-dev libswscale-dev libv4l-dev
           curl -fsSL "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.tar.gz" \
             | tar -xz
           cmake -S "opencv-${OPENCV_VERSION}" -B opencv-build \

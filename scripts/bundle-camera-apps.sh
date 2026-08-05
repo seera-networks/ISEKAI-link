@@ -76,8 +76,13 @@ Linux)
     search="${stage}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
     for app in "${apps[@]}"; do
+        # A "not found" here is a library this machine does not have, so it
+        # cannot be copied — and a silent skip is how the first bundle went out
+        # without any ffmpeg. Said at the moment it happens; the check at the
+        # end is what makes it fatal.
         LD_LIBRARY_PATH="${search}" ldd "${stage}/bin/${app}" \
-            | awk '/=> \//{print $3}' \
+            | awk '/not found/{print "warning: " $1 " is not installed here, so it \
+cannot be bundled" > "/dev/stderr"} /=> \//{print $3}' \
             | while read -r so; do
                 base=$(basename "${so}")
                 if is_host_library "${base}"; then
@@ -94,7 +99,8 @@ Linux)
         find "${stage}/lib" -name '*.so*' -type f -print0 \
             | while IFS= read -r -d '' lib; do
                 LD_LIBRARY_PATH="${search}" ldd "${lib}" 2>/dev/null \
-                    | awk '/=> \//{print $3}' \
+                    | awk '/not found/{print "warning: " $1 " is not installed here, so it \
+cannot be bundled" > "/dev/stderr"} /=> \//{print $3}' \
                     | while read -r so; do
                         base=$(basename "${so}")
                         if is_host_library "${base}"; then
