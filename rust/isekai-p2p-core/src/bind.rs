@@ -27,6 +27,9 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use bytes::Bytes;
+/// Re-exported so a caller of [`BindSession::inbound_activity`] can name what it
+/// gets back without depending on the MASQUE crate directly.
+pub use channel_masque::InboundActivity;
 use channel_masque::{
     CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClientEvent, MasqueClientMode,
 };
@@ -120,6 +123,7 @@ pub struct BindSession {
     /// this Endpoint's edge/relay addresses).
     pub events: mpsc::Receiver<MasqueClientEvent>,
     observed: ObservedAddressWatch,
+    inbound: InboundActivity,
     shutdown: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
@@ -132,6 +136,16 @@ impl BindSession {
     /// path to it.
     pub fn observed(&self) -> ObservedAddressWatch {
         self.observed.clone()
+    }
+
+    /// What this leg has received from the peer.
+    ///
+    /// The only first-hand evidence this side has that the peer is still there.
+    /// A listener holds a leg until somebody tells it not to, so holding one
+    /// says nothing; datagrams arriving on it do. See
+    /// [`InboundActivity`](channel_masque::InboundActivity).
+    pub fn inbound_activity(&self) -> InboundActivity {
+        self.inbound.clone()
     }
 
     /// Cancel the session and wait for it to wind down.
@@ -210,8 +224,11 @@ pub async fn open_bind_session(
     // caller awaits this so it only returns once the leg is ready.
     let (ready_tx, ready_rx) = oneshot::channel();
     let session_shutdown = shutdown.clone();
+    // Built here rather than in the task so its activity handle can be taken
+    // before it moves; afterwards there is nothing left to ask.
+    let mut client = MasqueClient::new(channel, None);
+    let inbound = client.inbound_activity();
     let task = tokio::spawn(async move {
-        let mut client = MasqueClient::new(channel, None);
         match client
             .start(MasqueClientMode::Forward(forward_to), session_shutdown)
             .await
@@ -237,6 +254,7 @@ pub async fn open_bind_session(
         Ok(Ok(())) => Ok(BindSession {
             events: out_rx,
             observed,
+            inbound,
             shutdown,
             task: Some(task),
         }),

@@ -5,6 +5,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
 };
 
@@ -610,6 +611,7 @@ where
 {
     channel: S,
     executor: SharedExec,
+    inbound: InboundActivity,
     phantom: std::marker::PhantomData<(RespBody, ReqBodyErr)>,
 }
 
@@ -656,6 +658,38 @@ pub enum ContextIdRegistrationStage {
     FromUdpToQuic,
 }
 
+/// How many datagrams a MASQUE session has received from the proxy.
+///
+/// The one thing a session knows first-hand about whoever is on the far side:
+/// datagrams arrive on it or they do not. Everything else a caller might use as
+/// evidence of a live peer — a control-plane listing, a connection that was
+/// never reported closed — is a claim somebody else made, and stays true after
+/// the peer is gone.
+///
+/// Cheap enough to keep always on: one relaxed increment per datagram. Cloning
+/// shares the count, so a caller takes a handle before the session moves into
+/// its own task and reads it from wherever it ends up.
+///
+/// Datagrams rather than bytes: what a reader wants is "did anything arrive
+/// since last time", and a counter that only ever goes up answers it by
+/// comparison, with no clock and no window to agree on.
+#[derive(Debug, Clone, Default)]
+pub struct InboundActivity(Arc<AtomicU64>);
+
+impl InboundActivity {
+    /// Datagrams received so far. Compare two reads: unchanged means nothing
+    /// arrived between them.
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Count one datagram. Called by the session that owns this; public so a
+    /// caller can exercise its own reaction to a leg going quiet.
+    pub fn record(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl<S, RespBody, ReqBodyErr> MasqueClient<S, RespBody, ReqBodyErr>
 where
     S: Service<
@@ -671,8 +705,17 @@ where
         Self {
             channel: inner,
             executor: executor.unwrap_or_else(SharedExec::tokio),
+            inbound: InboundActivity::default(),
             phantom: std::marker::PhantomData,
         }
+    }
+
+    /// A handle on what this session has received (see [`InboundActivity`]).
+    ///
+    /// Available before `start`, which is when a caller that hands the client
+    /// off to its own task has to take it.
+    pub fn inbound_activity(&self) -> InboundActivity {
+        self.inbound.clone()
     }
 
     /// Establish a **concrete-target** CONNECT-UDP session (RFC 9298 classic) to
@@ -732,7 +775,10 @@ where
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
         proxy_state
             .from_quic_to_udp
-            .register_stream_id(MasqueClientMode::ConnectUdp(inbound_tx))
+            .register_stream_id(
+                MasqueClientMode::ConnectUdp(inbound_tx),
+                self.inbound.clone(),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("failed to register connect-udp stream: {e}"))?;
 
@@ -840,7 +886,7 @@ where
 
         let mut notification_rx_from_quic = match proxy_state
             .from_quic_to_udp
-            .register_stream_id(mode.clone())
+            .register_stream_id(mode.clone(), self.inbound.clone())
             .await
         {
             Ok(res) => res,

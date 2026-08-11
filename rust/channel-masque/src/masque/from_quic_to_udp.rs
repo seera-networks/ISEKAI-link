@@ -11,6 +11,7 @@ pub enum Message {
     RegisterStreamId(
         StreamId,
         crate::MasqueClientMode,
+        crate::InboundActivity,
         mpsc::Sender<Notification>,
         oneshot::Sender<anyhow::Result<()>>,
     ),
@@ -40,9 +41,13 @@ impl Controller {
         Self { stream_id, tx }
     }
 
+    /// `activity` is bumped for every datagram this stream receives, so a
+    /// caller can tell a session that is carrying something from one that has
+    /// gone quiet (see [`crate::InboundActivity`]).
     pub async fn register_stream_id(
         &self,
         mode: crate::MasqueClientMode,
+        activity: crate::InboundActivity,
     ) -> anyhow::Result<mpsc::Receiver<Notification>> {
         let (notification_tx, notification_rx) = mpsc::channel(1024);
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -50,6 +55,7 @@ impl Controller {
             .send(Message::RegisterStreamId(
                 self.stream_id,
                 mode,
+                activity,
                 notification_tx,
                 resp_tx,
             ))
@@ -137,6 +143,7 @@ where
 {
     let mut notification_senders: HashMap<StreamId, mpsc::Sender<Notification>> = HashMap::new();
     let mut modes: HashMap<StreamId, crate::MasqueClientMode> = HashMap::new();
+    let mut activity: HashMap<StreamId, crate::InboundActivity> = HashMap::new();
     let mut socket_info: HashMap<(StreamId, SocketAddr), (Arc<UdpSocket>, bool)> = HashMap::new();
     let mut compression_info: HashMap<(StreamId, u64), Option<SocketAddr>> = HashMap::new();
     let mut queued_datagrams: HashMap<(StreamId, SocketAddr), Vec<Vec<u8>>> = HashMap::new();
@@ -145,10 +152,11 @@ where
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
-                    Some(Message::RegisterStreamId(stream_id, mode, notification_tx, resp_tx)) => {
+                    Some(Message::RegisterStreamId(stream_id, mode, inbound, notification_tx, resp_tx)) => {
                         tracing::debug!("received RegisterStreamId Message for stream id {}", stream_id);
                         notification_senders.insert(stream_id, notification_tx);
                         modes.insert(stream_id, mode);
+                        activity.insert(stream_id, inbound);
                         if resp_tx.send(anyhow::Ok(())).is_err() {
                             tracing::debug!("RegisterStreamId response receiver dropped");
                         }
@@ -226,6 +234,13 @@ where
                     }
                 };
                 let stream_id = datagram.stream_id();
+                // Counted here, before anything can decide to drop it: what a
+                // reader is asking is whether the far side is still sending,
+                // and a datagram that arrived answers that whether or not this
+                // end had somewhere to put it.
+                if let Some(inbound) = activity.get(&stream_id) {
+                    inbound.record();
+                }
                 let datagram = datagram.into_payload();
                 let Some((context_id, mut payload)): Option<(u64, &[u8])> = crate::decode_var_int(datagram.chunk()) else {
                     tracing::error!("failed to decode var int from datagram");

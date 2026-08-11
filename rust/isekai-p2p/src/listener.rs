@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use isekai_p2p_core::bind::{open_bind_session, BindSession, RelayOptions};
+use isekai_p2p_core::bind::{open_bind_session, BindSession, InboundActivity, RelayOptions};
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
 use isekai_p2p_core::proxy::{
@@ -163,6 +163,24 @@ impl SignalingState {
 /// Keeps the spawned bind leg alive; cancels it on drop / close.
 struct BindGuard {
     handle: tokio::task::JoinHandle<()>,
+    /// What the leg has received, and what it had received when
+    /// [`renew_connections`](ListenerSession::renew_connections) last looked.
+    inbound: InboundActivity,
+    seen: u64,
+}
+
+impl BindGuard {
+    /// Whether anything arrived on this leg since the last time this was asked.
+    ///
+    /// Two reads of a counter that only goes up, which is why there is no clock
+    /// and no window here: "since last time" is however long the caller went
+    /// between asking.
+    fn carried_traffic(&mut self) -> bool {
+        let count = self.inbound.count();
+        let moved = count != self.seen;
+        self.seen = count;
+        moved
+    }
 }
 
 /// How many peers one listener will serve at once.
@@ -322,12 +340,19 @@ impl ListenerSession {
             self.opts.clone(),
         )
         .await?;
+        let inbound = session.inbound_activity();
         // Own the session in a task that drains its notifications, so an unread
         // events channel can never stall the underlying MASQUE loop. Dropping
         // the task (on close) drops the session, whose Drop cancels the relay.
         let handle = tokio::spawn(drive_bind_session(session, self.observed_tx.clone()));
-        self.binds
-            .insert(connection_id.to_owned(), BindGuard { handle });
+        self.binds.insert(
+            connection_id.to_owned(),
+            BindGuard {
+                handle,
+                inbound,
+                seen: 0,
+            },
+        );
         Ok(())
     }
 
@@ -490,18 +515,48 @@ impl ListenerSession {
     /// peer at the same age, however well the streams are going. On a device
     /// that was two streams cut at three hundred seconds to the tenth.
     ///
-    /// Only the connections this listener actually holds a leg for are renewed.
-    /// A peer that has gone away should lapse, and that is what makes it.
+    /// **Only the legs that are carrying something are renewed.** Holding a leg
+    /// is not evidence that anyone is on the other end of it: a leg comes down
+    /// when the peer reports itself closed, and a peer that was killed reports
+    /// nothing, so this side would go on claiming a viewer that left at the
+    /// wall socket. Renewing on that claim is what kept the proxy's TTL from
+    /// ever firing, and eight abandoned legs is a camera that will not take
+    /// another viewer.
+    ///
+    /// Datagrams arriving on the leg are the one thing this side sees for
+    /// itself, and they keep arriving for as long as the peer is there —
+    /// including after it has moved onto the direct path, because the relay
+    /// path is kept as a backup and the path keepalive pings it, so the peer's
+    /// acknowledgements come back this way (`camera-core`'s
+    /// `DIRECT_PATH_KEEPALIVE`). When the peer goes, they stop within a
+    /// keepalive interval, this stops renewing, and the connection lapses on
+    /// its own TTL — which is the same thing that happens when the peer's own
+    /// renewal stops, and needs nothing to be reported.
+    ///
+    /// A peer that has not been updated to renew for itself is unaffected: it
+    /// is watching, so its traffic is here.
     ///
     /// Failures are reported per connection and not returned: one connection
     /// the proxy will not renew — because it has already been reaped, say —
     /// says nothing about the others, and the next pass tries again.
-    pub async fn renew_connections(&self, state: &SignalingState) -> Vec<SignalingEvent> {
+    pub async fn renew_connections(&mut self, state: &SignalingState) -> Vec<SignalingEvent> {
+        // Taken in one pass so every leg's counter is read, and read before any
+        // of the requests below can hold things up. A leg with no guard here is
+        // not this listener's to claim.
+        let renewing: Vec<String> = state
+            .bound()
+            .filter(|id| {
+                self.binds
+                    .get_mut(*id)
+                    .is_some_and(BindGuard::carried_traffic)
+            })
+            .map(str::to_owned)
+            .collect();
         let mut events = Vec::new();
-        for connection_id in state.bound() {
-            if let Err(e) = self.proxy.renew_connection(connection_id).await {
+        for connection_id in renewing {
+            if let Err(e) = self.proxy.renew_connection(&connection_id).await {
                 events.push(SignalingEvent::RenewFailed {
-                    connection_id: connection_id.to_owned(),
+                    connection_id,
                     error: format!("{e}"),
                 });
             }
@@ -803,5 +858,61 @@ mod tests {
 
         forget_gone(&mut state, &[conn("conn_a")]);
         assert!(state.spent.is_empty());
+    }
+
+    /// A guard over a leg that has received `datagrams` so far.
+    ///
+    /// The handle is a finished task rather than a live leg: nothing here reads
+    /// it, and what is under test is the counter, not the session.
+    fn leg(datagrams: u64) -> BindGuard {
+        let inbound = InboundActivity::default();
+        for _ in 0..datagrams {
+            inbound.record();
+        }
+        BindGuard {
+            handle: tokio::spawn(std::future::ready(())),
+            inbound,
+            seen: 0,
+        }
+    }
+
+    /// The whole point of the change: holding a leg is not evidence of a peer,
+    /// so a leg that has received nothing gets no claim made on its behalf.
+    /// This is the viewer that was killed — its leg is still here, and nothing
+    /// is coming in on it.
+    #[tokio::test]
+    async fn a_leg_that_has_received_nothing_is_not_claimed() {
+        let mut quiet = leg(0);
+        assert!(!quiet.carried_traffic());
+        assert!(!quiet.carried_traffic(), "and it stays that way");
+    }
+
+    /// A viewer that is watching sends — video acknowledgements, or the path
+    /// keepalive once it has moved to the direct path — so every pass sees the
+    /// counter move and the lease is pushed out.
+    #[tokio::test]
+    async fn a_leg_still_receiving_is_claimed_every_pass() {
+        let mut busy = leg(1);
+        assert!(busy.carried_traffic());
+
+        busy.inbound.record();
+        assert!(busy.carried_traffic());
+        busy.inbound.record();
+        assert!(busy.carried_traffic());
+    }
+
+    /// What is compared is the counter against its own previous reading, not
+    /// against zero: a leg that carried plenty and then went quiet stops being
+    /// claimed, which is what makes a peer that leaves mid-session lapse.
+    #[tokio::test]
+    async fn a_leg_that_goes_quiet_stops_being_claimed() {
+        let mut leg = leg(4_000);
+        assert!(leg.carried_traffic(), "still arriving");
+
+        assert!(!leg.carried_traffic(), "nothing since");
+        assert!(!leg.carried_traffic());
+
+        leg.inbound.record();
+        assert!(leg.carried_traffic(), "and it recovers if the peer returns");
     }
 }
