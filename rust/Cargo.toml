@@ -20,9 +20,9 @@ egui = "0.34.3"
 egui_plot = "0.35.0"
 futures = "0.3"
 futures-concurrency = "7.6.3"
-h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
-h3-datagram = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
-h3-quinn = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
+h3 = { git = "https://github.com/hyperium/h3", rev = "c916ed5af1c6818c74fb86cc05a18e51ecc1fcb1" }
+h3-datagram = { git = "https://github.com/hyperium/h3", rev = "c916ed5af1c6818c74fb86cc05a18e51ecc1fcb1" }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "c916ed5af1c6818c74fb86cc05a18e51ecc1fcb1" }
 h3-util = { path = "../submodules/tonic-h3/h3-util", default-features = false }
 http = "1"
 http-body = "1"
