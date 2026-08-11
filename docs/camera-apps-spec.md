@@ -114,7 +114,26 @@ Direct は `camera-server` が MASQUE で公開アドレスと証明書を受け
 同時に serve する視聴者数の上限は **8**（`MAX_CONCURRENT_PEERS`）。超えた相手は
 待機として報告され、レグが空き次第束ねられる。
 
-### 2.4 画面
+### 2.4 Listener のリースを保つ
+
+Peer Listener には期限があり（作成時の `ttl`、既定 3600 秒）、過ぎると制御プレーン
+から消える（§8.2.4）。**このアプリは延長を明示的に要求しない。** 延長は owner 自身が
+その Listener を読むたびに起きる（§8.2.5）ためで、配信中のカメラは次を叩いている。
+
+| | |
+| --- | --- |
+| 接続一覧の poll | ストリームが無いとき 3 秒ごと、あるとき 60 秒ごとの控え |
+| イベント購読 | 購読時、および保持中もリースの半分ごと |
+
+つまり**配信していれば勝手に延びる**。ここに手当てが要るのは §4 の `Manual` の
+場合だけである。
+
+> 以前はこの延長が存在せず、配信中のカメラが 1 時間で Listener を失い、接続と
+> リレーエッジを道連れにして映像が止まっていた
+> （[ISEKAI-link-server#215](https://github.com/seera-networks/ISEKAI-link-server/issues/215)、
+> [#216](https://github.com/seera-networks/ISEKAI-link-server/pull/216) で解決）。
+
+### 2.5 画面
 
 | 区画 | 内容 |
 | --- | --- |
@@ -126,7 +145,7 @@ Direct は `camera-server` が MASQUE で公開アドレスと証明書を受け
 | Manual exchange | Capability 発行と接続 ID による bind（`Manual` 用、折りたたみ） |
 | 映像 | 捕捉中のプレビュー、開始／停止 |
 
-### 2.5 端末に置くもの
+### 2.6 端末に置くもの
 
 | ファイル | 内容 |
 | --- | --- |
@@ -180,7 +199,7 @@ Grant はカメラの Listener ではなく owner に属するので、カメラ
 
 ### 3.5 端末に置くもの
 
-`camera-client-endpoint.pem` と `camera-client-auth0.json`。役割と扱いは §2.5 と
+`camera-client-endpoint.pem` と `camera-client-auth0.json`。役割と扱いは §2.6 と
 同じ。
 
 ---
@@ -189,10 +208,10 @@ Grant はカメラの Listener ではなく owner に属するので、カメラ
 
 実装が意図してそうなっている、または直っていない事項。
 
-- **Peer Listener のリースは延長できない。** 既定 3600 秒で失効し、失効すると
-  制御プレーンから消える（§8.2.4）。延長 API が無いため、放置すると配信中でも
-  リレー経由の映像が止まる。サーバ側 issue
-  [ISEKAI-link-server#215](https://github.com/seera-networks/ISEKAI-link-server/issues/215)
+- **`AcceptPolicy::Manual` の Listener はリースが切れる。** 延長は owner 自身の
+  読み取りで起きる（§8.2.5）が、`Manual` では poll もイベント購読も走らないため、
+  それを叩くものが無い。既定の `AutoNotify` では起きない。`Manual` を使うのは
+  試験用の例だけなので実害は無いが、常駐させるなら手当てが要る
 - **映像はリレー運営者に対して秘匿されない。** 映像 QUIC の TLS 証明書と秘密鍵は
   プロキシが発行して配布するため、リレー経由の間は技術的にアクセスし得る。
   プライバシーポリシー §5 に明記してある。直接経路確立後はリレーを通らない
