@@ -110,8 +110,8 @@ fn renew_delay(
 /// candidate address and an unknown state, and [`ProxyClient::renew_connection`]
 /// sends neither — its body is `{}`. If that endpoint gains a reason to refuse a
 /// bare renewal, this stops renewing and the symptom is video ending one TTL in,
-/// with a single `info` line to find it by. A dedicated kind from the proxy
-/// (`connection-closed`) would settle it; until then, the premise is here.
+/// with a single `info` line to find it by. A dedicated kind would settle it and
+/// is asked for in `ISEKAI-link-server#217`; until then, the premise is here.
 fn renewal_is_over(error: &ProxyError) -> bool {
     match error {
         ProxyError::Problem { problem, .. } => matches!(
