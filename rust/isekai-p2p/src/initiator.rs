@@ -27,13 +27,30 @@ pub struct InitiatorSession {
     pub connection: PeerConnection,
     relay: ConnectRelay,
     /// Kept so [`close`](Self::close) can tell the proxy the connection is
-    /// over. Nothing else here needs the control plane once the leg is up.
+    /// over, and so the lease below can be renewed.
     proxy: ProxyClient<MasqueH3Transport>,
+    /// Keeps the Peer Connection's lease alive while this session exists.
+    ///
+    /// **Held here, on the side that is using the connection.** A renewal is a
+    /// claim that somebody is still there (spec §8.5.4), and this is the only
+    /// side that can make it honestly — the listener cannot see whether its
+    /// viewer is still watching. Because the claim stops when this value is
+    /// dropped, it also stops when the process is killed, which is what lets
+    /// the proxy expire the connection and the camera release its relay leg.
+    lease: ConnectionLease,
     /// Replaces the Endpoint Token before it expires. Shared with the
     /// [`PeerDirectory`] this was opened over, when there was one, so there is
     /// one renewal loop however many handles are holding the same client.
     _renewal: Arc<TokenRenewal>,
 }
+
+/// How often to renew the Peer Connection's lease.
+///
+/// Well inside the proxy's connect TTL, whose default is five minutes — this
+/// side does not know that number, and being cut off mid-view is what happens
+/// if the guess is wrong. One request a minute is nothing beside the video
+/// coming the other way.
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long [`InitiatorSession::close`] waits to report the connection closed.
 ///
@@ -41,6 +58,49 @@ pub struct InitiatorSession {
 /// is lost by giving up is that the listener holds its relay leg for this
 /// connection until the proxy expires it.
 const REPORT_CLOSED_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Renews one Peer Connection's lease until dropped.
+///
+/// Dropping stops the claim, which is the point: a viewer that goes away —
+/// closed, killed, crashed, off the network — stops asserting it is there, and
+/// the proxy expires the connection on its own. Nothing has to notice the
+/// difference between those, and nothing has to be reported for it to work.
+struct ConnectionLease(tokio::task::JoinHandle<()>);
+
+impl ConnectionLease {
+    fn spawn(proxy: ProxyClient<MasqueH3Transport>, connection_id: String) -> Self {
+        Self(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(LEASE_RENEW_INTERVAL).await;
+                if let Err(e) = proxy.renew_connection(&connection_id).await {
+                    // Not fatal on its own: the lease outlives several of these,
+                    // so a proxy that is briefly unreachable costs nothing. It
+                    // is worth saying, because the visible consequence of it
+                    // continuing is the video stopping partway through.
+                    tracing::warn!(
+                        connection_id = %connection_id,
+                        "could not renew the peer connection's lease: {e}",
+                    );
+                }
+            }
+        }))
+    }
+
+    /// Stop claiming, without waiting for the drop.
+    ///
+    /// Used before reporting the connection closed: `closed` is terminal, and a
+    /// renewal racing behind it would be refused with `400 invalid-request` and
+    /// logged as a failure that is really just bad timing.
+    fn stop(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// What lets an initiator open a connection.
 ///
@@ -372,11 +432,13 @@ impl InitiatorSession {
         .await?;
         let renewal = renewal
             .unwrap_or_else(|| Arc::new(spawn_token_renewal(cfg.clone(), proxy.clone(), None)));
+        let lease = ConnectionLease::spawn(proxy.clone(), connection.connection_id.clone());
         Ok(Self {
             local_addr: handle.local_addr,
             connection,
             relay: handle,
             proxy: proxy.clone(),
+            lease,
             _renewal: renewal,
         })
     }
@@ -424,6 +486,9 @@ impl InitiatorSession {
     /// runs on the way out, the connection expires on its own either way, and
     /// there is nothing a disconnecting application could do with the error.
     pub async fn close(self) {
+        // Before the report: `closed` is terminal, so a renewal arriving behind
+        // it is refused and logged as a failure that is only bad timing.
+        self.lease.stop();
         let reported = tokio::time::timeout(
             REPORT_CLOSED_TIMEOUT,
             self.proxy
@@ -447,5 +512,38 @@ impl InitiatorSession {
             ),
         }
         self.relay.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The interval has to stay well under the proxy's connect TTL, whose
+    /// default is 300 seconds and which this side never learns. Drifting up to
+    /// it does not fail a build or a test anywhere else — it shows up as video
+    /// that stops partway through, on somebody's screen.
+    #[test]
+    fn the_lease_is_renewed_well_inside_the_default_ttl() {
+        let default_connect_ttl = Duration::from_secs(300);
+        assert!(
+            LEASE_RENEW_INTERVAL * 3 <= default_connect_ttl,
+            "renewing every {LEASE_RENEW_INTERVAL:?} leaves no room for a failure or two",
+        );
+    }
+
+    /// Dropping the session stops the claim. This is what makes a viewer that
+    /// was killed — Ctrl+C, a crash, a lost network — release the camera's
+    /// relay leg without reporting anything.
+    #[tokio::test]
+    async fn dropping_the_lease_stops_renewing() {
+        let lease = ConnectionLease(tokio::spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        let handle = lease.0.abort_handle();
+        assert!(!handle.is_finished());
+        drop(lease);
+        tokio::task::yield_now().await;
+        assert!(handle.is_finished(), "the renewal outlived the session");
     }
 }
