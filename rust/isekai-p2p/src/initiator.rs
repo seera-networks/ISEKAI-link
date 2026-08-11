@@ -67,11 +67,26 @@ const LEASE_RENEW_MAX: Duration = Duration::from_secs(60);
 /// file. A constant here would be a second place that number lives, and the
 /// kind that breaks silently on the day the proxy's `--p2p-connect-ttl-secs`
 /// moves.
-fn renew_delay(expires_at: Option<&str>, now: OffsetDateTime) -> Duration {
-    let Some(deadline) = expires_at.and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()) else {
+///
+/// **And measured on the proxy's clock, not this one.** The same response
+/// carries `updated_at`, the moment the deadline was set from, so subtracting
+/// one server timestamp from the other gives the lease's length without this
+/// side's clock entering into it. Reading it against a local `now` instead
+/// would mean a device running fast sees every fresh lease as already lapsed
+/// and renews at the floor forever — six times the requests, and an `info` line
+/// nowhere to say why. The local clock is only the fallback, for a response
+/// that carries no `updated_at`.
+fn renew_delay(
+    expires_at: Option<&str>,
+    updated_at: Option<&str>,
+    now: OffsetDateTime,
+) -> Duration {
+    let timestamp = |s: Option<&str>| s.and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
+    let Some(deadline) = timestamp(expires_at) else {
         return LEASE_RENEW_MAX;
     };
-    let remaining = deadline - now;
+    // The answer just arrived, so the lease's whole length is what is left of it.
+    let remaining = deadline - timestamp(updated_at).unwrap_or(now);
     if !remaining.is_positive() {
         // Already lapsed as far as this side can tell. Renewing at once is the
         // only thing that might still save it, and the floor keeps that from
@@ -89,6 +104,14 @@ fn renew_delay(expires_at: Option<&str>, now: OffsetDateTime) -> Duration {
 /// improves by asking again, and a task that keeps asking every minute for the
 /// life of the process is a warning a minute about something nobody can act on.
 /// Anything else — a transport failure, a 5xx — is worth retrying.
+///
+/// **`invalid-request` is a shared code, so this rests on a premise:** the only
+/// other reasons `POST /v1/peer/connections/{id}/state` returns it are a bad
+/// candidate address and an unknown state, and [`ProxyClient::renew_connection`]
+/// sends neither — its body is `{}`. If that endpoint gains a reason to refuse a
+/// bare renewal, this stops renewing and the symptom is video ending one TTL in,
+/// with a single `info` line to find it by. A dedicated kind from the proxy
+/// (`connection-closed`) would settle it; until then, the premise is here.
 fn renewal_is_over(error: &ProxyError) -> bool {
     match error {
         ProxyError::Problem { problem, .. } => matches!(
@@ -115,21 +138,23 @@ const REPORT_CLOSED_TIMEOUT: Duration = Duration::from_secs(3);
 struct ConnectionLease(tokio::task::JoinHandle<()>);
 
 impl ConnectionLease {
-    /// `expires_at` is the deadline the `connect` response carried, so the first
-    /// renewal is timed off the real lease like every one after it.
-    fn spawn(
-        proxy: ProxyClient<MasqueH3Transport>,
-        connection_id: String,
-        expires_at: Option<String>,
-    ) -> Self {
+    /// Takes the `connect` response itself, so the first renewal is timed off
+    /// the real lease exactly like every one after it.
+    fn spawn(proxy: ProxyClient<MasqueH3Transport>, connection: &PeerConnection) -> Self {
+        let connection_id = connection.connection_id.clone();
+        let mut delay = renew_delay(
+            connection.expires_at.as_deref(),
+            connection.updated_at.as_deref(),
+            OffsetDateTime::now_utc(),
+        );
         Self(tokio::spawn(async move {
-            let mut delay = renew_delay(expires_at.as_deref(), OffsetDateTime::now_utc());
             loop {
                 tokio::time::sleep(delay).await;
                 match proxy.renew_connection(&connection_id).await {
                     Ok(connection) => {
                         delay = renew_delay(
                             connection.expires_at.as_deref(),
+                            connection.updated_at.as_deref(),
                             OffsetDateTime::now_utc(),
                         );
                         tracing::trace!(
@@ -510,11 +535,7 @@ impl InitiatorSession {
         .await?;
         let renewal = renewal
             .unwrap_or_else(|| Arc::new(spawn_token_renewal(cfg.clone(), proxy.clone(), None)));
-        let lease = ConnectionLease::spawn(
-            proxy.clone(),
-            connection.connection_id.clone(),
-            connection.expires_at.clone(),
-        );
+        let lease = ConnectionLease::spawn(proxy.clone(), &connection);
         Ok(Self {
             local_addr: handle.local_addr,
             connection,
@@ -601,10 +622,21 @@ impl InitiatorSession {
 mod tests {
     use super::*;
 
-    fn at(offset_secs: i64) -> (Option<String>, OffsetDateTime) {
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_800_000_000);
-        let deadline = now + time::Duration::seconds(offset_secs);
-        (Some(deadline.format(&Rfc3339).unwrap()), now)
+    const SERVER_NOW: i64 = 1_800_000_000;
+
+    fn stamp(unix_secs: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(unix_secs)
+    }
+
+    /// A lease of `secs` the proxy just handed out: both timestamps on its clock.
+    fn lease(secs: i64) -> (Option<String>, Option<String>) {
+        let format = |t: OffsetDateTime| Some(t.format(&Rfc3339).unwrap());
+        (format(stamp(SERVER_NOW + secs)), format(stamp(SERVER_NOW)))
+    }
+
+    /// This side's clock, `skew` seconds off the proxy's.
+    fn local_clock(skew: i64) -> OffsetDateTime {
+        stamp(SERVER_NOW + skew)
     }
 
     /// The interval comes from the lease the proxy just handed back, so a proxy
@@ -612,15 +644,40 @@ mod tests {
     /// at. A third of what is left leaves room for two failures.
     #[test]
     fn the_interval_is_measured_from_the_deadline() {
-        let (expires_at, now) = at(150);
+        let (expires_at, updated_at) = lease(150);
         assert_eq!(
-            renew_delay(expires_at.as_deref(), now),
+            renew_delay(expires_at.as_deref(), updated_at.as_deref(), local_clock(0)),
             Duration::from_secs(50)
         );
-        let (expires_at, now) = at(90);
+        let (expires_at, updated_at) = lease(90);
         assert_eq!(
-            renew_delay(expires_at.as_deref(), now),
+            renew_delay(expires_at.as_deref(), updated_at.as_deref(), local_clock(0)),
             Duration::from_secs(30)
+        );
+    }
+
+    /// Both timestamps come from the proxy, so what this device thinks the time
+    /// is cannot move the interval. Without that, a clock running an hour fast
+    /// reads every fresh lease as lapsed and renews at the floor for as long as
+    /// the app runs — six times the requests, and nothing said about it.
+    #[test]
+    fn a_wrong_local_clock_does_not_change_the_interval() {
+        let (expires_at, updated_at) = lease(150);
+        for skew in [0, 3_600, -3_600] {
+            assert_eq!(
+                renew_delay(
+                    expires_at.as_deref(),
+                    updated_at.as_deref(),
+                    local_clock(skew)
+                ),
+                Duration::from_secs(50),
+                "a clock {skew}s off should not have mattered",
+            );
+        }
+        // And that is what the local clock alone would have made of it.
+        assert_eq!(
+            renew_delay(expires_at.as_deref(), None, local_clock(3_600)),
+            LEASE_RENEW_MIN
         );
     }
 
@@ -630,21 +687,38 @@ mod tests {
     #[test]
     fn an_unreadable_deadline_still_renews_in_time() {
         let now = OffsetDateTime::UNIX_EPOCH;
-        assert_eq!(renew_delay(None, now), LEASE_RENEW_MAX);
-        assert_eq!(renew_delay(Some("soon"), now), LEASE_RENEW_MAX);
+        assert_eq!(renew_delay(None, None, now), LEASE_RENEW_MAX);
+        assert_eq!(renew_delay(Some("soon"), None, now), LEASE_RENEW_MAX);
         assert!(LEASE_RENEW_MAX < Duration::from_secs(300));
+    }
+
+    /// An unreadable `updated_at` is not fatal — it falls back to the local
+    /// clock, which is what this did before the proxy's own was available.
+    #[test]
+    fn an_unreadable_issue_time_falls_back_to_the_local_clock() {
+        let (expires_at, _) = lease(150);
+        assert_eq!(
+            renew_delay(expires_at.as_deref(), Some("just now"), local_clock(0)),
+            Duration::from_secs(50)
+        );
     }
 
     /// A long lease must not push the renewal past the fallback, and a lapsed
     /// or absurdly short one must not turn into a spin.
     #[test]
     fn the_interval_stays_between_its_bounds() {
-        let (expires_at, now) = at(86_400);
-        assert_eq!(renew_delay(expires_at.as_deref(), now), LEASE_RENEW_MAX);
-        let (expires_at, now) = at(1);
-        assert_eq!(renew_delay(expires_at.as_deref(), now), LEASE_RENEW_MIN);
-        let (expires_at, now) = at(-60);
-        assert_eq!(renew_delay(expires_at.as_deref(), now), LEASE_RENEW_MIN);
+        for (secs, expected) in [
+            (86_400, LEASE_RENEW_MAX),
+            (1, LEASE_RENEW_MIN),
+            (-60, LEASE_RENEW_MIN),
+        ] {
+            let (expires_at, updated_at) = lease(secs);
+            assert_eq!(
+                renew_delay(expires_at.as_deref(), updated_at.as_deref(), local_clock(0)),
+                expected,
+                "a lease of {secs}s",
+            );
+        }
     }
 
     fn problem(kind: &str) -> ProxyError {
