@@ -154,6 +154,14 @@ pub fn make_msquic_async_listener_with(
             // counted per path and reset by nothing. Both ends have to set it —
             // each connection's timer runs off its own settings, and the default
             // is 0, which sends no PING at all.
+            //
+            // **The peer's half of this is also how a camera knows its viewer is
+            // still there.** Once the video moves to the direct path, these
+            // PINGs are the only thing left crossing the relay leg, and
+            // `ListenerSession::renew_connections` renews that connection's
+            // lease only while something is. Dropping the setting on either end
+            // would look like a keepalive tidy-up and show up as viewers cut off
+            // one connect TTL into watching.
             .set_PathKeepAliveIntervalMs(PATH_KEEP_ALIVE_INTERVAL_MS)
     } else {
         settings

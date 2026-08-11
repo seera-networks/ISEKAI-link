@@ -175,6 +175,11 @@ impl BindGuard {
     /// Two reads of a counter that only goes up, which is why there is no clock
     /// and no window here: "since last time" is however long the caller went
     /// between asking.
+    ///
+    /// The first ask compares against nothing having arrived, so a leg bound
+    /// moments earlier and not yet used answers no. That costs one pass, and
+    /// several fit inside a lease — by which time a peer that connected has
+    /// sent something, because connecting is what it did.
     fn carried_traffic(&mut self) -> bool {
         let count = self.inbound.count();
         let moved = count != self.seen;
@@ -524,17 +529,29 @@ impl ListenerSession {
     /// another viewer.
     ///
     /// Datagrams arriving on the leg are the one thing this side sees for
-    /// itself, and they keep arriving for as long as the peer is there —
-    /// including after it has moved onto the direct path, because the relay
-    /// path is kept as a backup and the path keepalive pings it, so the peer's
-    /// acknowledgements come back this way (`camera-core`'s
-    /// `DIRECT_PATH_KEEPALIVE`). When the peer goes, they stop within a
-    /// keepalive interval, this stops renewing, and the connection lapses on
-    /// its own TTL — which is the same thing that happens when the peer's own
-    /// renewal stops, and needs nothing to be reported.
+    /// itself, and they keep arriving for as long as the peer is there. While
+    /// the video is on the relay that is the video. **After the peer has moved
+    /// onto the direct path it is the path keepalive**: the relay path is kept
+    /// as a backup rather than torn down, and the peer pings it every ten
+    /// seconds, because the peer sets `PathKeepAliveIntervalMs` too — the timer
+    /// runs off each connection's own settings, so both ends have their own
+    /// (`camera-core`'s `DIRECT_PATH_KEEPALIVE` on the viewer, and
+    /// `isekai-link-utils`' `PATH_KEEP_ALIVE_INTERVAL_MS` for the listener this
+    /// runs beside). A peer old enough not to negotiate multipath pings
+    /// nothing, and needs to: it never left the relay, so the video is still
+    /// coming this way.
+    ///
+    /// When the peer goes, they stop within a keepalive interval, this stops
+    /// renewing, and the connection lapses on its own TTL — which is the same
+    /// thing that happens when the peer's own renewal stops, and needs nothing
+    /// to be reported.
     ///
     /// A peer that has not been updated to renew for itself is unaffected: it
-    /// is watching, so its traffic is here.
+    /// is watching, so its traffic is here. What this does drop is a peer that
+    /// is still running and has stopped sending — suspended, or backgrounded on
+    /// iOS. Its lease lapses, its leg comes down, and the slot goes back, which
+    /// is the intended reading of §8.5.4: not "is anyone still there" but "is
+    /// anyone still using this". A peer that returns connects again.
     ///
     /// Failures are reported per connection and not returned: one connection
     /// the proxy will not renew — because it has already been reaped, say —

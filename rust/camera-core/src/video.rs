@@ -1147,7 +1147,17 @@ fn video_client_config(
     // it is not the connection keepalive — see `DIRECT_PATH_KEEPALIVE` for why
     // that distinction cost a field test — and it is not symmetric with the
     // listener's: the timer runs off each connection's own settings, so this
-    // side pinging says nothing about the other side.
+    // side pinging says nothing about the other side. The listener sets its own
+    // (`isekai_link_utils::PATH_KEEP_ALIVE_INTERVAL_MS`), which is why both ends
+    // ping rather than one.
+    //
+    // **These PINGs are also what tells the camera this viewer is still here.**
+    // Once the video is on the direct path they are the only thing this side
+    // still sends across the relay leg, and the camera renews the connection's
+    // lease only while something arrives on it
+    // (`ListenerSession::renew_connections`). Reading this as "the direct path's
+    // keepalive, so the relay path does not need it" would cut this viewer off
+    // one connect TTL into watching.
     let settings = if enable_migration {
         settings
             .set_ReceiveObservedAddressReports()
