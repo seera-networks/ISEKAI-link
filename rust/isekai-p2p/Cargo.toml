@@ -22,6 +22,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 # The Auth0 device-authorization flow and refresh (`auth`).
 reqwest = { workspace = true }
+# Reading the `expires_at` the proxy puts on a lease (`initiator`).
+time = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }
