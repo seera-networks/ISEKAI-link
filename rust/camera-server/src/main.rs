@@ -70,6 +70,15 @@ fn deliver_frame(
         }
     }
 
+    // ✅ MASQUEチャンネルへ送信（接続中のみ）
+    //
+    // Taken out of the lock before encoding, so the encode neither happens
+    // under it nor happens at all while nobody is connected — which is most of
+    // the time a camera is started, and was thirty discarded JPEGs a second.
+    let Some(sender) = mjpeg.lock().unwrap().clone() else {
+        return Ok(std::ops::ControlFlow::Continue(()));
+    };
+
     let mut buf = core::Vector::<u8>::new();
     let params = core::Vector::from(vec![
         imgcodecs::IMWRITE_JPEG_QUALITY,
@@ -78,16 +87,13 @@ fn deliver_frame(
     imgcodecs::imencode(".jpg", frame, &mut buf, &params)?;
     let jpeg_data = Bytes::copy_from_slice(buf.as_slice());
 
-    // ✅ MASQUEチャンネルへ送信（接続中のみ）
-    if let Some(sender) = mjpeg.lock().unwrap().as_ref() {
-        match sender.try_send(jpeg_data) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Drop this frame under backpressure.
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                tracing::error!("mjpeg sender closed");
-            }
+    match sender.try_send(jpeg_data) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            // Drop this frame under backpressure.
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            tracing::error!("mjpeg sender closed");
         }
     }
     Ok(std::ops::ControlFlow::Continue(()))
@@ -324,13 +330,15 @@ async fn main() -> eframe::Result<()> {
             // and not the camera's, so it is dropped rather than ending
             // capture. Counted, because one that fails every time is a defect
             // and 30 warnings a second is not how to report it.
+            //
+            // The count is cumulative and never reset. Resetting it on a good
+            // frame would make the every-hundredth rule cover only unbroken
+            // runs of failures — and an intermittent fault, which is the one
+            // that actually produces a flood, would report every single time.
             let mut dropped: u64 = 0;
             capture::run(camera, is_streaming_camera, is_terminated_camera, |frame| {
                 match deliver_frame(frame, &tx, &mjpeg_tx_holder_camera) {
-                    Ok(flow) => {
-                        dropped = 0;
-                        flow
-                    }
+                    Ok(flow) => flow,
                     Err(e) => {
                         if dropped.is_multiple_of(100) {
                             tracing::warn!(dropped, "could not deliver a frame: {e:#}");
@@ -612,6 +620,9 @@ struct MyApp {
     /// Which camera the capture thread should use, and what it is making of
     /// that. The thread owns the device; this window only asks.
     camera: capture::Handle,
+    /// What the index field holds, which is not the selection until it is
+    /// committed — see [`MyApp::camera_picker_ui`].
+    camera_index_field: i32,
     /// The cameras found, and whether a scan for them is running.
     ///
     /// Scanning opens devices, which is slow enough to stutter the window, so it
@@ -671,6 +682,7 @@ impl MyApp {
             texture: None,
             is_streaming,
             camera,
+            camera_index_field: capture::DEFAULT_INDEX,
             cameras: Arc::new(Mutex::new(None)),
             scanning: Arc::new(AtomicBool::new(false)),
             log: "Ready.".to_string(),
@@ -1122,11 +1134,6 @@ impl MyApp {
     /// what is attached and being wrong about that must not make a working
     /// device unreachable.
     fn camera_picker_ui(&mut self, ui: &mut egui::Ui) {
-        // The first paint starts a scan, so the list is there by the time
-        // anyone looks for it.
-        if self.cameras.lock().unwrap().is_none() {
-            self.scan_cameras();
-        }
         let scanning = self.scanning.load(Ordering::Relaxed);
         if scanning {
             // Nothing else would bring the result on screen: it arrives on
@@ -1146,6 +1153,19 @@ impl MyApp {
             egui::ComboBox::from_id_salt("camera_device")
                 .selected_text(label)
                 .show_ui(ui, |ui| {
+                    // Scanned when the list is opened, and not before.
+                    //
+                    // **Opening a camera is something the operator has to have
+                    // asked for.** A scan opens devices — that is what makes it
+                    // an answer rather than a guess — and where the platform
+                    // gates cameras behind a permission, doing it on the first
+                    // paint means a prompt and a lit indicator before anyone has
+                    // touched anything. This closure runs only while the list is
+                    // showing, which is exactly the moment somebody asked what
+                    // the cameras are.
+                    if self.cameras.lock().unwrap().is_none() {
+                        self.scan_cameras();
+                    }
                     for device in &found {
                         let mut index = selected;
                         if ui
@@ -1153,6 +1173,7 @@ impl MyApp {
                             .clicked()
                         {
                             self.camera.selection.set(device.index);
+                            self.camera_index_field = device.index;
                         }
                     }
                     if found.is_empty() {
@@ -1164,14 +1185,20 @@ impl MyApp {
                     }
                 });
 
-            // For a camera the scan missed. The capture thread decides whether
-            // it works, and says so below.
-            let mut index = selected;
-            if ui
-                .add(egui::DragValue::new(&mut index).range(0..=63).prefix("#"))
-                .changed()
-            {
-                self.camera.selection.set(index);
+            // For a camera the scan missed. Committed when the drag ends or the
+            // field is left — **not** on every value it passes through. A
+            // DragValue reports each one, and each one here is a camera to open:
+            // dragging 0 → 4 would let go of the working camera and then spend
+            // half a second failing on every index in between.
+            let entry = ui
+                .add(
+                    egui::DragValue::new(&mut self.camera_index_field)
+                        .range(0..=63)
+                        .prefix("#"),
+                )
+                .on_hover_text("A camera the scan did not find");
+            if entry.drag_stopped() || entry.lost_focus() {
+                self.camera.selection.set(self.camera_index_field);
             }
 
             if ui

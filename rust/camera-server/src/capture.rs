@@ -271,8 +271,10 @@ pub fn run(
             break;
         }
         if !is_streaming.load(Ordering::Relaxed) {
-            // Nothing is being sent or shown, so nothing is captured — but the
-            // device stays open, which is what makes Start immediate.
+            // Nothing is being sent or shown, so nothing is captured. Any
+            // device already open stays open, so stopping and starting again
+            // does not pay for another one; the first Start after launch is
+            // what opens it.
             std::thread::sleep(FRAME_INTERVAL);
             continue;
         }
@@ -309,7 +311,13 @@ mod tests {
     /// The device already open is reported without being probed. Probing it
     /// would fail — it cannot be opened twice — and would drop the one camera
     /// that is known to work from the list the operator picks from.
+    ///
+    /// **Ignored by default, because it opens the machine's cameras.** Run it
+    /// with `cargo test -p camera-server -- --ignored` when that is wanted; on
+    /// an ordinary `cargo test` it would light the webcam, and it would fight
+    /// a `camera-server` running beside it for the device.
     #[test]
+    #[ignore = "opens the machine's cameras"]
     fn the_camera_in_use_is_listed_without_being_opened() {
         // No real device is opened here: whatever `candidates` returns, an
         // index that is in use must appear, and one that is not must survive
