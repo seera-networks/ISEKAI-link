@@ -17,8 +17,11 @@ name: Camera apps
 # | Windows | vcpkg, with the `OPENCV_*` variables set explicitly | slow |
 # | macOS | Homebrew | quick |
 #
-# Each caches what it can, so the cost lands on the first run after a change to
-# the version pinned here and not on every push.
+# Each caches what it can, so the cost lands on a run that changed something and
+# not on every push. On Linux and macOS what is cached is the finished install,
+# and only the version pinned below decides whether it is still good. Windows
+# caches a vcpkg store instead, which is also answerable to the vcpkg the runner
+# image ships — see the key it is given below, and why.
 
 on:
   push:
@@ -196,12 +199,60 @@ jobs:
       # not reliably emit the link flags, and picked the debug import libraries
       # — whose CRT mismatches Rust's release CRT and fails at link. Hence the
       # variables set by hand below, pointing at the release libraries.
+      # **Two caches in a row here, and only one of them is this file's.** The
+      # step below stores a *vcpkg binary cache*, and vcpkg decides what in it
+      # it can use by an ABI hash that covers the port versions of the vcpkg the
+      # runner image ships. That vcpkg moves with the image, so a store built
+      # against an older one matches nothing — while `actions/cache` still
+      # reports a hit, because its key knew nothing about any of that.
+      #
+      # Which is how this came to rebuild OpenCV on every run for an hour, in
+      # silence:
+      #
+      #   Cache hit for: vcpkg-opencv4-Windows-4.11.0
+      #   Restored 0 package(s) from …/vcpkg-cache in 604 us.
+      #
+      # And it could not repair itself. `actions/cache` writes only when the key
+      # missed, so a constant key means the store is saved once, on the first
+      # run ever, and never again — whatever the rebuild produced was discarded
+      # at the end of every job.
+      #
+      # So the key carries the port tree's revision. When the image's vcpkg
+      # moves the key misses, which is both correct (that store is stale) and
+      # what makes the refreshed one get saved. `restore-keys` seeds it from the
+      # previous store, so a revision bump costs only the ports whose ABI
+      # actually changed rather than all of OpenCV again.
+      #
+      # Carrying the old store forward means it accumulates: nothing removes the
+      # entries a bump stranded. Deliberate — the alternative is rebuilding all
+      # of OpenCV on every bump, and growth is slow (tens of MB) next to an hour
+      # of runner time. Entries under superseded keys age out of the cache on
+      # their own, so what grows is one store rather than the repository's
+      # quota.
+      - name: Identify the vcpkg the image ships (Windows)
+        if: runner.os == 'Windows'
+        id: vcpkg-rev
+        shell: pwsh
+        run: |
+          $rev = ''
+          try {
+            $rev = (& git -C "$env:VCPKG_INSTALLATION_ROOT" rev-parse HEAD).Trim()
+          } catch {
+            # Not a checkout, or no git. The image version moves whenever its
+            # vcpkg does, so it is a coarser answer to the same question.
+            Write-Host "no vcpkg revision available: $_"
+          }
+          if (-not $rev) { $rev = "image-$env:ImageVersion" }
+          Write-Host "vcpkg port tree: $rev"
+          "rev=$rev" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Cache the vcpkg binaries (Windows)
         if: runner.os == 'Windows'
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg-cache
-          key: vcpkg-opencv4-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+          key: vcpkg-opencv4-${{ runner.os }}-${{ env.OPENCV_VERSION }}-${{ steps.vcpkg-rev.outputs.rev }}
+          restore-keys: |
+            vcpkg-opencv4-${{ runner.os }}-${{ env.OPENCV_VERSION }}-
       - name: Install OpenCV via vcpkg (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -209,6 +260,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg-cache" | Out-Null
           $env:VCPKG_BINARY_SOURCES = "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
           & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install opencv4:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # `docs/Build.md`: the binding generator needs libclang 19 or newer
       # against MSVC 14.4x, or it stops at "STL1000: Unexpected compiler
       # version". Installed rather than taken from the image, whose LLVM is
