@@ -1165,6 +1165,11 @@ impl MyApp {
                     // the cameras are.
                     if self.cameras.lock().unwrap().is_none() {
                         self.scan_cameras();
+                        // This frame read `scanning` before the scan set it, so
+                        // nothing else here asks for the repaint that shows the
+                        // result. Without it, a pointer held still leaves "None
+                        // found" on screen until the next input.
+                        ui.ctx().request_repaint();
                     }
                     for device in &found {
                         let mut index = selected;
@@ -1177,7 +1182,9 @@ impl MyApp {
                         }
                     }
                     if found.is_empty() {
-                        ui.label(if scanning {
+                        // Read again rather than reusing `scanning` from above,
+                        // which predates the scan this frame may have started.
+                        ui.label(if self.scanning.load(Ordering::Relaxed) {
                             "Scanning…"
                         } else {
                             "None found"
