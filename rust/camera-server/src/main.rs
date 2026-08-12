@@ -9,12 +9,10 @@ use isekai_link_utils::{
     get_certificate, get_public_address, get_udp_mode, make_msquic_async_client_config,
     make_msquic_async_listener, set_udp_mode,
 };
-use msquic_async::msquic;
 use opencv::{
     core::{self, AlgorithmHint},
     imgcodecs, imgproc,
     prelude::*,
-    videoio,
 };
 use std::{
     collections::VecDeque,
@@ -25,7 +23,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    thread,
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -33,6 +30,68 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::{broadcast, oneshot};
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+
+mod capture;
+
+/// Hand one captured frame to the preview and to whoever is streaming.
+///
+/// The two go to different places and neither is required: the preview is
+/// dropped when the window is not repainting, and there is nothing to stream to
+/// until a viewer connects. What is reported is only a frame that could not be
+/// converted or encoded at all.
+fn deliver_frame(
+    frame: &Mat,
+    preview: &mpsc::SyncSender<([usize; 2], Bytes)>,
+    mjpeg: &Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
+) -> anyhow::Result<std::ops::ControlFlow<()>> {
+    // BGR → RGB
+    let mut rgb = Mat::default();
+    imgproc::cvt_color(
+        frame,
+        &mut rgb,
+        imgproc::COLOR_BGR2RGB,
+        0,
+        AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
+
+    let size = [rgb.cols() as usize, rgb.rows() as usize];
+    let data = Bytes::copy_from_slice(rgb.data_bytes()?);
+
+    // ✅ UIへ送信（満杯なら最新性を優先してドロップ）
+    match preview.try_send((size, data)) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            // UI isn't repainting (e.g. window occluded); drop the frame.
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            // The window is gone, so there is nothing left to capture for.
+            tracing::error!("failed to send frame to UI");
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+    }
+
+    let mut buf = core::Vector::<u8>::new();
+    let params = core::Vector::from(vec![
+        imgcodecs::IMWRITE_JPEG_QUALITY,
+        80, // 品質 (0-100)
+    ]);
+    imgcodecs::imencode(".jpg", frame, &mut buf, &params)?;
+    let jpeg_data = Bytes::copy_from_slice(buf.as_slice());
+
+    // ✅ MASQUEチャンネルへ送信（接続中のみ）
+    if let Some(sender) = mjpeg.lock().unwrap().as_ref() {
+        match sender.try_send(jpeg_data) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Drop this frame under backpressure.
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!("mjpeg sender closed");
+            }
+        }
+    }
+    Ok(std::ops::ControlFlow::Continue(()))
+}
 
 async fn run_isekai_connection(
     reg: Arc<msquic_async::Registration>,
@@ -253,82 +312,35 @@ async fn main() -> eframe::Result<()> {
         Arc::new(Mutex::new(None));
     let mjpeg_tx_holder_camera = Arc::clone(&mjpeg_tx_holder);
 
+    // Which camera to capture from, and what the thread is making of that.
+    // Shared with the UI, which offers the choice (`camera_ui_controls`).
+    let camera = capture::Handle::new(capture::DEFAULT_INDEX);
+
     // ✅ カメラスレッド起動
-    let camera_task_handle = tokio::task::spawn_blocking(move || {
-        let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY).unwrap();
-        cam.set(videoio::CAP_PROP_FRAME_WIDTH, 640.0)?;
-        cam.set(videoio::CAP_PROP_FRAME_HEIGHT, 480.0)?;
-
-        loop {
-            if is_terminated_camera.load(Ordering::Relaxed) {
-                tracing::debug!("camera task terminating");
-                break;
-            }
-            if !is_streaming_camera.load(Ordering::Relaxed) {
-                thread::sleep(std::time::Duration::from_millis(33));
-                continue;
-            }
-
-            let mut frame = Mat::default();
-            cam.read(&mut frame).unwrap();
-
-            if frame.empty() {
-                // Grab failed (e.g. device busy); back off instead of busy-looping.
-                thread::sleep(std::time::Duration::from_millis(33));
-                continue;
-            }
-
-            // BGR → RGB
-            let mut rgb = Mat::default();
-            imgproc::cvt_color(
-                &frame,
-                &mut rgb,
-                imgproc::COLOR_BGR2RGB,
-                0,
-                AlgorithmHint::ALGO_HINT_DEFAULT,
-            )
-            .unwrap();
-
-            let size = [rgb.cols() as usize, rgb.rows() as usize];
-            let data = Bytes::copy_from_slice(rgb.data_bytes().unwrap());
-
-            // ✅ UIへ送信（満杯なら最新性を優先してドロップ）
-            match tx.try_send((size, data)) {
-                Ok(()) => {}
-                Err(mpsc::TrySendError::Full(_)) => {
-                    // UI isn't repainting (e.g. window occluded); drop the frame.
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    tracing::error!("failed to send frame to UI");
-                    break;
-                }
-            }
-
-            let mut buf = core::Vector::<u8>::new();
-            let params = core::Vector::from(vec![
-                imgcodecs::IMWRITE_JPEG_QUALITY,
-                80, // 品質 (0-100)
-            ]);
-            imgcodecs::imencode(".jpg", &frame, &mut buf, &params).unwrap();
-            let jpeg_data = Bytes::copy_from_slice(buf.as_slice());
-
-            // ✅ MASQUEチャンネルへ送信（接続中のみ）
-            if let Some(sender) = mjpeg_tx_holder_camera.lock().unwrap().as_ref() {
-                match sender.try_send(jpeg_data) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        // Drop this frame under backpressure.
+    let camera_task_handle = tokio::task::spawn_blocking({
+        let camera = camera.clone();
+        move || {
+            // A frame that will not convert or encode is that frame's problem
+            // and not the camera's, so it is dropped rather than ending
+            // capture. Counted, because one that fails every time is a defect
+            // and 30 warnings a second is not how to report it.
+            let mut dropped: u64 = 0;
+            capture::run(camera, is_streaming_camera, is_terminated_camera, |frame| {
+                match deliver_frame(frame, &tx, &mjpeg_tx_holder_camera) {
+                    Ok(flow) => {
+                        dropped = 0;
+                        flow
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::error!("mjpeg sender closed");
+                    Err(e) => {
+                        if dropped.is_multiple_of(100) {
+                            tracing::warn!(dropped, "could not deliver a frame: {e:#}");
+                        }
+                        dropped += 1;
+                        std::ops::ControlFlow::Continue(())
                     }
                 }
-            }
-
-            // FPS制御
-            thread::sleep(std::time::Duration::from_millis(33));
+            })
         }
-        anyhow::Ok(())
     });
 
     // Filled in when a session starts, taken after the window closes. See
@@ -352,6 +364,7 @@ async fn main() -> eframe::Result<()> {
                 Arc::clone(&reg),
                 rx,
                 is_streaming,
+                camera,
                 mjpeg_tx_holder,
                 Arc::clone(&p2p_finished),
             )))
@@ -359,7 +372,7 @@ async fn main() -> eframe::Result<()> {
     );
     tracing::debug!("eframe exited, stopping camera task");
     is_terminated.store(true, Ordering::Relaxed);
-    camera_task_handle.await.unwrap().unwrap();
+    camera_task_handle.await.unwrap();
     tracing::debug!("camera task finished");
 
     // Closing the window dropped the app, which cancelled the P2P session; what
@@ -596,6 +609,16 @@ struct MyApp {
     rx: mpsc::Receiver<([usize; 2], Bytes)>,
     texture: Option<egui::TextureHandle>,
     is_streaming: Arc<AtomicBool>,
+    /// Which camera the capture thread should use, and what it is making of
+    /// that. The thread owns the device; this window only asks.
+    camera: capture::Handle,
+    /// The cameras found, and whether a scan for them is running.
+    ///
+    /// Scanning opens devices, which is slow enough to stutter the window, so it
+    /// happens on a worker and lands here. `None` is "not scanned yet", which is
+    /// how the first paint knows to start one.
+    cameras: Arc<Mutex<Option<Vec<capture::Device>>>>,
+    scanning: Arc<AtomicBool>,
 
     // ログ表示用ローカルコピー
     log: String,
@@ -613,6 +636,7 @@ impl MyApp {
         reg: Arc<msquic_async::Registration>,
         rx: mpsc::Receiver<([usize; 2], Bytes)>,
         is_streaming: Arc<AtomicBool>,
+        camera: capture::Handle,
         mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
         p2p_finished: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     ) -> Self {
@@ -646,6 +670,9 @@ impl MyApp {
             rx,
             texture: None,
             is_streaming,
+            camera,
+            cameras: Arc::new(Mutex::new(None)),
+            scanning: Arc::new(AtomicBool::new(false)),
             log: "Ready.".to_string(),
             consent: camera_ui::ConsentGate::new("camera-server", japanese),
         }
@@ -1088,6 +1115,108 @@ impl MyApp {
         }
     }
 
+    /// Choose which camera to capture from.
+    ///
+    /// The list is a convenience and not the choice: an index can be typed for
+    /// a camera the scan did not find, because there is no portable way to ask
+    /// what is attached and being wrong about that must not make a working
+    /// device unreachable.
+    fn camera_picker_ui(&mut self, ui: &mut egui::Ui) {
+        // The first paint starts a scan, so the list is there by the time
+        // anyone looks for it.
+        if self.cameras.lock().unwrap().is_none() {
+            self.scan_cameras();
+        }
+        let scanning = self.scanning.load(Ordering::Relaxed);
+        if scanning {
+            // Nothing else would bring the result on screen: it arrives on
+            // another thread, and egui repaints on input.
+            ui.ctx().request_repaint();
+        }
+        let found = self.cameras.lock().unwrap().clone().unwrap_or_default();
+        let selected = self.camera.selection.get();
+
+        ui.horizontal(|ui| {
+            ui.label("Camera:");
+            let label = found
+                .iter()
+                .find(|d| d.index == selected)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| format!("Camera {selected}"));
+            egui::ComboBox::from_id_salt("camera_device")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for device in &found {
+                        let mut index = selected;
+                        if ui
+                            .selectable_value(&mut index, device.index, &device.name)
+                            .clicked()
+                        {
+                            self.camera.selection.set(device.index);
+                        }
+                    }
+                    if found.is_empty() {
+                        ui.label(if scanning {
+                            "Scanning…"
+                        } else {
+                            "None found"
+                        });
+                    }
+                });
+
+            // For a camera the scan missed. The capture thread decides whether
+            // it works, and says so below.
+            let mut index = selected;
+            if ui
+                .add(egui::DragValue::new(&mut index).range(0..=63).prefix("#"))
+                .changed()
+            {
+                self.camera.selection.set(index);
+            }
+
+            if ui
+                .add_enabled(!scanning, egui::Button::new("Scan"))
+                .on_hover_text("Open each candidate device to see which answer")
+                .clicked()
+            {
+                self.scan_cameras();
+            }
+        });
+
+        let status = self.camera.status.lock().unwrap().clone();
+        match (status.open, &status.error) {
+            (_, Some(error)) => {
+                ui.colored_label(egui::Color32::from_rgb(0xC0, 0x39, 0x2B), error);
+            }
+            (Some(open), None) => {
+                ui.label(format!("Capturing from camera {open}."));
+            }
+            (None, None) => {
+                ui.label("No camera opened yet — capture opens one when it starts.");
+            }
+        }
+    }
+
+    /// Look for attached cameras, off the UI thread.
+    ///
+    /// Scanning opens devices one at a time, which takes long enough per device
+    /// to be visible as a stutter — and the capture thread is meanwhile holding
+    /// one of them, which is why the one in use is passed in rather than probed.
+    fn scan_cameras(&self) {
+        if self.scanning.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let cameras = Arc::clone(&self.cameras);
+        let scanning = Arc::clone(&self.scanning);
+        let in_use = self.camera.open();
+        tokio::task::spawn_blocking(move || {
+            let found = capture::enumerate(in_use);
+            tracing::debug!(count = found.len(), "camera scan finished");
+            *cameras.lock().unwrap() = Some(found);
+            scanning.store(false, Ordering::Relaxed);
+        });
+    }
+
     fn p2p_status_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let (status, info, capability, observed) = {
@@ -1417,6 +1546,10 @@ impl eframe::App for MyApp {
                             "Stopped"
                         }
                     ));
+
+                    ui.separator();
+
+                    self.camera_picker_ui(ui);
 
                     ui.separator();
 
