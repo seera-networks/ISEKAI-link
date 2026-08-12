@@ -2,21 +2,6 @@
 
 Version: 2026-08-05
 
-> **Note — remove before publishing.**
-> This was drafted from what the ISEKAI link client code actually sends and
-> stores, and has **not been reviewed by a lawyer**. Have it reviewed against
-> the applicable data-protection law before publishing.
->
-> **Assumptions to settle before publishing**
-> - Section 6.2 assumes a data processing addendum (DPA) is in place with
->   Okta, Inc. Without one, that section does not hold.
-> - Whether the DPA's terms meet the standard in Article 16(1) of the APPI
->   Enforcement Rules — against the annex to the guidelines on transfers to
->   third parties in foreign countries — needs separate confirmation.
-> - The way section 10 names foreign countries is the conservative reading:
->   it goes beyond the recipient under Article 28 to the countries its
->   sub-processors are in.
-
 ## 1. Who we are
 
 | | |
