@@ -52,6 +52,14 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// it. The report normally lands within a round trip of the leg coming up; if it
 /// does not, streaming over the relay matters more than a direct path.
 const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
+/// How long a video connection may carry nothing before it is closed.
+///
+/// Also the answer to "was this connection still alive?" for anything that
+/// could not watch it — an iOS viewer coming back from the background knows
+/// only how long it was away, and longer than this means the connection is
+/// gone whatever the app still holds. Exported for that.
+pub const VIDEO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long the whole connection may go without sending before it gets a PING.
 ///
 /// Distinct from [`DIRECT_PATH_KEEPALIVE`], which is per path; this one is
@@ -1181,7 +1189,7 @@ fn video_client_config(
     };
     let alpn = [msquic::BufferRef::from(VIDEO_ALPN)];
     let settings = msquic::Settings::new()
-        .set_IdleTimeoutMs(30_000)
+        .set_IdleTimeoutMs(VIDEO_IDLE_TIMEOUT.as_millis() as u64)
         // Keep a single unanswered handshake alive long enough to span
         // the peer's relay-bind gap: msquic keeps retransmitting the
         // Initial on ONE connection until the far leg comes up, rather

@@ -366,6 +366,54 @@ final class ViewerModel: ObservableObject {
         rttMs = nil
     }
 
+    // MARK: - App lifecycle
+
+    /// When the app was last put into the background, if it still is.
+    private var backgroundedAt: Date?
+
+    /// The app went away. Remember when, because that is the only thing it will
+    /// know on the way back.
+    func didEnterBackground() {
+        backgroundedAt = Date()
+    }
+
+    /// The app came back.
+    ///
+    /// **A suspended app is told nothing while it is away, and is not told
+    /// promptly on return either.** The connection is closed by its idle
+    /// timeout, but this app only hears about it when the core's receive loop
+    /// next gets to run and errors out — some moment after the foreground, not
+    /// at it. Until then the app still believes it is connected: Disconnect
+    /// where Connect should be, and the settings form locked.
+    ///
+    /// That window is what a person walks into. Two returns after the same two
+    /// minutes away behaved differently on device, purely by whether the report
+    /// had landed yet.
+    ///
+    /// So this does not wait to be told. Away for longer than the idle timeout
+    /// means the connection is gone, and that much the app can work out for
+    /// itself. It stops there rather than reconnecting: coming back to a phone
+    /// in a pocket should not open a camera and spend data on it.
+    func willEnterForeground() {
+        guard let since = backgroundedAt else { return }
+        backgroundedAt = nil
+        let away = Date().timeIntervalSince(since)
+        guard session != nil, away >= Self.idleTimeout else { return }
+
+        releaseSession()
+        phase = .failed
+        let seconds = Int(away.rounded())
+        statusDetail = "Connection lost while the app was in the background (\(seconds)s)."
+        errorMessage = statusDetail
+    }
+
+    /// How long a connection survives with nothing watching it.
+    ///
+    /// Asked of the core rather than written down here. It is the video
+    /// connection's own idle timeout, and the same number in two places is the
+    /// same number only until somebody moves one of them.
+    private static let idleTimeout = TimeInterval(videoIdleTimeoutSeconds())
+
     /// Forget the Endpoint key and mint a new identity. Any capability the
     /// camera server issued for the old Endpoint ID stops matching.
     func resetEndpointKey() {

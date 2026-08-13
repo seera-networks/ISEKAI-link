@@ -9,6 +9,7 @@ import SwiftUI
 /// gets wrong.
 struct ContentView: View {
     @StateObject private var model = ViewerModel()
+    @Environment(\.scenePhase) private var scenePhase
     @State private var signInError: String?
     @State private var pairingCode = ""
     @State private var isScanning = false
@@ -28,6 +29,18 @@ struct ContentView: View {
             .navigationTitle("ISEKAI Viewer")
         }
         .task { model.prepare() }
+        // A connection does not survive the app being suspended, and the app is
+        // not told so on the way back — `willEnterForeground` is where it works
+        // that out for itself. `.inactive` is deliberately not treated as
+        // leaving: the app keeps running through a notification banner or the
+        // app switcher, and so does the connection.
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .background: model.didEnterBackground()
+            case .active: model.willEnterForeground()
+            default: break
+            }
+        }
         .sheet(isPresented: $isScanning) {
             QRScannerView(
                 onCode: { code in
