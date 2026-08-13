@@ -83,15 +83,18 @@ fn make_msquic_async_listner(
                 // `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU, so the 1200 written
                 // here was silently 1248 and only misled whoever read it.
                 //
-                // **It is also below what a relay connection needs.** This one
-                // carries CONNECT-UDP for a peer, and a full-size inner QUIC
-                // packet costs ~1292 on the wire — see the arithmetic on
-                // `isekai_p2p_core::transport`'s `MinimumMtu`, which is 1350 for
-                // exactly this reason. Left alone here rather than changed
-                // blind: this binary is a standalone utility, nothing in CI
-                // builds it, and what runs inside its tunnel is the caller's.
-                // If it is ever used to relay QUIC, this is why full-size
-                // packets vanish while ACKs get through.
+                // **The floor is too low, and is left that way on purpose.**
+                // This connection carries CONNECT-UDP for a peer, and a
+                // full-size relayed inner QUIC packet costs ~1292 on the wire —
+                // see the arithmetic on `isekai_p2p_core::transport`'s
+                // `MinimumMtu`, which is 1350 for exactly that. This binary is
+                // the WebRTC one and is not being maintained, so raising it
+                // belongs to whoever next works on it rather than to a change
+                // that was only correcting comments.
+                //
+                // Whoever that is: the symptom of leaving it is that full-size
+                // packets vanish while ACKs get through, so the path looks lossy
+                // rather than misconfigured.
                 .set_MaximumMtu(1248)
                 .set_KeepAliveIntervalMs(10_000)
                 .set_DestCidUpdateIdleTimeoutMs(0)
