@@ -338,9 +338,30 @@ final class ViewerModel: ObservableObject {
 
     func disconnect() {
         session?.disconnect()
+        releaseSession()
+        phase = .closed
+    }
+
+    /// Let go of a session that has already ended.
+    ///
+    /// Ending it and letting go of it are two things, and only the first was
+    /// being done when a connection stopped on its own. `connect()` refuses
+    /// while a session is held, and `isConnected` — which is just "a session is
+    /// held" — disables the whole settings form and shows a Disconnect button.
+    /// So a connection that died left the app offering to end something already
+    /// over, and the way back was to press that and *then* Connect: two actions
+    /// for something nobody chose.
+    ///
+    /// Nothing is reported to the proxy here, unlike `disconnect()`. The state
+    /// that brought us here is terminal, so there is nothing left to say — and
+    /// dropping the session is what stops it renewing that connection's lease,
+    /// which is the part that matters.
+    ///
+    /// The phase and any error are left alone: what happened is still worth
+    /// showing.
+    private func releaseSession() {
         session = nil
         sink = nil
-        phase = .closed
         paths = nil
         rttMs = nil
     }
@@ -374,13 +395,18 @@ final class ViewerModel: ObservableObject {
         case .streaming:
             phase = .streaming
             statusDetail = ""
+        // Both terminal, and both have to let go of the session. The camera
+        // stopping, the network going, or this app being suspended past the
+        // video connection's 30s idle timeout all arrive here.
         case .closed:
             phase = .closed
             statusDetail = ""
+            releaseSession()
         case .failed:
             phase = .failed
             statusDetail = detail
             errorMessage = detail
+            releaseSession()
         }
     }
 
