@@ -369,12 +369,27 @@ final class ViewerModel: ObservableObject {
     // MARK: - App lifecycle
 
     /// When the app was last put into the background, if it still is.
-    private var backgroundedAt: Date?
+    ///
+    /// `ContinuousClock` rather than `Date`, because this is a measurement and
+    /// not a time. A wall clock steps backwards when the network corrects it or
+    /// somebody sets it, and a negative interval reads as "barely away" — which
+    /// puts the app straight back into the stuck state this exists to prevent,
+    /// occasionally and for no visible reason. `ContinuousClock` only goes
+    /// forwards and keeps counting while the device sleeps, which is exactly
+    /// the span being asked about.
+    private var backgroundedAt: ContinuousClock.Instant?
 
     /// The app went away. Remember when, because that is the only thing it will
     /// know on the way back.
+    ///
+    /// This is when it was *backgrounded*, which is a little before it was
+    /// suspended and the connection actually went quiet — so a long enough
+    /// background can be declared lost while the connection was in fact still
+    /// alive. That way round on purpose: being early costs a needless "lost"
+    /// and one press of Connect, being late costs the stuck state, and nobody
+    /// should tighten this without knowing which side to err on.
     func didEnterBackground() {
-        backgroundedAt = Date()
+        backgroundedAt = ContinuousClock.now
     }
 
     /// The app came back.
@@ -397,13 +412,13 @@ final class ViewerModel: ObservableObject {
     func willEnterForeground() {
         guard let since = backgroundedAt else { return }
         backgroundedAt = nil
-        let away = Date().timeIntervalSince(since)
+        let away = ContinuousClock.now - since
         guard session != nil, away >= Self.idleTimeout else { return }
 
         releaseSession()
         phase = .failed
-        let seconds = Int(away.rounded())
-        statusDetail = "Connection lost while the app was in the background (\(seconds)s)."
+        statusDetail =
+            "Connection lost while the app was in the background (\(away.components.seconds)s)."
         errorMessage = statusDetail
     }
 
@@ -412,7 +427,7 @@ final class ViewerModel: ObservableObject {
     /// Asked of the core rather than written down here. It is the video
     /// connection's own idle timeout, and the same number in two places is the
     /// same number only until somebody moves one of them.
-    private static let idleTimeout = TimeInterval(videoIdleTimeoutSeconds())
+    private static let idleTimeout = Duration.seconds(videoIdleTimeoutSeconds())
 
     /// Forget the Endpoint key and mint a new identity. Any capability the
     /// camera server issued for the old Endpoint ID stops matching.
@@ -429,7 +444,19 @@ final class ViewerModel: ObservableObject {
 
     // MARK: - Called by ViewerSink
 
-    func apply(state: ConnectionState, detail: String) {
+    func apply(state: ConnectionState, detail: String, from sink: ViewerSink) {
+        // A report from a sink this model is no longer listening to. The core's
+        // loop unwinds after the session is dropped, so a `.closed` can arrive
+        // *after* `willEnterForeground` has already said what happened — and it
+        // would blank that message and walk `.failed` back to `.closed`. Worse,
+        // if the person has reconnected in between, it would be describing the
+        // old connection over the new one's state.
+        //
+        // Identity, because the sink is set at the top of `connect()` and stays
+        // for the whole attempt: this holds during connecting, when there is a
+        // sink and not yet a session. Only state is guarded — frames, paths and
+        // RTT are display values that the next real one replaces.
+        guard sink === self.sink else { return }
         switch state {
         case .connecting:
             phase = .connecting
@@ -511,10 +538,7 @@ final class ViewerModel: ObservableObject {
     private func fail(_ message: String) {
         errorMessage = message
         phase = .failed
-        session = nil
-        sink = nil
-        paths = nil
-        rttMs = nil
+        releaseSession()
     }
 }
 

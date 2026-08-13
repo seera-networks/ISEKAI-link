@@ -210,18 +210,6 @@ pub struct PrivacyPolicy {
 }
 
 /// The policy to show, and the version to record alongside the answer.
-/// How long a connection this app is not watching survives, in seconds.
-///
-/// For the one question a suspended app can answer about a connection it could
-/// not observe: it knows how long it was away, and longer than this means the
-/// connection is gone whatever handle is still held. Read from
-/// `camera-core` rather than written down again on the Swift side — the same
-/// number in two places is the same number until somebody moves one of them.
-#[uniffi::export]
-pub fn video_idle_timeout_seconds() -> u32 {
-    camera_core::VIDEO_IDLE_TIMEOUT.as_secs() as u32
-}
-
 #[uniffi::export]
 pub fn privacy_policy() -> PrivacyPolicy {
     PrivacyPolicy {
@@ -231,6 +219,18 @@ pub fn privacy_policy() -> PrivacyPolicy {
         text_ja: camera_core::privacy::TEXT_JA.to_owned(),
         text_en: camera_core::privacy::TEXT_EN.to_owned(),
     }
+}
+
+/// How long a connection this app is not watching survives, in seconds.
+///
+/// For the one question a suspended app can answer about a connection it could
+/// not observe: it knows how long it was away, and longer than this means the
+/// connection is gone whatever handle is still held. Read from `camera-core`
+/// rather than written down again on the Swift side — the same number in two
+/// places is the same number until somebody moves one of them.
+#[uniffi::export]
+pub fn video_idle_timeout_seconds() -> u32 {
+    camera_core::VIDEO_IDLE_TIMEOUT.as_secs() as u32
 }
 
 /// Where the core gets a *current* Auth0 access token.

@@ -31,8 +31,10 @@ final class ViewerSink: FrameSink {
     }
 
     func onState(state: ConnectionState, detail: String) {
-        Task { @MainActor [weak model] in
-            model?.apply(state: state, detail: detail)
+        // Named as the source, so the model can tell a report about the session
+        // it is watching from one about a session it has already let go of.
+        Task { @MainActor [weak model, self] in
+            model?.apply(state: state, detail: detail, from: self)
         }
     }
 
