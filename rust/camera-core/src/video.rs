@@ -295,13 +295,26 @@ async fn leg_of(
             return Some(observed);
         }
         if tokio::time::Instant::now() >= deadline {
-            // Either it is not a relay connection — something dialled the video
-            // listener directly — or a leg is slower to report than this waited.
-            // Both end the same way and neither is worth failing over.
-            tracing::debug!(
-                %peer,
-                "no relay leg claims this connection; staying relay-only",
-            );
+            // Two different things, and only one of them is fine.
+            //
+            // With no leg claiming any address, this is a connection that did
+            // not come through a relay — something dialled the video listener
+            // directly — and relay-only is the right answer.
+            //
+            // With legs claiming addresses and none of them this one, the way a
+            // leg is identified has stopped working (see `LegDirectory`), and
+            // *every* connection is about to quietly lose its direct path. Said
+            // loudly, because the symptom on its own is only that migration
+            // never happens.
+            match directory.claimed() {
+                0 => tracing::debug!(%peer, "no relay leg has reported; staying relay-only"),
+                claimed => tracing::warn!(
+                    %peer,
+                    claimed,
+                    "no relay leg claims this connection, though others are claimed; \
+                     staying relay-only",
+                ),
+            }
             return None;
         }
         tokio::select! {

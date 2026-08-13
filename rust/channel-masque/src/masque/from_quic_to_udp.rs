@@ -341,6 +341,15 @@ where
                     };
                     let socket = match mode {
                         crate::MasqueClientMode::Forward(forward_addr) => {
+                            // The `connect` is not only about sending. It also
+                            // decides the source address, which is what makes
+                            // `local_addr` — reported as `NewRemoteHost`'s
+                            // second field — the address `forward_addr` will
+                            // see this traffic coming from. `isekai-p2p`'s
+                            // `LegDirectory` identifies a relay leg by exactly
+                            // that. Bound to the wildcard and left unconnected,
+                            // it would report `0.0.0.0:p`, match nothing, and
+                            // take every direct path down with it silently.
                             let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.with_context(|| "failed to bind UDP socket")?);
                             socket.connect(forward_addr).await.with_context(|| "failed to connect UDP socket")?;
                             socket_info.insert((stream_id, addr), (socket.clone(), true));

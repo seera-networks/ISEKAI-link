@@ -183,6 +183,14 @@ impl SignalingState {
 ///
 /// One leg can appear more than once — a peer that changes address gets another
 /// forwarding socket — which is why this is keyed by address rather than by leg.
+///
+/// **This rests on the forwarding socket being connected before its address is
+/// read.** It is bound to the wildcard, so what makes `local_addr` report
+/// `127.0.0.1:p` rather than `0.0.0.0:p` is the `connect` to the local listener
+/// that precedes it (`channel-masque`'s `from_quic_to_udp`). Were that to go —
+/// a leg fanning out to several destinations, say — nothing here would ever
+/// match, and every connection would fall back to relay-only in silence. There
+/// is a note at the other end saying the same thing.
 #[derive(Clone, Default)]
 pub struct LegDirectory {
     forwarding: Arc<Mutex<HashMap<SocketAddr, ObservedAddressWatch>>>,
@@ -202,13 +210,53 @@ impl LegDirectory {
         self.forwarding.lock().unwrap().insert(forwarding, leg);
     }
 
-    /// Forget a leg's addresses, so the map is bounded by the legs that exist
-    /// rather than by every leg this session has ever had.
+    /// Forget a leg's addresses. Called from [`AttachedLeg`]'s `Drop`, which is
+    /// what makes the map bounded by the legs that exist.
     fn detach(&self, forwarding: &[SocketAddr]) {
         let mut map = self.forwarding.lock().unwrap();
         for addr in forwarding {
             map.remove(addr);
         }
+    }
+
+    /// How many addresses are claimed. Zero and non-zero mean different things
+    /// to a connection nothing claims — see `camera-core`'s `leg_of`.
+    pub fn claimed(&self) -> usize {
+        self.forwarding.lock().unwrap().len()
+    }
+}
+
+/// One leg's entries in a [`LegDirectory`], removed when the leg's task ends.
+///
+/// **`Drop` and not a line after the loop**, because legs are normally taken
+/// down by aborting that task — [`ListenerSession::unbind`] when a peer goes,
+/// and `close` on the way out — and an aborted task does not run what follows
+/// its last await. Left in the map, a dead leg's entry keeps its watch alive
+/// and, once the operating system hands that ephemeral port to a new leg's
+/// forwarding socket, answers for it: a connection advertised somebody else's
+/// binding, which is the fault this whole mechanism exists to remove.
+struct AttachedLeg {
+    legs: LegDirectory,
+    forwarding: Vec<SocketAddr>,
+}
+
+impl AttachedLeg {
+    fn new(legs: LegDirectory) -> Self {
+        Self {
+            legs,
+            forwarding: Vec::new(),
+        }
+    }
+
+    fn attach(&mut self, forwarding: SocketAddr, leg: ObservedAddressWatch) {
+        self.legs.attach(forwarding, leg);
+        self.forwarding.push(forwarding);
+    }
+}
+
+impl Drop for AttachedLeg {
+    fn drop(&mut self) {
+        self.legs.detach(&self.forwarding);
     }
 }
 
@@ -714,9 +762,9 @@ async fn drive_bind_session(
 ) {
     let mut leg = session.observed();
     // The addresses this leg has been reached at, so they can be forgotten with
-    // it. Kept here rather than looked up in the directory, which cannot say
-    // whose an entry is.
-    let mut forwarding: Vec<SocketAddr> = Vec::new();
+    // it however it ends. Kept here rather than looked up in the directory,
+    // which cannot say whose an entry is.
+    let mut attached = AttachedLeg::new(legs);
     // The leg's watch ends when its connection does; keep draining events after
     // that rather than spinning on a closed channel.
     let mut leg_open = true;
@@ -732,8 +780,7 @@ async fn drive_bind_session(
                         tracing::debug!(
                             %peer, forwarding = %socket, "a peer is reaching this leg",
                         );
-                        legs.attach(socket, session.observed());
-                        forwarding.push(socket);
+                        attached.attach(socket, session.observed());
                     } else {
                         tracing::debug!("bind session event: {event:?}");
                     }
@@ -745,7 +792,6 @@ async fn drive_bind_session(
             }
         }
     }
-    legs.detach(&forwarding);
 }
 
 /// Republish one change from a leg's watch into the session-lifetime watch.
@@ -1023,19 +1069,31 @@ mod tests {
 
     /// A leg that ends takes its addresses with it, so the map is bounded by
     /// the legs that exist rather than by every leg this session ever had.
+    ///
+    /// **Through `Drop`, which is the only path that runs.** Legs are normally
+    /// taken down by aborting their task, and an aborted task does not reach
+    /// anything after its loop — so cleaning up there left every leg a peer had
+    /// left behind still answering, its watch alive, ready to be handed to
+    /// whichever new leg the operating system gave that port to next.
     #[test]
     fn a_leg_that_ends_stops_answering() {
         let legs = LegDirectory::default();
-        legs.attach(forwarding(40001), leg_watch(1));
-        legs.attach(forwarding(40002), leg_watch(2));
+        let other = {
+            let mut ending = AttachedLeg::new(legs.clone());
+            ending.attach(forwarding(40001), leg_watch(1));
+            let mut other = AttachedLeg::new(legs.clone());
+            other.attach(forwarding(40002), leg_watch(2));
+            assert_eq!(legs.claimed(), 2);
+            other
+        };
 
-        legs.detach(&[forwarding(40001)]);
-
-        assert!(legs.leg_for(forwarding(40001)).is_none());
+        assert!(legs.leg_for(forwarding(40001)).is_none(), "it ended");
         assert!(
             legs.leg_for(forwarding(40002)).is_some(),
             "the other leg is untouched",
         );
+        drop(other);
+        assert_eq!(legs.claimed(), 0);
     }
 
     /// A guard over a leg that has received `datagrams` so far.
