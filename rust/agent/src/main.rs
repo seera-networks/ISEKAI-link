@@ -79,7 +79,20 @@ fn make_msquic_async_listner(
         Some(
             &&&msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
-                .set_MaximumMtu(1200)
+                // 1248, because that is what this asks for: msquic clamps
+                // `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU, so the 1200 written
+                // here was silently 1248 and only misled whoever read it.
+                //
+                // **It is also below what a relay connection needs.** This one
+                // carries CONNECT-UDP for a peer, and a full-size inner QUIC
+                // packet costs ~1292 on the wire — see the arithmetic on
+                // `isekai_p2p_core::transport`'s `MinimumMtu`, which is 1350 for
+                // exactly this reason. Left alone here rather than changed
+                // blind: this binary is a standalone utility, nothing in CI
+                // builds it, and what runs inside its tunnel is the caller's.
+                // If it is ever used to relay QUIC, this is why full-size
+                // packets vanish while ACKs get through.
+                .set_MaximumMtu(1248)
                 .set_KeepAliveIntervalMs(10_000)
                 .set_DestCidUpdateIdleTimeoutMs(0)
                 .set_PeerBidiStreamCount(100)
