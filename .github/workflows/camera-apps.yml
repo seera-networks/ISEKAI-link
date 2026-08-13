@@ -360,13 +360,33 @@ jobs:
           done
           ls -l release
 
+      # Attach to the release if there is one, create it if there is not.
+      #
+      # This only created, which assumes the tag arrives before anything else —
+      # true when a tag is pushed from a terminal, false when a person cuts the
+      # release from the GitHub UI. That makes the release *and* the tag, so
+      # this job starts with the release already there and `gh release create`
+      # answers 422. Which is what happened to v0.1.0: everything built, and
+      # nothing was attached.
+      #
+      # `--clobber` so re-running the job replaces the archives rather than
+      # failing on the ones it uploaded last time.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            release/*.zip
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; attaching to it"
+            gh release upload "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              release/*.zip
+          else
+            echo "no release $GITHUB_REF_NAME yet; creating it"
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              release/*.zip
+          fi
