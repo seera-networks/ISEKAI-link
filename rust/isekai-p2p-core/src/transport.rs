@@ -288,7 +288,30 @@ pub(crate) fn make_client_config(
         Some(
             &msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
-                .set_DestCidUpdateIdleTimeoutMs(0)
+                // Keep the connection from going idle into that timeout.
+                //
+                // Without it, whether one of these survives depends on the
+                // caller happening to send something every thirty seconds —
+                // a control-plane client between requests, or a relay leg
+                // whose peer has gone quiet, has no such guarantee. Ten
+                // seconds leaves two attempts inside the timeout.
+                //
+                // This is the *connection* keepalive and not
+                // `PathKeepAliveIntervalMs`: it is re-armed by any activity
+                // anywhere on the connection, so it fires only when the whole
+                // thing is quiet, which is exactly the case being covered.
+                // Keeping an idle *path* warm is a different setting and a
+                // different problem (see `camera-core`'s video connection).
+                .set_KeepAliveIntervalMs(10_000)
+                // `DestCidUpdateIdleTimeoutMs` is left at its default — rotate
+                // the destination connection ID after 20s idle — and its
+                // absence here is a decision rather than an omission.
+                //
+                // It was pinned to 0, which switches that rotation off, to work
+                // around an msquic defect. That defect is fixed, so the reason
+                // is gone. Worth saying because nearly every other
+                // configuration in this repository still carries the pin: a
+                // reader matching them up would put it back.
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()
