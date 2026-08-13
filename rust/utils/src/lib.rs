@@ -53,6 +53,14 @@ pub fn make_msquic_async_client_config(
         Some(
             &msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
+                // Keep the connection from going idle into the timeout above.
+                // Ten seconds leaves two attempts inside it.
+                //
+                // The peer usually pings too, and one side's keepalive is enough to
+                // hold both ends open — a PING is ack-eliciting, so it resets the
+                // receiver's idle timer and the sender's alike. This is here so that
+                // staying up does not depend on the peer being configured that way.
+                .set_KeepAliveIntervalMs(10_000)
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()

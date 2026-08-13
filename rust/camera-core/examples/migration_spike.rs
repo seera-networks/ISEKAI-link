@@ -1205,6 +1205,8 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
     let alpn = [msquic::BufferRef::from(ALPN)];
     let settings = msquic::Settings::new()
         .set_IdleTimeoutMs(30_000)
+        // As `video_client_config` does, which this is here to reproduce.
+        .set_KeepAliveIntervalMs(10_000)
         .set_PeerUnidiStreamCount(100)
         .set_StreamMultiReceiveEnabled()
         .set_ReceiveObservedAddressReports();

@@ -303,16 +303,22 @@ pub(crate) fn make_client_config(
                 // Keeping an idle *path* warm is a different setting and a
                 // different problem (see `camera-core`'s video connection).
                 .set_KeepAliveIntervalMs(10_000)
-                // `DestCidUpdateIdleTimeoutMs` is left at its default — rotate
-                // the destination connection ID after 20s idle — and its
+                // `DestCidUpdateIdleTimeoutMs` is left at its default, and its
                 // absence is a decision rather than an omission.
                 //
                 // Every configuration in this repository used to pin it to 0,
-                // which switches that rotation off, to work around an msquic
-                // defect. That defect is fixed, so none of them does now. Said
-                // here because this is the one place a reader will look for the
-                // reason, and because a pin that was once everywhere is easy to
-                // reintroduce from memory.
+                // switching off the destination CID rotation to work around an
+                // msquic defect. That defect is fixed, so none of them does now.
+                //
+                // **This does not get the rotation back, and is not meant to.**
+                // The gate is 20 s since the last flush (`send.c`), and the
+                // keepalive above flushes every 10, so on any connection
+                // configured like this one it will not fire. What the removal
+                // achieves is that a workaround whose reason is gone stops
+                // being carried — and stops being copied into the next
+                // configuration somebody writes. Wanting the rotation to
+                // actually happen would mean settling the keepalive interval
+                // against that 20 s, which is a different question.
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()
