@@ -65,7 +65,6 @@ fn make_msquic_async_reg_and_config(
             &&msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
                 .set_KeepAliveIntervalMs(10_000)
-                .set_DestCidUpdateIdleTimeoutMs(0)
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()

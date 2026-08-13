@@ -32,7 +32,6 @@ fn make_msquic_async_client_config(
     // which we feed to `add_candidate_addr` to enable path migration.
     let settings = msquic::Settings::new()
         .set_IdleTimeoutMs(30_000)
-        .set_DestCidUpdateIdleTimeoutMs(0)
         .set_PeerBidiStreamCount(100)
         .set_PeerUnidiStreamCount(100)
         .set_DatagramReceiveEnabled()

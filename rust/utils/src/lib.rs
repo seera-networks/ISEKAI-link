@@ -53,7 +53,6 @@ pub fn make_msquic_async_client_config(
         Some(
             &msquic::Settings::new()
                 .set_IdleTimeoutMs(30_000)
-                .set_DestCidUpdateIdleTimeoutMs(0)
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()
@@ -142,7 +141,6 @@ pub fn make_msquic_async_listener_with(
         // connection that is carrying traffic it never fires at all. Keeping an
         // idle path alive is `PathKeepAliveIntervalMs` below.
         .set_KeepAliveIntervalMs(10_000)
-        .set_DestCidUpdateIdleTimeoutMs(0)
         .set_PeerBidiStreamCount(100)
         .set_PeerUnidiStreamCount(100)
         .set_DatagramReceiveEnabled()

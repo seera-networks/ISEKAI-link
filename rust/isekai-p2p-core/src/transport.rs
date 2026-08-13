@@ -305,13 +305,14 @@ pub(crate) fn make_client_config(
                 .set_KeepAliveIntervalMs(10_000)
                 // `DestCidUpdateIdleTimeoutMs` is left at its default — rotate
                 // the destination connection ID after 20s idle — and its
-                // absence here is a decision rather than an omission.
+                // absence is a decision rather than an omission.
                 //
-                // It was pinned to 0, which switches that rotation off, to work
-                // around an msquic defect. That defect is fixed, so the reason
-                // is gone. Worth saying because nearly every other
-                // configuration in this repository still carries the pin: a
-                // reader matching them up would put it back.
+                // Every configuration in this repository used to pin it to 0,
+                // which switches that rotation off, to work around an msquic
+                // defect. That defect is fixed, so none of them does now. Said
+                // here because this is the one place a reader will look for the
+                // reason, and because a pin that was once everywhere is easy to
+                // reintroduce from memory.
                 .set_PeerBidiStreamCount(100)
                 .set_PeerUnidiStreamCount(100)
                 .set_DatagramReceiveEnabled()

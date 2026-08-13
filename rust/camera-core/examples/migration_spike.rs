@@ -1219,14 +1219,11 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
         Some(mtu) => settings.set_MaximumMtu(mtu),
         None => settings,
     };
-    // SPIKE_PIN_DCID=0 drops it. Every other client config in this repo sets it,
-    // including Direct mode's; `video_client_config` is the one that does not.
-    // Migrating to a new path needs a spare destination connection ID.
-    let settings = if std::env::var("SPIKE_PIN_DCID").as_deref() == Ok("0") {
-        settings
-    } else {
-        settings.set_DestCidUpdateIdleTimeoutMs(0)
-    };
+    // `SPIKE_PIN_DCID` is gone along with the pin it toggled. Every client
+    // config in this repository used to set `DestCidUpdateIdleTimeoutMs(0)`,
+    // switching off the destination CID rotation to work around an msquic
+    // defect; that defect is fixed and none of them does now, so there is no
+    // longer a pinned arm for an unpinned one to be compared against.
     let settings = if enable_natt {
         settings.set_AddAddressMode(msquic::AddAddressMode::NatTraversal)
     } else {
@@ -1313,7 +1310,6 @@ async fn spawn_listener_variant(
                     .set_IdleTimeoutMs(30_000)
                     .set_MaximumMtu(1200)
                     .set_KeepAliveIntervalMs(10_000)
-                    .set_DestCidUpdateIdleTimeoutMs(0)
                     .set_PeerBidiStreamCount(100)
                     .set_PeerUnidiStreamCount(100)
                     .set_DatagramReceiveEnabled()

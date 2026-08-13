@@ -52,6 +52,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// it. The report normally lands within a round trip of the leg coming up; if it
 /// does not, streaming over the relay matters more than a direct path.
 const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
+/// How long the whole connection may go without sending before it gets a PING.
+///
+/// Distinct from [`DIRECT_PATH_KEEPALIVE`], which is per path; this one is
+/// reset by any activity and so only fires on a connection carrying nothing.
+/// Well inside the 30 s idle timeout, with two attempts to spare.
+const CONNECTION_KEEPALIVE: Duration = Duration::from_secs(10);
+
 /// How long a path may go without sending before it gets a PING.
 ///
 /// `PathKeepAliveIntervalMs`, and **not** `KeepAliveIntervalMs`. The two look
@@ -1180,6 +1187,17 @@ fn video_client_config(
         // Initial on ONE connection until the far leg comes up, rather
         // than many short-lived attempts (which poison the relay path).
         .set_HandshakeIdleTimeoutMs(60_000)
+        // Keep the connection from going idle into the timeout above.
+        //
+        // The other keepalive, and both are wanted. `DIRECT_PATH_KEEPALIVE`
+        // below explains why this one does not keep a *path* warm: it is
+        // re-armed by activity anywhere on the connection, so on a connection
+        // carrying video it never fires at all. What it covers is the case
+        // where there is no video — the camera stopped streaming, or has not
+        // started — and the connection would otherwise be dropped at thirty
+        // seconds with the viewer still sitting there. The listener side has
+        // had this all along (`isekai_link_utils`); this side had not.
+        .set_KeepAliveIntervalMs(CONNECTION_KEEPALIVE.as_millis() as u32)
         // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
         // (1248), so asking for less is silently ignored — 1248 is what
         // this connection actually uses, and stating it keeps the code

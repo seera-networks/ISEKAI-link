@@ -101,9 +101,11 @@ jobs:
             case "$out" in PASS*) ;; *) fail=1 ;; esac
           }
           run_case 'two-process baseline            ' 57701 DUMMY=1
-          run_case 'two-process MaximumMtu=1200     ' 57702 SPIKE_MAX_MTU=1200
-          run_case 'two-process no DestCidUpdate    ' 57703 SPIKE_PIN_DCID=0
-          run_case 'two-process = video_client_config' 57704 SPIKE_MAX_MTU=1200 SPIKE_PIN_DCID=0
+          # The two DestCidUpdate cases are gone with `SPIKE_PIN_DCID`: no
+          # client config pins the destination CID any more, so both of them
+          # were running the baseline under another name. What is left of the
+          # second is its MTU, which is what `video_client_config` differs by.
+          run_case 'two-process = video_client_config' 57702 SPIKE_MAX_MTU=1248
           exit $fail
         shell: bash
 
