@@ -1212,9 +1212,17 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
     // camera-core's `video_client_config` (which does not, in the field). Knobs
     // rather than a guess, so each can be ruled in or out on its own.
     //
-    // SPIKE_MAX_MTU: the real config pins MaximumMtu to 1200 to fit inside the
-    // relay tunnel. msquic's default MinimumMtu is 1248, so that leaves the
-    // range inverted — and a freshly opened path has to size itself.
+    // SPIKE_MAX_MTU: the real config caps MaximumMtu at 1248 so a video packet
+    // plus its CONNECT-UDP encapsulation fits inside the relay tunnel. There is
+    // nothing to vary below that — msquic clamps `MaximumMtu` up to
+    // QUIC_DPLPMTUD_MIN_MTU, which is also 1248 — so a value under it is
+    // silently ignored and the knob only reaches upwards, where a freshly
+    // opened path has to size itself.
+    //
+    // This used to say the real config pinned 1200 and that the range was
+    // therefore inverted. Neither was ever true: the clamp is what made 1200
+    // ineffective, which is why the real config was corrected to say 1248, and
+    // an ignored setting cannot invert anything.
     let settings = match std::env::var("SPIKE_MAX_MTU").ok().and_then(|v| v.parse().ok()) {
         Some(mtu) => settings.set_MaximumMtu(mtu),
         None => settings,
@@ -1305,13 +1313,15 @@ async fn spawn_listener_variant(
         let cert = camera_core::tls::dev_cert(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
         let alpn = [msquic::BufferRef::from(ALPN)];
         // Identical to make_msquic_async_listener's settings, plus the two
-        // knobs under test.
+        // knobs under test. It said 1200 here, which msquic clamps up to 1248
+        // anyway — the same behaviour and the wrong number, which is exactly
+        // how a reader ends up believing 1200 is reachable.
         let config = reg.open_configuration(
             &alpn,
             Some(
                 &msquic::Settings::new()
                     .set_IdleTimeoutMs(30_000)
-                    .set_MaximumMtu(1200)
+                    .set_MaximumMtu(1248)
                     .set_KeepAliveIntervalMs(10_000)
                     .set_DestCidUpdateIdleTimeoutMs(0)
                     .set_PeerBidiStreamCount(100)

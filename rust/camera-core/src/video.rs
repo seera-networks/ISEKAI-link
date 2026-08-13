@@ -1189,8 +1189,11 @@ fn video_client_config(
         // encapsulation fits inside the relay tunnel's HTTP datagram.
         // Without it the default 1500 overflows the tunnel and packets
         // are dropped as `TooLarge`. The outer connection's
-        // MinimumMtu(1400) (see `isekai_p2p_core::transport`) is sized
-        // to carry 1248 plus that encapsulation.
+        // `MinimumMtu` (see `isekai_p2p_core::transport`, which does the
+        // arithmetic) is what is sized to carry 1248 plus that
+        // encapsulation. Deliberately not repeated here: this said 1400
+        // for a while after that floor became 1350, and a number in two
+        // places is a number that disagrees with itself.
         .set_MaximumMtu(1248)
         .set_PeerUnidiStreamCount(100)
         .set_StreamMultiReceiveEnabled();

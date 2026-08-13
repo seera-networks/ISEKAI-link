@@ -300,10 +300,13 @@ pub(crate) fn make_client_config(
                 // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
                 // (`core/settings.c`), so a full inner packet is 1248 bytes and
                 // there is no way to ask for less. As a CONNECT-UDP payload
-                // that is 1248 + 1 context-id byte, and this connection's
-                // max-datagram length runs about 42 bytes under its MTU. So the
-                // floor has to be at least ~1291; anything lower and **every**
-                // full-size inner packet fails to send and is dropped, while
+                // that is 1248 + 1 context-id byte, and the HTTP datagram
+                // carrying it prefixes a quarter-stream-id varint — one byte
+                // for the low stream ids a CONNECT-UDP session gets — so about
+                // 1250 goes on the wire. This connection's max-datagram length
+                // runs about 42 bytes under its MTU. So the floor has to be at
+                // least ~1292; anything lower and **every** full-size inner
+                // packet fails to send and is dropped, while
                 // ACKs and control packets still fit — which looks like a lossy
                 // path rather than a misconfigured one.
                 //
