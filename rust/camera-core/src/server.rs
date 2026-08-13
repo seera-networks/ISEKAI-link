@@ -23,7 +23,7 @@ use msquic_async::Registration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::video::{bind_video_listener, serve_frames_with, ServeOptions};
+use crate::video::{bind_video_listener, serve_frames_with, RelayLegs, ServeOptions};
 
 /// What the operator conveys to the initiator once the server is up.
 #[derive(Clone, Debug)]
@@ -161,17 +161,20 @@ pub async fn spawn_p2p_server(
         video_addr,
     };
 
+    // The session-wide watch, for the operator's benefit: it carries whichever
+    // leg reported last, which is fine to show and wrong to advertise. What is
+    // advertised to each connection is its own leg (`RelayLegs::PerConnection`).
+    //
     // Taken before any leg is bound — which is the normal order, since binding
-    // waits on a connection id conveyed by hand. The session's watch survives
-    // that gap and any later rebind.
-    let observed = session.observed_address();
-    let observed_for_handle = observed.clone();
+    // waits on a connection id conveyed by hand. It survives that gap and any
+    // later rebind.
+    let observed_for_handle = session.observed_address();
     tokio::spawn(serve_frames_with(
         listener,
         frame_rx,
         shutdown.clone(),
         ServeOptions {
-            observed: Some(observed),
+            legs: Some(RelayLegs::PerConnection(session.legs())),
         },
     ));
 

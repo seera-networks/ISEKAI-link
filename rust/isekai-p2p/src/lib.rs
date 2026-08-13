@@ -28,7 +28,8 @@ pub use auth::{Auth0TokenSource, StaticAuth0Token};
 pub use config::{fetch_relay_certificate, issue_endpoint_token, load_or_generate_key, P2pConfig};
 pub use initiator::{InitiatorSession, PeerDirectory};
 pub use listener::{
-    AcceptPolicy, ListenerSession, SignalingEvent, SignalingState, MAX_CONCURRENT_PEERS,
+    AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,
+    MAX_CONCURRENT_PEERS,
 };
 
 /// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.

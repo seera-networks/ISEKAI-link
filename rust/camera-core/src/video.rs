@@ -19,6 +19,7 @@ use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use isekai_p2p::agent::{CertBundle, ObservedAddress, ObservedAddressWatch};
+use isekai_p2p::LegDirectory;
 
 use crate::tls::dev_cert;
 
@@ -130,14 +131,14 @@ pub fn bind_video_listener(
 /// How [`serve_frames_with`] serves. Default is the plain relay-only behaviour.
 #[derive(Default)]
 pub struct ServeOptions {
-    /// How the proxy sees this Endpoint's relay bind leg
-    /// ([`ListenerSession::observed_address`](isekai_p2p::ListenerSession::observed_address)).
+    /// The relay legs peers reach this listener through, and how to tell which
+    /// belongs to whom (see [`RelayLegs`]).
     ///
-    /// When set, every accepted connection is told about that address so the
-    /// initiator can validate a direct path to it and migrate off the relay.
-    /// Without it the connection stays relay-only, which is the pre-migration
-    /// behaviour.
-    pub observed: Option<ObservedAddressWatch>,
+    /// When set, each accepted connection is told the binding of its own leg,
+    /// so the initiator can validate a direct path to it and migrate off the
+    /// relay. Without it the connection stays relay-only, which is the
+    /// pre-migration behaviour.
+    pub legs: Option<RelayLegs>,
 }
 
 /// Accept video connections and fan frames from `frame_rx` out to each
@@ -175,8 +176,8 @@ pub async fn serve_frames_with(
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok(conn) => {
-                    if let Some(observed) = &opts.observed {
-                        advertise_direct_path(conn.clone(), observed.clone(), shutdown.clone());
+                    if let Some(legs) = &opts.legs {
+                        advertise_direct_path(conn.clone(), legs.clone(), shutdown.clone());
                     }
                     tokio::spawn(push_frames(conn, frames.subscribe()));
                 }
@@ -195,48 +196,70 @@ pub async fn serve_frames_with(
     }
 }
 
-/// Tell `conn` about the relay leg's binding, so the peer can punch a direct
-/// path to it and migrate off the relay.
+/// How an accepted connection is told which binding to punch to.
 ///
-/// **Applied once, and never changed afterwards.** Each peer reaches this
-/// listener through its own relay leg, and every leg has its own local port —
-/// `set_local_addr` is given a freshly bound ephemeral socket per leg. So the
-/// addresses in this watch belong to different peers' paths, and re-applying
-/// the latest one would hand a connection the binding of somebody else's leg.
-/// That is what it did: a second viewer arriving re-pointed the first viewer's
-/// connection at the new leg, and the first viewer's relay traffic stopped.
+/// Two situations, and which one applies is not a detail: a listener with one
+/// leg can hand its address to anybody, and a listener with several cannot.
+#[derive(Clone)]
+pub enum RelayLegs {
+    /// One leg serves everybody, so every connection gets its address.
+    ///
+    /// What a single-viewer harness has. Wrong for a listener serving several
+    /// peers: each has a leg of its own, with a binding of its own.
+    Single(ObservedAddressWatch),
+    /// Legs told apart by the address a connection arrives from
+    /// ([`LegDirectory`]).
+    PerConnection(LegDirectory),
+}
+
+/// How long to wait for the leg a connection arrived on to identify itself.
 ///
-/// The address may not be known yet when the connection is accepted, so an
-/// empty watch keeps a task alive to apply the first one that arrives. In
-/// automatic mode the leg is established before the peer's video traffic can
-/// flow through it, so the first address to arrive is that peer's.
+/// The leg records its forwarding socket when it creates one, which is when the
+/// peer's first packet arrives — before the video handshake this connection has
+/// just finished. So it is normally already there and this is for the race, not
+/// for the usual case.
+const LEG_LOOKUP_WAIT: Duration = Duration::from_secs(3);
+const LEG_LOOKUP_POLL: Duration = Duration::from_millis(50);
+
+/// Tell `conn` about the binding of the leg **it** arrived on, so the peer can
+/// punch a direct path to it and migrate off the relay.
 ///
-/// The durable fix is to attribute a connection to the leg it came in on — its
-/// peer address is that leg's forwarding socket — and give it only that leg's
-/// watch. That needs the forwarding socket's address surfaced out of the MASQUE
-/// client, which it is not today.
+/// **Which leg matters, and used not to be answerable.** Every leg delivers
+/// here, and each has its own binding, so handing a connection the wrong leg's
+/// address advertises a path the peer cannot reach — it stays on the relay, and
+/// nothing says why. Worse, before this the newest address replaced whatever a
+/// connection had, so a second viewer arriving re-pointed the first viewer's
+/// connection at the new leg and stopped its relay traffic.
+///
+/// The answer is the address the connection came *from*: a leg forwards what it
+/// receives from a socket of its own, so that socket's address names the leg
+/// (see [`LegDirectory`]). What replaced the bug in between — take the first
+/// address offered and never change it — was right only while legs came up in
+/// the order their peers connected, which `Manual`, two near-simultaneous
+/// viewers, and a leg that reconnects all break.
 ///
 /// Failures are logged, not fatal: an Endpoint that cannot advertise a direct
 /// path simply keeps streaming over the relay.
-fn advertise_direct_path(
-    conn: Connection,
-    mut observed: ObservedAddressWatch,
-    shutdown: CancellationToken,
-) {
-    if let Some(address) = first_address(None, *observed.borrow_and_update()) {
-        apply_direct_path(&conn, address);
-        return;
-    }
+fn advertise_direct_path(conn: Connection, legs: RelayLegs, shutdown: CancellationToken) {
     tokio::spawn(async move {
+        let Some(mut observed) = leg_of(&conn, &legs, &shutdown).await else {
+            return;
+        };
+        // Applied once, and the `break` is what says so. Not because a later
+        // address might be somebody else's — this now knows whose leg it is
+        // watching — but because the binding is by then attached to the
+        // connection, and a second `add_bound_addr` fails with
+        // `QUIC_STATUS_ADDRESS_IN_USE`. So a leg that reconnects onto a new
+        // binding is not re-advertised; the peer keeps the path it validated.
         loop {
+            if let Some(address) = *observed.borrow_and_update() {
+                apply_direct_path(&conn, address);
+                break;
+            }
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 changed = observed.changed() => {
                     if changed.is_err() {
-                        break;
-                    }
-                    if let Some(address) = first_address(None, *observed.borrow_and_update()) {
-                        apply_direct_path(&conn, address);
                         break;
                     }
                 }
@@ -245,20 +268,46 @@ fn advertise_direct_path(
     });
 }
 
-/// The address to hand to a connection that has not been given one.
+/// The watch belonging to the leg `conn` came in on.
 ///
-/// Applying twice fails with `QUIC_STATUS_ADDRESS_IN_USE` — the binding is
-/// already attached — and a second address is somebody else's leg anyway
-/// (see [`advertise_direct_path`]). A watch that is `None` is also a no-op: the
-/// address already on the connection stays valid, and there is nothing better
-/// to replace it with.
-fn first_address(
-    applied: Option<ObservedAddress>,
-    latest: Option<ObservedAddress>,
-) -> Option<ObservedAddress> {
-    match latest {
-        Some(address) if applied.is_none() => Some(address),
-        _ => None,
+/// `None` means there is no direct path to advertise to this connection, and
+/// says which of the two reasons it is: a connection that did not come through
+/// a leg at all, or a leg that never identified itself in time.
+async fn leg_of(
+    conn: &Connection,
+    legs: &RelayLegs,
+    shutdown: &CancellationToken,
+) -> Option<ObservedAddressWatch> {
+    let directory = match legs {
+        RelayLegs::Single(observed) => return Some(observed.clone()),
+        RelayLegs::PerConnection(directory) => directory,
+    };
+    let peer = match conn.get_remote_addr() {
+        Ok(peer) => peer,
+        Err(e) => {
+            tracing::warn!("could not read a connection's peer address; staying relay-only: {e}");
+            return None;
+        }
+    };
+    let deadline = tokio::time::Instant::now() + LEG_LOOKUP_WAIT;
+    loop {
+        if let Some(observed) = directory.leg_for(peer) {
+            return Some(observed);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Either it is not a relay connection — something dialled the video
+            // listener directly — or a leg is slower to report than this waited.
+            // Both end the same way and neither is worth failing over.
+            tracing::debug!(
+                %peer,
+                "no relay leg claims this connection; staying relay-only",
+            );
+            return None;
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            _ = tokio::time::sleep(LEG_LOOKUP_POLL) => {}
+        }
     }
 }
 
@@ -1228,44 +1277,6 @@ mod tests {
         let (tx, mut rx) = watch::channel::<Option<Bytes>>(None);
         drop(tx);
         assert_eq!(next_frame(&mut rx).await, None);
-    }
-
-    fn observed(port: u16) -> ObservedAddress {
-        ObservedAddress {
-            local: SocketAddr::from(([192, 168, 1, 59], port)),
-            observed: SocketAddr::from(([203, 0, 113, 5], port)),
-        }
-    }
-
-    /// A connection takes the first address it is offered and keeps it.
-    ///
-    /// The rule this replaces was "apply the latest", which read as caution —
-    /// a rebind onto a new leg ought to be advertised — but the watch carries
-    /// every leg's address, and legs belong to different peers. Following the
-    /// latest handed one viewer the binding of another viewer's leg.
-    #[test]
-    fn the_first_address_is_the_one_kept() {
-        assert_eq!(
-            first_address(None, Some(observed(1000))),
-            Some(observed(1000))
-        );
-        assert_eq!(
-            first_address(Some(observed(1000)), Some(observed(2000))),
-            None,
-            "a later leg belongs to a later peer, not to this connection"
-        );
-        assert_eq!(
-            first_address(Some(observed(1000)), Some(observed(1000))),
-            None
-        );
-    }
-
-    /// An empty watch is not an address, so there is nothing to apply and the
-    /// connection keeps whatever it has.
-    #[test]
-    fn an_empty_report_leaves_the_connection_alone() {
-        assert_eq!(first_address(Some(observed(1000)), None), None);
-        assert_eq!(first_address(None, None), None);
     }
 
     fn pair(port: u16) -> (SocketAddr, SocketAddr) {

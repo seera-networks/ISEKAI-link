@@ -27,12 +27,11 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use bytes::Bytes;
+use channel_masque::{CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClientMode};
 /// Re-exported so a caller of [`BindSession::inbound_activity`] can name what it
-/// gets back without depending on the MASQUE crate directly.
-pub use channel_masque::InboundActivity;
-use channel_masque::{
-    CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClientEvent, MasqueClientMode,
-};
+/// gets back, and one draining [`BindSession::events`] can match on them,
+/// without depending on the MASQUE crate directly.
+pub use channel_masque::{InboundActivity, MasqueClientEvent};
 use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use http::Uri;

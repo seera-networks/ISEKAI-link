@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use camera_core::video::{
-    bind_video_listener, receive_frames, serve_frames, serve_frames_with, ServeOptions,
+    bind_video_listener, receive_frames, serve_frames, serve_frames_with, RelayLegs, ServeOptions,
 };
 use isekai_p2p::agent::ObservedAddress;
 use msquic_async::{msquic, Registration};
@@ -101,7 +101,7 @@ async fn frames_keep_flowing_when_the_direct_path_cannot_be_advertised() {
         frame_rx,
         shutdown.clone(),
         ServeOptions {
-            observed: Some(observed_rx),
+            legs: Some(RelayLegs::Single(observed_rx)),
         },
     ));
 

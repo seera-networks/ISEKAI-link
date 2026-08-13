@@ -308,7 +308,7 @@ async fn role_server_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
         frame_rx,
         shutdown.clone(),
         camera_core::ServeOptions {
-            observed: Some(observed_rx),
+            legs: Some(camera_core::RelayLegs::Single(observed_rx)),
         },
     ));
 
