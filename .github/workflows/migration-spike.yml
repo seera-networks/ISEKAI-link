@@ -66,7 +66,11 @@ jobs:
       # check the bundle itself here so a failure is attributable to packaging
       # rather than showing up as six skipped msquic checks.
       - name: Check the dev certificate packaging
-        run: cargo test -p camera-core --lib
+        # `--lib` used to be here, and it was hiding `tests/video_loopback.rs`:
+        # that test hung forever, and nothing said so because nothing ran it.
+        # Now that it terminates, the integration tests run too — they are the
+        # only coverage the loopback path has.
+        run: cargo test -p camera-core
 
       - name: Run the spike
         id: spike

@@ -1,5 +1,18 @@
 //! The video transport carries frames end to end over a plain loopback QUIC
 //! connection (no proxy): `serve_frames` pushes, `receive_frames` receives.
+//!
+//! **Both ends share one registration, and it is drained before it drops.**
+//! Neither is decoration. `RegistrationClose` is a synchronous, uninterruptible
+//! wait on every handle derived from it (`camera_core::shutdown`), so dropping
+//! one with a connection still live hangs the process with no way out — which
+//! is what these tests did, for however long anyone let them run.
+//!
+//! The trap is that `receive_frames(None, ..)` *makes* a registration of its
+//! own and drops it on the way out, undrained. Handing it one that outlives the
+//! call is what keeps that drop from being the last reference. The applications
+//! do not meet this because they leave through `_exit` (see
+//! `shutdown_and_exit`), so the wind-down path these tests take is one nothing
+//! else exercises.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,9 +41,10 @@ async fn frames_travel_from_server_to_client() {
     // Client: dial that address (dev cert → skip validation) and collect frames.
     let (recv_tx, mut recv_rx) = mpsc::channel::<(u64, Bytes)>(16);
     let client_shutdown = shutdown.clone();
+    let client_reg = reg.clone();
     let receive = tokio::spawn(async move {
         receive_frames(
-            None,
+            Some(client_reg),
             "127.0.0.1",
             addr.port(),
             false,
@@ -71,6 +85,12 @@ async fn frames_travel_from_server_to_client() {
     shutdown.cancel();
     let _ = serve.await;
     let _ = receive.await;
+    // Before `reg` goes out of scope below, and after both ends have let their
+    // handles go. Skipping this is a hang, not a leak.
+    assert!(
+        camera_core::drain_registration(&reg, Duration::from_secs(10)).await,
+        "the registration should be idle once both ends have stopped"
+    );
 }
 
 /// Advertising a direct path must never cost the relay path.
@@ -107,9 +127,10 @@ async fn frames_keep_flowing_when_the_direct_path_cannot_be_advertised() {
 
     let (recv_tx, mut recv_rx) = mpsc::channel::<(u64, Bytes)>(16);
     let client_shutdown = shutdown.clone();
+    let client_reg = reg.clone();
     let receive = tokio::spawn(async move {
         receive_frames(
-            None,
+            Some(client_reg),
             "127.0.0.1",
             addr.port(),
             false,
@@ -141,4 +162,10 @@ async fn frames_keep_flowing_when_the_direct_path_cannot_be_advertised() {
     shutdown.cancel();
     let _ = serve.await;
     let _ = receive.await;
+    // Before `reg` goes out of scope below, and after both ends have let their
+    // handles go. Skipping this is a hang, not a leak.
+    assert!(
+        camera_core::drain_registration(&reg, Duration::from_secs(10)).await,
+        "the registration should be idle once both ends have stopped"
+    );
 }
