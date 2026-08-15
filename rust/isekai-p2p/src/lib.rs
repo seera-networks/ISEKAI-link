@@ -25,9 +25,7 @@ pub mod listener;
 pub mod secret;
 
 pub use auth::{Auth0TokenSource, StaticAuth0Token};
-pub use config::{
-    fetch_relay_certificate, issue_endpoint_token, load_or_generate_key, proxy_client, P2pConfig,
-};
+pub use config::{issue_endpoint_token, load_or_generate_key, proxy_client, P2pConfig};
 pub use initiator::{InitiatorSession, PeerDirectory};
 pub use listener::{
     AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,

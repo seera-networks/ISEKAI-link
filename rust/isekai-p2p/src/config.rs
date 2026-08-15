@@ -14,7 +14,7 @@ use anyhow::Context as _;
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::https::HttpsTransport;
 use isekai_p2p_core::identity::{EndpointToken, IdentityClient};
-use isekai_p2p_core::proxy::{CertBundle, ControlPlaneTransport, ProxyClient};
+use isekai_p2p_core::proxy::{ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::auth::Auth0TokenSource;
@@ -96,29 +96,9 @@ pub async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<EndpointTok
     }
 }
 
-/// Download this Endpoint's per-endpoint relay TLS certificate from the proxy,
-/// using an Endpoint Token the caller already holds.
-///
-/// Returns `Ok(None)` when the proxy has relay certificates disabled — the
-/// listener then presents a dev certificate and the initiator skips validation.
-/// A returned bundle is issued for a loopback FQDN (see
-/// [`PeerConnection::video_host`](isekai_p2p_core::proxy::PeerConnection::video_host)),
-/// which the listener presents on the video QUIC and the initiator validates.
-pub async fn fetch_relay_certificate(
-    cfg: &P2pConfig,
-    endpoint_token: &str,
-) -> anyhow::Result<Option<CertBundle>> {
-    let proxy = ProxyClient::new(
-        MasqueH3Transport::connect(&cfg.proxy_url)?,
-        cfg.key.clone(),
-        endpoint_token,
-    );
-    Ok(proxy.get_certificate().await?)
-}
-
 /// A control-plane client for `cfg`'s proxy, authenticated with `endpoint_token`.
 ///
-/// The same client [`fetch_relay_certificate`] builds for itself, handed out so
+/// Handed out rather than built per call, so
 /// a caller that needs more than one call — issuing a certificate takes two —
 /// does not open a connection per request.
 pub fn proxy_client(

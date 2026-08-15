@@ -9,6 +9,11 @@
 //! key is made on the device, kept at `0600`, and what goes to the proxy is a
 //! certificate request — a public key and a name (spec §8.6.2).
 //!
+//! There is no path that accepts a key from the proxy. The old route that
+//! handed one over is not called, not even as a fallback: the proxies that
+//! needed it are gone and will not be deployed again, and a fallback nobody can
+//! reach is a way for the key to leave the device that nobody can test either.
+//!
 //! Separate from the Endpoint key on purpose. That one is a signing-only
 //! identity, ideally never out of secure storage and never handed to a QUIC
 //! stack; reusing one key across two protocols is its own hazard.
@@ -86,10 +91,12 @@ pub async fn issue_video_cert(
     key: &KeyPair,
 ) -> anyhow::Result<Option<VideoCert>> {
     let Some(params) = proxy.certificate_parameters().await? else {
-        // Either the proxy issues nothing, or it predates the CSR route. The
-        // two look the same from here, and the old route tells them apart by
-        // answering.
-        return legacy_video_cert(proxy).await;
+        // The proxy issues no certificates — no `--p2p-cert-domain` — so there
+        // is nothing to ask for. The listener presents a development
+        // certificate and the peer skips validation, as it did before any of
+        // this existed.
+        tracing::warn!("proxy issues no relay certificate; using a development one");
+        return Ok(None);
     };
     // Said before asking, because the answer costs an issuance slot and the
     // reason is not otherwise visible: the proxy cannot know this device lost
@@ -127,10 +134,10 @@ pub async fn issue_video_cert(
 
     let csr = certificate_request(key, &params.hostname)?;
     let Some(issued) = issue_with_retries(proxy, &csr).await? else {
-        // `parameters` answered and this did not, which should not happen —
-        // they arrived together. Treat it as the old proxy it looks like.
-        tracing::warn!("proxy has the parameters route but not the issuing one");
-        return legacy_video_cert(proxy).await;
+        // `parameters` answered and this did not. They arrived in the same
+        // change, so this is not a version this proxy can be — something is
+        // answering for the route that should be issuing.
+        anyhow::bail!("the proxy has the certificate parameters route but not the issuing one");
     };
 
     // Checked rather than trusted. A certificate for a different key is one
@@ -194,37 +201,6 @@ async fn issue_with_retries(
         tracing::info!(?delay, "the proxy is not ready to issue yet: {error}");
         tokio::time::sleep(*delay).await;
     }
-}
-
-/// The pre-CSR route: ask the proxy to generate the key and send it here.
-///
-/// **Kept for proxies that have not been upgraded, and worse than the CSR
-/// path.** The proxy ends up holding the key to the ciphertext it relays, which
-/// is the whole thing being removed. It is still better than the alternative on
-/// such a proxy: without a certificate the peer skips validation entirely, so
-/// anyone can stand in — where this at least protects against everyone but the
-/// proxy.
-///
-/// Said out loud each time, because a transition that goes quiet is one nobody
-/// finishes.
-async fn legacy_video_cert(
-    proxy: &ProxyClient<MasqueH3Transport>,
-) -> anyhow::Result<Option<VideoCert>> {
-    let Some(bundle) = proxy.get_certificate().await? else {
-        return Ok(None);
-    };
-    tracing::warn!(
-        hostname = %bundle.hostname,
-        "this proxy generated the video TLS key and sent it here — it can read the relayed video. \
-         Upgrade the proxy to one that issues from a certificate request",
-    );
-    Ok(Some(VideoCert {
-        hostname: bundle.hostname,
-        cert_pem: bundle.cert_pem,
-        key_pem: bundle.key_pem,
-        // Empty means the proxy shipped none; the PEM path is then used.
-        pkcs12: (!bundle.pkcs12.is_empty()).then_some(bundle.pkcs12),
-    }))
 }
 
 /// Load the video TLS key, generating and persisting one on first use.
