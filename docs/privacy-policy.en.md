@@ -1,6 +1,6 @@
 # ISEKAI link Privacy Policy
 
-Version: 2026-08-05
+Version: 2026-08-15
 
 ## 1. Who we are
 
@@ -77,12 +77,22 @@ parties for any of those purposes.
 3. To investigate faults and improve quality.
 4. To meet legal obligations.
 
-## 5. Video — please read
+## 5. Video
 
-**While video passes through the relay, our systems are technically capable of
-accessing its content.** The TLS certificate for the video connection, and the
-matching private key, are issued by our servers and given to the camera
-application.
+**The key that encrypts your video is created on the device running the camera
+application, and does not leave it.** What reaches us is a certificate signing
+request — a public key and a name — and our servers return a certificate signed
+against it. We do not hold the matching private key. Video passing through the
+relay is therefore ciphertext whose content we cannot read.
+
+We do, however, issue that certificate, and we control the name it is issued
+for. In principle, then, we could obtain a second certificate for the same name
+and place ourselves in the middle. To prevent that, the camera application signs
+a statement, with the device's own key, saying which key it uses; the viewer
+application refuses any connection that does not present that key. A certificate
+we obtained separately does not allow the connection to be established at all.
+The viewer also checks that the device answering is the one recorded when you
+paired with it.
 
 - We do not view or retain video beyond the purposes in this policy.
 - We do not record or accumulate video. The relay forwards it and nothing more.
@@ -91,8 +101,16 @@ application.
   longer passes through our relay.** Whether that path can be established
   depends on both networks.
 
-This is not an arrangement in which we are technically unable to see your video,
-and we would rather say so than imply otherwise.
+Two things this does not change:
+
+- **This section does not describe version 0.1.0 of the camera application.**
+  In that version the private key for the video connection is issued by our
+  servers and given to the application, and the application signs no statement
+  about which key it uses, so the viewer validates only the name on the
+  certificate. **In that case we remain technically capable of accessing the
+  content of the video.**
+- Separately from content, **when two devices communicated, which ones, and how
+  much** is handled by our servers (sections 3.3 and 7).
 
 ## 6. Sharing, processors and transfers abroad
 
@@ -139,6 +157,8 @@ in a foreign country.**
 The following is stored on your device and not sent to us:
 
 - the device's private key, a long-lived secret that must not be shared
+- the private key used to encrypt the video connection, likewise
+- the device identifier (Endpoint ID) of each camera you have paired with
 - your Auth0 access and refresh tokens
 - settings such as which servers to connect to
 
