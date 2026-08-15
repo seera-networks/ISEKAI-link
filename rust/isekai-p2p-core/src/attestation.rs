@@ -25,10 +25,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
-use crate::endpoint::{endpoint_id_from_jwk, verify_b64url, EndpointKey};
+use crate::endpoint::{EndpointKey, endpoint_id_from_jwk, verify_b64url};
 
 /// The first line of the signed string.
 ///
@@ -43,9 +43,17 @@ const DOMAIN: &str = "isekai-p2p-cert-attestation-v1";
 pub struct Attestation {
     /// The Endpoint's public key — the same value the token's `cnf.jwk` holds.
     pub jwk: Value,
-    /// When the statement stops being good. The proxy caps this at the
-    /// certificate's `not_after`: a statement outliving its certificate would
-    /// have an initiator pinning a key nobody will present.
+    /// When the statement stops being good.
+    ///
+    /// **Chosen by the signer, and not capped by anyone.** It is one of the
+    /// signed lines, so nothing downstream can shorten it without destroying
+    /// the signature — the proxy checks only that it parses and is in the
+    /// future.
+    ///
+    /// It bounds the statement rather than the certificate. What is being
+    /// vouched for is a *key*, and the key outlives any one certificate issued
+    /// against it, so a statement may safely outlast the certificate that was
+    /// current when it was made.
     pub expires_at: String,
     /// ES256 over the canonical string, base64url.
     pub signature: String,

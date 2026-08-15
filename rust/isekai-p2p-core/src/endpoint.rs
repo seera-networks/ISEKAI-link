@@ -7,8 +7,8 @@
 //! MASQUE proxy's server-side derivation exactly (spec §4.2), so a token's
 //! `cnf` and its `endpoint_id` agree.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
@@ -167,9 +167,11 @@ mod tests {
         let id = key.endpoint_id();
         assert!(id.starts_with("ep:"));
         assert_eq!(id.len(), ENDPOINT_ID_PREFIX.len() + 64);
-        assert!(id[3..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(
+            id[3..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
         assert_eq!(key.endpoint_id(), id); // deterministic
     }
 
