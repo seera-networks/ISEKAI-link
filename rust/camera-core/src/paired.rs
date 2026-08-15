@@ -41,15 +41,33 @@ fn path() -> anyhow::Result<PathBuf> {
 }
 
 fn load() -> Record {
-    // A file that is missing, unreadable or malformed leaves nothing to compare
-    // against, which is the same position a viewer that has never paired is in.
-    // Refusing to start over a file this owns would be worse than the check it
-    // provides.
-    path()
-        .ok()
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    let Ok(path) = path() else {
+        return Record::default();
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        // Nothing paired yet, which is where every device starts.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Record::default(),
+        Err(e) => {
+            // Refusing to start over a file this owns would be worse than the
+            // check it provides — but a check that has quietly stopped running
+            // is the one failure nobody would notice, so it is said out loud.
+            tracing::error!(
+                "cannot read {}: {e}; connections cannot be checked against the \
+                 Endpoints this device paired with",
+                path.display(),
+            );
+            return Record::default();
+        }
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::error!(
+            "{} does not parse: {e}; connections cannot be checked against the \
+             Endpoints this device paired with, and pairing again will replace it",
+            path.display(),
+        );
+        Record::default()
+    })
 }
 
 /// Remember that this device paired with `endpoint`.
@@ -57,6 +75,13 @@ fn load() -> Record {
 /// Called on a successful pairing. Idempotent: pairing with the same camera
 /// again records the same thing.
 pub fn remember(endpoint: &str) -> anyhow::Result<()> {
+    // The Endpoint is the proxy's JSON. An empty one would go in as an entry
+    // that matches the "nothing selected" case, and every hand-carried
+    // connection — the ones this deliberately leaves alone — would be refused,
+    // with nothing in any interface to clear it.
+    if endpoint.is_empty() {
+        anyhow::bail!("the grant named no endpoint, so there is nothing to remember");
+    }
     let mut record = load();
     if !record.endpoints.insert(endpoint.to_owned()) {
         return Ok(());
@@ -67,7 +92,14 @@ pub fn remember(endpoint: &str) -> anyhow::Result<()> {
             .with_context(|| format!("failed to create {}", dir.display()))?;
     }
     let json = serde_json::to_vec_pretty(&record).context("failed to encode the paired list")?;
-    std::fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))
+    // Through a temporary and a rename, because this is read-modify-write: a
+    // write interrupted halfway leaves a file that does not parse, and what
+    // follows is not a loud failure but a check that silently passes
+    // everything. `write_secret` is stricter than this needs (0600 on a list of
+    // public identifiers) but it is the atomicity that is wanted, and writing
+    // the dance out a second time is how the two come to differ.
+    isekai_p2p::secret::write_secret(&path, &json)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Whether `endpoint` is one this device paired with.
@@ -122,7 +154,10 @@ fn decide(
     intended: &str,
     answered: Option<&str>,
 ) -> Result<(), WrongPeer> {
-    if !paired.contains(intended) || answered == Some(intended) {
+    // An empty `intended` is "no camera was selected from a listing", which is
+    // the hand-carried case and not something an entry could match — but a
+    // stray empty entry would make it match everything.
+    if intended.is_empty() || !paired.contains(intended) || answered == Some(intended) {
         return Ok(());
     }
     Err(WrongPeer {
@@ -164,6 +199,13 @@ mod tests {
             Some("ep:someone-else")
         )
         .is_ok());
+    }
+
+    /// An empty entry — which `remember` refuses to create — must not turn the
+    /// hand-carried case into a refusal.
+    #[test]
+    fn an_empty_entry_does_not_refuse_everything() {
+        assert!(decide(&paired(&["", "ep:a"]), "", Some("ep:x")).is_ok());
     }
 
     /// A response that names nobody is not a way around the check.

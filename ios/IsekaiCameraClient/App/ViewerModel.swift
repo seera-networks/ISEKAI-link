@@ -140,6 +140,17 @@ final class ViewerModel: ObservableObject {
         }
     }
 
+    /// A listener typed in by hand, which is not the camera that was picked
+    /// from the list.
+    ///
+    /// The Endpoint that came with that pick no longer describes it, and left
+    /// standing it would refuse a perfectly good hand-carried connection while
+    /// naming a camera the user is not asking for.
+    func enterListenerByHand(_ id: String) {
+        settings.listenerID = id
+        settings.expectedEndpoint = ""
+    }
+
     func select(camera: Camera) {
         settings.listenerID = camera.listenerId
         // Which Endpoint that listener is said to belong to, kept so connecting

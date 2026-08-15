@@ -807,11 +807,17 @@ pub fn connect(
     // Who answered, against who was meant. The pin below proves the peer holds
     // the key its Endpoint signed for; this is what says that Endpoint is the
     // camera the user paired with, and the proxy names both.
-    camera_core::paired::check(
+    if let Err(e) = camera_core::paired::check(
         &config.expected_endpoint,
         session.connection.peer_endpoint.as_deref(),
-    )
-    .map_err(|e| ClientError::WrongPeer(e.to_string()))?;
+    ) {
+        // Tell the proxy the connection is over before returning. The task that
+        // owns the only other `close` is not spawned yet, and dropping the
+        // session does not close it — so the camera would go on holding a relay
+        // leg for a viewer that has already refused it, on every retry.
+        runtime.block_on(session.close());
+        return Err(ClientError::WrongPeer(e.to_string()));
+    }
 
     let connection_id = session.connection_id().to_owned();
     let video_port = session.local_addr.port();

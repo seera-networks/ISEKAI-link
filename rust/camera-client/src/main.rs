@@ -205,6 +205,11 @@ struct MyApp {
     register: bool,
     capability: String,
     listener_id: String,
+    /// The Endpoint the selected camera was listed as, kept from the moment it
+    /// was picked. Re-reading it from the listing at connect time would let the
+    /// proxy switch the check off by dropping the listener from the next
+    /// listing. Empty for a listener id typed in by hand.
+    expected_endpoint: String,
     /// Cameras this Endpoint may connect to, or `None` before the proxy has
     /// been asked. "no cameras" and "not asked yet" have to look different on
     /// screen: someone who paired a camera yesterday should not be shown a bare
@@ -271,6 +276,7 @@ impl MyApp {
             register: true,
             capability: String::new(),
             listener_id: String::new(),
+            expected_endpoint: String::new(),
             cameras: Arc::new(Mutex::new(None)),
             cameras_requested: false,
             pairing_code: String::new(),
@@ -539,16 +545,8 @@ impl MyApp {
         let listener_id = self.listener_id.trim().to_string();
         // Which camera the operator means, as an Endpoint rather than a
         // listener: a listener is whichever one the camera started most
-        // recently, but the Endpoint is what pairing recorded. Empty for a
-        // listener id typed in by hand, which brings no pairing to check.
-        let expected_endpoint = self
-            .cameras
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|cameras| cameras.iter().find(|c| c.listener_id == listener_id))
-            .map(|c| c.owner_endpoint.clone())
-            .unwrap_or_default();
+        // recently, but the Endpoint is what pairing recorded.
+        let expected_endpoint = self.expected_endpoint.clone();
 
         let handle = tokio::spawn(async move {
             // The relay leg goes on a shared, unconnected socket so a direct
@@ -604,6 +602,11 @@ impl MyApp {
             ) {
                 shared.lock().unwrap().status = format!("refused: {e}");
                 tracing::error!("{e}");
+                // Tell the proxy the connection is over. Every other way out of
+                // this task closes the session, and without it the camera goes
+                // on holding a relay leg for a viewer that has already refused
+                // it — and this is the one failure that repeats on every retry.
+                session.close().await;
                 return;
             }
             let local_port = session.local_addr.port();
@@ -894,6 +897,9 @@ impl MyApp {
                     // Selecting a camera is all the connect needs: a grant is
                     // already in place, so there is no capability to go with it.
                     self.listener_id = camera.listener_id.clone();
+                    // Which Endpoint that listener is said to belong to, kept
+                    // so connecting can hold the proxy's answer against it.
+                    self.expected_endpoint = camera.owner_endpoint.clone();
                     self.capability.clear();
                 }
             });
@@ -1016,7 +1022,14 @@ impl MyApp {
             .default_open(false)
             .show(ui, |ui| {
                 field(ui, "Capability:  ", &mut self.capability, false);
-                field(ui, "Listener ID: ", &mut self.listener_id, false);
+                // A listener typed in here is not the one that was picked
+                // from the list, so the Endpoint that came with that pick no
+                // longer describes it — left standing it would refuse a
+                // perfectly good hand-carried connection, naming a camera the
+                // operator is not asking for.
+                if field(ui, "Listener ID: ", &mut self.listener_id, false).changed() {
+                    self.expected_endpoint.clear();
+                }
                 ui.label(
                     egui::RichText::new(
                         "An empty Capability connects on a standing grant, which is what \

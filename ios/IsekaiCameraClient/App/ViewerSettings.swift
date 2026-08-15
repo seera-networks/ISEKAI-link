@@ -32,11 +32,39 @@ struct ViewerSettings: Codable, Equatable {
 }
 
 extension ViewerSettings {
+    private enum CodingKeys: String, CodingKey {
+        case identityURL, proxyURL, protocolName, capability, listenerID
+        case expectedEndpoint, register, insecureSkipVerify, enableMigration, logFilter
+    }
+
+    /// Decoded a field at a time, so a blob written by an older build keeps
+    /// what it does have.
+    ///
+    /// A property's default value does not cover it: the synthesized decoder
+    /// throws `keyNotFound` for a field added since, and `load()` falls back to
+    /// defaults **wholesale** — so adding one field would have reset every
+    /// server URL and dropped the selected camera on every installed app.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = ViewerSettings()
+        identityURL = try c.decodeIfPresent(String.self, forKey: .identityURL) ?? d.identityURL
+        proxyURL = try c.decodeIfPresent(String.self, forKey: .proxyURL) ?? d.proxyURL
+        protocolName = try c.decodeIfPresent(String.self, forKey: .protocolName) ?? d.protocolName
+        capability = try c.decodeIfPresent(String.self, forKey: .capability) ?? d.capability
+        listenerID = try c.decodeIfPresent(String.self, forKey: .listenerID) ?? d.listenerID
+        expectedEndpoint =
+            try c.decodeIfPresent(String.self, forKey: .expectedEndpoint) ?? d.expectedEndpoint
+        register = try c.decodeIfPresent(Bool.self, forKey: .register) ?? d.register
+        insecureSkipVerify =
+            try c.decodeIfPresent(Bool.self, forKey: .insecureSkipVerify) ?? d.insecureSkipVerify
+        enableMigration =
+            try c.decodeIfPresent(Bool.self, forKey: .enableMigration) ?? d.enableMigration
+        logFilter = try c.decodeIfPresent(String.self, forKey: .logFilter) ?? d.logFilter
+    }
+
     private static let defaultsKey = "viewer.settings"
 
-    /// The saved settings, or fresh defaults. A blob written by an older build
-    /// that lacks a field added since decodes as nil and falls back to defaults
-    /// wholesale — acceptable while the shape is still moving.
+    /// The saved settings, or fresh defaults.
     static func load() -> ViewerSettings {
         guard let data = UserDefaults.standard.data(forKey: defaultsKey),
               let decoded = try? JSONDecoder().decode(ViewerSettings.self, from: data)

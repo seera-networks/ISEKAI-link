@@ -193,7 +193,10 @@ struct ContentView: View {
 
             DisclosureGroup("Enter a listener by hand") {
                 LabeledField("Capability", text: $model.settings.capability)
-                LabeledField("Listener ID", text: $model.settings.listenerID)
+                LabeledField("Listener ID", text: Binding(
+                    get: { model.settings.listenerID },
+                    set: { model.enterListenerByHand($0) }
+                ))
                 CopyableValue(label: "Endpoint ID", value: model.endpointID)
                 Button("Reset Endpoint key", role: .destructive) { model.resetEndpointKey() }
                     .disabled(model.isConnected)
