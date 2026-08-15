@@ -105,6 +105,26 @@ pub async fn issue_video_cert(
         _ => {}
     }
 
+    // Said when it is nearly gone, because the way this is found out otherwise
+    // is a `429` that lasts a week. Deleting the key file to test reissuance —
+    // a reasonable thing to do — spends one each time.
+    if let Some(quota) = &params.issue_quota {
+        if quota.remaining <= 1 {
+            tracing::warn!(
+                remaining = quota.remaining,
+                limit = quota.limit,
+                reset_at = ?quota.reset_at,
+                "few certificate issuances left for this Endpoint; a new key would need one",
+            );
+        } else {
+            tracing::debug!(
+                remaining = quota.remaining,
+                limit = quota.limit,
+                "issuance quota"
+            );
+        }
+    }
+
     let csr = certificate_request(key, &params.hostname)?;
     let Some(issued) = issue_with_retries(proxy, &csr).await? else {
         // `parameters` answered and this did not, which should not happen —
