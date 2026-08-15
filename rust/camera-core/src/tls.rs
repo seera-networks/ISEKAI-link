@@ -1,4 +1,22 @@
-//! A self-signed development certificate for the video QUIC listener.
+//! The video QUIC listener's TLS material: the key this device holds, the
+//! certificate request that gets it signed, and a self-signed fallback.
+//!
+//! # The key is generated here and never leaves
+//!
+//! The relay carries the video connection's ciphertext. While the proxy
+//! generated the key that opens it, the encryption on that leg protected the
+//! peers from everyone *except* the proxy sitting in the middle of it. So the
+//! key is made on the device, kept at `0600`, and what goes to the proxy is a
+//! certificate request — a public key and a name (spec §8.6.2).
+//!
+//! Separate from the Endpoint key on purpose. That one is a signing-only
+//! identity, ideally never out of secure storage and never handed to a QUIC
+//! stack; reusing one key across two protocols is its own hazard.
+//!
+//! The same key is reused across issuances. A new one spends an issuance slot —
+//! five per seven days — and would invalidate any pinning built on it later.
+//!
+//! # A self-signed development certificate
 //!
 //! In P2P mode the server presents this to the video (`sample` ALPN)
 //! connection; the client dials with certificate validation disabled (dev
@@ -22,7 +40,210 @@
 //! whatever OpenSSL the system ships, and the PEM path already works there — so
 //! [`DevCert::pkcs12`] is `None` off Windows and nothing links OpenSSL.
 
+use std::path::Path;
+
 use anyhow::Context as _;
+use isekai_p2p::agent::{MasqueH3Transport, ProxyClient};
+use rcgen::{CertificateParams, KeyPair};
+
+/// What the video listener needs to present a certificate: the chain the proxy
+/// issued, and the key this device kept.
+///
+/// The same three fields [`DevCert`] carries, because the listener cannot tell
+/// the difference and should not have to.
+pub struct VideoCert {
+    /// The FQDN the certificate is for.
+    pub hostname: String,
+    /// The issued chain, leaf first.
+    pub cert_pem: String,
+    /// The device's key. **Never sent anywhere** — it is here because the
+    /// listener has to be given it.
+    pub key_pem: String,
+    /// The pair as PKCS#12, on the platform that needs it. See the module docs.
+    pub pkcs12: Option<String>,
+}
+
+/// Obtain the video listener's certificate, with the key never leaving here.
+///
+/// Three outcomes, and the caller treats the last two the same way:
+///
+/// | | |
+/// | --- | --- |
+/// | issued | a chain for a key this device generated (spec §8.6.2) |
+/// | `None` | the proxy issues no certificates, or is older than the CSR route |
+/// | error | the proxy refused in a way worth reporting |
+///
+/// `None` is not a failure. A proxy without `--p2p-cert-domain` never issued
+/// anything, and one older than the CSR route still answers the old
+/// `GET /v1/peer/certificate` — but that route hands over a key the proxy
+/// generated, which is the thing being removed, so this does not fall back to
+/// it. The caller uses a dev certificate and the peer skips validation, exactly
+/// as it did before any of this existed.
+pub async fn issue_video_cert(
+    proxy: &ProxyClient<MasqueH3Transport>,
+    key: &KeyPair,
+) -> anyhow::Result<Option<VideoCert>> {
+    let Some(params) = proxy.certificate_parameters().await? else {
+        // Either the proxy issues nothing, or it predates the CSR route. The
+        // two look the same from here, and the old route tells them apart by
+        // answering.
+        return legacy_video_cert(proxy).await;
+    };
+    // Said before asking, because the answer costs an issuance slot and the
+    // reason is not otherwise visible: the proxy cannot know this device lost
+    // its key, and this device cannot know what the proxy is holding.
+    let local = spki_sha256(key);
+    match &params.certificate {
+        Some(cached) if cached.spki_sha256 != local => tracing::warn!(
+            held = %cached.spki_sha256,
+            local = %local,
+            "the certificate the proxy holds is for another key — this device's is new or was \
+             lost, and reissuing spends one of the Endpoint's issuances",
+        ),
+        _ => {}
+    }
+
+    let csr = certificate_request(key, &params.hostname)?;
+    let Some(issued) = proxy.issue_certificate(&csr).await? else {
+        // `parameters` answered and this did not, which should not happen —
+        // they arrived together. Treat it as the old proxy it looks like.
+        tracing::warn!("proxy has the parameters route but not the issuing one");
+        return legacy_video_cert(proxy).await;
+    };
+
+    // Checked rather than trusted. A certificate for a different key is one
+    // this listener cannot present, and finding that out at the TLS handshake
+    // would say nothing about why.
+    anyhow::ensure!(
+        issued.spki_sha256 == local,
+        "the proxy issued a certificate for another key (issued {}, local {})",
+        issued.spki_sha256,
+        local,
+    );
+    tracing::info!(
+        hostname = %issued.hostname,
+        not_after = ?issued.not_after,
+        "issued a relay certificate for a key that stayed on this device",
+    );
+    video_cert(&issued.hostname, &issued.cert_pem, key).map(Some)
+}
+
+/// The pre-CSR route: ask the proxy to generate the key and send it here.
+///
+/// **Kept for proxies that have not been upgraded, and worse than the CSR
+/// path.** The proxy ends up holding the key to the ciphertext it relays, which
+/// is the whole thing being removed. It is still better than the alternative on
+/// such a proxy: without a certificate the peer skips validation entirely, so
+/// anyone can stand in — where this at least protects against everyone but the
+/// proxy.
+///
+/// Said out loud each time, because a transition that goes quiet is one nobody
+/// finishes.
+async fn legacy_video_cert(
+    proxy: &ProxyClient<MasqueH3Transport>,
+) -> anyhow::Result<Option<VideoCert>> {
+    let Some(bundle) = proxy.get_certificate().await? else {
+        return Ok(None);
+    };
+    tracing::warn!(
+        hostname = %bundle.hostname,
+        "this proxy generated the video TLS key and sent it here — it can read the relayed video. \
+         Upgrade the proxy to one that issues from a certificate request",
+    );
+    Ok(Some(VideoCert {
+        hostname: bundle.hostname,
+        cert_pem: bundle.cert_pem,
+        key_pem: bundle.key_pem,
+        // Empty means the proxy shipped none; the PEM path is then used.
+        pkcs12: (!bundle.pkcs12.is_empty()).then_some(bundle.pkcs12),
+    }))
+}
+
+/// Load the video TLS key, generating and persisting one on first use.
+///
+/// Reused across issuances: see the module docs for why a fresh key is not
+/// free. Written `0600` and never sent — a caller that logs, backs up or syncs
+/// this file has undone the point of it.
+pub fn load_or_generate_video_key(path: &Path) -> anyhow::Result<KeyPair> {
+    if path.exists() {
+        let pem = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read the video TLS key at {}", path.display()))?;
+        return KeyPair::from_pem(&pem)
+            .with_context(|| format!("failed to parse the video TLS key at {}", path.display()));
+    }
+    // P-256: on the proxy's accepted list, the same curve as the Endpoint key,
+    // and the smallest handshake of the options.
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .context("failed to generate a video TLS key")?;
+    write_private(path, &key.serialize_pem())?;
+    Ok(key)
+}
+
+/// Write `contents` to `path` readable only by this user.
+///
+/// Created with the mode already set rather than relaxed afterwards: a key that
+/// is world-readable for even an instant has been world-readable.
+fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600);
+    }
+    let mut file = open
+        .open(path)
+        .with_context(|| format!("failed to create the video TLS key at {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write the video TLS key at {}", path.display()))?;
+    Ok(())
+}
+
+/// A PKCS#10 certificate request for `hostname`, signed by `key`.
+///
+/// One `dNSName` SAN and nothing else, which is what the proxy checks against
+/// the name it derives (spec §8.6.2 rule 6). The subject is not checked and
+/// rcgen's default is fine. `keyUsage` / `extendedKeyUsage` are the only other
+/// extensions it requests, and both are on the permitted list.
+pub fn certificate_request(key: &KeyPair, hostname: &str) -> anyhow::Result<String> {
+    let params = CertificateParams::new(vec![hostname.to_owned()])
+        .context("failed to build the certificate request parameters")?;
+    let csr = params
+        .serialize_request(key)
+        .context("failed to sign the certificate request")?;
+    csr.pem()
+        .context("failed to encode the certificate request")
+}
+
+/// SHA-256 of `key`'s SubjectPublicKeyInfo, base64url without padding.
+///
+/// The proxy reports the same value for what it has issued and cached, so
+/// comparing them answers "is the certificate it holds still one this device
+/// can use" — which nothing else can answer, since only this device has the key.
+pub fn spki_sha256(key: &KeyPair) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+
+    let digest = Sha256::digest(key.public_key_der());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Assemble what the listener needs from an issued chain and the local key.
+///
+/// The PKCS#12 is built here because this is the only side that can: the
+/// issuance response deliberately carries no key.
+pub fn video_cert(hostname: &str, cert_pem: &str, key: &KeyPair) -> anyhow::Result<VideoCert> {
+    let key_pem = key.serialize_pem();
+    let pkcs12 = pkcs12_bundle(cert_pem, &key_pem)?;
+    Ok(VideoCert {
+        hostname: hostname.to_owned(),
+        cert_pem: cert_pem.to_owned(),
+        key_pem,
+        pkcs12,
+    })
+}
 
 /// A PEM certificate and its private key, plus — on Windows — the same pair
 /// packaged as PKCS#12.
@@ -87,6 +308,98 @@ fn pkcs12_bundle(_cert_pem: &str, _key_pem: &str) -> anyhow::Result<Option<Strin
     Ok(None)
 }
 
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("isekai-tls-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("video-tls.pem")
+    }
+
+    /// The same key comes back, because a new one costs an issuance — five per
+    /// seven days — and would invalidate anything pinned to the old one.
+    #[test]
+    fn the_key_is_generated_once_and_then_reused() {
+        let path = temp_path("reuse");
+        let _ = std::fs::remove_file(&path);
+
+        let first = load_or_generate_video_key(&path).expect("generate");
+        let again = load_or_generate_video_key(&path).expect("load");
+
+        assert_eq!(
+            spki_sha256(&first),
+            spki_sha256(&again),
+            "a restart must not order a new certificate",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// It is a private key on disk. Anything that widens this has undone the
+    /// reason the key is generated here at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_key_file_is_owner_only_from_the_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = temp_path("mode");
+        let _ = std::fs::remove_file(&path);
+        load_or_generate_video_key(&path).expect("generate");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the video TLS key must be 0600");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The proxy checks the SAN against the name it derived (spec §8.6.2 rule
+    /// 6) and rejects anything else, so the request has to carry exactly the
+    /// hostname it was given — not one this side worked out.
+    #[test]
+    fn the_request_asks_for_the_name_it_was_given() {
+        let path = temp_path("csr");
+        let _ = std::fs::remove_file(&path);
+        let key = load_or_generate_video_key(&path).expect("generate");
+
+        let csr = certificate_request(&key, "e4f9c3.p2p.isekai.tools").expect("csr");
+
+        assert!(csr.starts_with("-----BEGIN CERTIFICATE REQUEST-----"));
+        assert!(csr.len() < 8 * 1024, "the proxy caps the CSR at 8 KiB");
+        let der = pem_body(&csr);
+        assert!(
+            contains(&der, b"e4f9c3.p2p.isekai.tools"),
+            "the SAN has to be the hostname the proxy gave",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The digest is over the public key, so it is the same whoever computes
+    /// it — which is what makes comparing it to the proxy's answer meaningful.
+    #[test]
+    fn two_keys_do_not_share_a_digest() {
+        let a = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("a");
+        let b = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("b");
+        assert_ne!(spki_sha256(&a), spki_sha256(&b));
+        assert_eq!(spki_sha256(&a), spki_sha256(&a));
+    }
+
+    fn pem_body(pem: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        let body: String = pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("");
+        base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .expect("base64")
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -104,7 +417,9 @@ mod tests {
             .expect("bundle is standard base64");
         let parsed = openssl::pkcs12::Pkcs12::from_der(&der).expect("bundle is PKCS#12");
         // Empty password, as `PFXImportCertStore` is called with a null one.
-        let parsed = parsed.parse2("").expect("bundle opens with an empty password");
+        let parsed = parsed
+            .parse2("")
+            .expect("bundle opens with an empty password");
         assert!(parsed.cert.is_some(), "bundle carries the certificate");
         assert!(parsed.pkey.is_some(), "bundle carries the private key");
     }

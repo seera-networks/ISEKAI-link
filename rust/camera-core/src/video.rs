@@ -18,10 +18,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
-use isekai_p2p::agent::{CertBundle, ObservedAddress, ObservedAddressWatch};
+use isekai_p2p::agent::{ObservedAddress, ObservedAddressWatch};
 use isekai_p2p::LegDirectory;
 
-use crate::tls::dev_cert;
+use crate::tls::{dev_cert, VideoCert};
 
 /// ALPN for the camera video protocol.
 pub const VIDEO_ALPN: &str = "sample";
@@ -104,15 +104,13 @@ const MIGRATED_PATH_GRACE: Duration = Duration::from_secs(5);
 pub fn bind_video_listener(
     reg: Option<Arc<Registration>>,
     addr: SocketAddr,
-    cert: Option<&CertBundle>,
+    cert: Option<&VideoCert>,
 ) -> anyhow::Result<(Arc<Registration>, Listener, SocketAddr)> {
     let (cert_pem, key_pem, pkcs12) = match cert {
-        // `pkcs12` is empty when the proxy doesn't ship one; fall back to the
-        // PEM path then instead of importing an empty PKCS#12 blob.
         Some(bundle) => (
             bundle.cert_pem.clone(),
             bundle.key_pem.clone(),
-            (!bundle.pkcs12.is_empty()).then(|| bundle.pkcs12.clone()),
+            bundle.pkcs12.clone(),
         ),
         None => {
             // On Windows the bundle is what makes the dev certificate usable at

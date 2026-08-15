@@ -196,6 +196,77 @@ pub struct CertBundle {
     pub pkcs12: String,
 }
 
+/// What the proxy needs from a caller before it will issue a certificate, and
+/// what it currently holds for this Endpoint (spec §8.6.1).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CertificateParameters {
+    /// The FQDN to put in the CSR's SAN.
+    ///
+    /// **Used verbatim.** The label comes from the Endpoint ID and the domain
+    /// from the proxy's `--p2p-cert-domain`, which this side cannot know, so
+    /// deriving it here would be reimplementing half an answer the proxy is
+    /// already giving.
+    pub hostname: String,
+    /// The proxy's current certificate domain, for a caller that wants to
+    /// derive a *peer's* name. Not needed to issue one's own.
+    #[serde(default)]
+    pub domain: String,
+    /// The key types the proxy will accept (spec §8.6.2 rule 3). What it lists
+    /// and what it accepts are the same set, so a key chosen from here cannot
+    /// be refused afterwards.
+    #[serde(default)]
+    pub key_types: Vec<String>,
+    /// Whether the proxy will still generate a key on request — the old route.
+    /// Reported so a caller can tell "not supported" from "turned off".
+    #[serde(default)]
+    pub server_key_issuance: bool,
+    /// How many issuances this Endpoint has left.
+    #[serde(default)]
+    pub issue_quota: Option<IssueQuota>,
+    /// The certificate the proxy is holding, or `None` if it has never issued
+    /// one. Present so a caller can notice its key no longer matches.
+    #[serde(default)]
+    pub certificate: Option<CachedCertificate>,
+}
+
+/// The issuance allowance for one Endpoint (spec §8.6.1).
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueQuota {
+    pub limit: u32,
+    pub window_secs: u64,
+    pub remaining: u32,
+    #[serde(default)]
+    pub reset_at: Option<String>,
+}
+
+/// What the proxy has cached for this Endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachedCertificate {
+    /// SHA-256 of the certificate's SubjectPublicKeyInfo, base64url.
+    pub spki_sha256: String,
+    pub not_after: String,
+}
+
+/// A certificate issued against a CSR (spec §8.6.2).
+///
+/// **No key and no PKCS#12, and their absence is the point**: the key stayed on
+/// the device, so anything needing a PKCS#12 is assembled by the side holding
+/// it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssuedCertificate {
+    pub hostname: String,
+    /// The full chain, leaf first.
+    pub cert_pem: String,
+    /// SHA-256 of the SubjectPublicKeyInfo, base64url. **Check this against the
+    /// local key before using the certificate** — it is also what §8.6.4 will
+    /// pin.
+    pub spki_sha256: String,
+    #[serde(default)]
+    pub issued_at: Option<String>,
+    #[serde(default)]
+    pub not_after: Option<String>,
+}
+
 /// A standing authorization for one Endpoint to reach one listener (spec §8.8).
 ///
 /// Where a [`Capability`] is a one-shot token the owner has to carry to the
@@ -804,6 +875,51 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         let resp = self.send("GET", "/v1/peer/certificate", Vec::new()).await?;
         match resp.status {
             404 => Ok(None),
+            s if (200..300).contains(&s) => serde_json::from_slice(&resp.body)
+                .map(Some)
+                .map_err(ProxyError::Decode),
+            _ => Err(problem_error(&resp)),
+        }
+    }
+
+    /// `GET /v1/peer/certificate/parameters` (spec §8.6.1).
+    ///
+    /// `None` when the proxy issues no certificates at all (no
+    /// `--p2p-cert-domain`), and also what an older proxy answers by not
+    /// knowing the route. Either way the caller falls back to a dev
+    /// certificate or to [`get_certificate`](Self::get_certificate).
+    ///
+    /// Touches no CA, so it is cheap to call before every issuance.
+    pub async fn certificate_parameters(
+        &self,
+    ) -> Result<Option<CertificateParameters>, ProxyError> {
+        let resp = self
+            .send("GET", "/v1/peer/certificate/parameters", Vec::new())
+            .await?;
+        match resp.status {
+            404 | 405 => Ok(None),
+            s if (200..300).contains(&s) => serde_json::from_slice(&resp.body)
+                .map(Some)
+                .map_err(ProxyError::Decode),
+            _ => Err(problem_error(&resp)),
+        }
+    }
+
+    /// `POST /v1/peer/certificate` (spec §8.6.2).
+    ///
+    /// The CSR is covered by this request's PoP signature — §5.2 puts the body
+    /// hash in the signed string — so the chain from Endpoint ID to public key
+    /// is one somebody other than the proxy could check.
+    ///
+    /// `Ok(None)` if the route is not there, which is an older proxy.
+    pub async fn issue_certificate(
+        &self,
+        csr_pem: &str,
+    ) -> Result<Option<IssuedCertificate>, ProxyError> {
+        let body = to_vec(&serde_json::json!({ "csr_pem": csr_pem }));
+        let resp = self.send("POST", "/v1/peer/certificate", body).await?;
+        match resp.status {
+            404 | 405 => Ok(None),
             s if (200..300).contains(&s) => serde_json::from_slice(&resp.body)
                 .map(Some)
                 .map_err(ProxyError::Decode),

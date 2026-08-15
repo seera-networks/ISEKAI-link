@@ -47,6 +47,14 @@ const FRAMES_PER_LEG: usize = 5;
 /// that actually has to carry video. Override with FRAME_BYTES.
 const DEFAULT_FRAME_BYTES: usize = 30_000;
 
+/// Beside whatever key path this harness was given, and stable across runs:
+/// a fresh video key spends one of the Endpoint's five issuances a week.
+fn video_key_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("VIDEO_KEY_PATH").unwrap_or_else(|_| "video-tls-key.pem".to_owned()),
+    )
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
@@ -121,7 +129,7 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
     let server_cfg = config(auth0, identity, proxy, protocol, "e2e-server.pem");
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
     let server =
-        camera_core::spawn_p2p_server(Some(reg.clone()), server_cfg, frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone())
+        camera_core::spawn_p2p_server(Some(reg.clone()), server_cfg, &video_key_path(), frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone())
             .await?;
     println!(
         "server ready: listener={} endpoint={} video={}",

@@ -17,6 +17,10 @@ isekai-link-utils = { workspace = true }
 isekai-p2p = { workspace = true }
 # Dev self-signed certificate for the video ("sample" ALPN) QUIC listener.
 rcgen = { workspace = true }
+# The video TLS key's SPKI digest, compared against what the proxy reports, and
+# the PKCS#12 blob Windows loads credentials from (`tls`).
+base64 = { workspace = true }
+sha2 = { workspace = true }
 # The privacy policy and the record of agreeing to it (`privacy`).
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,7 +34,6 @@ time = { workspace = true }
 # which is the point of confining this to a target-specific dependency.
 [target.'cfg(windows)'.dependencies]
 openssl = { version = "0.10.66", features = ["vendored"] }
-base64 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

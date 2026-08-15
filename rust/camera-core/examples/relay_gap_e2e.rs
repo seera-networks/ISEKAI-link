@@ -23,6 +23,14 @@ use camera_core::{load_or_generate_key, InitiatorSession, P2pConfig, ServerComma
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// Beside whatever key path this harness was given, and stable across runs:
+/// a fresh video key spends one of the Endpoint's five issuances a week.
+fn video_key_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("VIDEO_KEY_PATH").unwrap_or_else(|_| "video-tls-key.pem".to_owned()),
+    )
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
@@ -106,7 +114,7 @@ async fn run(
     let server_cfg = config(auth0, identity, proxy, protocol, "gap-server.pem");
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
     let server =
-        camera_core::spawn_p2p_server(None, server_cfg, frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
+        camera_core::spawn_p2p_server(None, server_cfg, &video_key_path(), frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
     println!(
         "server ready: listener={} endpoint={} video={}",
         server.info.listener_id, server.info.endpoint_id, server.info.video_addr

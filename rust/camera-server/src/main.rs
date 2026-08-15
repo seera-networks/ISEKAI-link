@@ -422,6 +422,20 @@ const MSQUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// that a slow proxy is decided by that bound rather than by this one racing it.
 const P2P_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Where the video TLS key lives, given where the Endpoint key does.
+///
+/// Derived rather than configured: two paths to type is one to get wrong, and
+/// nothing good comes of the two keys living apart. Same directory, a name that
+/// says which is which.
+fn video_key_path_beside(endpoint_key_path: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(endpoint_key_path);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("camera-server");
+    path.with_file_name(format!("{stem}-video-tls.pem"))
+}
+
 /// How the camera stream reaches clients.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Mode {
@@ -812,6 +826,9 @@ impl MyApp {
         let protocol = self.protocol.clone();
         let register = self.register;
         let key_path = self.key_path.clone();
+        // Beside the Endpoint key, and just as much a long-term secret: the
+        // video TLS key is generated on this device and never sent anywhere.
+        let video_key_path = video_key_path_beside(&key_path);
 
         let handle = tokio::spawn(async move {
             let key = match camera_core::load_or_generate_key(std::path::Path::new(&key_path)) {
@@ -839,6 +856,7 @@ impl MyApp {
             match camera_core::spawn_p2p_server(
                 Some(reg),
                 cfg,
+                std::path::Path::new(&video_key_path),
                 mjpeg_rx,
                 camera_core::AcceptPolicy::AutoNotify,
                 shutdown,

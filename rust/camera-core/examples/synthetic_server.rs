@@ -42,6 +42,14 @@ use tokio_util::sync::CancellationToken;
 /// The port the iOS test harness looks for. Nothing else depends on the value.
 const DEFAULT_CONTROL_ADDR: &str = "127.0.0.1:57345";
 
+/// Beside whatever key path this harness was given, and stable across runs:
+/// a fresh video key spends one of the Endpoint's five issuances a week.
+fn video_key_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("VIDEO_KEY_PATH").unwrap_or_else(|_| "video-tls-key.pem".to_owned()),
+    )
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
@@ -255,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(4);
-    let server = camera_core::spawn_p2p_server(None, cfg, frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
+    let server = camera_core::spawn_p2p_server(None, cfg, &video_key_path(), frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
 
     println!(
         "listener={} endpoint={} video={}",

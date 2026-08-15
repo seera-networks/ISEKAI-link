@@ -9,6 +9,7 @@
 //! 4. [`ServerCommand::Bind`] attaches the relay for it.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use bytes::Bytes;
 use isekai_p2p::agent::ListenerEvent;
 use isekai_p2p::agent::{Grant, ObservedAddressWatch, PairingCode, RelayOptions};
 use isekai_p2p::{
-    fetch_relay_certificate, issue_endpoint_token, AcceptPolicy, ListenerSession, P2pConfig,
-    SignalingEvent, SignalingState,
+    issue_endpoint_token, proxy_client, AcceptPolicy, ListenerSession, P2pConfig, SignalingEvent,
+    SignalingState,
 };
 use msquic_async::Registration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -110,9 +111,15 @@ pub struct ServerHandle {
 /// and start serving frames from `frame_rx`. Returns once the listener and
 /// session exist; capability issuance and binding then happen via
 /// [`ServerHandle::commands`].
+///
+/// `video_key_path` is where this device's video TLS key lives. Named by the
+/// caller rather than derived here, because what it holds is the thing this
+/// whole arrangement exists to keep: a key that is generated on first use,
+/// reused for every issuance after, and sent nowhere.
 pub async fn spawn_p2p_server(
     reg: Option<Arc<Registration>>,
     cfg: P2pConfig,
+    video_key_path: &Path,
     frame_rx: mpsc::Receiver<Bytes>,
     policy: AcceptPolicy,
     shutdown: CancellationToken,
@@ -121,17 +128,21 @@ pub async fn spawn_p2p_server(
     // download and the listener session.
     let endpoint_token = issue_endpoint_token(&cfg).await?.endpoint_token;
 
-    // Download this Endpoint's per-endpoint relay certificate so the video
-    // listener can present it and the initiator can validate it. `None` when the
-    // proxy has relay certificates disabled — the listener then uses a dev cert.
-    let cert = fetch_relay_certificate(&cfg, &endpoint_token).await?;
-    if let Some(bundle) = &cert {
-        tracing::info!(
-            "using per-endpoint relay certificate for {}",
-            bundle.hostname
-        );
-    } else {
-        tracing::warn!("proxy has relay certificates disabled; using a dev certificate");
+    // Get this Endpoint's relay certificate for a key generated here, so the
+    // video listener can present it and the initiator can validate it.
+    //
+    // **The key is this device's and is not sent anywhere.** The relay carries
+    // the ciphertext this key opens; while the proxy generated it, the
+    // encryption on that leg protected the peers from everyone except the proxy
+    // in the middle of it (spec §8.6.2). What goes out is a certificate request.
+    //
+    // `None` when the proxy issues nothing — the listener then presents a dev
+    // certificate and the initiator skips validation, as before.
+    let video_key = crate::tls::load_or_generate_video_key(video_key_path)?;
+    let proxy = proxy_client(&cfg, &endpoint_token)?;
+    let cert = crate::tls::issue_video_cert(&proxy, &video_key).await?;
+    if cert.is_none() {
+        tracing::warn!("proxy issues no relay certificate; using a development one");
     }
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");

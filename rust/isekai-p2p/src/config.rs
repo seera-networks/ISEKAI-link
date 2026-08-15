@@ -116,6 +116,22 @@ pub async fn fetch_relay_certificate(
     Ok(proxy.get_certificate().await?)
 }
 
+/// A control-plane client for `cfg`'s proxy, authenticated with `endpoint_token`.
+///
+/// The same client [`fetch_relay_certificate`] builds for itself, handed out so
+/// a caller that needs more than one call — issuing a certificate takes two —
+/// does not open a connection per request.
+pub fn proxy_client(
+    cfg: &P2pConfig,
+    endpoint_token: &str,
+) -> anyhow::Result<ProxyClient<MasqueH3Transport>> {
+    Ok(ProxyClient::new(
+        MasqueH3Transport::connect(&cfg.proxy_url)?,
+        cfg.key.clone(),
+        endpoint_token,
+    ))
+}
+
 async fn issue<T: ControlPlaneTransport>(
     client: &IdentityClient<T>,
     cfg: &P2pConfig,
