@@ -119,16 +119,24 @@ final class ViewerModel: ObservableObject {
             )
             return { model in
                 model.cameras = paired.cameras
+                // Pairing worked and the grant stands either way, but if
+                // nothing was written down then every later connection to this
+                // camera reports itself unchecked — and this is the only place
+                // that can say why, so it is carried onto whatever is shown.
+                let unchecked = paired.notRemembered.map {
+                    " This device could not remember which Endpoint (\($0)), so connections "
+                    + "to it cannot be checked against the pairing."
+                } ?? ""
                 guard let camera = paired.camera else {
                     // Paired with a camera that is not running. The code is
                     // spent and the grant stands; it appears here when it is
                     // next up. Saying "failed" would invite trying the code
                     // again, and a code works once.
                     model.cameraStatus = "Paired with \(paired.ownerEndpoint), which is not "
-                        + "running right now. It will appear here when it is."
+                        + "running right now. It will appear here when it is." + unchecked
                     return
                 }
-                model.cameraStatus = "Paired with \(camera.label)."
+                model.cameraStatus = "Paired with \(camera.label)." + unchecked
                 // Select it, and clear any capability: a grant is what
                 // authorizes this now, and a stale capability would be carried
                 // instead of it.

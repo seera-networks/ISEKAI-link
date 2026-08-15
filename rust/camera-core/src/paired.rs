@@ -92,6 +92,11 @@ pub fn remember(endpoint: &str) -> anyhow::Result<()> {
             .with_context(|| format!("failed to create {}", dir.display()))?;
     }
     let json = serde_json::to_vec_pretty(&record).context("failed to encode the paired list")?;
+    tracing::info!(
+        endpoint,
+        "remembering a paired Endpoint in {}",
+        path.display()
+    );
     // Through a temporary and a rename, because this is read-modify-write: a
     // write interrupted halfway leaves a file that does not parse, and what
     // follows is not a loud failure but a check that silently passes
@@ -139,9 +144,14 @@ pub enum Checked {
     /// The camera was paired with, and the Endpoint that answered is the one it
     /// was paired as.
     AgainstPairing,
-    /// The camera was not paired with — reached by a hand-carried capability —
-    /// so there was nothing out of band to hold the answer against.
-    NothingToCheckAgainst,
+    /// No camera was selected from a listing, so the caller named no Endpoint
+    /// to check. The ordinary hand-carried case.
+    NoSelection,
+    /// A camera was selected, but its Endpoint is not one this device paired
+    /// with. Ordinary for a listener reached by capability — and what a
+    /// pairing that failed to be written down also looks like, which is why it
+    /// is not folded in with [`Self::NoSelection`].
+    NotPaired,
 }
 
 impl std::fmt::Display for Checked {
@@ -150,9 +160,13 @@ impl std::fmt::Display for Checked {
             Self::AgainstPairing => {
                 f.write_str("the camera answered as the Endpoint it was paired as")
             }
-            Self::NothingToCheckAgainst => f.write_str(
-                "this camera was not paired with, so the proxy is trusted about which \
-                 Endpoint answered",
+            Self::NoSelection => f.write_str(
+                "no camera was selected from a listing, so the proxy is trusted about \
+                 which Endpoint answered",
+            ),
+            Self::NotPaired => f.write_str(
+                "this camera is not among the ones this device paired with, so the proxy \
+                 is trusted about which Endpoint answered",
             ),
         }
     }
@@ -186,8 +200,11 @@ fn decide(
     // An empty `intended` is "no camera was selected from a listing", which is
     // the hand-carried case and not something an entry could match — but a
     // stray empty entry would make it match everything.
-    if intended.is_empty() || !paired.contains(intended) {
-        return Ok(Checked::NothingToCheckAgainst);
+    if intended.is_empty() {
+        return Ok(Checked::NoSelection);
+    }
+    if !paired.contains(intended) {
+        return Ok(Checked::NotPaired);
     }
     if answered == Some(intended) {
         return Ok(Checked::AgainstPairing);
@@ -242,7 +259,7 @@ mod tests {
     fn an_empty_entry_does_not_refuse_everything() {
         assert_eq!(
             decide(&paired(&["", "ep:a"]), "", Some("ep:x")),
-            Ok(Checked::NothingToCheckAgainst),
+            Ok(Checked::NoSelection),
         );
     }
 

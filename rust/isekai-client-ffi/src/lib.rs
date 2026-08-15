@@ -530,6 +530,14 @@ pub struct Paired {
     pub owner_endpoint: String,
     /// Everything reachable as of the pairing, this one included.
     pub cameras: Vec<Camera>,
+    /// Why the Endpoint could not be written down, when it could not be.
+    ///
+    /// Pairing still succeeded — the grant stands — but every later connection
+    /// to this camera will report itself unchecked, so the reason has to reach
+    /// somebody. It cannot do that through the log: [`install_logging`] runs on
+    /// connect, so at pairing time there may be no subscriber at all, and on a
+    /// phone there is no console behind it either.
+    pub not_remembered: Option<String>,
 }
 
 /// Turn on dev-only certificate acceptance, at most once in a process.
@@ -658,12 +666,15 @@ pub fn pair_with_code(
         //
         // A device that cannot write the list still pairs: refusing would turn
         // a check that was not there yesterday into a reason pairing fails.
-        if let Err(e) = camera_core::paired::remember(&grant.owner_endpoint) {
-            tracing::warn!(
-                "paired, but could not remember which Endpoint: {e:#}; later connections \
-                 to this camera cannot be checked against it",
-            );
-        }
+        let not_remembered = camera_core::paired::remember(&grant.owner_endpoint)
+            .err()
+            .map(|e| {
+                tracing::warn!(
+                    "paired, but could not remember which Endpoint: {e:#}; later \
+                     connections to this camera cannot be checked against it",
+                );
+                format!("{e:#}")
+            });
         // The grant names the Endpoint, not a listener, so the camera to offer
         // comes from reading the list back — which is also where its name is,
         // and which the caller wants anyway.
@@ -682,6 +693,7 @@ pub fn pair_with_code(
                 .cloned(),
             owner_endpoint: grant.owner_endpoint,
             cameras,
+            not_remembered,
         })
     })
 }
