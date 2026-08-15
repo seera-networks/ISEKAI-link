@@ -95,6 +95,10 @@ pub struct ClientConfig {
     /// Log filter for the Rust core, in `RUST_LOG` syntax — e.g.
     /// `camera_core=debug,isekai_p2p_core=debug`. Empty disables logging.
     ///
+    /// This crate's own records are added at `info` unless the filter names it,
+    /// because what says whether the pairing check ran and whether the key was
+    /// pinned comes from here — see [`with_own_records`].
+    ///
     /// Records go to [`FrameSink::on_log`]. A phone has no console to read
     /// `RUST_LOG` on, so this is the only way to see what the core is doing.
     pub log_filter: String,
@@ -415,6 +419,23 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SinkWriter {
     }
 }
 
+/// This crate's own records, added to a filter that does not mention it.
+///
+/// What says whether the pairing check ran and whether the peer's key was
+/// pinned is emitted from here, while the equivalent on the desktop comes from
+/// `camera_client` — so a filter carried over from there, or the example in
+/// [`ClientConfig::log_filter`], leaves exactly the two lines worth reading
+/// invisible, and a connection with no protection looks like one with it.
+///
+/// A filter that names this crate is left alone: someone who asked for
+/// `isekai_client_ffi=warn` meant it.
+fn with_own_records(filter: &str) -> String {
+    if filter.contains("isekai_client_ffi") {
+        return filter.to_owned();
+    }
+    format!("{filter},isekai_client_ffi=info")
+}
+
 /// Point the core's logging at `sink`, installing the subscriber on first use.
 ///
 /// The filter cannot be changed afterwards — `tracing` allows one global
@@ -424,6 +445,7 @@ fn install_logging(filter: &str, sink: &Arc<dyn FrameSink>) {
     if filter.is_empty() {
         return;
     }
+    let filter = &with_own_records(filter);
     *LOG_SINK.lock().expect("log sink mutex poisoned") = Some(Arc::clone(sink));
     LOG_INIT.call_once(|| {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -451,7 +473,8 @@ fn install_logging(filter: &str, sink: &Arc<dyn FrameSink>) {
         }
     });
     // Runs on every connect, so a filter changed in the app takes effect on the
-    // next one rather than needing the app restarted.
+    // next one rather than needing the app restarted. Through the same addition,
+    // or editing the field would be a way to switch those records back off.
     if let Some(reload) = LOG_FILTER
         .lock()
         .expect("log filter mutex poisoned")
@@ -954,6 +977,25 @@ mod tests {
 
     fn loopback(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// The example filter in the field's own documentation hides this crate,
+    /// which is where the pairing check and the pin report themselves.
+    #[test]
+    fn a_filter_that_does_not_mention_this_crate_gains_its_records() {
+        assert_eq!(
+            with_own_records("camera_core=debug,isekai_p2p_core=debug"),
+            "camera_core=debug,isekai_p2p_core=debug,isekai_client_ffi=info",
+        );
+    }
+
+    /// Someone who asked for less than `info` from here meant it.
+    #[test]
+    fn a_filter_that_mentions_this_crate_is_left_alone() {
+        assert_eq!(
+            with_own_records("isekai_client_ffi=warn"),
+            "isekai_client_ffi=warn",
+        );
     }
 
     /// Nothing to offer until both paths are known, so the button stays inert
