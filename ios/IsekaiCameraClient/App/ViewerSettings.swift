@@ -11,6 +11,11 @@ struct ViewerSettings: Codable, Equatable {
     var capability = ""
     /// The camera server's "Listener ID".
     var listenerID = ""
+    /// The Endpoint that camera is expected to be, kept beside the listener it
+    /// is running. Saved rather than re-read because the check it feeds is
+    /// against the proxy, and a relaunch must not quietly drop it. Empty for a
+    /// camera reached by a hand-carried capability.
+    var expectedEndpoint = ""
     /// Register the Endpoint with the Identity API before a token is issued.
     var register = true
     /// **Dev only.** Accepts self-signed proxy/Identity certificates; Phase 4 of

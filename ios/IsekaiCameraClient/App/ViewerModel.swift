@@ -95,6 +95,7 @@ final class ViewerModel: ObservableObject {
                 // a selection that is not on the list.
                 if !found.contains(where: { $0.listenerId == model.settings.listenerID }) {
                     model.settings.listenerID = ""
+                    model.settings.expectedEndpoint = ""
                     model.settings.save()
                 }
             }
@@ -132,6 +133,7 @@ final class ViewerModel: ObservableObject {
                 // authorizes this now, and a stale capability would be carried
                 // instead of it.
                 model.settings.listenerID = camera.listenerId
+                model.settings.expectedEndpoint = camera.ownerEndpoint
                 model.settings.capability = ""
                 model.settings.save()
             }
@@ -140,6 +142,9 @@ final class ViewerModel: ObservableObject {
 
     func select(camera: Camera) {
         settings.listenerID = camera.listenerId
+        // Which Endpoint that listener is said to belong to, kept so connecting
+        // can hold the proxy's answer against it.
+        settings.expectedEndpoint = camera.ownerEndpoint
         settings.capability = ""
         settings.save()
     }
@@ -282,6 +287,7 @@ final class ViewerModel: ObservableObject {
             protocol: settings.protocolName.trimmed,
             capability: settings.capability.trimmed,
             listenerId: settings.listenerID.trimmed,
+            expectedEndpoint: settings.expectedEndpoint.trimmed,
             register: settings.register,
             insecureSkipVerify: settings.insecureSkipVerify,
             enableMigration: settings.enableMigration,

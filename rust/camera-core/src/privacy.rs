@@ -179,17 +179,20 @@ fn consent_path(app: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// The per-user configuration directory, by each platform's own convention.
-fn config_dir() -> anyhow::Result<PathBuf> {
+///
+/// Shared with [`crate::paired`], so what it says when there is nowhere to
+/// write names no one caller.
+pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var_os("APPDATA")
-            .context("APPDATA is not set, so there is nowhere to record consent")?;
+            .context("APPDATA is not set, so there is nowhere to keep settings")?;
         return Ok(Path::new(&base).join("ISEKAI link"));
     }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var_os("HOME")
-            .context("HOME is not set, so there is nowhere to record consent")?;
+            .context("HOME is not set, so there is nowhere to keep settings")?;
         return Ok(Path::new(&home)
             .join("Library/Application Support")
             .join("ISEKAI link"));
@@ -201,7 +204,7 @@ fn config_dir() -> anyhow::Result<PathBuf> {
         }
         let home = std::env::var_os("HOME").context(
             "neither XDG_CONFIG_HOME nor HOME is set, so there is nowhere to \
-                      record consent",
+                      keep settings",
         )?;
         Ok(Path::new(&home).join(".config").join("isekai-link"))
     }

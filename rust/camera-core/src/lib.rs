@@ -10,8 +10,11 @@
 //!   video listener, create a P2P `ListenerSession` relaying to it, and drive
 //!   capability issuance / the relay bind leg from the GUI.
 //! * [`tls`] — the dev self-signed certificate for the video listener.
+//! * [`paired`] — the Endpoints this device paired with, so a later connection
+//!   can be held against the one the code was read off.
 
 pub mod cameras;
+pub mod paired;
 pub mod privacy;
 pub mod server;
 pub mod shutdown;

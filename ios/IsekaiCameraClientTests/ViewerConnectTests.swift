@@ -39,6 +39,7 @@ final class ViewerConnectTests: XCTestCase {
             protocol: try XCTUnwrap(peer["protocol"], "hello: \(hello)"),
             capability: capability,
             listenerId: try XCTUnwrap(peer["listener"], "hello: \(hello)"),
+            expectedEndpoint: "",
             register: true,
             // Follow whatever the peer is talking to: a local stack needs this,
             // the live deployment must not have it.

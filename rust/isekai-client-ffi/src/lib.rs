@@ -35,6 +35,13 @@ pub enum ClientError {
     InvalidArgument(String),
     #[error("connect failed: {0}")]
     Connect(String),
+    /// The camera answered as an Endpoint other than the one it was paired as.
+    ///
+    /// Apart from [`Self::Connect`] because it is not a transient failure and
+    /// retrying it is wrong: it says the introduction changed, and it will say
+    /// so again every time until the pairing is redone.
+    #[error("{0}")]
+    WrongPeer(String),
     #[error("runtime error: {0}")]
     Runtime(String),
 }
@@ -65,6 +72,13 @@ pub struct ClientConfig {
     pub capability: String,
     /// The camera to reach, from [`list_cameras`] or typed in by hand.
     pub listener_id: String,
+    /// The Endpoint that camera is expected to be, from [`list_cameras`].
+    ///
+    /// Checked against the Endpoint the proxy answers with, but only when this
+    /// device paired with it — see [`camera_core::paired`]. Empty for a camera
+    /// reached by a hand-carried capability, which brings no pairing to check
+    /// against.
+    pub expected_endpoint: String,
     /// Register the Endpoint with the Identity API before issuing a token.
     pub register: bool,
     /// **Dev only** — accept self-signed proxy/Identity certificates. Never true
@@ -615,6 +629,18 @@ pub fn pair_with_code(
             .pair(&code, label.as_deref())
             .await
             .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
+        // Pairing is the one moment an Endpoint ID arrives from outside the
+        // proxy — it was read off the camera and typed in here. Remembered now
+        // because there is no later chance to learn it the same way.
+        //
+        // A device that cannot write the list still pairs: refusing would turn
+        // a check that was not there yesterday into a reason pairing fails.
+        if let Err(e) = camera_core::paired::remember(&grant.owner_endpoint) {
+            tracing::warn!(
+                "paired, but could not remember which Endpoint: {e:#}; later connections \
+                 to this camera cannot be checked against it",
+            );
+        }
         // The grant names the Endpoint, not a listener, so the camera to offer
         // comes from reading the list back — which is also where its name is,
         // and which the caller wants anyway.
@@ -777,6 +803,15 @@ pub fn connect(
             }
         })
         .map_err(|e| ClientError::Connect(format!("{e:#}")))?;
+
+    // Who answered, against who was meant. The pin below proves the peer holds
+    // the key its Endpoint signed for; this is what says that Endpoint is the
+    // camera the user paired with, and the proxy names both.
+    camera_core::paired::check(
+        &config.expected_endpoint,
+        session.connection.peer_endpoint.as_deref(),
+    )
+    .map_err(|e| ClientError::WrongPeer(e.to_string()))?;
 
     let connection_id = session.connection_id().to_owned();
     let video_port = session.local_addr.port();

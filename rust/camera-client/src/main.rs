@@ -537,6 +537,18 @@ impl MyApp {
         let plane = Arc::clone(&self.control_plane);
         let capability = self.capability.trim().to_string();
         let listener_id = self.listener_id.trim().to_string();
+        // Which camera the operator means, as an Endpoint rather than a
+        // listener: a listener is whichever one the camera started most
+        // recently, but the Endpoint is what pairing recorded. Empty for a
+        // listener id typed in by hand, which brings no pairing to check.
+        let expected_endpoint = self
+            .cameras
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|cameras| cameras.iter().find(|c| c.listener_id == listener_id))
+            .map(|c| c.owner_endpoint.clone())
+            .unwrap_or_default();
 
         let handle = tokio::spawn(async move {
             // The relay leg goes on a shared, unconnected socket so a direct
@@ -582,6 +594,18 @@ impl MyApp {
                     return;
                 }
             };
+            // Who answered, against who was meant. The pin below proves the
+            // peer holds the key its Endpoint signed for; this is what says
+            // that Endpoint is the camera the operator paired with, and the
+            // proxy names both.
+            if let Err(e) = camera_core::paired::check(
+                &expected_endpoint,
+                session.connection.peer_endpoint.as_deref(),
+            ) {
+                shared.lock().unwrap().status = format!("refused: {e}");
+                tracing::error!("{e}");
+                return;
+            }
             let local_port = session.local_addr.port();
             // Dial the peer's loopback FQDN (which resolves to 127.0.0.1) so the
             // per-endpoint relay certificate can be validated. When the proxy has
@@ -806,6 +830,20 @@ impl MyApp {
             };
             match dir.pair(&code, Some("camera-client")).await {
                 Ok(grant) => {
+                    // Pairing is the one moment an Endpoint ID arrives from
+                    // outside the proxy — it was read off the camera and typed
+                    // in here. Remembered now because there is no later chance
+                    // to learn it the same way.
+                    //
+                    // A device that cannot write the list still pairs: refusing
+                    // would turn a check that was not there yesterday into a
+                    // reason pairing fails.
+                    if let Err(e) = camera_core::paired::remember(&grant.owner_endpoint) {
+                        tracing::warn!(
+                            "paired, but could not remember which Endpoint: {e:#}; later \
+                             connections to this camera cannot be checked against it",
+                        );
+                    }
                     // Read the list back straight away rather than making the
                     // operator work out that a refresh is now needed — and it
                     // is also where the camera's own name comes from, which is
