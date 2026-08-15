@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 /// Write `contents` to `path`, owner-only and atomically.
-pub(crate) fn write_secret(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub fn write_secret(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let temp = temp_beside(path);
     // Any leftover from an interrupted earlier write: `create_new` below fails
     // on an existing file, which is what makes the mode it asks for binding.

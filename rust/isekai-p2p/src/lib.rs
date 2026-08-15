@@ -22,7 +22,7 @@ pub mod auth0;
 pub mod config;
 pub mod initiator;
 pub mod listener;
-mod secret;
+pub mod secret;
 
 pub use auth::{Auth0TokenSource, StaticAuth0Token};
 pub use config::{
@@ -46,7 +46,7 @@ pub mod agent {
         PairingCode, PeerConnection, ReachableListener,
     };
     pub use isekai_p2p_core::proxy::{
-        CachedCertificate, CertificateParameters, IssuedCertificate, ProxyClient,
+        CachedCertificate, CertificateParameters, IssuedCertificate, ProxyClient, ProxyError,
     };
     pub use isekai_p2p_core::transport::{drain_msquic, shutdown_msquic, MasqueH3Transport};
 }

@@ -41,9 +41,11 @@
 //! [`DevCert::pkcs12`] is `None` off Windows and nothing links OpenSSL.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context as _;
-use isekai_p2p::agent::{MasqueH3Transport, ProxyClient};
+use isekai_p2p::agent::{IssuedCertificate, MasqueH3Transport, ProxyClient, ProxyError};
+use isekai_p2p::secret::write_secret;
 use rcgen::{CertificateParams, KeyPair};
 
 /// What the video listener needs to present a certificate: the chain the proxy
@@ -104,7 +106,7 @@ pub async fn issue_video_cert(
     }
 
     let csr = certificate_request(key, &params.hostname)?;
-    let Some(issued) = proxy.issue_certificate(&csr).await? else {
+    let Some(issued) = issue_with_retries(proxy, &csr).await? else {
         // `parameters` answered and this did not, which should not happen —
         // they arrived together. Treat it as the old proxy it looks like.
         tracing::warn!("proxy has the parameters route but not the issuing one");
@@ -126,6 +128,52 @@ pub async fn issue_video_cert(
         "issued a relay certificate for a key that stayed on this device",
     );
     video_cert(&issued.hostname, &issued.cert_pem, key).map(Some)
+}
+
+/// How long to wait between attempts when the proxy says to come back.
+///
+/// The proxy advertises `Retry-After: 30`, and this does not read it: the
+/// control-plane transport hands back a status and a body, not headers. These
+/// are chosen to cover an ACME order that is merely slow without turning a
+/// broken proxy into a minute of silence at startup. Reading the header is the
+/// better answer if this ever needs to be more than approximately right.
+const ISSUANCE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+];
+
+/// Issue, retrying the answers that say retrying is the point.
+///
+/// **`certificate-unavailable` means an order is in flight or the CA was
+/// slow** — a condition that clears on its own, and the first issuance for an
+/// Endpoint is exactly when it happens. Failing on it would mean a camera that
+/// cannot start the first time it is asked to.
+///
+/// Nothing else is retried. `certificate-rate-limited` clears in days, not
+/// seconds, and `csr-invalid` is a fault on this side that will read the same
+/// however many times it is sent.
+async fn issue_with_retries(
+    proxy: &ProxyClient<MasqueH3Transport>,
+    csr: &str,
+) -> Result<Option<IssuedCertificate>, ProxyError> {
+    let mut delays = ISSUANCE_RETRY_DELAYS.iter();
+    loop {
+        let error = match proxy.issue_certificate(csr).await {
+            Ok(issued) => return Ok(issued),
+            Err(e) => e,
+        };
+        let retryable = matches!(
+            &error,
+            ProxyError::Problem { problem, .. }
+                if problem.as_ref().map(|p| p.kind()) == Some("certificate-unavailable")
+        );
+        let Some(delay) = delays.next().filter(|_| retryable) else {
+            return Err(error);
+        };
+        tracing::info!(?delay, "the proxy is not ready to issue yet: {error}");
+        tokio::time::sleep(*delay).await;
+    }
 }
 
 /// The pre-CSR route: ask the proxy to generate the key and send it here.
@@ -165,48 +213,60 @@ async fn legacy_video_cert(
 /// free. Written `0600` and never sent — a caller that logs, backs up or syncs
 /// this file has undone the point of it.
 pub fn load_or_generate_video_key(path: &Path) -> anyhow::Result<KeyPair> {
-    if path.exists() {
-        let pem = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read the video TLS key at {}", path.display()))?;
-        return KeyPair::from_pem(&pem)
-            .with_context(|| format!("failed to parse the video TLS key at {}", path.display()));
+    if let Some(key) = read_key(path)? {
+        return Ok(key);
     }
     // P-256: on the proxy's accepted list, the same curve as the Endpoint key,
     // and the smallest handshake of the options.
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .context("failed to generate a video TLS key")?;
-    write_private(path, &key.serialize_pem())?;
-    Ok(key)
+    // Written through a temporary and renamed into place, so a crash between
+    // the two leaves either the old file or none — never a half-written one.
+    // A truncated key here is not a lost file: `read_key` would find it, fail
+    // to parse it, and go on failing at every start, because a key is only
+    // generated when there is nothing there at all.
+    write_secret(path, key.serialize_pem().as_bytes())
+        .with_context(|| format!("failed to store the video TLS key at {}", path.display()))?;
+
+    // Read back rather than returning what was just generated. Two processes
+    // starting together both generate, and the rename means one file wins; the
+    // one that reads its own key would hold a key its own file does not have,
+    // and would find out at the next start when the certificate it had issued
+    // no longer matched. Whatever is on disk is the key.
+    read_key(path)?.with_context(|| {
+        format!(
+            "the video TLS key vanished after writing {}",
+            path.display()
+        )
+    })
 }
 
-/// Write `contents` to `path` readable only by this user.
+/// The key at `path`, or `None` if there is no file there.
 ///
-/// Created with the mode already set rather than relaxed afterwards: a key that
-/// is world-readable for even an instant has been world-readable.
-fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
-    let mut open = std::fs::OpenOptions::new();
-    open.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600);
-    }
-    let mut file = open
-        .open(path)
-        .with_context(|| format!("failed to create the video TLS key at {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("failed to write the video TLS key at {}", path.display()))?;
-    Ok(())
+/// A file that is present and unreadable is an error rather than a reason to
+/// generate: overwriting it would throw away the identity a certificate was
+/// issued against, and spend one of the Endpoint's issuances doing it.
+fn read_key(path: &Path) -> anyhow::Result<Option<KeyPair>> {
+    let pem = match std::fs::read_to_string(path) {
+        Ok(pem) => pem,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to read the video TLS key at {}", path.display()))
+        }
+    };
+    KeyPair::from_pem(&pem)
+        .with_context(|| format!("failed to parse the video TLS key at {}", path.display()))
+        .map(Some)
 }
 
 /// A PKCS#10 certificate request for `hostname`, signed by `key`.
 ///
-/// One `dNSName` SAN and nothing else, which is what the proxy checks against
-/// the name it derives (spec §8.6.2 rule 6). The subject is not checked and
-/// rcgen's default is fine. `keyUsage` / `extendedKeyUsage` are the only other
-/// extensions it requests, and both are on the permitted list.
+/// One `dNSName` SAN and **no other extension request at all** — rcgen omits the
+/// attribute entirely when neither `keyUsage` nor `extendedKeyUsage` is set, so
+/// what goes on the wire is the SAN and nothing more. That satisfies §8.6.2
+/// rule 7 by having nothing to permit, rather than by asking for the permitted
+/// things.
 pub fn certificate_request(key: &KeyPair, hostname: &str) -> anyhow::Result<String> {
     let mut params = CertificateParams::new(vec![hostname.to_owned()])
         .context("failed to build the certificate request parameters")?;
@@ -363,6 +423,24 @@ mod key_tests {
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the video TLS key must be 0600");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A key file that is there but unreadable is not a reason to make a new
+    /// one. Overwriting it throws away the identity a certificate was issued
+    /// against and spends one of five issuances a week doing it — so a
+    /// truncated file has to be a loud failure, not a quiet fresh start.
+    #[test]
+    fn an_unreadable_key_is_an_error_and_not_a_new_one() {
+        let path = temp_path("truncated");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "-----BEGIN PRIVATE KEY-----\ntruncated").expect("write");
+
+        let err = load_or_generate_video_key(&path).expect_err("must not silently replace it");
+        assert!(
+            format!("{err:#}").contains("failed to parse"),
+            "the error should name what it could not read: {err:#}",
+        );
         let _ = std::fs::remove_file(&path);
     }
 
