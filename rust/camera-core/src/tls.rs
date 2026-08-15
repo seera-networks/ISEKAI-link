@@ -208,8 +208,22 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
 /// rcgen's default is fine. `keyUsage` / `extendedKeyUsage` are the only other
 /// extensions it requests, and both are on the permitted list.
 pub fn certificate_request(key: &KeyPair, hostname: &str) -> anyhow::Result<String> {
-    let params = CertificateParams::new(vec![hostname.to_owned()])
+    let mut params = CertificateParams::new(vec![hostname.to_owned()])
         .context("failed to build the certificate request parameters")?;
+    // **The CN has to be the hostname, even though nothing reads it as a name.**
+    // The proxy does not check the subject — the CA takes the name from the SAN
+    // — but ACME order validation checks that whatever CN is present is also in
+    // the SAN, and rcgen's default is `CN=rcgen self signed cert`. Left alone,
+    // every request is refused with
+    //
+    //   common name `rcgen self signed cert` is missing from the CSR's
+    //   subjectAltName extension
+    //
+    // which names the CN and so reads like a subject problem, when what it is
+    // asking for is agreement with the SAN.
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, hostname);
+    params.distinguished_name = dn;
     let csr = params
         .serialize_request(key)
         .context("failed to sign the certificate request")?;
@@ -369,6 +383,11 @@ mod key_tests {
         assert!(
             contains(&der, b"e4f9c3.p2p.isekai.tools"),
             "the SAN has to be the hostname the proxy gave",
+        );
+        assert!(
+            !contains(&der, b"rcgen self signed cert"),
+            "rcgen's default CN is not in the SAN, and ACME order validation \
+             refuses a CN that is not",
         );
         let _ = std::fs::remove_file(&path);
     }

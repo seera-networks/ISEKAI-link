@@ -119,7 +119,15 @@ pub enum ProxyError {
     Transport(anyhow::Error),
     #[error("failed to decode response: {0}")]
     Decode(serde_json::Error),
-    #[error("proxy returned status {status}{}", .problem.as_ref().map(|p| format!(" ({})", p.kind())).unwrap_or_default())]
+    // The `detail` is included, not just the kind. The kind says which rule was
+    // broken and the detail says how — `certificate-unavailable` alone cannot
+    // tell "an order is already in flight" from "the CA refused", and a caller
+    // reading only the kind has to go and ask the proxy's operator for the half
+    // of the answer it was already sent.
+    #[error("proxy returned status {status}{}", .problem.as_ref().map(|p| match p.detail.as_deref() {
+        Some(detail) => format!(" ({}: {detail})", p.kind()),
+        None => format!(" ({})", p.kind()),
+    }).unwrap_or_default())]
     Problem {
         status: u16,
         problem: Option<Problem>,
