@@ -129,6 +129,35 @@ impl std::fmt::Display for WrongPeer {
 
 impl std::error::Error for WrongPeer {}
 
+/// What [`check`] found, when it did not refuse.
+///
+/// A connection that was held against a pairing and one that had nothing to be
+/// held against both go on to stream, and **only one of them is protected**.
+/// Told apart so an operator can see which they have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checked {
+    /// The camera was paired with, and the Endpoint that answered is the one it
+    /// was paired as.
+    AgainstPairing,
+    /// The camera was not paired with — reached by a hand-carried capability —
+    /// so there was nothing out of band to hold the answer against.
+    NothingToCheckAgainst,
+}
+
+impl std::fmt::Display for Checked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgainstPairing => {
+                f.write_str("the camera answered as the Endpoint it was paired as")
+            }
+            Self::NothingToCheckAgainst => f.write_str(
+                "this camera was not paired with, so the proxy is trusted about which \
+                 Endpoint answered",
+            ),
+        }
+    }
+}
+
 /// Check who answered against who was meant.
 ///
 /// `intended` is the Endpoint of the camera the viewer chose; `answered` is the
@@ -144,7 +173,7 @@ impl std::error::Error for WrongPeer {}
 /// was paired this is a response that does not hold together rather than an
 /// older proxy — and stripping the field is how the check would otherwise be
 /// stepped around.
-pub fn check(intended: &str, answered: Option<&str>) -> Result<(), WrongPeer> {
+pub fn check(intended: &str, answered: Option<&str>) -> Result<Checked, WrongPeer> {
     decide(&load().endpoints, intended, answered)
 }
 
@@ -153,12 +182,15 @@ fn decide(
     paired: &BTreeSet<String>,
     intended: &str,
     answered: Option<&str>,
-) -> Result<(), WrongPeer> {
+) -> Result<Checked, WrongPeer> {
     // An empty `intended` is "no camera was selected from a listing", which is
     // the hand-carried case and not something an entry could match — but a
     // stray empty entry would make it match everything.
-    if intended.is_empty() || !paired.contains(intended) || answered == Some(intended) {
-        return Ok(());
+    if intended.is_empty() || !paired.contains(intended) {
+        return Ok(Checked::NothingToCheckAgainst);
+    }
+    if answered == Some(intended) {
+        return Ok(Checked::AgainstPairing);
     }
     Err(WrongPeer {
         expected: intended.to_owned(),
@@ -186,7 +218,10 @@ mod tests {
     /// The ordinary case, and the one that must not become noisy.
     #[test]
     fn the_same_endpoint_is_fine() {
-        assert!(decide(&paired(&["ep:a"]), "ep:a", Some("ep:a")).is_ok());
+        assert_eq!(
+            decide(&paired(&["ep:a"]), "ep:a", Some("ep:a")),
+            Ok(Checked::AgainstPairing),
+        );
     }
 
     /// A capability entered by hand is a legitimate way in and brings no
@@ -205,7 +240,10 @@ mod tests {
     /// hand-carried case into a refusal.
     #[test]
     fn an_empty_entry_does_not_refuse_everything() {
-        assert!(decide(&paired(&["", "ep:a"]), "", Some("ep:x")).is_ok());
+        assert_eq!(
+            decide(&paired(&["", "ep:a"]), "", Some("ep:x")),
+            Ok(Checked::NothingToCheckAgainst),
+        );
     }
 
     /// A response that names nobody is not a way around the check.
@@ -221,7 +259,10 @@ mod tests {
     #[test]
     fn each_camera_is_checked_against_itself() {
         let known = paired(&["ep:a", "ep:b"]);
-        assert!(decide(&known, "ep:b", Some("ep:b")).is_ok());
+        assert_eq!(
+            decide(&known, "ep:b", Some("ep:b")),
+            Ok(Checked::AgainstPairing)
+        );
         assert!(decide(&known, "ep:a", Some("ep:b")).is_err());
     }
 }

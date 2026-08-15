@@ -807,16 +807,26 @@ pub fn connect(
     // Who answered, against who was meant. The pin below proves the peer holds
     // the key its Endpoint signed for; this is what says that Endpoint is the
     // camera the user paired with, and the proxy names both.
-    if let Err(e) = camera_core::paired::check(
+    match camera_core::paired::check(
         &config.expected_endpoint,
         session.connection.peer_endpoint.as_deref(),
     ) {
-        // Tell the proxy the connection is over before returning. The task that
-        // owns the only other `close` is not spawned yet, and dropping the
-        // session does not close it — so the camera would go on holding a relay
-        // leg for a viewer that has already refused it, on every retry.
-        runtime.block_on(session.close());
-        return Err(ClientError::WrongPeer(e.to_string()));
+        // Said either way. A connection that was held against a pairing and one
+        // that had nothing to be held against both go on to stream, and only
+        // one of them is protected.
+        Ok(outcome @ camera_core::paired::Checked::AgainstPairing) => {
+            tracing::info!(peer = %config.expected_endpoint, "{outcome}")
+        }
+        Ok(outcome) => tracing::info!("{outcome}"),
+        Err(e) => {
+            // Tell the proxy the connection is over before returning. The task
+            // that owns the only other `close` is not spawned yet, and dropping
+            // the session does not close it — so the camera would go on holding
+            // a relay
+            // leg for a viewer that has already refused it, on every retry.
+            runtime.block_on(session.close());
+            return Err(ClientError::WrongPeer(e.to_string()));
+        }
     }
 
     let connection_id = session.connection_id().to_owned();

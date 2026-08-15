@@ -596,18 +596,28 @@ impl MyApp {
             // peer holds the key its Endpoint signed for; this is what says
             // that Endpoint is the camera the operator paired with, and the
             // proxy names both.
-            if let Err(e) = camera_core::paired::check(
+            match camera_core::paired::check(
                 &expected_endpoint,
                 session.connection.peer_endpoint.as_deref(),
             ) {
-                shared.lock().unwrap().status = format!("refused: {e}");
-                tracing::error!("{e}");
-                // Tell the proxy the connection is over. Every other way out of
-                // this task closes the session, and without it the camera goes
-                // on holding a relay leg for a viewer that has already refused
-                // it — and this is the one failure that repeats on every retry.
-                session.close().await;
-                return;
+                // Said either way. A connection that was held against a pairing
+                // and one that had nothing to be held against both go on to
+                // stream, and only one of them is protected.
+                Ok(outcome @ camera_core::paired::Checked::AgainstPairing) => {
+                    tracing::info!(peer = %expected_endpoint, "{outcome}")
+                }
+                Ok(outcome) => tracing::info!("{outcome}"),
+                Err(e) => {
+                    shared.lock().unwrap().status = format!("refused: {e}");
+                    tracing::error!("{e}");
+                    // Tell the proxy the connection is over. Every other way
+                    // out of this task closes the session, and without it the
+                    // camera goes on holding a relay leg for a viewer that has
+                    // already refused it — and this is the one failure that
+                    // repeats on every retry.
+                    session.close().await;
+                    return;
+                }
             }
             let local_port = session.local_addr.port();
             // Dial the peer's loopback FQDN (which resolves to 127.0.0.1) so the
