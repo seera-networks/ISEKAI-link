@@ -140,7 +140,7 @@ pub async fn spawn_p2p_server(
     // certificate and the initiator skips validation, as before.
     let video_key = crate::tls::load_or_generate_video_key(video_key_path)?;
     let proxy = proxy_client(&cfg, &endpoint_token)?;
-    let cert = crate::tls::issue_video_cert(&proxy, &video_key).await?;
+    let cert = crate::tls::issue_video_cert(&proxy, &cfg.key, &video_key).await?;
     if cert.is_none() {
         tracing::warn!("proxy issues no relay certificate; using a development one");
     }

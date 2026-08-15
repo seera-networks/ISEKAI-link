@@ -19,6 +19,7 @@
 //! The Identity API client, the proxy H3 control-plane client (via
 //! `channel-masque`), and the MASQUE relay legs build on top of these.
 
+pub mod attestation;
 pub mod endpoint;
 /// HTTPS (HTTP/1.1 + HTTP/2) transport for the Identity API.
 pub mod https;

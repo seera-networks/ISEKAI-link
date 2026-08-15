@@ -49,7 +49,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use isekai_p2p::agent::{IssuedCertificate, MasqueH3Transport, ProxyClient, ProxyError};
+use isekai_p2p::agent::{
+    attest, Attestation, CertificateParameters, EndpointKey, IssuedCertificate, MasqueH3Transport,
+    ProxyClient, ProxyError,
+};
 use isekai_p2p::secret::write_secret;
 use rcgen::{CertificateParams, KeyPair};
 
@@ -88,6 +91,7 @@ pub struct VideoCert {
 /// as it did before any of this existed.
 pub async fn issue_video_cert(
     proxy: &ProxyClient<MasqueH3Transport>,
+    endpoint_key: &EndpointKey,
     key: &KeyPair,
 ) -> anyhow::Result<Option<VideoCert>> {
     let Some(params) = proxy.certificate_parameters().await? else {
@@ -133,7 +137,22 @@ pub async fn issue_video_cert(
     }
 
     let csr = certificate_request(key, &params.hostname)?;
-    let Some(issued) = issue_with_retries(proxy, &csr).await? else {
+
+    // Say, in this Endpoint's own hand, which key the certificate is for.
+    //
+    // **This is what the proxy cannot forge.** It can obtain a second valid
+    // certificate for the same name — it owns the name and the ACME account —
+    // but it cannot sign as this Endpoint, so an initiator that checks this
+    // statement and then pins the key it names is talking to this device or to
+    // nobody (spec §8.6.5).
+    //
+    // Published on the issuance request, so a certificate and the statement
+    // about it are settled together and a cached re-issue carries a fresh one.
+    // Optional, and ignored by a proxy that does not know the field, so sending
+    // it costs nothing where it is not yet understood.
+    let attestation = attestation_for(endpoint_key, &params, &local);
+
+    let Some(issued) = issue_with_retries(proxy, &csr, attestation.as_ref()).await? else {
         // `parameters` answered and this did not. They arrived in the same
         // change, so this is not a version this proxy can be — something is
         // answering for the route that should be issuing.
@@ -180,13 +199,38 @@ const ISSUANCE_RETRY_DELAYS: [Duration; 3] = [
 /// Nothing else is retried. `certificate-rate-limited` clears in days, not
 /// seconds, and `csr-invalid` is a fault on this side that will read the same
 /// however many times it is sent.
+/// The statement to publish alongside the request, when there is an expiry to
+/// give it.
+///
+/// The proxy caps `expires_at` at the certificate's `not_after`, so the
+/// certificate it is holding is the natural bound: a statement outliving its
+/// certificate would have an initiator pinning a key nobody will present.
+///
+/// `None` when the proxy holds no certificate yet — the first issuance for an
+/// Endpoint has no `not_after` to borrow, and guessing one would either expire
+/// early or outlive the certificate. The next issuance carries one.
+fn attestation_for(
+    endpoint_key: &EndpointKey,
+    params: &CertificateParameters,
+    spki_sha256: &str,
+) -> Option<Attestation> {
+    let expires_at = params.certificate.as_ref().map(|c| c.not_after.clone())?;
+    Some(attest(
+        endpoint_key,
+        &params.hostname,
+        spki_sha256,
+        &expires_at,
+    ))
+}
+
 async fn issue_with_retries(
     proxy: &ProxyClient<MasqueH3Transport>,
     csr: &str,
+    attestation: Option<&Attestation>,
 ) -> Result<Option<IssuedCertificate>, ProxyError> {
     let mut delays = ISSUANCE_RETRY_DELAYS.iter();
     loop {
-        let error = match proxy.issue_certificate(csr).await {
+        let error = match proxy.issue_certificate(csr, attestation).await {
             Ok(issued) => return Ok(issued),
             Err(e) => e,
         };

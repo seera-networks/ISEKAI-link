@@ -7,8 +7,8 @@
 //! MASQUE proxy's server-side derivation exactly (spec §4.2), so a token's
 //! `cnf` and its `endpoint_id` agree.
 
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
@@ -78,9 +78,7 @@ impl EndpointKey {
     /// Note the spec applies SHA-256 to the RFC 7638 thumbprint (itself a
     /// SHA-256 digest); this is implemented literally to match the proxy.
     pub fn endpoint_id(&self) -> String {
-        let thumbprint = jwk_thumbprint(&self.public_jwk());
-        let digest = Sha256::digest(thumbprint);
-        format!("{ENDPOINT_ID_PREFIX}{}", hex_encode(&digest))
+        endpoint_id_from_jwk(&self.public_jwk())
     }
 
     /// Sign `message` (ECDSA P-256 / SHA-256), returning the base64url of the
@@ -94,6 +92,40 @@ impl EndpointKey {
         let signature: Signature = self.signing.sign(message);
         URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes())
     }
+}
+
+/// The Endpoint ID a public JWK derives to.
+///
+/// **The identity is a property of the key, not a claim beside it.** That is
+/// what lets a statement signed by an Endpoint be attributed without asking
+/// anyone — see [`crate::attestation`], where the party being defended against
+/// is the one that would otherwise be asked.
+pub fn endpoint_id_from_jwk(jwk: &Value) -> String {
+    let thumbprint = jwk_thumbprint(jwk);
+    let digest = Sha256::digest(thumbprint);
+    format!("{ENDPOINT_ID_PREFIX}{}", hex_encode(&digest))
+}
+
+/// Whether `signature_b64` is `jwk`'s signature over `message`.
+///
+/// The counterpart to [`EndpointKey::sign_b64url`]: base64url of an ASN.1 DER
+/// ECDSA P-256 signature. Anything it cannot parse is `false` — a signature
+/// that cannot be read is not one that verified.
+pub fn verify_b64url(jwk: &Value, message: &[u8], signature_b64: &str) -> bool {
+    use p256::ecdsa::signature::Verifier as _;
+
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(signature_b64) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_der(&bytes) else {
+        return false;
+    };
+    let Ok(public) = p256::PublicKey::from_jwk_str(&jwk.to_string()) else {
+        return false;
+    };
+    p256::ecdsa::VerifyingKey::from(public)
+        .verify(message, &signature)
+        .is_ok()
 }
 
 /// Compute the RFC 7638 JWK thumbprint (SHA-256) of an EC P-256 public JWK.
@@ -135,11 +167,9 @@ mod tests {
         let id = key.endpoint_id();
         assert!(id.starts_with("ep:"));
         assert_eq!(id.len(), ENDPOINT_ID_PREFIX.len() + 64);
-        assert!(
-            id[3..]
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        );
+        assert!(id[3..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         assert_eq!(key.endpoint_id(), id); // deterministic
     }
 

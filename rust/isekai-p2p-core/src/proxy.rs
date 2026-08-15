@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
+use crate::attestation::Attestation;
 use crate::endpoint::EndpointKey;
 use crate::pop;
 
@@ -475,6 +476,16 @@ pub struct PeerConnection {
     /// that case the initiator falls back to dialing `127.0.0.1` unvalidated.
     #[serde(default)]
     pub video_host: Option<String>,
+    /// The target's own statement about the key its certificate is for
+    /// (spec §8.6.5), to be checked before dialing and then pinned in the
+    /// handshake.
+    ///
+    /// **Absent is the ordinary case today** and means only that there is
+    /// nothing to pin — a target that has not published one, or a proxy that
+    /// does not carry the field. A statement that is *present and wrong* is the
+    /// opposite of ordinary and must stop the connection.
+    #[serde(default)]
+    pub video_attestation: Option<Attestation>,
     #[serde(default)]
     pub candidates: Vec<Candidate>,
     #[serde(default)]
@@ -920,11 +931,22 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// is one somebody other than the proxy could check.
     ///
     /// `Ok(None)` if the route is not there, which is an older proxy.
+    /// `attestation` is the target's own statement about the key it is asking
+    /// for (spec §8.6.5), and is optional: a proxy that does not know the field
+    /// ignores it, and an initiator that receives no statement simply has
+    /// nothing to pin. It is checked **before** issuance, so a mistake in it
+    /// costs no quota.
     pub async fn issue_certificate(
         &self,
         csr_pem: &str,
+        attestation: Option<&Attestation>,
     ) -> Result<Option<IssuedCertificate>, ProxyError> {
-        let body = to_vec(&serde_json::json!({ "csr_pem": csr_pem }));
+        let mut request = serde_json::json!({ "csr_pem": csr_pem });
+        if let Some(attestation) = attestation {
+            request["attestation"] = serde_json::to_value(attestation)
+                .expect("an attestation is plain data and always serialises");
+        }
+        let body = to_vec(&request);
         let resp = self.send("POST", "/v1/peer/certificate", body).await?;
         match resp.status {
             404 | 405 => Ok(None),
