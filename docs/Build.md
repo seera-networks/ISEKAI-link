@@ -11,7 +11,7 @@ This document describes how to build ISEKAI Link from source.
 - [3. Install OpenCV / libclang (for camera-server & camera-client)](#3-install-opencv--libclang-for-camera-server--camera-client)
 - [4. Build](#4-build)
 - [5. Run](#5-run)
-- [6. P2P mode and path migration](#6-p2p-mode-and-path-migration)
+- [6. Connecting, and path migration](#6-connecting-and-path-migration)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -269,18 +269,15 @@ cargo run -p camera-server -- --help
 
 ---
 
-## 6. P2P mode and path migration
+## 6. Connecting, and path migration
 
-`camera-server` and `camera-client` each offer two modes:
+`camera-server` and `camera-client` reach each other one way: the two sides are
+introduced through the proxy's P2P Connect control plane and the video rides a MASQUE
+relay. Neither side needs a reachable public address, and there is no mode to choose.
 
-- **Direct (legacy)** — the server publishes a public address through the relay and the
-  client dials it.
-- **P2P** — the two sides are introduced through the proxy's P2P Connect control plane
-  and the video rides a MASQUE relay. Neither side needs a reachable public address.
-
-In P2P mode the connection can then **migrate off the relay onto a direct path** between
-the two endpoints, which is lower latency and takes the proxy out of the data path. The
-relay path stays available and the connection can move back to it at any time.
+The connection can then **migrate off the relay onto a direct path** between the two
+endpoints, which is lower latency and takes the proxy out of the data path. The relay
+path stays available and the connection can move back to it at any time.
 
 ### 6-1. Bringing a P2P connection up
 
@@ -380,7 +377,7 @@ knowing:
 - **`camera-*.exe` fails to start with a missing `opencv_*.dll` error**
   The OpenCV DLLs must be on `PATH` at runtime. Add `C:\vcpkg\installed\x64-windows\bin` to `PATH` (or copy the DLLs next to the executable).
 
-- **The Migrate button stays greyed out (P2P mode)**
+- **The Migrate button stays greyed out**
   No direct path has been validated. Check, in order: the server logged `advertised a
   direct path to the video client` (if not, no relay is bound, or the proxy has not
   reported its address yet); the client logged `offered direct-path candidates`; and then

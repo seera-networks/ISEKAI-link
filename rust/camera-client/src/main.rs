@@ -2,67 +2,15 @@ use bytes::Bytes;
 use camera_core::{P2pConfig, PathEvent, RelayOptions, VideoRecvOptions};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
-use msquic_async::msquic;
 use opencv::{core::AlgorithmHint, imgcodecs, prelude::*};
 use std::{
     collections::VecDeque,
-    future::poll_fn,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncReadExt, sync::mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-fn make_msquic_async_client_config(
-    registration: Option<Arc<msquic_async::Registration>>,
-    alpn: &str,
-    disable_verification: bool,
-    enable_natt: bool,
-) -> anyhow::Result<(Arc<msquic_async::Registration>, Arc<msquic::Configuration>)> {
-    let registration = if let Some(registration) = registration {
-        registration
-    } else {
-        Arc::new(msquic_async::Registration::new(
-            &msquic::RegistrationConfig::default(),
-        )?)
-    };
-    let alpn = [msquic::BufferRef::from(alpn)];
-    // Accept observed-address reports so the peer tells us our public address,
-    // which we feed to `add_candidate_addr` to enable path migration.
-    let settings = msquic::Settings::new()
-        .set_IdleTimeoutMs(30_000)
-        // Keep the connection from going idle into the timeout above.
-        // Ten seconds leaves two attempts inside it.
-        //
-        // The peer usually pings too, and one side's keepalive is enough to
-        // hold both ends open — a PING is ack-eliciting, so it resets the
-        // receiver's idle timer and the sender's alike. This is here so that
-        // staying up does not depend on the peer being configured that way.
-        .set_KeepAliveIntervalMs(10_000)
-        .set_PeerBidiStreamCount(100)
-        .set_PeerUnidiStreamCount(100)
-        .set_DatagramReceiveEnabled()
-        .set_StreamMultiReceiveEnabled()
-        .set_ReceiveObservedAddressReports();
-    // NAT-traversal mode advertises candidate addresses so the connection can
-    // probe and migrate to a direct path.
-    let settings = if enable_natt {
-        settings.set_AddAddressMode(msquic::AddAddressMode::NatTraversal)
-    } else {
-        settings
-    };
-    let configuration = registration.open_configuration(&alpn, Some(&settings))?;
-
-    let cred_config = msquic::CredentialConfig::new_client();
-    let cred_config = if disable_verification {
-        cred_config.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION)
-    } else {
-        cred_config
-    };
-    configuration.load_credential(&cred_config)?;
-    Ok((registration, Arc::new(configuration)))
-}
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
@@ -116,15 +64,6 @@ fn show_rtt_plot(ui: &mut egui::Ui, rtt_history: &VecDeque<f64>) {
     Plot::new("rtt_plot").height(200.0).show(ui, |plot_ui| {
         plot_ui.line(line);
     });
-}
-
-/// How the client reaches the server.
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Mode {
-    /// Legacy: dial the server's public address directly.
-    Direct,
-    /// P2P Connect: reach the server over the MASQUE relay.
-    P2p,
 }
 
 /// The proxy control plane, kept open between the actions that use it.
@@ -182,12 +121,6 @@ struct MyApp {
     /// bindings up per registration, so the video connection and the relay leg
     /// have to share one for a direct path to be openable at all.
     reg: Arc<msquic_async::Registration>,
-    mode: Mode,
-    // Direct 接続設定
-    server_addr: String,
-    server_port: String,
-
-    // P2P 接続設定
     identity_url: String,
     proxy_url: String,
     auth0_token: String,
@@ -228,17 +161,15 @@ struct MyApp {
 
     connected: bool,
     rx: Option<mpsc::Receiver<(u64, Bytes)>>,
-    conn_task: Option<tokio::task::AbortHandle>,
-    /// The P2P connection task, kept as a join handle rather than an abort
-    /// handle so disconnecting can let it report the connection closed first.
+    /// The connection task, kept as a join handle rather than an abort handle
+    /// so disconnecting can let it report the connection closed first.
     p2p_task: Option<tokio::task::JoinHandle<()>>,
     shutdown: Option<CancellationToken>,
     texture: Option<egui::TextureHandle>,
     rtt_rx: Option<mpsc::Receiver<f64>>,
     rtt_history: VecDeque<f64>,
 
-    // Path migration — both modes report through the same channel and share
-    // this state, so the UI has one code path rather than one per mode.
+    // Path migration.
     /// true while on the initial (relay) path, false once migrated to the
     /// direct path. Follows what the connection *reports*, not what was asked
     /// for, so a failed switch does not leave the label lying.
@@ -261,9 +192,6 @@ impl MyApp {
     fn new(reg: Arc<msquic_async::Registration>, japanese: bool) -> Self {
         Self {
             reg,
-            mode: Mode::Direct,
-            server_addr: "161.33.142.214".to_string(),
-            server_port: "16205".to_string(),
             identity_url: "https://identity.isekai.tools:9443".to_string(),
             proxy_url: "https://tokyo.link.isekai.tools:8443".to_string(),
             auth0_token: String::new(),
@@ -286,7 +214,6 @@ impl MyApp {
             p2p_shared: Arc::new(Mutex::new(P2pShared::default())),
             connected: false,
             rx: None,
-            conn_task: None,
             p2p_task: None,
             shutdown: None,
             texture: None,
@@ -333,176 +260,6 @@ impl MyApp {
                 Some(self.auth0_login.clone()),
             ));
         }
-    }
-
-    fn connect(&mut self) {
-        match self.mode {
-            Mode::Direct => self.connect_direct(),
-            Mode::P2p => self.connect_p2p(),
-        }
-    }
-
-    fn connect_direct(&mut self) {
-        let (tx, rx) = mpsc::channel::<(u64, Bytes)>(100);
-        let (rtt_tx, rtt_rx) = mpsc::channel::<f64>(100);
-        self.rtt_rx = Some(rtt_rx);
-        let addr = self.server_addr.clone();
-        let port: u16 = self.server_port.parse().unwrap_or_else(|_| {
-            tracing::warn!(
-                "Invalid port '{}', falling back to default 15640",
-                self.server_port
-            );
-            15640
-        });
-
-        let (migrate_tx, mut migrate_rx) = mpsc::channel::<(SocketAddr, SocketAddr)>(10);
-        let (path_tx, path_rx) = mpsc::channel::<PathEvent>(16);
-        let reg_direct = Arc::clone(&self.reg);
-        let handle = tokio::spawn(async move {
-            // Phase 1: reach the relay to discover our observed (public) address.
-            let (reg, config_h3) =
-                make_msquic_async_client_config(Some(reg_direct), "h3", false, false)?;
-            let conn = msquic_async::Connection::new(&reg)?;
-            conn.start(&config_h3, "tokyo.link.isekai.tools", 8443)
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to connect to tokyo.link.isekai.tools:8443: {e:?}");
-                    anyhow::anyhow!("Failed to connect to tokyo.link.isekai.tools:8443: {e:?}")
-                })?;
-            let Ok(msquic_async::ConnectionEvent::NotifyObservedAddress {
-                local_address,
-                observed_address,
-            }) = poll_fn(|cx| conn.poll_event(cx)).await
-            else {
-                anyhow::bail!("Failed to get observed address from relay");
-            };
-            tracing::info!("Observed address: {observed_address}");
-            std::mem::drop(conn);
-
-            // Phase 2: connect to the server with the observed address as a
-            // migration candidate, so the path can later move to a direct one.
-            let (reg, configuration) =
-                make_msquic_async_client_config(Some(reg), "sample", true, true)?;
-            let conn = msquic_async::Connection::new(&reg)?;
-            conn.add_candidate_addr(local_address, observed_address)?;
-            tracing::info!("Starting connection to {addr}:{port}");
-            conn.start(&configuration, &addr, port).await.map_err(|e| {
-                tracing::error!("Failed to start connection to {addr}:{port}: {e:?}");
-                anyhow::anyhow!("Failed to start connection to {addr}:{port}: {e:?}")
-            })?;
-            let local_addr = conn
-                .get_local_addr()
-                .map_err(|e| anyhow::anyhow!("Failed to get local address: {e:?}"))?;
-            let remote_addr = conn
-                .get_remote_addr()
-                .map_err(|e| anyhow::anyhow!("Failed to get remote address: {e:?}"))?;
-            let _ = path_tx
-                .send(PathEvent::Relay {
-                    local: local_addr,
-                    remote: remote_addr,
-                })
-                .await;
-            let orig_path = (local_addr, remote_addr);
-
-            // Sample RTT once a second while draining inbound frames and
-            // handling migration events.
-            let mut rtt_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    _ = rtt_interval.tick() => {
-                        match conn.get_stats() {
-                            // Rtt is reported in microseconds; plot milliseconds.
-                            Ok(stats) => {
-                                let _ = rtt_tx.try_send(stats.Rtt as f64 / 1000.0);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to get connection stats: {:?}", e);
-                            }
-                        }
-                    }
-                    res = poll_fn(|cx| conn.poll_event(cx)) => {
-                        match res {
-                            Ok(event) => {
-                                tracing::info!("Connection event: {event:?}");
-                                match event {
-                                    msquic_async::ConnectionEvent::PathValidated {
-                                        local_address,
-                                        remote_address,
-                                    } => {
-                                        // A newly validated path other than the
-                                        // original one is the direct P2P path.
-                                        if (local_address, remote_address) != orig_path {
-                                            let _ = path_tx.send(PathEvent::DirectValidated {
-                                                local: local_address,
-                                                remote: remote_address,
-                                            }).await;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Connection error: {e:?}");
-                                break;
-                            }
-                        }
-                    }
-                    ret = migrate_rx.recv() => {
-                        if let Some((local_addr, remote_addr)) = ret {
-                            tracing::info!("Migrating to path: local {local_addr}, remote {remote_addr}");
-                            match conn.activate_path(local_addr, remote_addr) {
-                                Ok(()) => {
-                                    let _ = path_tx.send(PathEvent::Activated {
-                                        local: local_addr,
-                                        remote: remote_addr,
-                                    }).await;
-                                }
-                                // Not fatal: the stream keeps running on the
-                                // path it is already on.
-                                Err(e) => tracing::error!("Failed to activate path: {e}"),
-                            }
-                        } else {
-                            tracing::info!("Migration channel closed");
-                            break;
-                        }
-                    }
-                    res = conn.accept_inbound_uni_stream() => {
-                        match res {
-                            Ok(mut stream) => {
-                                let stream_id = stream.id().unwrap();
-                                tracing::debug!("Inbound stream {stream_id} accepted");
-                                let mut data = Vec::new();
-                                if let Err(e) = stream.read_to_end(&mut data).await {
-                                    tracing::error!("Failed to read stream {stream_id}: {:?}", e);
-                                    continue;
-                                }
-                                tracing::debug!("Inbound stream {stream_id} read {} bytes", data.len());
-                                match tx.try_send((stream_id, Bytes::copy_from_slice(&data))) {
-                                    Ok(_) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        tracing::debug!("Frame channel full, dropping frame {stream_id}");
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to accept inbound stream: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            anyhow::Ok(())
-        });
-
-        self.conn_task = Some(handle.abort_handle());
-        self.migrate_tx = Some(migrate_tx);
-        self.path_rx = Some(path_rx);
-        self.rx = Some(rx);
-        self.connected = true;
     }
 
     /// Load (or generate) the Endpoint key and show its id, so the operator can
@@ -688,9 +445,6 @@ impl MyApp {
         if let Some(token) = self.shutdown.take() {
             token.cancel();
         }
-        if let Some(handle) = self.conn_task.take() {
-            handle.abort();
-        }
         if let Some(mut handle) = self.p2p_task.take() {
             // Let this one wind down rather than killing it. The last thing it
             // does is close the session, and the first thing closing does is
@@ -723,7 +477,7 @@ impl MyApp {
     }
 
     /// Ask the connection to switch between the Isekai Link path and a
-    /// validated direct path. Works in both modes.
+    /// validated direct path.
     ///
     /// The label is *not* flipped here: `is_isekai_link` follows the
     /// `Activated` event, so a switch that fails leaves the UI telling the
@@ -1066,8 +820,7 @@ impl MyApp {
             });
     }
 
-    /// Which path the traffic is on, and what it could move to. Mode-agnostic:
-    /// both Direct and P2P report the same events.
+    /// Which path the traffic is on, and what it could move to.
     fn path_status_ui(&self, ui: &mut egui::Ui) {
         let show = |ui: &mut egui::Ui,
                     label: &str,
@@ -1205,33 +958,7 @@ impl eframe::App for MyApp {
                 .show(ui, |ui| {
                     ui.heading("📷 Camera Stream");
 
-                    ui.horizontal(|ui| {
-                        ui.label("Mode:");
-                        ui.add_enabled_ui(!self.connected, |ui| {
-                            ui.selectable_value(&mut self.mode, Mode::Direct, "Direct (legacy)");
-                            ui.selectable_value(&mut self.mode, Mode::P2p, "P2P");
-                        });
-                    });
-
-                    match self.mode {
-                        Mode::Direct => {
-                            ui.horizontal(|ui| {
-                                ui.label("Server:");
-                                ui.add_enabled(
-                                    !self.connected,
-                                    egui::TextEdit::singleline(&mut self.server_addr),
-                                );
-                                ui.label("Port:");
-                                ui.add_enabled(
-                                    !self.connected,
-                                    egui::TextEdit::singleline(&mut self.server_port),
-                                );
-                            });
-                        }
-                        Mode::P2p => {
-                            self.p2p_settings_ui(ui);
-                        }
-                    }
+                    self.p2p_settings_ui(ui);
 
                     ui.horizontal(|ui| {
                         if self.connected {
@@ -1242,8 +969,8 @@ impl eframe::App for MyApp {
                             connect_clicked = true;
                         }
 
-                        // Path migration, in either mode: enabled once both the
-                        // initial path and a validated direct path are known.
+                        // Path migration: enabled once both the relay path and
+                        // a validated direct path are known.
                         if ui
                             .add_enabled(
                                 self.connected
@@ -1261,9 +988,7 @@ impl eframe::App for MyApp {
                         }
                     });
 
-                    if self.mode == Mode::P2p {
-                        self.p2p_status_ui(ui);
-                    }
+                    self.p2p_status_ui(ui);
 
                     if self.connected {
                         self.path_status_ui(ui);
@@ -1295,7 +1020,7 @@ impl eframe::App for MyApp {
         });
 
         if connect_clicked {
-            self.connect();
+            self.connect_p2p();
         }
         if disconnect_clicked {
             self.disconnect();

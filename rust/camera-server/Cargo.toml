@@ -15,7 +15,6 @@ h3-util = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true, features = ["channel"] }
-isekai-link-utils = { workspace = true }
 msquic-async = { workspace = true }
 opencv = { workspace = true }
 qrcode = { workspace = true }

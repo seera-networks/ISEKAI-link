@@ -244,6 +244,9 @@ Both apps gain a **"Connection mode"** UI selector: `Direct (legacy)` vs `P2P`.
 Direct keeps calling `isekai-link-utils` unchanged. P2P uses `camera-core` (which
 builds on `isekai-p2p`).
 
+> The selector was removed once P2P was proven; both apps are P2P-only. The
+> paragraph above describes the transition, not the apps as they are.
+
 **`camera-server` (P2P mode).** New UI fields: identity URL, proxy URL, Auth0
 token, key path, and — after start — a read-only display of `listener_id` and
 `endpoint_id`, plus a text box to paste the **client's** Endpoint ID and an
@@ -388,5 +391,7 @@ flow, so the camera work never blocks the library refactor.
   server's WebRTC signaling) would remove the manual paste; deferred.
 - **Direct (hole-punched) upgrade.** The plan uses the relay leg only. Candidate
   exchange + relay→direct promotion (spec §14) is a later optimization.
-- **Retiring the legacy `isekai-link-utils` path** once P2P is proven.
+- ~~**Retiring the legacy `isekai-link-utils` path** once P2P is proven.~~ Done:
+  both apps are P2P-only, with no mode to select. `camera-server` no longer
+  depends on `isekai-link-utils` at all.
 - **Key/token lifecycle UX** (token refresh, revocation surfaced in the UI).

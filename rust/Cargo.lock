@@ -1096,7 +1096,6 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "isekai-link-utils",
  "msquic-async",
  "opencv",
  "qrcode",

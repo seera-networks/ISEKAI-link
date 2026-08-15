@@ -3,12 +3,6 @@ use camera_core::{
     Grant, ObservedAddressWatch, P2pConfig, PairingCode, ServerCommand, ServerInfo, SignalingEvent,
 };
 use eframe::egui;
-use http::Uri;
-use isekai_link_utils::{
-    create_forward_masque_connection, create_masque_channel, create_normal_channel,
-    get_certificate, get_public_address, get_udp_mode, make_msquic_async_client_config,
-    make_msquic_async_listener, set_udp_mode,
-};
 use opencv::{
     core::{self, AlgorithmHint},
     imgcodecs, imgproc,
@@ -16,8 +10,6 @@ use opencv::{
 };
 use std::{
     collections::VecDeque,
-    future::poll_fn,
-    net::SocketAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -28,7 +20,6 @@ use std::{
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::{broadcast, oneshot};
-use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 mod capture;
@@ -97,198 +88,6 @@ fn deliver_frame(
         }
     }
     Ok(std::ops::ControlFlow::Continue(()))
-}
-
-async fn run_isekai_connection(
-    reg: Arc<msquic_async::Registration>,
-    target: String,
-    jwt: String,
-    mut mjpeg_rx: tokio::sync::mpsc::Receiver<Bytes>,
-    public_address_out: Arc<Mutex<Option<String>>>,
-    log_out: Arc<Mutex<String>>,
-    shutdown_token: CancellationToken,
-) -> anyhow::Result<()> {
-    let uri: Uri = target.parse()?;
-
-    let (reg, config) = make_msquic_async_client_config(Some(reg), "h3")?;
-    let (reg, config_qmux) = make_msquic_async_client_config(Some(reg), "h3qx-01")?;
-
-    let normal_channel = create_normal_channel(
-        uri.clone(),
-        reg.clone(),
-        config.clone(),
-        config_qmux.clone(),
-        false,
-    )
-    .await?;
-    let public_addr = get_public_address(uri.clone(), &jwt, normal_channel.clone()).await?;
-
-    let udp_mode = get_udp_mode(uri.clone(), &jwt, normal_channel.clone()).await?;
-    tracing::info!("got udp mode: {:?}", udp_mode);
-    if udp_mode.mode != Some("dedicated".to_string()) {
-        set_udp_mode(uri.clone(), &jwt, normal_channel.clone(), "dedicated").await?;
-    }
-
-    let cert_info = get_certificate(uri.clone(), &jwt, normal_channel).await?;
-    tracing::info!(
-        "got certificate for hostname {}, public address: {}",
-        cert_info.hostname,
-        public_addr
-    );
-
-    *log_out.lock().unwrap() = format!(
-        "Connected. Hostname: {}  Public IP: {}",
-        cert_info.hostname, public_addr
-    );
-
-    let mut tasks = JoinSet::new();
-
-    let listen_addr: SocketAddr = "127.0.0.1:0".parse()?;
-    let (reg, listener) = make_msquic_async_listener(
-        Some(reg),
-        "sample",
-        Some(listen_addr),
-        &cert_info.cert_pem,
-        &cert_info.key_pem,
-        Some(&cert_info.pkcs12),
-    )?;
-    let listen_addr = listener.local_addr()?;
-    tracing::info!("camera server local listening on: {}", listen_addr);
-
-    let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<msquic_async::Connection>(16);
-    let channel = create_masque_channel(
-        uri.clone(),
-        reg.clone(),
-        config,
-        config_qmux.clone(),
-        true,
-        Some(conn_tx),
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to create MASQUE channel: {e:?}");
-        anyhow::anyhow!("Failed to create MASQUE channel: {e:?}")
-    })?;
-
-    create_forward_masque_connection(
-        &jwt,
-        listen_addr,
-        channel,
-        &mut tasks,
-        shutdown_token.clone(),
-        Some(Arc::clone(&public_address_out)),
-    )
-    .await?;
-
-    // Observed address the MASQUE relay reports for this server; applied to
-    // accepted client connections so they can migrate to our direct path.
-    let migrating_addr: Arc<Mutex<Option<(SocketAddr, SocketAddr)>>> = Arc::new(Mutex::new(None));
-    let mut txs = Vec::new();
-    loop {
-        tokio::select! {
-            _ = shutdown_token.cancelled() => {
-                tracing::debug!("shutdown signal received, exiting ISEKAI connection task");
-                break;
-            }
-            conn = conn_rx.recv() => {
-                match conn {
-                    Some(conn) => {
-                        // The MASQUE relay reports the address it observes for this
-                        // server; poll the connection's events to receive it and
-                        // remember it for migrating accepted client connections.
-                        let shutdown_token = shutdown_token.clone();
-                        let migrating_addr = Arc::clone(&migrating_addr);
-                        tasks.spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    _ = shutdown_token.cancelled() => break,
-                                    event = poll_fn(|cx| conn.poll_event(cx)) => {
-                                        match event {
-                                            Ok(msquic_async::ConnectionEvent::NotifyObservedAddress {
-                                                local_address,
-                                                observed_address,
-                                            }) => {
-                                                tracing::info!(
-                                                    "observed address reported: local {local_address}, observed {observed_address}"
-                                                );
-                                                migrating_addr
-                                                    .lock()
-                                                    .unwrap()
-                                                    .replace((local_address, observed_address));
-                                            }
-                                            Ok(other) => {
-                                                tracing::debug!("connection event: {other:?}");
-                                            }
-                                            Err(err) => {
-                                                tracing::debug!("connection event stream ended: {err}");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            anyhow::Ok(())
-                        });
-                    }
-                    None => {
-                        tracing::error!("conn_rx closed");
-                        break;
-                    }
-                }
-            }
-            conn = listener.accept() => {
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(100);
-                txs.push(tx);
-                match conn {
-                    Ok(conn) => {
-                        // Advertise our observed (public) address to the client so
-                        // it can validate and migrate to a direct path.
-                        if let Some((local_addr, observed_addr)) = *migrating_addr.lock().unwrap() {
-                            if let Err(e) = conn.add_bound_addr(local_addr) {
-                                tracing::error!("Failed to add bound address: {e}");
-                            }
-                            if let Err(e) = conn.add_observed_addr(local_addr, observed_addr) {
-                                tracing::error!("Failed to add observed address: {e}");
-                            }
-                        }
-                        tokio::spawn(async move {
-                            while let Some(jpeg_data) = rx.recv().await {
-                                tracing::debug!("sending jpeg data to client, size: {}", jpeg_data.len());
-                                let mut stream = conn.open_outbound_stream(msquic_async::StreamType::Unidirectional, false).await?;
-                                stream.write_all(&jpeg_data).await?;
-                                poll_fn(|cx| stream.poll_finish_write(cx)).await?;
-                            }
-                            anyhow::Ok(())
-                        });
-                    }
-                    Err(err) => {
-                        tracing::error!("error on accept connection: {}", err);
-                        break;
-                    }
-                }
-            }
-            jpeg_data = mjpeg_rx.recv() => {
-                if let Some(jpeg_data) = jpeg_data {
-                    txs.retain(|tx| !tx.is_closed());
-                    for tx in &txs {
-                        if tx.send(jpeg_data.clone()).await.is_err() {
-                            tracing::error!("failed to send jpeg data to client");
-                        }
-                    }
-                } else {
-                    tracing::error!("mjpeg_rx closed");
-                    break;
-                }
-            }
-        }
-    }
-
-    tracing::debug!("ISEKAI connection task shutting down, waiting for tasks to finish");
-    tasks.join_all().await;
-    tracing::debug!("ISEKAI connection task exiting");
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Give some time for tasks to finish
-
-    anyhow::Ok(())
 }
 
 #[tokio::main]
@@ -436,15 +235,6 @@ fn video_key_path_beside(endpoint_key_path: &str) -> std::path::PathBuf {
     path.with_file_name(format!("{stem}-video-tls.pem"))
 }
 
-/// How the camera stream reaches clients.
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Mode {
-    /// Legacy: proxy-issued cert + public address, client dials it directly.
-    Direct,
-    /// P2P Connect: stream over the MASQUE relay (no public address).
-    P2p,
-}
-
 /// Shared runtime state of a running P2P server, updated by the async task and
 /// read by the UI.
 #[derive(Default)]
@@ -581,13 +371,9 @@ fn qr_image(text: &str) -> Option<egui::ColorImage> {
 }
 
 struct MyApp {
-    // 接続設定
-    mode: Mode,
-    target: String,
-    jwt: String,
     is_open: bool,
 
-    // P2P 接続設定
+    // 接続設定
     identity_url: String,
     proxy_url: String,
     auth0_token: String,
@@ -612,7 +398,6 @@ struct MyApp {
     open_task: Option<tokio::task::AbortHandle>,
     shutdown_token: Option<CancellationToken>,
     mjpeg_tx_holder: Arc<Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>>,
-    public_address: Arc<Mutex<Option<String>>>,
     log_shared: Arc<Mutex<String>>,
 
     // P2P 実行時の共有状態
@@ -667,9 +452,6 @@ impl MyApp {
     ) -> Self {
         Self {
             reg,
-            mode: Mode::Direct,
-            target: "https://tokyo.link.isekai.tools:8443".to_string(),
-            jwt: String::new(),
             is_open: false,
             identity_url: "https://identity.isekai.tools:9443".to_string(),
             proxy_url: "https://tokyo.link.isekai.tools:8443".to_string(),
@@ -686,7 +468,6 @@ impl MyApp {
             open_task: None,
             shutdown_token: None,
             mjpeg_tx_holder,
-            public_address: Arc::new(Mutex::new(None)),
             log_shared: Arc::new(Mutex::new("Ready.".to_string())),
             p2p_shared: Arc::new(Mutex::new(P2pShared::default())),
             qr_texture: None,
@@ -751,50 +532,6 @@ impl MyApp {
                 Some(self.auth0_login.clone()),
             ));
         }
-    }
-
-    fn open(&mut self) {
-        match self.mode {
-            Mode::Direct => self.open_direct(),
-            Mode::P2p => self.open_p2p(),
-        }
-    }
-
-    fn open_direct(&mut self) {
-        let (mjpeg_tx, mjpeg_rx) = tokio::sync::mpsc::channel::<Bytes>(100);
-        *self.mjpeg_tx_holder.lock().unwrap() = Some(mjpeg_tx);
-
-        let target = self.target.clone();
-        let jwt = self.jwt.clone();
-        let public_address = Arc::clone(&self.public_address);
-        let log_shared = Arc::clone(&self.log_shared);
-
-        *log_shared.lock().unwrap() = "Connecting...".to_string();
-
-        let shutdown_token = CancellationToken::new();
-        let shutdown_token_clone = shutdown_token.clone();
-        let reg = Arc::clone(&self.reg);
-        let handle = tokio::spawn(async move {
-            let log_for_error = Arc::clone(&log_shared);
-            if let Err(e) = run_isekai_connection(
-                reg,
-                target,
-                jwt,
-                mjpeg_rx,
-                public_address,
-                log_shared,
-                shutdown_token_clone,
-            )
-            .await
-            {
-                tracing::error!("ISEKAI connection failed: {e:?}");
-                *log_for_error.lock().unwrap() = format!("Error: {e}");
-            }
-            tracing::debug!("ISEKAI connection task finished");
-        });
-        self.open_task = Some(handle.abort_handle());
-        self.shutdown_token = Some(shutdown_token);
-        self.is_open = true;
     }
 
     fn open_p2p(&mut self) {
@@ -1055,7 +792,6 @@ impl MyApp {
         //     handle.abort();
         // }
         *self.mjpeg_tx_holder.lock().unwrap() = None;
-        *self.public_address.lock().unwrap() = None;
         *self.p2p_commands.lock().unwrap() = None;
         *self.p2p_shared.lock().unwrap() = P2pShared {
             status: "Closed.".to_string(),
@@ -1529,40 +1265,8 @@ impl eframe::App for MyApp {
 
                     ui.separator();
 
-                    // ✅ 接続モード
-                    ui.horizontal(|ui| {
-                        ui.label("Mode:");
-                        ui.add_enabled_ui(!self.is_open, |ui| {
-                            ui.selectable_value(&mut self.mode, Mode::Direct, "Direct (legacy)");
-                            ui.selectable_value(&mut self.mode, Mode::P2p, "P2P");
-                        });
-                    });
-
                     // ✅ 接続設定
-                    match self.mode {
-                        Mode::Direct => {
-                            ui.horizontal(|ui| {
-                                ui.label("Target:");
-                                ui.add_enabled(
-                                    !self.is_open,
-                                    egui::TextEdit::singleline(&mut self.target)
-                                        .desired_width(300.0),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("JWT:   ");
-                                ui.add_enabled(
-                                    !self.is_open,
-                                    egui::TextEdit::singleline(&mut self.jwt)
-                                        .desired_width(300.0)
-                                        .password(true),
-                                );
-                            });
-                        }
-                        Mode::P2p => {
-                            self.p2p_settings_ui(ui);
-                        }
-                    }
+                    self.p2p_settings_ui(ui);
 
                     // ✅ Open / Closeボタン
                     ui.horizontal(|ui| {
@@ -1576,16 +1280,7 @@ impl eframe::App for MyApp {
                     });
 
                     // ✅ 接続後の状態表示
-                    match self.mode {
-                        Mode::Direct => {
-                            if let Some(addr) = self.public_address.lock().unwrap().as_ref() {
-                                ui.label(format!("Public Address: {}", addr));
-                            }
-                        }
-                        Mode::P2p => {
-                            self.p2p_status_ui(ui);
-                        }
-                    }
+                    self.p2p_status_ui(ui);
 
                     ui.separator();
 
@@ -1642,7 +1337,7 @@ impl eframe::App for MyApp {
         });
 
         if open_clicked {
-            self.open();
+            self.open_p2p();
         }
         if close_clicked {
             self.close();
