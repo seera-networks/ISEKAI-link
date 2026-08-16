@@ -24,6 +24,9 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 # Reading the `expires_at` the proxy puts on a lease (`initiator`).
 time = { workspace = true }
+# Winding the relay leg down when a renewal says this Endpoint is refused
+# (`initiator`).
+tokio-util = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }

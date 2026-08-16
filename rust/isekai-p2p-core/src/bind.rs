@@ -32,8 +32,8 @@ use channel_masque::{CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClien
 /// gets back, and one draining [`BindSession::events`] can match on them,
 /// without depending on the MASQUE crate directly.
 pub use channel_masque::{InboundActivity, MasqueClientEvent};
-use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
+use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use http_body::Frame;
@@ -47,7 +47,7 @@ use tower_http::auth::AddAuthorizationLayer;
 use tower_http::set_header::SetRequestHeaderLayer;
 
 use crate::endpoint::EndpointKey;
-use crate::observed::{spawn_observed_address_watch, ObservedAddressWatch};
+use crate::observed::{ObservedAddressWatch, spawn_observed_address_watch};
 use crate::pop;
 use crate::transport::make_client_config;
 
@@ -290,6 +290,16 @@ impl ConnectRelay {
     /// `add_candidate_addr` to offer a direct path.
     pub fn observed(&self) -> ObservedAddressWatch {
         self.observed.clone()
+    }
+
+    /// The token that winds this leg down, for a holder that has to end the
+    /// session from somewhere else.
+    ///
+    /// Cancelling it is the local half of a teardown: the leg stops, the video
+    /// connection riding it fails, and the application sees the session end.
+    /// [`close`](Self::close) does the same and then waits.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// Cancel the relay and wait for it to wind down.

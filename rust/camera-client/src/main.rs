@@ -414,24 +414,37 @@ impl MyApp {
             // that gap (the server may bind seconds later, when a human pastes
             // the connection id), so dialing now is safe. The `session` stays
             // alive to hold the relay leg.
-            if let Err(e) = camera_core::receive_frames_with(
-                &video_host,
-                local_port,
-                tx,
-                shutdown,
-                VideoRecvOptions {
-                    registration: Some(reg),
-                    verify,
-                    pin,
-                    observed: Some(session.observed_address()),
-                    path_events: Some(path_tx),
-                    migrate: Some(migrate_rx),
-                    rtt: Some(rtt_tx),
-                },
-            )
-            .await
-            {
-                shared.lock().unwrap().status = format!("receive error: {e:#}");
+            // Watched alongside the receive rather than left to the leg being
+            // torn down: a session on a direct path is not carried by the leg,
+            // and one that is would go quiet and time out half a minute later
+            // without ever saying why.
+            let ended = session.ended();
+            tokio::select! {
+                received = camera_core::receive_frames_with(
+                    &video_host,
+                    local_port,
+                    tx,
+                    shutdown,
+                    VideoRecvOptions {
+                        registration: Some(reg),
+                        verify,
+                        pin,
+                        observed: Some(session.observed_address()),
+                        path_events: Some(path_tx),
+                        migrate: Some(migrate_rx),
+                        rtt: Some(rtt_tx),
+                    },
+                ) => {
+                    if let Err(e) = received {
+                        shared.lock().unwrap().status = format!("receive error: {e:#}");
+                    }
+                }
+                () = ended.cancelled() => {
+                    shared.lock().unwrap().status =
+                        "the proxy no longer allows this endpoint on the connection; \
+                         the session has ended"
+                            .to_string();
+                }
             }
             session.close().await;
         });

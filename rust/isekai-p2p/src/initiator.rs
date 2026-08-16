@@ -18,6 +18,7 @@ use isekai_p2p_core::proxy::{
 use isekai_p2p_core::transport::MasqueH3Transport;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{issue_endpoint_token, spawn_token_renewal, P2pConfig, TokenRenewal};
 
@@ -42,6 +43,9 @@ pub struct InitiatorSession {
     /// dropped, it also stops when the process is killed, which is what lets
     /// the proxy expire the connection and the camera release its relay leg.
     lease: ConnectionLease,
+    /// Cancelled when the proxy stops accepting this Endpoint for this
+    /// connection — see [`ended`](Self::ended).
+    ended: CancellationToken,
     /// Replaces the Endpoint Token before it expires. Shared with the
     /// [`PeerDirectory`] this was opened over, when there was one, so there is
     /// one renewal loop however many handles are holding the same client.
@@ -97,28 +101,46 @@ fn renew_delay(
         .clamp(LEASE_RENEW_MIN, LEASE_RENEW_MAX)
 }
 
-/// Whether a failed renewal can ever succeed.
+/// What a failed renewal means for the loop (spec §8.5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Renewal {
+    /// Might work next time. The lease outlives several of these.
+    Retry,
+    /// No later report succeeds. Stop asking.
+    Over,
+    /// Stop, and end the session here as well: what is refused is the Endpoint,
+    /// not the request, so nothing this process does next will be accepted
+    /// either.
+    Refused,
+}
+
+/// What a failed renewal means.
 ///
-/// `connection-not-found` means the lease is gone, and `invalid-request` is what
-/// a report against a terminal state gets — the peer closed it. Neither
-/// improves by asking again, and a task that keeps asking every minute for the
-/// life of the process is a warning a minute about something nobody can act on.
-/// Anything else — a transport failure, a 5xx — is worth retrying.
+/// **A loop that cannot tell these apart keeps asking once a minute for the
+/// life of the process**, which is a warning a minute about something nobody
+/// can act on — and for a revoked Endpoint it is worse than noisy: the session
+/// goes on looking alive while carrying nothing.
 ///
-/// **`invalid-request` is a shared code, so this rests on a premise:** the only
-/// other reasons `POST /v1/peer/connections/{id}/state` returns it are a bad
-/// candidate address and an unknown state, and [`ProxyClient::renew_connection`]
-/// sends neither — its body is `{}`. If that endpoint gains a reason to refuse a
-/// bare renewal, this stops renewing and the symptom is video ending one TTL in,
-/// with a single `info` line to find it by. A dedicated kind would settle it and
-/// is asked for in `ISEKAI-link-server#217`; until then, the premise is here.
-fn renewal_is_over(error: &ProxyError) -> bool {
-    match error {
-        ProxyError::Problem { problem, .. } => matches!(
-            problem.as_ref().map(|p| p.kind()),
-            Some("connection-not-found" | "invalid-request")
-        ),
-        _ => false,
+/// `connection-closed` is what a terminal connection answers now that
+/// [`ISEKAI-link-server#226`](https://github.com/seera-networks/ISEKAI-link-server/pull/226)
+/// has shipped. `invalid-request` is kept alongside it because that is what a
+/// proxy from before it answers, and because there is nothing in a renewal for
+/// it to be about otherwise — [`ProxyClient::renew_connection`] sends `{}`, and
+/// [`InitiatorSession::close`] reports no candidates. **A renewal that ever
+/// carries a candidate has to revisit this**: a reflexive address the proxy
+/// refuses (CGNAT, spec §8.4.1) is refused every time, and treating that as
+/// terminal would end a session over one bad candidate.
+fn renewal_verdict(error: &ProxyError) -> Renewal {
+    let ProxyError::Problem { problem, .. } = error else {
+        // A transport failure says nothing about the connection.
+        return Renewal::Retry;
+    };
+    match problem.as_ref().map(|p| p.kind()) {
+        Some("connection-closed" | "connection-not-found" | "invalid-request") => Renewal::Over,
+        Some("endpoint-revoked" | "insufficient-permission") => Renewal::Refused,
+        // `token-expired` included: the token is shared with the renewal loop
+        // that replaces it, so the next attempt carries the new one.
+        _ => Renewal::Retry,
     }
 }
 
@@ -140,7 +162,16 @@ struct ConnectionLease(tokio::task::JoinHandle<()>);
 impl ConnectionLease {
     /// Takes the `connect` response itself, so the first renewal is timed off
     /// the real lease exactly like every one after it.
-    fn spawn(proxy: ProxyClient<MasqueH3Transport>, connection: &PeerConnection) -> Self {
+    /// Both tokens are cancelled for the answers that mean this process will
+    /// not be let back in: `leg` winds the relay down, and `ended` is what the
+    /// application watches — a session that has migrated to a direct path does
+    /// not stop when the leg does.
+    fn spawn(
+        proxy: ProxyClient<MasqueH3Transport>,
+        connection: &PeerConnection,
+        leg: CancellationToken,
+        ended: CancellationToken,
+    ) -> Self {
         let connection_id = connection.connection_id.clone();
         let mut delay = renew_delay(
             connection.expires_at.as_deref(),
@@ -163,7 +194,7 @@ impl ConnectionLease {
                             "renewed the peer connection's lease",
                         );
                     }
-                    Err(e) if renewal_is_over(&e) => {
+                    Err(e) if renewal_verdict(&e) == Renewal::Over => {
                         // The connection is gone or the peer closed it. Said
                         // once, and then this stops rather than asking a
                         // question that now has a permanent answer.
@@ -171,6 +202,23 @@ impl ConnectionLease {
                             connection_id = %connection_id,
                             "the peer connection is over; no longer renewing it: {e}",
                         );
+                        return;
+                    }
+                    Err(e) if renewal_verdict(&e) == Renewal::Refused => {
+                        // The Endpoint is refused, not the request. Renewing is
+                        // pointless and so is everything else this process would
+                        // do with the connection — but the video is riding a
+                        // relay leg that is still up, so left alone the viewer
+                        // watches a session that looks alive and carries
+                        // nothing. Revocation is the emergency stop; ending the
+                        // leg is how it reaches whoever is watching.
+                        tracing::error!(
+                            connection_id = %connection_id,
+                            "this endpoint is no longer allowed to use the peer connection; \
+                             ending the session: {e}",
+                        );
+                        leg.cancel();
+                        ended.cancel();
                         return;
                     }
                     Err(e) => {
@@ -192,8 +240,8 @@ impl ConnectionLease {
     /// Stop claiming, without waiting for the drop.
     ///
     /// Used before reporting the connection closed: `closed` is terminal, and a
-    /// renewal racing behind it would be refused with `400 invalid-request` and
-    /// logged as a failure that is really just bad timing.
+    /// renewal racing behind it would be refused with `400 connection-closed`
+    /// and logged as a failure that is really just bad timing.
     fn stop(&self) {
         self.0.abort();
     }
@@ -535,15 +583,37 @@ impl InitiatorSession {
         .await?;
         let renewal = renewal
             .unwrap_or_else(|| Arc::new(spawn_token_renewal(cfg.clone(), proxy.clone(), None)));
-        let lease = ConnectionLease::spawn(proxy.clone(), &connection);
+        let ended = CancellationToken::new();
+        let lease = ConnectionLease::spawn(
+            proxy.clone(),
+            &connection,
+            handle.shutdown_token(),
+            ended.clone(),
+        );
         Ok(Self {
             local_addr: handle.local_addr,
             connection,
             relay: handle,
             proxy: proxy.clone(),
             lease,
+            ended,
             _renewal: renewal,
         })
+    }
+
+    /// Cancelled if the proxy refuses this Endpoint (`endpoint-revoked`,
+    /// `insufficient-permission` — spec §8.5.4).
+    ///
+    /// **Worth watching even though the relay leg is torn down too.** A session
+    /// that has migrated to a direct path is not carried by the leg any more, so
+    /// dropping the leg does not stop it; and where the leg *is* carrying the
+    /// video, what the application sees is a connection that goes quiet and
+    /// times out half a minute later, rather than a reason.
+    ///
+    /// Revocation is the emergency stop. This is how it reaches whoever is
+    /// watching.
+    pub fn ended(&self) -> CancellationToken {
+        self.ended.clone()
     }
 
     /// The connection id, to hand to the target so it can bind its relay leg.
@@ -740,8 +810,38 @@ mod tests {
     /// about something nobody can act on.
     #[test]
     fn a_permanent_answer_ends_the_renewal() {
-        assert!(renewal_is_over(&problem("connection-not-found")));
-        assert!(renewal_is_over(&problem("invalid-request")));
+        assert_eq!(
+            renewal_verdict(&problem("connection-closed")),
+            Renewal::Over
+        );
+        assert_eq!(
+            renewal_verdict(&problem("connection-not-found")),
+            Renewal::Over,
+        );
+    }
+
+    /// What a proxy from before `connection-closed` answers for the same thing.
+    /// Dropping it would turn a terminal connection into the forever-loop this
+    /// exists to prevent, against every proxy that has not been updated yet.
+    #[test]
+    fn the_older_answer_for_the_same_thing_still_ends_it() {
+        assert_eq!(renewal_verdict(&problem("invalid-request")), Renewal::Over);
+    }
+
+    /// A refused Endpoint is refused on every request, so this must not be
+    /// mistaken for something worth retrying — and it is not merely permanent,
+    /// it has to end the session, or the viewer keeps watching a connection
+    /// that carries nothing.
+    #[test]
+    fn a_refused_endpoint_ends_the_session_as_well() {
+        assert_eq!(
+            renewal_verdict(&problem("endpoint-revoked")),
+            Renewal::Refused,
+        );
+        assert_eq!(
+            renewal_verdict(&problem("insufficient-permission")),
+            Renewal::Refused,
+        );
     }
 
     /// Anything that might work next time keeps the loop alive: the lease
@@ -749,10 +849,18 @@ mod tests {
     /// not end a session that is streaming fine.
     #[test]
     fn a_transient_failure_does_not() {
-        assert!(!renewal_is_over(&problem("internal")));
-        assert!(!renewal_is_over(&ProxyError::Transport(anyhow::anyhow!(
-            "connection reset"
-        ))));
+        assert_eq!(renewal_verdict(&problem("internal")), Renewal::Retry);
+        assert_eq!(
+            renewal_verdict(&ProxyError::Transport(anyhow::anyhow!("connection reset"))),
+            Renewal::Retry,
+        );
+    }
+
+    /// The token is shared with the loop that replaces it, so the next attempt
+    /// carries the new one — retrying is the refresh.
+    #[test]
+    fn an_expired_token_is_worth_another_attempt() {
+        assert_eq!(renewal_verdict(&problem("token-expired")), Renewal::Retry);
     }
 
     /// Dropping the session stops the claim. This is what makes a viewer that

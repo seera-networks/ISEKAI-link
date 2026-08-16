@@ -902,25 +902,40 @@ pub fn connect(
     let recv_shutdown = shutdown.clone();
     let recv_sink = Arc::clone(&sink);
     let recv_registration = Arc::clone(&registration);
+    // Watched alongside the receive rather than left to the leg being torn
+    // down: a session on a direct path is not carried by the leg, and one that
+    // is would go quiet and time out half a minute later without ever saying
+    // why.
+    let ended = session.ended();
     runtime.spawn(async move {
-        if let Err(e) = receive_frames_with(
-            &video_host,
-            video_port,
-            frame_tx,
-            recv_shutdown,
-            VideoRecvOptions {
-                registration: Some(recv_registration),
-                verify,
-                pin,
-                observed,
-                path_events: Some(path_tx),
-                migrate: Some(migrate_rx),
-                rtt: Some(rtt_tx),
-            },
-        )
-        .await
-        {
-            recv_sink.on_state(ConnectionState::Failed, format!("{e:#}"));
+        tokio::select! {
+            received = receive_frames_with(
+                &video_host,
+                video_port,
+                frame_tx,
+                recv_shutdown,
+                VideoRecvOptions {
+                    registration: Some(recv_registration),
+                    verify,
+                    pin,
+                    observed,
+                    path_events: Some(path_tx),
+                    migrate: Some(migrate_rx),
+                    rtt: Some(rtt_tx),
+                },
+            ) => {
+                if let Err(e) = received {
+                    recv_sink.on_state(ConnectionState::Failed, format!("{e:#}"));
+                }
+            }
+            () = ended.cancelled() => {
+                recv_sink.on_state(
+                    ConnectionState::Failed,
+                    "the proxy no longer allows this endpoint on the connection; \
+                     the session has ended"
+                        .to_owned(),
+                );
+            }
         }
     });
 
