@@ -193,12 +193,19 @@ fn read_key(path: &Path) -> anyhow::Result<Option<KeyPair>> {
 fn write_key(path: &Path, pem: &str) -> anyhow::Result<()> {
     use std::io::Write as _;
 
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut temp = match dir {
-        Some(dir) => tempfile::NamedTempFile::new_in(dir),
-        None => tempfile::NamedTempFile::new(),
-    }
-    .context("failed to create a temporary file beside the key")?;
+    // **Beside the key, never in the system temp directory.** `persist` is a
+    // rename, which does not cross filesystems, and a bare relative path — the
+    // default for `masque-h3-server` — has an empty parent. Left to fall back
+    // on `NamedTempFile::new()`, the temporary lands on `/tmp`, the rename
+    // fails `EXDEV`, and the key is never written: the same failure on every
+    // start.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .context("failed to create a temporary file beside the key")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -366,12 +373,19 @@ pub async fn obtain_managed_certificate(
     let csr = certificate_request(&key, &params.hostname)?;
     let issued = issue_certificate(uri, jwt, channel, &csr).await?;
 
+    // **Against the certificate, not against the digest beside it.** The field
+    // is the proxy's word for what it issued; the chain is what will be served,
+    // and a mismatch between the two would otherwise surface as a handshake
+    // that fails for no stated reason. An omitted field is then not a way past
+    // the check, which is what comparing the two strings made it.
     let local = spki_sha256(&key);
+    let leaf = leaf_der(&issued.cert_pem).context("the issued chain has no certificate in it")?;
+    let issued_for =
+        spki_sha256_of_certificate(&leaf).context("the issued certificate could not be parsed")?;
     anyhow::ensure!(
-        issued.spki_sha256.is_empty() || issued.spki_sha256 == local,
-        "the proxy issued a certificate for another key ({} rather than {local}); \
-         it would not be usable here",
-        issued.spki_sha256,
+        issued_for == local,
+        "the proxy issued a certificate for another key ({issued_for} rather than \
+         {local}); it would not be usable here",
     );
     anyhow::ensure!(
         issued.hostname == params.hostname,
@@ -384,6 +398,25 @@ pub async fn obtain_managed_certificate(
         cert_pem: issued.cert_pem,
         key_pem: key.serialize_pem(),
     })
+}
+
+/// The first certificate in a PEM chain, as DER.
+///
+/// A chain is leaf-first, and the leaf is the one the key has to match.
+fn leaf_der(chain_pem: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    let start = chain_pem.find(BEGIN)? + BEGIN.len();
+    let end = chain_pem[start..].find(END)? + start;
+    let body: String = chain_pem[start..end]
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("");
+    base64::engine::general_purpose::STANDARD.decode(body).ok()
 }
 
 /// One request, with the status checked and the body carried either way.
@@ -448,7 +481,9 @@ async fn get(
     let detail = detail.trim();
     let retry = match (status, retry_after) {
         (StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE, Some(after)) => {
-            format!("; retry after {after}s")
+            // Seconds or an HTTP-date (RFC 9110), so it is repeated rather
+            // than given a unit.
+            format!("; retry-after {after}")
         }
         _ => String::new(),
     };
@@ -583,6 +618,53 @@ mod tests {
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "{mode:o}");
     }
+
+    /// A key path with no directory component is the default for
+    /// `masque-h3-server`. A temporary in the system temp directory cannot be
+    /// renamed onto a different filesystem, so this is not a cosmetic detail:
+    /// it is the difference between working and failing identically forever.
+    #[test]
+    fn a_key_path_with_no_directory_is_written_beside_the_cwd() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let previous = std::env::current_dir().expect("cwd");
+        // Serialised against the other cwd-sensitive test by the lock below.
+        let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_current_dir(dir.path()).expect("chdir");
+        let written = load_or_generate_key(Path::new("bare-key.pem"));
+        std::env::set_current_dir(previous).expect("chdir back");
+        written.expect("a bare path is written beside the cwd");
+        assert!(dir.path().join("bare-key.pem").is_file());
+    }
+
+    /// A directory that is not there yet is made, rather than being an error
+    /// that leaves the caller with no key.
+    #[test]
+    fn a_missing_directory_is_created() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("not").join("there").join("tls.pem");
+        load_or_generate_key(&path).expect("generate");
+        assert!(path.is_file());
+    }
+
+    /// The digest is taken from the certificate, so a chain for somebody else's
+    /// key is refused whatever the response says beside it.
+    #[test]
+    fn the_leaf_of_a_chain_is_what_is_digested() {
+        let key = key();
+        let params = CertificateParams::new(vec!["p1.example.com".to_owned()]).expect("params");
+        let cert = params.self_signed(&key).expect("self-sign");
+        let leaf = leaf_der(&cert.pem()).expect("the leaf parses");
+        assert_eq!(spki_sha256_of_certificate(&leaf), Some(spki_sha256(&key)));
+    }
+
+    /// Anything that is not a chain is a missing leaf rather than a panic.
+    #[test]
+    fn a_chain_with_no_certificate_has_no_leaf() {
+        assert_eq!(leaf_der(""), None);
+        assert_eq!(leaf_der("-----BEGIN CERTIFICATE-----\nnot base64!\n"), None);
+    }
+
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn pem_body(pem: &str) -> Vec<u8> {
         use base64::Engine as _;

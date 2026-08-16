@@ -300,17 +300,22 @@ async fn main() -> anyhow::Result<()> {
         cert_res.hostname,
     );
 
-    isekai_link_utils::set_udp_mode(
-        uri.clone(),
-        &cmd_opts.jwt,
-        channel,
-        if cmd_opts.shared_mode {
-            "shared"
-        } else {
-            "dedicated"
-        },
-    )
-    .await?;
+    let wanted = if cmd_opts.shared_mode {
+        "shared"
+    } else {
+        "dedicated"
+    };
+    let settled =
+        isekai_link_utils::set_udp_mode(uri.clone(), &cmd_opts.jwt, channel, wanted).await?;
+    // The answer is checked, not just the status: a proxy that accepts the
+    // request and reports the other mode leaves this server running on a
+    // binding it did not ask for, and the symptom shows up much later as
+    // traffic arriving on the wrong socket.
+    anyhow::ensure!(
+        settled.mode.as_deref() == Some(wanted),
+        "asked for UDP mode {wanted} but the proxy reports {:?}",
+        settled.mode,
+    );
 
     // ── Start the local quinn H3 server on a loopback address ────────────────
     let server_config = make_quinn_server_config(&cert_res.cert_pem, &cert_res.key_pem)?;
