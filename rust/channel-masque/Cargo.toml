@@ -27,6 +27,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 argh = { workspace = true }
+# `masque-h3-server` talks to the proxy's control routes, which live there —
+# including the managed-domain certificate API (`cert`). A dev-dependency, so
+# this stays a leaf crate for anything that links it.
+isekai-link-utils = { workspace = true }
 h3-quinn = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }

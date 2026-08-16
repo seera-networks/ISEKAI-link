@@ -1071,14 +1071,12 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "time",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "x509-parser",
 ]
 
 [[package]]
@@ -1249,6 +1247,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
+ "isekai-link-utils",
  "quinn",
  "rustls",
  "rustls-pemfile",
@@ -3030,9 +3029,11 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "rcgen",
  "schannel",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3041,6 +3042,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "windows",
+ "x509-parser",
 ]
 
 [[package]]

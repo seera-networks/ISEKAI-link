@@ -53,7 +53,7 @@ use isekai_p2p::agent::{
     attest, Attestation, EndpointKey, IssuedCertificate, MasqueH3Transport, ProxyClient, ProxyError,
 };
 use isekai_p2p::secret::write_secret;
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::KeyPair;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -310,33 +310,12 @@ fn read_key(path: &Path) -> anyhow::Result<Option<KeyPair>> {
 
 /// A PKCS#10 certificate request for `hostname`, signed by `key`.
 ///
-/// One `dNSName` SAN and **no other extension request at all** — rcgen omits the
-/// attribute entirely when neither `keyUsage` nor `extendedKeyUsage` is set, so
-/// what goes on the wire is the SAN and nothing more. That satisfies §8.6.2
-/// rule 7 by having nothing to permit, rather than by asking for the permitted
-/// things.
+/// [`isekai_link_utils::cert::certificate_request`] builds it: §7.4.2 states
+/// its CSR rules as identical to §8.6.2 rules 1–8, so the managed-domain route
+/// and this one ask for the same thing and there is one place that knows what
+/// that is.
 pub fn certificate_request(key: &KeyPair, hostname: &str) -> anyhow::Result<String> {
-    let mut params = CertificateParams::new(vec![hostname.to_owned()])
-        .context("failed to build the certificate request parameters")?;
-    // **The CN has to be the hostname, even though nothing reads it as a name.**
-    // The proxy does not check the subject — the CA takes the name from the SAN
-    // — but ACME order validation checks that whatever CN is present is also in
-    // the SAN, and rcgen's default is `CN=rcgen self signed cert`. Left alone,
-    // every request is refused with
-    //
-    //   common name `rcgen self signed cert` is missing from the CSR's
-    //   subjectAltName extension
-    //
-    // which names the CN and so reads like a subject problem, when what it is
-    // asking for is agreement with the SAN.
-    let mut dn = rcgen::DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, hostname);
-    params.distinguished_name = dn;
-    let csr = params
-        .serialize_request(key)
-        .context("failed to sign the certificate request")?;
-    csr.pem()
-        .context("failed to encode the certificate request")
+    isekai_link_utils::cert::certificate_request(key, hostname)
 }
 
 /// SHA-256 of `key`'s SubjectPublicKeyInfo, base64url without padding.
@@ -345,11 +324,7 @@ pub fn certificate_request(key: &KeyPair, hostname: &str) -> anyhow::Result<Stri
 /// comparing them answers "is the certificate it holds still one this device
 /// can use" — which nothing else can answer, since only this device has the key.
 pub fn spki_sha256(key: &KeyPair) -> String {
-    use base64::Engine as _;
-    use sha2::{Digest as _, Sha256};
-
-    let digest = Sha256::digest(key.public_key_der());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    isekai_link_utils::cert::spki_sha256(key)
 }
 
 /// The SPKI digest of a certificate, in the form the attestation names.
@@ -361,13 +336,7 @@ pub fn spki_sha256(key: &KeyPair) -> String {
 /// `None` for anything that will not parse — a certificate that cannot be read
 /// is not one that matched.
 pub fn spki_sha256_of_certificate(der: &[u8]) -> Option<String> {
-    use base64::Engine as _;
-    use sha2::{Digest as _, Sha256};
-    use x509_parser::prelude::*;
-
-    let (_, certificate) = X509Certificate::from_der(der).ok()?;
-    let digest = Sha256::digest(certificate.tbs_certificate.subject_pki.raw);
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest))
+    isekai_link_utils::cert::spki_sha256_of_certificate(der)
 }
 
 /// Assemble what the listener needs from an issued chain and the local key.
@@ -451,6 +420,9 @@ fn pkcs12_bundle(_cert_pem: &str, _key_pem: &str) -> anyhow::Result<Option<Strin
 #[cfg(test)]
 mod key_tests {
     use super::*;
+    // The CSR and digest helpers are shared with the managed-domain route now,
+    // so this names what the tests build with rather than what `tls` imports.
+    use rcgen::CertificateParams;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("isekai-tls-{}-{name}", std::process::id()));

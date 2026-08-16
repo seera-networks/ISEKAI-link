@@ -1,3 +1,5 @@
+pub mod cert;
+
 use bytes::Bytes;
 use h3_util::msquic_async::{
     h3_msquic_async::{msquic, msquic_async},

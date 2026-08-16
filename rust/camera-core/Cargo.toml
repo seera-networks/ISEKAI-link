@@ -17,11 +17,10 @@ isekai-link-utils = { workspace = true }
 isekai-p2p = { workspace = true }
 # Dev self-signed certificate for the video ("sample" ALPN) QUIC listener.
 rcgen = { workspace = true }
-# The video TLS key's SPKI digest, compared against what the proxy reports, and
-# the PKCS#12 blob Windows loads credentials from (`tls`).
+# The PKCS#12 blob Windows loads credentials from (`tls`). The SPKI digests it
+# is compared against come from `isekai-link-utils::cert`, which the
+# managed-domain route shares.
 base64 = { workspace = true }
-sha2 = { workspace = true }
-x509-parser = { workspace = true }
 # The privacy policy and the record of agreeing to it (`privacy`).
 serde = { workspace = true }
 serde_json = { workspace = true }

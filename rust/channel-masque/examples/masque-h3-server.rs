@@ -22,22 +22,19 @@
 ///   masque-h3-server [--target <url>] [--jwt <token>]
 use argh::FromArgs;
 use bytes::Bytes;
-use h3_util::msquic_async::{
-    H3MsQuicAsyncConnector,
-    h3_msquic_async::{msquic, msquic_async},
-};
+use h3_util::msquic_async::h3_msquic_async::{msquic, msquic_async};
 use http::{
-    Request, Uri,
+    Uri,
     header::{HeaderName, HeaderValue},
     uri::{Authority, Scheme},
 };
 use http_body::Frame;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::StreamBody;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::{convert::Infallible, io::BufReader, net::SocketAddr, sync::Arc};
+use std::{convert::Infallible, io::BufReader, sync::Arc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tower::{Service, ServiceBuilder, ServiceExt};
+use tower::ServiceBuilder;
 use tower_http::{auth::AddAuthorizationLayer, set_header::SetRequestHeaderLayer};
 use tracing_subscriber::EnvFilter;
 
@@ -196,239 +193,6 @@ async fn handle_h3_connection(conn: quinn::Connection) {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct CertificateResponse {
-    hostname: String,
-    cert_pem: String,
-    key_pem: String,
-}
-
-/// Body for `PUT /udp_mode`.
-///
-/// `mode` must be `"shared"`, `"dedicated"`, or `null` / omitted to reset
-/// to the server default.
-#[derive(serde::Serialize)]
-struct UdpModeSettingRequest {
-    mode: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct UdpModeSettingResponse {
-    /// `"shared"`, `"dedicated"`, or `null` (server default).
-    mode: Option<String>,
-}
-
-async fn create_normal_channel(
-    uri: Uri,
-    reg: Arc<msquic_async::Registration>,
-    config: Arc<msquic::Configuration>,
-    config_qmux: Arc<msquic::Configuration>,
-) -> anyhow::Result<channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>> {
-    let connector = H3MsQuicAsyncConnector::new(uri.clone(), config, Some(config_qmux), false, reg);
-    let channel = channel_masque::H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
-    Ok(channel)
-}
-
-/// Fetch a TLS certificate from the MASQUE server by making an HTTP/3 request over msquic.
-async fn get_public_address(
-    uri: Uri,
-    jwt: &str,
-    channel: channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
-) -> anyhow::Result<SocketAddr> {
-    let mut channel = ServiceBuilder::new()
-        .option_layer((!jwt.is_empty()).then(|| AddAuthorizationLayer::bearer(jwt)))
-        .service(channel);
-    let uri = Uri::builder()
-        .scheme(uri.scheme().cloned().expect("URI scheme is required"))
-        .authority(uri.authority().cloned().expect("URI authority is required"))
-        .path_and_query("/public_address")
-        .build()?;
-    let request = Request::builder()
-        .uri(uri)
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-
-    let response = channel
-        .ready()
-        .await
-        .map_err(|e| {
-            tracing::error!("channel ready error: {e}");
-            anyhow::anyhow!("channel ready error: {e}")
-        })?
-        .call(request)
-        .await
-        .map_err(|e| {
-            tracing::error!("channel call error: {e}");
-            anyhow::anyhow!("channel call error: {e}")
-        })?;
-    let data = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| {
-            tracing::error!("response body collect error: {e}");
-            anyhow::anyhow!("response body collect error: {e}")
-        })?
-        .to_bytes();
-    Ok(String::from_utf8(data.to_vec())?.parse()?)
-}
-
-/// Fetch a TLS certificate from the MASQUE server by making an HTTP/3 request over msquic.
-async fn get_certificate_response(
-    uri: Uri,
-    jwt: &str,
-    channel: channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
-) -> anyhow::Result<CertificateResponse> {
-    let mut channel = ServiceBuilder::new()
-        .option_layer((!jwt.is_empty()).then(|| AddAuthorizationLayer::bearer(jwt)))
-        .service(channel);
-    let uri = Uri::builder()
-        .scheme(uri.scheme().cloned().expect("URI scheme is required"))
-        .authority(uri.authority().cloned().expect("URI authority is required"))
-        .path_and_query("/certificate")
-        .build()?;
-    let request = Request::builder()
-        .uri(uri)
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-
-    let response = channel
-        .ready()
-        .await
-        .map_err(|e| {
-            tracing::error!("channel ready error: {e}");
-            anyhow::anyhow!("channel ready error: {e}")
-        })?
-        .call(request)
-        .await
-        .map_err(|e| {
-            tracing::error!("channel call error: {e}");
-            anyhow::anyhow!("channel call error: {e}")
-        })?;
-    let data = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| {
-            tracing::error!("response body collect error: {e}");
-            anyhow::anyhow!("response body collect error: {e}")
-        })?
-        .to_bytes();
-    Ok(serde_json::from_slice::<CertificateResponse>(&data)?)
-}
-
-/// Set the UDP mode on the MASQUE server by making an HTTP/3 request over msquic.
-async fn set_udp_mode(
-    uri: Uri,
-    jwt: &str,
-    is_shared: bool,
-    channel: channel_masque::H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
-) -> anyhow::Result<()> {
-    let mut channel = ServiceBuilder::new()
-        .option_layer((!jwt.is_empty()).then(|| AddAuthorizationLayer::bearer(jwt)))
-        .service(channel);
-    let uri = Uri::builder()
-        .scheme(uri.scheme().cloned().expect("URI scheme is required"))
-        .authority(uri.authority().cloned().expect("URI authority is required"))
-        .path_and_query("/udp_mode")
-        .build()?;
-    let request = Request::builder()
-        .uri(uri.clone())
-        .body(Full::new(Bytes::new()))?;
-
-    let response = channel
-        .ready()
-        .await
-        .map_err(|e| {
-            tracing::error!("channel ready error: {e}");
-            anyhow::anyhow!("channel ready error: {e}")
-        })?
-        .call(request)
-        .await
-        .map_err(|e| {
-            tracing::error!("channel call error: {e}");
-            anyhow::anyhow!("channel call error: {e}")
-        })?;
-    let data = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| {
-            tracing::error!("response body collect error: {e}");
-            anyhow::anyhow!("response body collect error: {e}")
-        })?
-        .to_bytes();
-    let udp_mode_response = serde_json::from_slice::<UdpModeSettingResponse>(&data)?;
-    let need_to_set = match udp_mode_response.mode {
-        Some(mode) if mode == "shared" => !is_shared,
-        Some(mode) if mode == "dedicated" => is_shared,
-        Some(mode) => anyhow::bail!("unexpected UDP mode in response: {mode}"),
-        None => true,
-    };
-    if !need_to_set {
-        tracing::info!("UDP mode already set to desired value, no change needed");
-        return Ok(());
-    } else {
-        tracing::info!(
-            "UDP mode needs to be changed to {}, sending request",
-            if is_shared { "shared" } else { "dedicated" }
-        );
-    }
-
-    let udp_mode_request = serde_json::json!(UdpModeSettingRequest {
-        mode: Some(if is_shared {
-            "shared".to_string()
-        } else {
-            "dedicated".to_string()
-        }),
-    });
-
-    let request = Request::builder()
-        .uri(uri.clone())
-        .method("PUT")
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(udp_mode_request.to_string())))?;
-
-    let response = channel
-        .ready()
-        .await
-        .map_err(|e| {
-            tracing::error!("channel ready error: {e}");
-            anyhow::anyhow!("channel ready error: {e}")
-        })?
-        .call(request)
-        .await
-        .map_err(|e| {
-            tracing::error!("channel call error: {e}");
-            anyhow::anyhow!("channel call error: {e}")
-        })?;
-    let data = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| {
-            tracing::error!("response body collect error: {e}");
-            anyhow::anyhow!("response body collect error: {e}")
-        })?
-        .to_bytes();
-
-    let udp_mode_response = serde_json::from_slice::<UdpModeSettingResponse>(&data)?;
-    let failed_to_set = match &udp_mode_response.mode {
-        Some(mode) if mode == "shared" => !is_shared,
-        Some(mode) if mode == "dedicated" => is_shared,
-        Some(mode) => anyhow::bail!("unexpected UDP mode in response: {mode}"),
-        None => true,
-    };
-    if failed_to_set {
-        anyhow::bail!(
-            "failed to set UDP mode to desired value: server responded with {:?}",
-            udp_mode_response.mode
-        );
-    }
-
-    Ok(())
-}
-
 // ── CLI ──────────────────────────────────────────────────────────────────────
 #[derive(FromArgs, Clone)]
 /// masque-h3-server: serve HTTP/3 behind a MASQUE UDP proxy
@@ -439,6 +203,14 @@ pub struct CmdOptions {
     /// JWT for authentication, if the server requires it
     #[argh(option, default = "String::from(\"\")")]
     jwt: String,
+
+    /// where to keep the TLS key for the managed-domain certificate
+    ///
+    /// Generated on first use and reused afterwards: a new key spends one of
+    /// the five weekly issuances, where the same one is answered from the
+    /// proxy's cache. It never leaves this machine.
+    #[argh(option, default = "String::from(\"masque-h3-server-tls.pem\")")]
+    key_path: String,
 
     /// log target: "file" (default) or "stdout"
     ///
@@ -497,26 +269,48 @@ async fn main() -> anyhow::Result<()> {
     let (reg, config) = make_msquic_async_reg_and_config(None, false)?;
     let (reg, config_qmux) = make_msquic_async_reg_and_config(Some(reg), true)?;
 
-    let channel = create_normal_channel(
+    let channel = isekai_link_utils::create_normal_channel(
         uri.clone(),
         reg.clone(),
         config.clone(),
         config_qmux.clone(),
+        false,
     )
     .await?;
 
     // ── Fetch the public address assigned by the MASQUE server for this client.
-    let public_addr = get_public_address(uri.clone(), &cmd_opts.jwt, channel.clone()).await?;
+    let public_addr =
+        isekai_link_utils::get_public_address(uri.clone(), &cmd_opts.jwt, channel.clone()).await?;
     tracing::info!("public address assigned by MASQUE server: {public_addr}");
 
-    // ── Fetch a TLS certificate from the MASQUE server to use for the local quinn/H3 server.
-    let cert_res = get_certificate_response(uri.clone(), &cmd_opts.jwt, channel.clone()).await?;
+    // ── Obtain a TLS certificate for the managed domain (spec §7.4) ──────────
+    // The key is generated here and stays here; what goes to the proxy is a
+    // certificate signing request, and what comes back has no key in it. The
+    // name is the proxy's to derive — `p{port}.{domain}` from the address just
+    // allocated — so it is read rather than assembled.
+    let cert_res = isekai_link_utils::cert::obtain_managed_certificate(
+        uri.clone(),
+        &cmd_opts.jwt,
+        channel.clone(),
+        std::path::Path::new(&cmd_opts.key_path),
+    )
+    .await?;
     tracing::info!(
-        "fetched certificate for {} from MASQUE server",
-        cert_res.hostname
+        "serving {} on a certificate issued for a key that never left this machine",
+        cert_res.hostname,
     );
 
-    set_udp_mode(uri.clone(), &cmd_opts.jwt, cmd_opts.shared_mode, channel).await?;
+    isekai_link_utils::set_udp_mode(
+        uri.clone(),
+        &cmd_opts.jwt,
+        channel,
+        if cmd_opts.shared_mode {
+            "shared"
+        } else {
+            "dedicated"
+        },
+    )
+    .await?;
 
     // ── Start the local quinn H3 server on a loopback address ────────────────
     let server_config = make_quinn_server_config(&cert_res.cert_pem, &cert_res.key_pem)?;

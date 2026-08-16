@@ -7,6 +7,12 @@ edition.workspace = true
 anyhow = { workspace = true }
 bytes = { workspace = true }
 channel-masque = { workspace = true }
+# The managed-domain certificate route (`cert`): building the CSR, digesting a
+# key or a chain, and generating the key that stays here.
+rcgen = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+x509-parser = { workspace = true }
 h3-util = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
@@ -22,6 +28,5 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-base64 = { workspace = true }
 schannel = { workspace = true }
 windows = { workspace = true, features = ["Win32_Security_Cryptography"]}
