@@ -130,6 +130,14 @@ enum Renewal {
 /// carries a candidate has to revisit this**: a reflexive address the proxy
 /// refuses (CGNAT, spec §8.4.1) is refused every time, and treating that as
 /// terminal would end a session over one bad candidate.
+///
+/// **Only `endpoint-revoked` ends the session.** `insufficient-permission` is
+/// refused against the permissions on the *current Endpoint Token*, and this
+/// process replaces that token every few minutes — so it can be a token minted
+/// before a permission existed rather than an Endpoint that may not do this.
+/// Retrying costs a warning a minute and recovers on its own; treating it as
+/// terminal would tear down every live session the day the proxy starts
+/// requiring a permission on this route.
 fn renewal_verdict(error: &ProxyError) -> Renewal {
     let ProxyError::Problem { problem, .. } = error else {
         // A transport failure says nothing about the connection.
@@ -137,9 +145,10 @@ fn renewal_verdict(error: &ProxyError) -> Renewal {
     };
     match problem.as_ref().map(|p| p.kind()) {
         Some("connection-closed" | "connection-not-found" | "invalid-request") => Renewal::Over,
-        Some("endpoint-revoked" | "insufficient-permission") => Renewal::Refused,
-        // `token-expired` included: the token is shared with the renewal loop
-        // that replaces it, so the next attempt carries the new one.
+        Some("endpoint-revoked") => Renewal::Refused,
+        // `token-expired` and `insufficient-permission` included: both are
+        // about the token, which is shared with the loop that replaces it, so
+        // the next attempt carries a new one.
         _ => Renewal::Retry,
     }
 }
@@ -194,44 +203,47 @@ impl ConnectionLease {
                             "renewed the peer connection's lease",
                         );
                     }
-                    Err(e) if renewal_verdict(&e) == Renewal::Over => {
-                        // The connection is gone or the peer closed it. Said
-                        // once, and then this stops rather than asking a
-                        // question that now has a permanent answer.
-                        tracing::info!(
-                            connection_id = %connection_id,
-                            "the peer connection is over; no longer renewing it: {e}",
-                        );
-                        return;
-                    }
-                    Err(e) if renewal_verdict(&e) == Renewal::Refused => {
-                        // The Endpoint is refused, not the request. Renewing is
-                        // pointless and so is everything else this process would
-                        // do with the connection — but the video is riding a
-                        // relay leg that is still up, so left alone the viewer
-                        // watches a session that looks alive and carries
-                        // nothing. Revocation is the emergency stop; ending the
-                        // leg is how it reaches whoever is watching.
-                        tracing::error!(
-                            connection_id = %connection_id,
-                            "this endpoint is no longer allowed to use the peer connection; \
-                             ending the session: {e}",
-                        );
-                        leg.cancel();
-                        ended.cancel();
-                        return;
-                    }
-                    Err(e) => {
-                        // Not fatal on its own: the lease outlives several of
-                        // these, so a proxy that is briefly unreachable costs
-                        // nothing. Worth saying, because the visible consequence
-                        // of it continuing is the video stopping partway through.
-                        tracing::warn!(
-                            connection_id = %connection_id,
-                            retry_in = ?delay,
-                            "could not renew the peer connection's lease: {e}",
-                        );
-                    }
+                    Err(e) => match renewal_verdict(&e) {
+                        Renewal::Over => {
+                            // The connection is gone or the peer closed it. Said
+                            // once, and then this stops rather than asking a
+                            // question that now has a permanent answer.
+                            tracing::info!(
+                                connection_id = %connection_id,
+                                "the peer connection is over; no longer renewing it: {e}",
+                            );
+                            return;
+                        }
+                        Renewal::Refused => {
+                            // The Endpoint is refused, not the request. Renewing
+                            // is pointless and so is everything else this
+                            // process would do with the connection — but the
+                            // video is riding a relay leg that is still up, so
+                            // left alone the viewer watches a session that looks
+                            // alive and carries nothing. Revocation is the
+                            // emergency stop; this is how it reaches whoever is
+                            // watching.
+                            tracing::error!(
+                                connection_id = %connection_id,
+                                "this endpoint has been revoked; ending the session: {e}",
+                            );
+                            leg.cancel();
+                            ended.cancel();
+                            return;
+                        }
+                        Renewal::Retry => {
+                            // Not fatal on its own: the lease outlives several
+                            // of these, so a proxy that is briefly unreachable
+                            // costs nothing. Worth saying, because the visible
+                            // consequence of it continuing is the video stopping
+                            // partway through.
+                            tracing::warn!(
+                                connection_id = %connection_id,
+                                retry_in = ?delay,
+                                "could not renew the peer connection's lease: {e}",
+                            );
+                        }
+                    },
                 }
             }
         }))
@@ -662,6 +674,15 @@ impl InitiatorSession {
         // Before the report: `closed` is terminal, so a renewal arriving behind
         // it is refused and logged as a failure that is only bad timing.
         self.lease.stop();
+        if self.ended.is_cancelled() {
+            // Revoked. `report_state` goes through the same auth layer that
+            // just refused the renewal, so it can only be refused too — and
+            // waiting out `REPORT_CLOSED_TIMEOUT` to be told so would end a
+            // revocation with a warning about the listener's leg staying
+            // reserved, which is neither true nor the point.
+            self.relay.close().await;
+            return;
+        }
         let reported = tokio::time::timeout(
             REPORT_CLOSED_TIMEOUT,
             self.proxy
@@ -828,19 +849,27 @@ mod tests {
         assert_eq!(renewal_verdict(&problem("invalid-request")), Renewal::Over);
     }
 
-    /// A refused Endpoint is refused on every request, so this must not be
+    /// A revoked Endpoint is refused on every request, so this must not be
     /// mistaken for something worth retrying — and it is not merely permanent,
     /// it has to end the session, or the viewer keeps watching a connection
     /// that carries nothing.
     #[test]
-    fn a_refused_endpoint_ends_the_session_as_well() {
+    fn a_revoked_endpoint_ends_the_session_as_well() {
         assert_eq!(
             renewal_verdict(&problem("endpoint-revoked")),
             Renewal::Refused,
         );
+    }
+
+    /// Permissions are checked against the token, not the Endpoint, and this
+    /// process replaces its token every few minutes. Ending the session here
+    /// would tear down every live one the day the proxy starts requiring a
+    /// permission on this route, against tokens minted before it existed.
+    #[test]
+    fn a_permission_the_token_lacks_is_not_the_endpoint_being_refused() {
         assert_eq!(
             renewal_verdict(&problem("insufficient-permission")),
-            Renewal::Refused,
+            Renewal::Retry,
         );
     }
 

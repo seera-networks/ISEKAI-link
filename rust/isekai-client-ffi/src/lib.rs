@@ -907,6 +907,7 @@ pub fn connect(
     // is would go quiet and time out half a minute later without ever saying
     // why.
     let ended = session.ended();
+    let recv_shutdown_on_end = shutdown.clone();
     runtime.spawn(async move {
         tokio::select! {
             received = receive_frames_with(
@@ -935,6 +936,11 @@ pub fn connect(
                      the session has ended"
                         .to_owned(),
                 );
+                // Nothing else stops the session: the task holding it waits on
+                // this token, so without the cancel it keeps a dead session,
+                // its runtime and the msquic registration alive for as long as
+                // the app runs.
+                recv_shutdown_on_end.cancel();
             }
         }
     });
