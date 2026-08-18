@@ -61,7 +61,10 @@ val generateJniLibs by tasks.registering(Exec::class) {
         // CMake inherits — and msquic's selfsign_openssl.c calls `glob()`,
         // which bionic only declares from 28. The two halves of the same
         // native build have to agree on this number.
-        "-p", "29",
+        //
+        // Spelled out: `-p` is cargo's `--package`, and cargo-ndk passes it
+        // straight through ("unknown package: 29").
+        "--platform", "29",
         "-o", file("src/main/jniLibs").absolutePath,
         "build", "-p", "isekai-client-ffi",
     )
