@@ -3080,6 +3080,7 @@ dependencies = [
  "http-body-util",
  "p256",
  "rand 0.8.6",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
@@ -3092,6 +3093,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]

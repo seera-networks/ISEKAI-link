@@ -28,6 +28,8 @@ msquic = [
 ]
 
 [dependencies]
+# Reading the names out of a peer certificate (`hostname`).
+x509-parser = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 p256 = { workspace = true }
@@ -56,4 +58,6 @@ tokio-stream = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Building certificates for the hostname-matching tests.
+rcgen = { workspace = true }
 axum = { workspace = true, features = ["json", "tokio", "http1"] }

@@ -70,13 +70,20 @@ impl MasqueH3Transport {
         let uri: Uri = target.parse().context("invalid proxy target URI")?;
         let (registration, config) = make_client_config(None, false)?;
         let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+        // The certificate has to name the host we dialled, and that is checked
+        // here rather than assumed of the layer below (#134).
+        let host = uri
+            .host()
+            .context("proxy target URI has no host")?
+            .to_owned();
         let connector = H3MsQuicAsyncConnector::new(
             uri.clone(),
             config,
             Some(config_qmux),
             false,
             registration,
-        );
+        )
+        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
         let channel = H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
         Ok(Self { channel, uri })
     }
@@ -379,6 +386,15 @@ pub(crate) fn make_client_config(
     // What Android actually needed is below: a CA file, because it has no
     // system PEM for the default paths to find.
     let mut credential = msquic::CredentialConfig::new_client();
+    // Ask to be shown the peer's certificate, in a form that parses off
+    // Windows. Added to whatever the platform already does rather than instead
+    // of it -- the flags are OR'd -- and it is what lets the name be checked
+    // (`hostname::refuse_other_hosts`, #134).
+    if std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_none() {
+        credential = credential
+            .set_credential_flags(msquic::CredentialFlags::INDICATE_CERTIFICATE_RECEIVED)
+            .set_credential_flags(msquic::CredentialFlags::USE_PORTABLE_CERTIFICATES);
+    }
     // Android ships no system PEM file, so the default verify paths find
     // nothing; the app copies a bundle out of its assets and points
     // `SSL_CERT_FILE` at it. Setting `CaCertificateFile` drives

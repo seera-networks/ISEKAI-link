@@ -37,6 +37,8 @@ pub mod agent {
     pub use isekai_p2p_core::attestation::{attest, verify, Attestation, AttestationError};
     pub use isekai_p2p_core::bind::RelayOptions;
     pub use isekai_p2p_core::endpoint::EndpointKey;
+    /// Whether a peer certificate names the host that was dialled (#134).
+    pub use isekai_p2p_core::hostname::certificate_matches;
     pub use isekai_p2p_core::identity::EndpointToken;
     pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::proxy::{

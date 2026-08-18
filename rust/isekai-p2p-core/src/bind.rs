@@ -32,8 +32,8 @@ use channel_masque::{CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClien
 /// gets back, and one draining [`BindSession::events`] can match on them,
 /// without depending on the MASQUE crate directly.
 pub use channel_masque::{InboundActivity, MasqueClientEvent};
-use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
+use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use http_body::Frame;
@@ -47,7 +47,7 @@ use tower_http::auth::AddAuthorizationLayer;
 use tower_http::set_header::SetRequestHeaderLayer;
 
 use crate::endpoint::EndpointKey;
-use crate::observed::{spawn_observed_address_watch, ObservedAddressWatch};
+use crate::observed::{ObservedAddressWatch, spawn_observed_address_watch};
 use crate::pop;
 use crate::transport::make_client_config;
 
@@ -89,13 +89,17 @@ fn relay_connector(
 ) -> anyhow::Result<(H3MsQuicAsyncConnector, ObservedAddressWatch)> {
     let (registration, config) = make_client_config(opts.registration.clone(), false)?;
     let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+    // The leg goes to the same proxy the control plane does, and gets the same
+    // check: the certificate has to name the host dialled (#134).
+    let host = uri.host().context("relay URI has no host")?.to_owned();
     let connector = H3MsQuicAsyncConnector::new(
         uri,
         config,
         Some(config_qmux),
         opts.unconnected,
         registration,
-    );
+    )
+    .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
     let (conn_tx, conn_rx) = mpsc::channel(4);
     let observed = spawn_observed_address_watch(conn_rx, shutdown);
     Ok((connector.with_channel(conn_tx), observed))

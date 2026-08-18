@@ -21,6 +21,7 @@
 
 pub mod attestation;
 pub mod endpoint;
+pub mod hostname;
 /// HTTPS (HTTP/1.1 + HTTP/2) transport for the Identity API.
 pub mod https;
 pub mod identity;

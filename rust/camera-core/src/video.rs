@@ -19,8 +19,8 @@ use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use isekai_p2p::agent::{
-    verify as verify_attestation, Attestation, ObservedAddress, ObservedAddressWatch,
-    PeerConnection,
+    certificate_matches, verify as verify_attestation, Attestation, ObservedAddress,
+    ObservedAddressWatch, PeerConnection,
 };
 use isekai_p2p::LegDirectory;
 use time::OffsetDateTime;
@@ -803,14 +803,14 @@ pub async fn receive_frames_with(
         None => None,
     };
 
-    let (reg, config) =
-        video_client_config(registration, verify, candidate.is_some(), pin.is_some())?;
+    let (reg, config) = video_client_config(registration, verify, candidate.is_some())?;
     let conn = dial_video(
         &reg,
         &config,
         host,
         port,
         candidate,
+        verify,
         pin.as_ref(),
         &shutdown,
     )
@@ -1117,7 +1117,12 @@ async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent)
 /// A rejection is logged at `warn` and not swallowed: an unattested certificate
 /// on a connection that expected one is either a misconfiguration or the thing
 /// this exists to catch, and both want saying.
-fn install_pin(conn: &Connection, pin: AttestedPeer, refused: Arc<Mutex<Option<String>>>) {
+fn install_certificate_check(
+    conn: &Connection,
+    host: String,
+    pin: Option<AttestedPeer>,
+    refused: Arc<Mutex<Option<String>>>,
+) {
     conn.set_peer_certificate_received_callback(move |certificate, _flags, _status, _chain| {
         // `USE_PORTABLE_CERTIFICATES` makes this a `QUIC_BUFFER` of DER. It is
         // msquic's memory and lives only for this call, so nothing is kept.
@@ -1127,25 +1132,38 @@ fn install_pin(conn: &Connection, pin: AttestedPeer, refused: Arc<Mutex<Option<S
                 .map(|buffer| msquic::BufferRef::from_ffi_ref(buffer).as_bytes())
         };
         let verdict = match der {
-            Some(der) => pin.accepts(der),
+            // The name first: a certificate for somebody else is somebody
+            // else's whatever it carries, and saying so names the right
+            // problem.
+            Some(der) => certificate_matches(der, &host).and_then(|()| match &pin {
+                Some(pin) => pin.accepts(der),
+                None => Ok(()),
+            }),
             None => Err("the peer presented no certificate".to_owned()),
         };
         match verdict {
+            Ok(()) if pin.is_none() => {
+                tracing::debug!(host = %host, "the video certificate is for the host dialled");
+                Ok(())
+            }
             Ok(()) => {
                 // Said at `info`, and once per handshake. "We are going to
                 // check" and "it held" are different facts, and only the second
                 // one is the protection — an operator who sees the first and
                 // then silence cannot tell which of them happened.
                 tracing::info!(
-                    peer = %pin.peer_endpoint,
+                    peer = pin
+                        .as_ref()
+                        .map(|p| p.peer_endpoint.as_str())
+                        .unwrap_or_default(),
                     "the peer presented the key it signed for; the connection is pinned to it",
                 );
                 Ok(())
             }
             Err(reason) => {
                 tracing::warn!(
-                    peer = %pin.peer_endpoint,
-                    host = %pin.video_host,
+                    peer = pin.as_ref().map(|p| p.peer_endpoint.as_str()).unwrap_or_default(),
+                    host = %host,
                     "refusing the video connection: {reason}",
                 );
                 // Left where the dial can find it. The handshake is about to
@@ -1198,6 +1216,9 @@ async fn dial_video(
     host: &str,
     port: u16,
     candidate: Option<ObservedAddress>,
+    // Whether this connection validates at all. Off is dev-only, and then
+    // there is nothing to check the certificate against.
+    verify: bool,
     pin: Option<&AttestedPeer>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Connection> {
@@ -1216,8 +1237,8 @@ async fn dial_video(
         // One slot per attempt: a verdict from a connection that has been
         // dropped says nothing about this one.
         let refused: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        if let Some(pin) = pin {
-            install_pin(&conn, pin.clone(), Arc::clone(&refused));
+        if verify {
+            install_certificate_check(&conn, host.to_owned(), pin.cloned(), Arc::clone(&refused));
         }
         // The handshake can stay unanswered for a long time by design, and until
         // it is answered there is nothing else to go on. Report what it is doing
@@ -1383,7 +1404,6 @@ fn video_client_config(
     reg: Option<Arc<Registration>>,
     verify: bool,
     enable_migration: bool,
-    pinning: bool,
 ) -> anyhow::Result<(Arc<Registration>, msquic::Configuration)> {
     let reg = match reg {
         Some(reg) => reg,
@@ -1510,12 +1530,15 @@ fn video_client_config(
     if !verify || skip_verify {
         cred = cred.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
     }
-    if pinning {
+    if verify && !skip_verify {
         // **Added to whatever validation is already happening, not instead of
-        // it.** The flags are OR'd, so msquic still checks the name exactly as
-        // before; this only asks to be shown the certificate as well, in a form
-        // that can be parsed on every platform, so the key inside it can be
-        // held against what the peer signed for.
+        // it.** The flags are OR'd, so nothing msquic does is switched off;
+        // this asks to be shown the certificate as well, in a form that parses
+        // on every platform.
+        //
+        // Asked for whenever this connection validates, not only when there is
+        // a key to pin: the name has to be checked here too (#134), and a
+        // certificate that is never handed over cannot be checked at all.
         cred = cred
             .set_credential_flags(msquic::CredentialFlags::INDICATE_CERTIFICATE_RECEIVED)
             .set_credential_flags(msquic::CredentialFlags::USE_PORTABLE_CERTIFICATES);
