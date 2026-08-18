@@ -5,10 +5,10 @@ name: Android client
 # Apple ones, so without this the first thing to notice a broken Android build
 # is a person.
 #
-# One job for now. `bindings` needs only a host toolchain and proves the Kotlin
-# bindings still generate from the Rust interface — the check that replaces
-# having them committed. Building the app itself needs the cross-compile, and
-# the note at the bottom says what stands in the way of that.
+# Two jobs, split by what they need. `bindings` needs only a host toolchain and
+# proves the Kotlin bindings still generate from the Rust interface — the check
+# that replaces having them committed. `app` adds the NDK, cross-compiles the
+# core and assembles the APK, and is the slower half.
 
 on:
   push:
@@ -64,21 +64,41 @@ jobs:
           name: kotlin-bindings
           path: rust/target/kotlin-bindings/
 
-# The app itself is not built here yet, and the reason is one missing block in
-# the msquic submodule rather than anything in `android/`.
-#
-# `seera-msquic/scripts/build.rs` has an iOS branch that hands CMake the
-# ios-cmake toolchain file and a `PLATFORM`; there is no Android counterpart. So
-# for `aarch64-linux-android`, cmake-rs sets `CMAKE_SYSTEM_NAME=Android` — which
-# makes CMake's `ANDROID` true — while nothing sets `ANDROID_ABI`, and
-# `submodules/CMakeLists.txt:219` stops with "Unknown android abi type". No
-# amount of environment on this side reaches it: the value has to arrive as a
-# `-D`, which only that build script is in a position to pass.
-#
-# Adding the block (toolchain file + `ANDROID_ABI` + `ANDROID_PLATFORM`, the
-# same shape as the iOS one) is a change to the submodule and a bump here.
-# `app/build.gradle.kts`'s `generateJniLibs` is the invocation it will need, and
-# the local recipe this port was built with does exist — it is in a setup note
-# on the author's machine rather than in the repository.
-#
-# A job that cannot go green is worse than no job, so this waits.
+  app:
+    name: Build the app
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install the NDK
+        # Pinned rather than "latest": the API level the cross-compile rests on
+        # is a property of what bionic declares (`minSdk = 29`, and
+        # `ANDROID_PLATFORM=android-29` in seera-msquic's build script), so the
+        # NDK moving under it should be a change made on purpose.
+        run: sdkmanager --install "ndk;26.3.11579264"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Cross-compile the core
+        run: ./gradlew --no-daemon :app:generateJniLibs
+        working-directory: android
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
+      # Assembling runs `generateUniFfiBindings` on the way, so a Kotlin file
+      # that no longer matches the Rust interface fails here rather than on a
+      # phone.
+      - name: Assemble
+        run: ./gradlew --no-daemon assembleDebug
+        working-directory: android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IsekaiCameraClient-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
