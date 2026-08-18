@@ -55,6 +55,13 @@ val generateJniLibs by tasks.registering(Exec::class) {
     commandLine(
         "cargo", "ndk",
         "-t", "arm64-v8a",
+        // The same API level as `minSdk` above, and as the `ANDROID_PLATFORM`
+        // seera-msquic's build script passes to CMake. cargo-ndk defaults to
+        // 21, which puts `--target=aarch64-linux-android21` in the CFLAGS
+        // CMake inherits — and msquic's selfsign_openssl.c calls `glob()`,
+        // which bionic only declares from 28. The two halves of the same
+        // native build have to agree on this number.
+        "-p", "29",
         "-o", file("src/main/jniLibs").absolutePath,
         "build", "-p", "isekai-client-ffi",
     )
