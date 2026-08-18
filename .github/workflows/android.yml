@@ -87,11 +87,15 @@ jobs:
           targets: aarch64-linux-android
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
+      # No `env:` mapping for the NDK on purpose. The `env` context only holds
+      # what a workflow defines, so `${{ env.ANDROID_NDK_ROOT }}` is empty and
+      # sets ANDROID_NDK_HOME to nothing — which cargo-ndk reports as "Error
+      # detecting NDK version for path ". The runner exports ANDROID_NDK_ROOT
+      # into the process environment, where cargo-ndk and seera-msquic's build
+      # script both find it.
       - name: Cross-compile the core
         run: ./gradlew --no-daemon :app:generateJniLibs
         working-directory: android
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
       # Assembling runs `generateUniFfiBindings` on the way, so a Kotlin file
       # that no longer matches the Rust interface fails here rather than on a
       # phone.
