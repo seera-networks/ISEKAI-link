@@ -3,6 +3,63 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// ── The Rust core, and the bindings onto it ──────────────────────────────────
+//
+// Neither is committed. The bindings are generated from the Rust interface, so
+// a copy in the tree is a copy that goes stale — the interface changes, the
+// Kotlin does not, and nothing says so until an app that compiled fine fails at
+// runtime. iOS generates its Swift bindings from the built library for exactly
+// this reason (`.github/workflows/ios-ffi.yml`), and this is the same shape.
+
+/// Where `uniffi-bindgen` writes, and where Kotlin compilation reads from.
+val uniffiOutputDir = layout.buildDirectory.dir("generated/uniffi")
+
+/// The workspace root, two directories up from `android/app`.
+val rustDir = rootProject.file("../rust")
+
+/// Build the FFI crate **for the host** and generate the Kotlin bindings from
+/// the library it produces.
+///
+/// The host build is deliberate: `uniffi-bindgen` reads the interface out of
+/// any build of the crate, and the interface does not vary by target. Making
+/// this wait on the Android cross-compile would tie a Kotlin-only step to the
+/// NDK.
+val generateUniFfiBindings by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Generate the Kotlin bindings from isekai-client-ffi"
+    workingDir = rustDir
+    outputs.dir(uniffiOutputDir)
+    // Rebuild when the interface could have moved.
+    inputs.files(fileTree("$rustDir/isekai-client-ffi/src"))
+    commandLine(
+        "sh", "-c",
+        listOf(
+            "set -eu",
+            "cargo build -p isekai-client-ffi",
+            "LIB=${'$'}(ls target/debug/libisekai_client_ffi.so 2>/dev/null " +
+                "|| ls target/debug/libisekai_client_ffi.dylib)",
+            "./target/debug/uniffi-bindgen generate --library \"${'$'}LIB\" " +
+                "--language kotlin --out-dir \"${uniffiOutputDir.get().asFile}\"",
+        ).joinToString("\n"),
+    )
+}
+
+/// Cross-compile the FFI crate for the ABIs the app ships, into `jniLibs`.
+///
+/// Separate from the bindings on purpose: this one needs the NDK and
+/// `cargo-ndk`, and a developer who only wants the app to compile does not.
+val generateJniLibs by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Cross-compile isekai-client-ffi into app/src/main/jniLibs"
+    workingDir = rustDir
+    commandLine(
+        "cargo", "ndk",
+        "-t", "arm64-v8a",
+        "-o", file("src/main/jniLibs").absolutePath,
+        "build", "-p", "isekai-client-ffi",
+    )
+}
+
 android {
     namespace = "tools.isekai.cameraclient"
     compileSdk = 34
@@ -34,11 +91,23 @@ android {
         compose = true
     }
 
+    sourceSets {
+        getByName("main") {
+            kotlin.srcDir(uniffiOutputDir)
+        }
+    }
+
     composeOptions {
         // Paired with Kotlin 1.9.24 per the Compose-compiler/Kotlin
         // compatibility map.
         kotlinCompilerExtensionVersion = "1.5.14"
     }
+}
+
+// Kotlin cannot compile without the bindings, so generating them is not an
+// optional extra step somebody has to remember.
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    dependsOn(generateUniFfiBindings)
 }
 
 dependencies {
