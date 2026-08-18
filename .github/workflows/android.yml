@@ -76,12 +76,12 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
-      - name: Install the NDK
-        # Pinned rather than "latest": the API level the cross-compile rests on
-        # is a property of what bionic declares (`minSdk = 29`, and
-        # `ANDROID_PLATFORM=android-29` in seera-msquic's build script), so the
-        # NDK moving under it should be a change made on purpose.
-        run: sdkmanager --install "ndk;26.3.11579264"
+      # Deliberately not installing one: the runner ships an NDK and points
+      # ANDROID_NDK_ROOT at it, so adding a second leaves cargo-ndk compiling
+      # with one while quictls configures against the other -- which it says
+      # out loud and then fails obscurely. The API level the build rests on is
+      # `ANDROID_PLATFORM=android-29` in seera-msquic's build script, not the
+      # NDK version.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -91,7 +91,7 @@ jobs:
         run: ./gradlew --no-daemon :app:generateJniLibs
         working-directory: android
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
       # Assembling runs `generateUniFfiBindings` on the way, so a Kotlin file
       # that no longer matches the Rust interface fails here rather than on a
       # phone.
