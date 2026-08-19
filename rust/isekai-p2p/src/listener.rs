@@ -656,7 +656,7 @@ impl ListenerSession {
     /// as a backup rather than torn down, and the peer pings it every ten
     /// seconds, because the peer sets `PathKeepAliveIntervalMs` too — the timer
     /// runs off each connection's own settings, so both ends have their own
-    /// (`camera-core`'s `DIRECT_PATH_KEEPALIVE` on the viewer, and
+    /// (`peer::DIRECT_PATH_KEEPALIVE` on the viewer, and
     /// `isekai-link-utils`' `PATH_KEEP_ALIVE_INTERVAL_MS` for the listener this
     /// runs beside). A peer old enough not to negotiate multipath pings
     /// nothing, and needs to: it never left the relay, so the video is still

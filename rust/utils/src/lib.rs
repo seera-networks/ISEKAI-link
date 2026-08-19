@@ -81,7 +81,7 @@ pub fn make_msquic_async_client_config(
 
 /// How long a path may go without sending before it gets a PING.
 ///
-/// Matches the video client's `DIRECT_PATH_KEEPALIVE`, which documents why this
+/// Matches `isekai_p2p::peer::DIRECT_PATH_KEEPALIVE`, which documents why this
 /// is `PathKeepAliveIntervalMs` and not the connection keepalive next to it.
 const PATH_KEEP_ALIVE_INTERVAL_MS: u32 = 10_000;
 
