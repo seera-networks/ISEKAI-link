@@ -73,9 +73,17 @@ impl Dialed {
 /// wait properly, and the four ways to get this wrong are written up in
 /// `docs/portal_plan.md` §4.4.
 ///
+/// What must be gone first is every **tracked** handle: connections, their
+/// streams, and listeners.
+///
+/// **A `Configuration` is not one of them, and goes the other way round.**
+/// msquic-async leaves it untracked deliberately and says to drop it *after*
+/// `wait_idle` resolves (`submodules/msquic-async-rs/docs/registration-wait-idle-design.md`
+/// §7). Dropping it first is what [`Dialed`] exists to prevent — which is why
+/// this sentence is worth being exact about, thirty lines below that type.
+///
 /// Takes the registration by reference because the caller usually holds an
-/// `Arc`; what matters is that every *other* handle — connections, streams,
-/// listeners, configurations — is gone before this is called.
+/// `Arc`.
 pub async fn drain_registration(reg: &Registration, timeout: Duration) -> bool {
     reg.shutdown();
     let drained = tokio::time::timeout(timeout, reg.wait_idle()).await.is_ok();

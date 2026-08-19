@@ -8,7 +8,7 @@ edition = "2021"
 default = []
 # The loopback scaffolding in `spike.rs`, and the certificate generator it
 # needs. Phase 1 deletes both.
-spike = ["dep:rcgen"]
+spike = ["dep:rcgen", "dep:isekai-p2p"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -18,8 +18,12 @@ msquic-async = { workspace = true }
 # The listener and client configuration helpers. Phase 1 replaces this with the
 # connection layer extracted out of `camera-core` (plan §4.4).
 isekai-link-utils = { workspace = true }
-# The rules for holding a peer QUIC connection (`isekai_p2p::peer`).
-isekai-p2p = { workspace = true }
+# The rules for holding a peer QUIC connection (`isekai_p2p::peer`). Optional
+# for the same reason `rcgen` is: only `spike.rs` uses it, and a default build
+# should not compile the whole P2P and Identity tree for code it leaves out.
+# Phase 1c makes this a plain dependency, when the forwarding itself needs a
+# session.
+isekai-p2p = { workspace = true, optional = true }
 tokio-util = { workspace = true }
 # The spike's throwaway certificate. Goes with `spike.rs` in phase 1.
 rcgen = { workspace = true, optional = true }

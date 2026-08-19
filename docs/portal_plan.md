@@ -217,12 +217,20 @@ The extracted layer should own this: a session handle whose `Drop` releases
 everything, and one drain that takes it by value. Leaving it to each caller is
 leaving four ways to hang.
 
-**Phase 1a does the first half of that**: `isekai_p2p::peer::Dialed` pairs a
-connection with the configuration it may not outlive, and
-`drain_registration` moves there from `camera-core::shutdown` — where it never
-belonged, since nothing about it is a camera. Both are rules rather than
-helpers, which is why they went first: each is a way to hang a process that
-every consumer would otherwise rediscover, and phase 0 rediscovered both.
+**Phase 1a states two of the four rules; it does not yet own them.**
+`isekai_p2p::peer::Dialed` pairs a connection with the configuration it may not
+outlive — which settles the drop order between those two — and
+`drain_registration` moves there from `camera-core::shutdown`, where it never
+belonged since nothing about it is a camera. Both are rules rather than helpers,
+which is why they went first: each is a way to hang a process that every
+consumer would otherwise rediscover, and phase 0 rediscovered both.
+
+What is still on the caller, and so still four ways to get wrong: `Dialed` has
+no `Drop` of its own beyond field order, the drain still takes `&Registration`
+rather than ownership, and `portal-core`'s test still hand-rolls the dance —
+cancel, release, then wait. **That wants a session handle to hang it on, which
+is 1c.** Until then the rules are written down but not enforced, and the
+difference is worth not overstating.
 
 ### 4.5 Identity, and a protocol identifier
 

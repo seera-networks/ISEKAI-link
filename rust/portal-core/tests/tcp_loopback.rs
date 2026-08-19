@@ -218,9 +218,10 @@ async fn exchange(client: &mut TcpStream, message: &[u8; 5]) -> [u8; 5] {
 /// does. The `Arc` is cloned out first so there is still a registration to wait
 /// on afterwards.
 ///
-/// The wait itself is the two lines `camera_core::shutdown::drain_registration`
-/// is, inlined rather than depended on: it is not a camera thing, and phase 1
-/// moves it into the extracted connection layer.
+/// The wait itself is `isekai_p2p::peer::drain_registration`, which is where
+/// that rule lives now — it was never a camera thing. It issues a `shutdown()`
+/// of its own, which `Halves::drop` has already done; the second is harmless
+/// and saying so is cheaper than arranging for exactly one.
 async fn drain(halves: Halves) {
     let reg = Arc::clone(&halves.reg);
     drop(halves);

@@ -31,13 +31,12 @@ pub use listener::{
     AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,
     MAX_CONCURRENT_PEERS,
 };
-
-/// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.
+/// Holding a peer QUIC connection: the rules that are not about what it
+/// carries. See [`peer::Dialed`] and [`peer::drain_registration`].
 pub mod peer;
 
+/// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.
 pub mod agent {
-    /// Holding a peer QUIC connection safely — see [`crate::peer`].
-    pub use crate::peer::{drain_registration, Dialed};
     pub use isekai_p2p_core::attestation::{attest, verify, Attestation, AttestationError};
     pub use isekai_p2p_core::bind::RelayOptions;
     pub use isekai_p2p_core::endpoint::EndpointKey;
