@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use isekai_p2p::peer::Dialed;
+use isekai_p2p::peer::PeerSession;
 use msquic_async::{msquic, Connection, Listener, Registration};
 
 use crate::PORTAL_ALPN;
@@ -50,7 +50,7 @@ pub fn bind(
 /// Validation is off, which is the whole reason this is not the real
 /// transport: the certificate above is self-signed and nothing checks who is
 /// on the other end.
-pub async fn dial(reg: &Arc<Registration>, port: u16) -> anyhow::Result<Dialed> {
+pub async fn dial(reg: &Arc<Registration>, port: u16) -> anyhow::Result<PeerSession> {
     let alpn = [msquic::BufferRef::from(PORTAL_ALPN)];
     let config = reg.open_configuration(
         &alpn,
@@ -80,8 +80,10 @@ pub async fn dial(reg: &Arc<Registration>, port: u16) -> anyhow::Result<Dialed> 
     .await
     .context("the spike handshake did not complete within ten seconds")?
     .context("failed to open the spike connection")?;
-    // The pairing is `isekai_p2p::peer`'s rule now, not this file's: a
-    // configuration outlives what was started with it, and phase 0 found that
-    // out the hard way so the next consumer would not have to.
-    Ok(Dialed::new(conn, config))
+    // The ordering is `isekai_p2p::peer`'s rule, not this file's: a
+    // configuration outlives what was started with it, a registration outlives
+    // both, and phase 0 found that out the hard way so the next consumer would
+    // not have to. Handing back a session rather than a connection is also what
+    // gives the caller a drain that takes ownership.
+    Ok(PeerSession::new(conn, config, Arc::clone(reg)))
 }

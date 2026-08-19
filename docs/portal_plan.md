@@ -225,20 +225,22 @@ The extracted layer should own this: a session handle whose `Drop` releases
 everything, and one drain that takes it by value. Leaving it to each caller is
 leaving four ways to hang.
 
-**Phase 1a states two of the four rules; it does not yet own them.**
-`isekai_p2p::peer::Dialed` pairs a connection with the configuration it may not
-outlive — which settles the drop order between those two — and
-`drain_registration` moves there from `camera-core::shutdown`, where it never
-belonged since nothing about it is a camera. Both are rules rather than helpers,
-which is why they went first: each is a way to hang a process that every
-consumer would otherwise rediscover, and phase 0 rediscovered both.
+**Phase 1a stated two of the four rules; 1c-ii owns all four.** The layer's
+entry point is `isekai_p2p::peer::dial`, and what it returns is a `PeerSession`
+holding the connection, the configuration it may not outlive, and the
+registration both belong to — declared in that order, so dropping it releases
+them in msquic's. `PeerSession::drain` takes that by value, which is the third
+rule enforced rather than restated: releasing the connection is no longer
+something a caller can forget to do before waiting.
 
-What is still on the caller, and so still four ways to get wrong: `Dialed` has
-no `Drop` of its own beyond field order, the drain still takes `&Registration`
-rather than ownership, and `portal-core`'s test still hand-rolls the dance —
-cancel, release, then wait. **That wants a session handle to hang it on, which
-is 1c.** Until then the rules are written down but not enforced, and the
-difference is worth not overstating.
+`Dialed` was 1a's way of saying the first rule and is gone; a strict subset of
+`PeerSession` with no users of its own was a second way to hold the pieces, and
+one type that cannot be held wrong is the point.
+
+What stays with the caller is the fourth: which of *its* tasks are holding
+handles, and when to stop them. Only the caller knows. `portal-core`'s test
+cancels its token in `Drop` and then drains — one call where it used to clone
+the `Arc` out, drop the value, and wait on what was left.
 
 ### 4.5 Identity, and a protocol identifier
 
@@ -293,10 +295,10 @@ having before anyone asks.
 | phase | what | done when |
 | --- | --- | --- |
 | **0** | Spike: TCP only, one hard-coded service, no config, no UI. Proves the framing and the stream mapping | **done** — `portal-core`, loopback. Against a real proxy is phase 1, which is where the session comes from |
-| **1a** | The rules: `Dialed` and `drain_registration` into `isekai_p2p::peer`; `camera-core` and the spike onto them | **done** |
+| **1a** | The rules: `Dialed` and `drain_registration` into `isekai_p2p::peer`; `camera-core` and the spike onto them | **done** — `Dialed` superseded by `PeerSession` in 1c-ii |
 | **1b** | `video_client_config` → the layer, ALPN as a parameter | **done** — the settings and their reasoning moved verbatim; `camera-core` delegates |
 | **1c-i** | `AttestedPeer`, `Unpinnable` and `install_certificate_check` → the layer | **done** — `camera-core` re-exports the names its viewers and FFI import |
-| **1c-ii** | `dial_video` → the layer, with the rules from 1a enforced rather than stated: a session handle whose `Drop` releases everything, a drain that takes ownership, and the certificate check installed by the dial rather than by the caller. #141 is classified here | the camera apps still pass their tests and run on hardware |
+| **1c-ii** | `dial_video` → the layer, with the rules from 1a enforced rather than stated: a session handle whose `Drop` releases everything, a drain that takes ownership, and the certificate check installed by the dial rather than by the caller. #141 is classified here | **done** — `peer::dial` returns a `PeerSession`; #141 classified off the transport status. Not yet run on hardware |
 | **1c-iii** | delete `spike.rs`; portal on a real `InitiatorSession` | portal forwards over a proxy |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |

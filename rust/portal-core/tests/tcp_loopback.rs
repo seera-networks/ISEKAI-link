@@ -50,32 +50,45 @@ async fn shouting_service() -> std::net::SocketAddr {
     addr
 }
 
-/// **Field order is load-bearing, and `Drop` more so.**
+/// **`Drop` is load-bearing.** A failing assertion unwinds, so nothing written
+/// after it in the test body runs: the teardown has to be in `Drop` or it is not
+/// teardown, it is a happy path.
 ///
-/// Fields drop in declaration order, so the connection has to come before the
-/// registration or the last `Arc<Registration>` goes first and
-/// `RegistrationClose` blocks on the handle still open — forever, with no
-/// message. And a failing assertion unwinds, so nothing written after it in the
-/// test body runs: the teardown has to be in `Drop` or it is not teardown, it is
-/// a happy path.
+/// The *ordering* half of the trap is no longer this file's problem —
+/// [`isekai_p2p::peer::PeerSession`] holds the connection, its configuration and
+/// the registration in the order they have to be released, so there is no field
+/// order here to get wrong. What is left is what only this test knows: which
+/// tasks are holding handles, and when to stop them.
 ///
 /// This is the trap `camera-core/tests/video_loopback.rs` documents, met from
 /// the other side: there the danger is dropping a registration you made, here it
 /// is failing before you get to.
 struct Halves {
-    // Before `reg`, deliberately.
-    dialed: isekai_p2p::peer::Dialed,
+    /// `None` only after [`drain`] has taken it, which is the last thing that
+    /// happens to a `Halves`.
+    session: Option<isekai_p2p::peer::PeerSession>,
     shutdown: CancellationToken,
-    reg: Arc<Registration>,
+}
+
+impl Halves {
+    fn connection(&self) -> &msquic_async::Connection {
+        self.session
+            .as_ref()
+            .expect("the session is only taken by `drain`")
+            .connection()
+    }
 }
 
 impl Drop for Halves {
     fn drop(&mut self) {
         // Stops the accept loop and the serve task, which is what holds the
         // `Listener`; `shutdown()` then tells msquic to let its handles go so
-        // the close below has nothing to wait on. Neither blocks.
+        // the close has nothing to wait on. Neither blocks, which is the whole
+        // reason they are what `Drop` does and the waiting is not.
         self.shutdown.cancel();
-        self.reg.shutdown();
+        if let Some(session) = &self.session {
+            session.registration().shutdown();
+        }
     }
 }
 
@@ -102,13 +115,12 @@ async fn connected(catalogue: Catalogue) -> Halves {
         }
     });
 
-    let dialed = spike::dial(&reg, bound.port())
+    let session = spike::dial(&reg, bound.port())
         .await
         .expect("dial the portal");
     Halves {
-        dialed,
+        session: Some(session),
         shutdown,
-        reg,
     }
 }
 
@@ -118,7 +130,7 @@ async fn bytes_reach_the_service_and_come_back() {
     let halves = connected(Catalogue::new().with("db", target)).await;
 
     let local = client::forward(
-        halves.dialed.connection().clone(),
+        halves.connection().clone(),
         "127.0.0.1:0".parse().unwrap(),
         "db".to_owned(),
         halves.shutdown.clone(),
@@ -147,7 +159,7 @@ async fn a_service_that_is_not_offered_gets_no_connection() {
     let halves = connected(Catalogue::new().with("db", target)).await;
 
     let local = client::forward(
-        halves.dialed.connection().clone(),
+        halves.connection().clone(),
         "127.0.0.1:0".parse().unwrap(),
         "not-offered".to_owned(),
         halves.shutdown.clone(),
@@ -177,7 +189,6 @@ async fn a_service_that_is_not_offered_gets_no_connection() {
     // pointing at msquic rather than at the line that is still holding it.
     {
         let mut stream = halves
-            .dialed
             .connection()
             .open_outbound_stream(StreamType::Bidirectional, false)
             .await
@@ -213,19 +224,19 @@ async fn exchange(client: &mut TcpStream, message: &[u8; 5]) -> [u8; 5] {
 /// Release everything, then wait for msquic's handles to close.
 ///
 /// **Takes `Halves` by value**, because waiting while still holding the
-/// connection is waiting for something that cannot happen — `Drop` is what
-/// cancels the tasks and lets the handles go, and it cannot run until the value
-/// does. The `Arc` is cloned out first so there is still a registration to wait
-/// on afterwards.
+/// connection is waiting for something that cannot happen. That used to be
+/// spelled out here — clone the `Arc` out, drop the value, wait on what is
+/// left — and it is [`isekai_p2p::peer::PeerSession::drain`]'s job now: taking
+/// the session by value *is* releasing the connection, and the order it then
+/// waits in is msquic's rather than this file's guess at it.
 ///
-/// The wait itself is `isekai_p2p::peer::drain_registration`, which is where
-/// that rule lives now — it was never a camera thing. It issues a `shutdown()`
-/// of its own, which `Halves::drop` has already done; the second is harmless
-/// and saying so is cheaper than arranging for exactly one.
-async fn drain(halves: Halves) {
-    let reg = Arc::clone(&halves.reg);
+/// The cancel stays, because only this test knows which tasks are holding
+/// handles. `Halves::drop` does it too, on the path where an assertion failed
+/// and this was never reached.
+async fn drain(mut halves: Halves) {
+    halves.shutdown.cancel();
+    let session = halves.session.take().expect("drained once");
     drop(halves);
-    // The same rule `camera-core` follows, from the place that now states it.
-    let drained = isekai_p2p::peer::drain_registration(&reg, Duration::from_secs(5)).await;
+    let drained = session.drain(Duration::from_secs(5)).await;
     assert!(drained, "the registration still had live handles after 5s");
 }

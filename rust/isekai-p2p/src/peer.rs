@@ -1,39 +1,46 @@
 //! The parts of holding a peer QUIC connection that are not about what it
 //! carries.
 //!
-//! **Slice 1 of `docs/portal_plan.md` §4.4.** `camera-core::video` is ~1,700
-//! lines of which the MJPEG is the small part; the rest — dialling across the
-//! peer's bind gap, the certificate callback, keepalives, the registration
-//! lifecycle — is peer-QUIC plumbing that a second consumer would otherwise
-//! fork. What is here is the subset with no camera types in it and no
-//! load-bearing prose to move:
+//! **`docs/portal_plan.md` §4.4.** `camera-core::video` is ~1,700 lines of
+//! which the MJPEG is the small part; the rest — dialling across the peer's
+//! bind gap, the certificate callback, keepalives, the registration lifecycle —
+//! is peer-QUIC plumbing that a second consumer would otherwise fork, and every
+//! fix this year with it.
 //!
-//! * [`Dialed`], the rule that a `Configuration` outlives its `Connection`
+//! The entry point is [`dial`]: one call that opens a configuration, dials
+//! across the peer's relay-bind gap, refuses a certificate that is for the
+//! wrong name or is not the key the peer signed for, and hands back a
+//! [`PeerSession`] that owns everything msquic needs kept alive.
+//!
+//! Under it are the rules, which came first (1a) because each is a way to hang
+//! a process that every consumer would otherwise rediscover — phase 0
+//! rediscovered two of them inside a week:
+//!
+//! * [`PeerSession`], the rule that a `Configuration` outlives its
+//!   `Connection` and a registration outlives both
 //! * [`drain_registration`], the rule that a registration is emptied before it
-//!   is dropped
+//!   is dropped, and [`PeerSession::drain`], which owns that rule rather than
+//!   restating it
+//! * [`client_config`] (1b) and the constants it reads, chosen for a connection
+//!   that rides a MASQUE relay leg and may migrate off it
+//! * [`AttestedPeer`] and [`install_certificate_check`] (1c-i) — what settles
+//!   whether the connection is to the Endpoint the proxy named, and the
+//!   callback that enforces that and the hostname
 //!
-//! Both are *rules* rather than helpers, which is why they came first: each one
-//! is a way to hang a process that every consumer would otherwise have to
-//! rediscover, and phase 0 rediscovered both.
-//!
-//! What is deliberately still in `camera-core`, and why:
-//!
-//! Phase 1b added [`client_config`] and the constants it reads. Phase 1c adds
-//! [`AttestedPeer`] and [`install_certificate_check`] — what settles whether the
-//! connection is to the Endpoint the proxy named, and the callback that enforces
-//! both that and the hostname.
-//!
-//! What is still in `camera-core`: `dial_video`, which is where the callback is
-//! installed and where a refusal is told apart from a retry. **Until that moves,
-//! installing the check is still the caller's job** — see
-//! [`ClientOptions::verify`].
+//! What stays in `camera-core` is what the connection carries: MJPEG frames,
+//! the path-event loop, the video listener.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use isekai_p2p_core::attestation::Attestation;
 use isekai_p2p_core::proxy::PeerConnection;
 use time::OffsetDateTime;
+use tokio::time::{sleep, Instant};
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::ObservedAddress;
 
 /// How long a video connection may carry nothing before it is closed.
 ///
@@ -68,41 +75,7 @@ pub const CONNECTION_KEEPALIVE: Duration = Duration::from_secs(10);
 /// carrying traffic on its own never gets a redundant PING.
 pub const DIRECT_PATH_KEEPALIVE: Duration = Duration::from_secs(10);
 
-use msquic_async::{msquic, Connection, Registration};
-
-/// A connection and the configuration it may not outlive.
-///
-/// **msquic shuts a connection down when the `Configuration` it was started
-/// with is dropped.** The symptom is not a message about configurations: it is
-/// `connection shutdown by local` arriving milliseconds after a handshake that
-/// plainly succeeded, and then a `RegistrationClose` that blocks forever on the
-/// handle left behind.
-///
-/// A function that keeps both as locals never meets this, which is why
-/// `camera-core` never did. Anything that *returns* a connection has to return
-/// this instead — the type is here so the next one does not find out the way
-/// the portal spike did.
-pub struct Dialed {
-    connection: Connection,
-    // Ordered after `connection` deliberately: fields drop in declaration
-    // order, and the configuration has to outlive what was started with it.
-    _config: msquic::Configuration,
-}
-
-impl Dialed {
-    /// Pair a connection with the configuration it was started with.
-    pub fn new(connection: Connection, config: msquic::Configuration) -> Self {
-        Self {
-            connection,
-            _config: config,
-        }
-    }
-
-    /// The connection. Cloning it is fine; outliving this value is not.
-    pub fn connection(&self) -> &Connection {
-        &self.connection
-    }
-}
+use msquic_async::{msquic, Connection, ConnectionError, ConnectionStartError, Registration};
 
 /// Shut a registration down and wait for its handles, returning whether they
 /// went.
@@ -120,8 +93,9 @@ impl Dialed {
 /// **A `Configuration` is not one of them, and goes the other way round.**
 /// msquic-async leaves it untracked deliberately and says to drop it *after*
 /// `wait_idle` resolves (`submodules/msquic-async-rs/docs/registration-wait-idle-design.md`
-/// §7). Dropping it first is what [`Dialed`] exists to prevent — which is why
-/// this sentence is worth being exact about, thirty lines below that type.
+/// §7). Dropping it first is what [`PeerSession`]'s field order exists to
+/// prevent, and what [`PeerSession::drain`] orders around this call — which is
+/// why this sentence is worth being exact about.
 ///
 /// Takes the registration by reference because the caller usually holds an
 /// `Arc`.
@@ -147,11 +121,12 @@ pub struct ClientOptions<'a> {
     /// verifies with a bare `X509_verify_cert` and never sets
     /// `X509_VERIFY_PARAM_set1_host`, so a chain-valid certificate issued for
     /// *any* name is accepted. That is #134, and what closes it is
-    /// [`install_certificate_check`], in this module since 1c-i.
+    /// [`install_certificate_check`].
     ///
-    /// **Installing it is still the caller's job** until 1c-ii moves the dial
-    /// here. A caller that sets this and installs nothing has #134 back;
-    /// `camera-core` installs it.
+    /// **[`dial`] installs it; this is the low-level way in.** A caller that
+    /// builds its own configuration, sets this, and installs nothing has #134
+    /// back — which is why [`DialOptions::verify`] means both and this one does
+    /// not.
     pub verify: bool,
     /// Offer a direct path and let the connection use it.
     pub enable_migration: bool,
@@ -460,8 +435,9 @@ impl AttestedPeer {
 /// to set both. This is a precondition rather than an assertion because the
 /// flags live on the `Configuration` and this is handed a `Connection`.
 ///
-/// 1c-ii removes the question by having the dial install this, so no caller
-/// holds the two halves apart.
+/// [`dial`] settles this by deciding both from the same [`DialOptions`], a line
+/// apart, so no caller holds the two halves. This is public for anything that
+/// builds its own configuration, and then the precondition is its own.
 pub fn install_certificate_check(
     conn: &Connection,
     // The host to hold the certificate against, or `None` when validation is
@@ -542,9 +518,549 @@ pub fn install_certificate_check(
     });
 }
 
+// ── Dialling, and what the dial hands back ───────────────────────────────────
+//
+// Moved from `camera-core::video::dial_video` (plan §4.4, phase 1c-ii). This is
+// where §4.4's four ways to hang stop being written down and start being
+// enforced: what the dial returns owns everything msquic needs kept alive, in
+// the order it needs releasing, and the drain takes that by value.
+
+/// How long to keep retrying the handshake before giving up.
+///
+/// This spans an entirely manual gap: the initiator opens its relay leg, and the
+/// peer can only bind *its* leg once a human has carried the connection id
+/// across — reading it off a phone, typing it into the camera server, starting
+/// the camera, pressing bind. Two minutes looked generous and was not: every
+/// field failure we chased for a day ended at exactly this deadline, with the
+/// relay leg still healthy and the operator still typing.
+///
+/// So it is set to a span no operator will lose a race against. Waiting costs
+/// nothing here — the connection retransmits an Initial every few seconds — and
+/// the caller can stop it at any time by cancelling `shutdown`, which is what
+/// the disconnect button does.
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(900);
+/// Delay between handshake attempts.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// How often to report what the handshake is doing while it is still
+/// unanswered.
+const HANDSHAKE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A dialled peer connection, and the two handles it may not outlive.
+///
+/// **msquic shuts a connection down when the `Configuration` it was started
+/// with is dropped.** The symptom is not a message about configurations: it is
+/// `connection shutdown by local` arriving milliseconds after a handshake that
+/// plainly succeeded, and then a `RegistrationClose` that blocks forever on the
+/// handle left behind. A function that keeps both as locals never meets this,
+/// which is why `camera-core` never did; anything that *returns* a connection
+/// does, which is how the portal spike found out.
+///
+/// So this returns instead of a `Connection`, and **dropping it releases all
+/// three in msquic's order**: fields drop in declaration order, so the
+/// connection goes first, then the configuration, then this reference to the
+/// registration. The connection releases its own reference to the configuration
+/// as it closes, so by the time the configuration's own drop runs there is
+/// nothing left holding it. ([`drain`](Self::drain) puts the configuration after
+/// `wait_idle` instead; that rule is about ordering against a wait, and this
+/// path does not wait.)
+///
+/// There is deliberately no `impl Drop`. Field order is what releases, and a
+/// `Drop` impl would forbid [`drain`](Self::drain) from taking the three apart —
+/// which it has to, because the one thing `Drop` cannot do is wait.
+///
+/// **So `Drop` releases; it does not wait.** If something else still holds a
+/// *clone* of the connection — a spawned reader, a stream — the handle it holds
+/// is still tracked, and dropping the last `Registration` reference then blocks
+/// in `RegistrationClose` forever. Stop those first and call
+/// [`drain`](Self::drain); a caller that keeps its own `Arc<Registration>`, as
+/// the camera apps do, never reaches that drop here at all.
+pub struct PeerSession {
+    connection: Connection,
+    // Ordered after `connection` deliberately: fields drop in declaration
+    // order, and the configuration has to outlive what was started with it.
+    _config: msquic::Configuration,
+    registration: Arc<Registration>,
+}
+
+impl PeerSession {
+    /// Pair a connection with the configuration it was started with and the
+    /// registration both belong to.
+    ///
+    /// [`dial`] is the usual way to get one. This is for anything that has to
+    /// build its own connection — and the ordering rule above applies to it
+    /// just the same, which is why there is no way to hand back the connection
+    /// on its own.
+    pub fn new(
+        connection: Connection,
+        config: msquic::Configuration,
+        registration: Arc<Registration>,
+    ) -> Self {
+        Self {
+            connection,
+            _config: config,
+            registration,
+        }
+    }
+
+    /// The connection. Cloning it is fine; outliving this value is not.
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// The registration this connection was opened on, for anything that has
+    /// to share it — msquic looks bindings up per registration, so a direct
+    /// path between two connections needs them on the same one.
+    pub fn registration(&self) -> &Arc<Registration> {
+        &self.registration
+    }
+
+    /// Release everything and wait for msquic to be finished with it.
+    ///
+    /// **Takes `self` by value because that is the mechanism, not a
+    /// convenience.** `wait_idle` resolves once every tracked handle is gone,
+    /// so a caller that waits while still holding the connection is waiting for
+    /// something that cannot happen — one of the four ways to hang in §4.4, and
+    /// the one that reads as a test binary that simply never exits.
+    ///
+    /// Ownership of *this* handle is not ownership of every clone taken off it.
+    /// Anything holding one has to be stopped first.
+    ///
+    /// The order below is msquic's: the connection releases its own reference
+    /// to the configuration when it closes, and the configuration is dropped
+    /// after `wait_idle` rather than before —
+    /// `submodules/msquic-async-rs/docs/registration-wait-idle-design.md` §7,
+    /// which is also why [`drain_registration`] does not touch it.
+    ///
+    /// `false` if the timeout ran out with handles still live, which is a leak
+    /// worth logging rather than a reason to keep waiting.
+    pub async fn drain(self, timeout: Duration) -> bool {
+        let Self {
+            connection,
+            _config: config,
+            registration,
+        } = self;
+        drop(connection);
+        let drained = drain_registration(&registration, timeout).await;
+        drop(config);
+        drained
+    }
+}
+
+/// What [`dial`] needs to reach a peer.
+pub struct DialOptions<'a> {
+    /// The protocol this connection speaks — see [`ClientOptions::alpn`].
+    pub alpn: &'a str,
+    /// The name to dial, which is also the name the certificate has to be for.
+    ///
+    /// A *name*, never an address to resolve; [`dial`] says why at length.
+    pub host: &'a str,
+    /// The loopback port the relay bridge is listening on.
+    pub port: u16,
+    /// Validate the peer's certificate chain, and hold it against `host`.
+    ///
+    /// Unlike [`ClientOptions::verify`], this covers both: [`dial`] installs
+    /// the name check itself, so there is no second thing to remember.
+    pub verify: bool,
+    /// What the peer signed for about its own key, where it published
+    /// anything. `None` leaves the connection on name validation alone, which
+    /// is the ordinary case while this is being adopted.
+    pub pin: Option<AttestedPeer>,
+    /// How the proxy sees this session's relay leg. `Some` offers it as a
+    /// direct-path candidate and turns migration on.
+    pub candidate: Option<ObservedAddress>,
+}
+
+/// Dial a peer, letting a single handshake ride across its relay-bind gap;
+/// retry only as a fallback, until the deadline or `shutdown`.
+///
+/// Over the P2P relay the initiator opens its own leg first and only then does
+/// the peer bind *its* leg — it needs the connection id out of band (e.g. a
+/// human pasting it into the camera server). Until both legs are bridged, the
+/// handshake's packets reach a half-open relay edge and go unanswered. A
+/// completed handshake is itself the readiness signal (both legs are up), and
+/// there is nothing on the control plane to poll — the loopback relay
+/// rendezvous injects no reachable candidate.
+///
+/// The key is to keep **one** connection retransmitting its Initial for the
+/// whole gap (a long `HandshakeIdleTimeoutMs`) rather than firing many
+/// short-lived attempts. Local relay testing showed rapid short attempts
+/// (a few seconds each) leave the relay path wedged so it never recovers even
+/// after the bind lands, whereas a single persistent handshake completes as
+/// soon as the far leg comes up. The retry loop below is therefore a
+/// last-resort fallback for a genuinely failed handshake, not the mechanism
+/// that bridges the gap.
+///
+/// `host` is a *name*, never an address to look up. Every caller dials the relay
+/// bridge on loopback, and the name is the per-endpoint FQDN the listener's relay
+/// certificate is issued for — it exists so the certificate can be validated, and
+/// its only DNS record points back at `127.0.0.1`. Pinning the remote address
+/// below says that outright, and keeps msquic from resolving the name: msquic
+/// resolves with a blocking `getaddrinfo` on the connection's worker thread, and
+/// that worker also drives the relay leg, so a slow resolver takes the leg down
+/// with it. A loopback-only name is exactly what mobile resolvers are slowest
+/// about — DNS64 will not synthesise an AAAA for `127.0.0.0/8`, and resolvers
+/// with rebinding protection refuse to return it at all — which is why this
+/// showed up on iOS long before it would have anywhere else.
+///
+/// # The configuration is built here on purpose
+///
+/// [`install_certificate_check`] is only sound on a credential carrying
+/// `USE_PORTABLE_CERTIFICATES`, and until 1c-ii the two halves sat in
+/// different crates: whoever built the configuration had to remember what
+/// whoever installed the callback needed. Building the configuration inside
+/// the dial retires the question — the flags and the callback are decided
+/// from the same [`DialOptions`], a line apart.
+///
+/// # What comes back
+///
+/// A [`PeerSession`]: the connection, the configuration it may not outlive,
+/// and the registration both belong to. Returning a bare `Connection` is what
+/// phase 0 did, and it hung.
+pub async fn dial(
+    reg: Option<Arc<Registration>>,
+    opts: DialOptions<'_>,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<PeerSession> {
+    let DialOptions {
+        alpn,
+        host,
+        port,
+        verify,
+        pin,
+        candidate,
+    } = opts;
+    // Both flags are read off the same options the loop below reads, rather
+    // than passed in beside them: a caller that asked to pin and got a
+    // configuration built without `USE_PORTABLE_CERTIFICATES` would not fail a
+    // check, it would read an `X509*` as a buffer.
+    let (reg, config) = client_config(
+        reg,
+        ClientOptions {
+            alpn,
+            verify,
+            enable_migration: candidate.is_some(),
+            pinning: pin.is_some(),
+        },
+    )?;
+    let deadline = Instant::now() + CONNECT_DEADLINE;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let conn = Connection::new(&reg)?;
+        // Every attempt builds a fresh connection, so the setup below has to be
+        // redone on each one.
+        conn.set_remote_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .map_err(|e| anyhow::anyhow!("could not pin the relay bridge address: {e}"))?;
+        if let Some(candidate) = candidate {
+            prepare_for_migration(&conn, candidate)?;
+        }
+        // One slot per attempt: a verdict from a connection that has been
+        // dropped says nothing about this one.
+        let refused: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        // The name is checked when this connection validates; the pin is
+        // checked whenever the peer published one, insecure switch included.
+        let check_name = verify && std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_none();
+        if check_name || pin.is_some() {
+            install_certificate_check(
+                &conn,
+                check_name.then(|| host.to_owned()),
+                pin.clone(),
+                Arc::clone(&refused),
+            );
+        }
+        // The handshake can stay unanswered for a long time by design, and until
+        // it is answered there is nothing else to go on. Report what it is doing
+        // while it waits: whether our packets are still leaving tells a peer
+        // that has not bound its leg apart from a path that has stopped
+        // carrying anything, and those want opposite fixes.
+        let start = conn.start(&config, host, port);
+        tokio::pin!(start);
+        let mut probe = tokio::time::interval(HANDSHAKE_PROBE_INTERVAL);
+        probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Carried out of the loop because the failure below has to describe a
+        // connection it has already had to drop.
+        let mut last: Option<(u64, u64)> = None;
+        let result = loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing the peer"),
+                r = &mut start => break r,
+                _ = probe.tick() => match conn.get_stats() {
+                    Ok(stats) => {
+                        last = Some((stats.Send.TotalPackets, stats.Recv.TotalPackets));
+                        log_connection_stats(&conn, &stats, "handshake");
+                    }
+                    Err(e) => tracing::debug!("could not read handshake stats: {e}"),
+                },
+            }
+        };
+        // Checked before the retry decision, because it is the one failure that
+        // retrying cannot help: the peer signed for a key, and this certificate
+        // is not it. Trying again produces the same answer, ~1,700 times, and
+        // the error finally reported would be the relay-leg timeout — which is
+        // what "the operator has not pasted the connection id yet" looks like.
+        // The two want opposite responses.
+        if let Some(reason) = refused.lock().expect("pin verdict lock poisoned").take() {
+            // Deliberately not naming the attestation: the same slot carries a
+            // name mismatch, and pointing an operator at a statement the peer
+            // never published sends them to the wrong problem.
+            anyhow::bail!("the peer's certificate was refused, so this is not the peer it claims to be: {reason}");
+        }
+        match result {
+            Ok(()) => return Ok(PeerSession::new(conn, config, reg)),
+            Err(e) => {
+                let observed = conn
+                    .get_stats()
+                    .ok()
+                    .map(|s| (s.Send.TotalPackets, s.Recv.TotalPackets))
+                    .or(last);
+                drop(conn);
+                // The other answer retrying cannot help, and the one #141 was
+                // filed for. The slot above only carries verdicts *our*
+                // callback reached; a chain msquic itself rejects never runs
+                // it, so an untrusted or expired certificate looked exactly
+                // like a peer that has not bound its leg and was asked again
+                // 1,766 times before the deadline reported a timeout.
+                if let Some(code) = permanent_verdict(&e) {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "the transport refused the handshake to {host}:{port} with \
+                         {code}, which is its answer on every attempt"
+                    )));
+                }
+                if Instant::now() >= deadline {
+                    // Say what was seen, not what it might mean. The old wording
+                    // asserted the peer had not bound its leg, and a day went
+                    // into chasing that assertion while it was wrong; the packet
+                    // counts distinguish the cases without guessing. Nothing
+                    // received at all is the peer never answering — a leg not
+                    // bridged yet, or an operator who has not finished carrying
+                    // the connection id across.
+                    let seen = match observed {
+                        Some((sent, received)) => {
+                            format!("{sent} packets sent, {received} received")
+                        }
+                        None => "no packet counts available".to_owned(),
+                    };
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "QUIC handshake to {host}:{port} did not complete within \
+                         {CONNECT_DEADLINE:?} ({attempt} attempts, {seen})"
+                    )));
+                }
+                // Debug, not Display: the transport status is what names the
+                // cause — an untrusted certificate and an unanswered handshake
+                // both read as "connection lost" otherwise.
+                tracing::debug!("handshake attempt {attempt} failed: {e:?}");
+                tokio::select! {
+                    _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing the peer"),
+                    _ = sleep(CONNECT_RETRY_DELAY) => {}
+                }
+            }
+        }
+    }
+}
+
+/// The transport's own verdict on a failed handshake, when that verdict will
+/// read the same on every attempt.
+///
+/// **This is #141.** The `refused` slot [`install_certificate_check`] writes
+/// into only ever carries verdicts *our* callback reached. A chain msquic
+/// itself rejects never runs it — an untrusted root, an expired certificate, a
+/// name schannel or SecTrust throws out — so nothing was recorded, and the dial
+/// treated the one permanent answer there is exactly like the most ordinary
+/// transient one: a peer that has not bridged its relay leg. A CI run spent
+/// fifteen minutes and 1,767 attempts on a status that was in the first one.
+///
+/// **The list is only the certificate statuses, and deliberately so.** #141
+/// asks whether anything else the transport reports is being retried when it
+/// cannot succeed, and the two candidates are ALPN and version negotiation —
+/// both of which are answers rather than silence. They are left retryable
+/// because the asymmetry is not close: a status wrongly called permanent is a
+/// viewer that fails where it used to work, while one wrongly called transient
+/// is the behaviour we have today. A certificate verdict is safe to call
+/// because nothing that happens inside this deadline changes it; what the
+/// half-open relay edge answers with before both legs are bridged has not been
+/// characterised well enough to say the same.
+fn permanent_verdict(e: &ConnectionStartError) -> Option<msquic::StatusCode> {
+    let status = match e {
+        ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByTransport(status, _)) => {
+            status
+        }
+        ConnectionStartError::OtherError(status) => status,
+        // `ShutdownByLocal` is our own cancellation, `ShutdownByPeer` is an
+        // application error code from a peer that completed a handshake, and
+        // the rest are states rather than verdicts. None of them says the next
+        // attempt reads the same.
+        _ => return None,
+    };
+    let code = status.try_as_status_code().ok()?;
+    is_permanent(&code).then_some(code)
+}
+
+/// Whether a status is a certificate the far end will present again.
+fn is_permanent(code: &msquic::StatusCode) -> bool {
+    use msquic::StatusCode::*;
+    matches!(
+        code,
+        // What the TLS stack made of the certificate itself.
+        QUIC_STATUS_BAD_CERTIFICATE
+            | QUIC_STATUS_UNSUPPORTED_CERTIFICATE
+            | QUIC_STATUS_REVOKED_CERTIFICATE
+            | QUIC_STATUS_EXPIRED_CERTIFICATE
+            | QUIC_STATUS_UNKNOWN_CERTIFICATE
+            | QUIC_STATUS_CERT_EXPIRED
+            | QUIC_STATUS_CERT_UNTRUSTED_ROOT
+            // The two "there wasn't one": a peer that presented nothing where
+            // one was required. Renewing a certificate is not something that
+            // happens inside this deadline either.
+            | QUIC_STATUS_REQUIRED_CERTIFICATE
+            | QUIC_STATUS_CERT_NO_CERT
+    )
+}
+
+/// Put the connection on a shared, unconnected socket and offer the relay
+/// leg's address as a direct-path candidate. Must run before `start`.
+///
+/// The order is fixed: `set_unconnected_socket` requires a shared binding, and
+/// an unconnected socket requires a specific — non-wildcard — local address.
+/// That address is deliberately **loopback**: this connection's own traffic
+/// goes to the relay bridge on `127.0.0.1`, and pinning it to a real interface
+/// address instead cannot work on Windows at all. The direct path does not need
+/// it, because `add_candidate_addr` accepts an address that is not bound here
+/// yet — msquic opens the path from the relay leg's binding once the peer's
+/// ADD_ADDRESS arrives (`docs/p2p_mode_migration_plan.md` §2.2.3).
+fn prepare_for_migration(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
+    // All three are required for a direct path to be validated at all — without
+    // them msquic never raises `PathValidated`, whatever candidate is offered.
+    conn.set_share_binding(true)
+        .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
+    conn.set_unconnected_socket(true)
+        .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
+    conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
+    conn.add_candidate_addr(candidate.local, candidate.observed)
+        .map_err(|e| anyhow::anyhow!("could not offer a direct-path candidate: {e}"))?;
+    // Also offer the host address itself. A peer on the same LAN can reach it
+    // directly, while the observed one is only reachable from outside the NAT —
+    // and a NAT that does not hairpin (most of them) drops a packet sent from
+    // inside to its own public address, so without this two peers behind the
+    // same NAT can never find each other. Across the internet this candidate
+    // simply fails to validate and the observed one wins.
+    if candidate.local != candidate.observed {
+        if let Err(e) = conn.add_candidate_addr(candidate.local, candidate.local) {
+            tracing::debug!("could not offer the host candidate: {e}");
+        }
+    }
+    tracing::info!(
+        local = %candidate.local,
+        observed = %candidate.observed,
+        "offered direct-path candidates to the peer",
+    );
+    Ok(())
+}
+
+/// Log what the connection is actually doing, which is the difference between
+/// "the migration stalled" and "the migration broke the connection".
+///
+/// `Send.PathMtu` is worth watching when a path has just been opened, since it
+/// has to size itself.
+///
+/// For loss, `send_lost` alone says very little: it counts packets the loss
+/// detector *declared* lost, and `send_spurious_lost` is how many of those
+/// turned out to have arrived after all. A high first number with a high second
+/// is an over-eager loss detector, not a lossy path, and the two want opposite
+/// fixes. `send_congestion` and the byte counters give the other half — whether
+/// the congestion controller is actually backing off, and what throughput that
+/// leaves.
+pub fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATISTICS, when: &str) {
+    tracing::debug!(
+        when,
+        local = ?conn.get_local_addr().ok(),
+        remote = ?conn.get_remote_addr().ok(),
+        rtt_us = stats.Rtt,
+        send_path_mtu = stats.Send.PathMtu,
+        send_packets = stats.Send.TotalPackets,
+        send_lost = stats.Send.SuspectedLostPackets,
+        send_spurious_lost = stats.Send.SpuriousLostPackets,
+        send_congestion = stats.Send.CongestionCount,
+        send_persistent_congestion = stats.Send.PersistentCongestionCount,
+        send_bytes = stats.Send.TotalBytes,
+        recv_packets = stats.Recv.TotalPackets,
+        recv_dropped = stats.Recv.DroppedPackets,
+        recv_bytes = stats.Recv.TotalBytes,
+        "peer connection stats",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use msquic::StatusCode;
+
+    fn lost(code: StatusCode) -> ConnectionStartError {
+        ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByTransport(
+            msquic::Status::new(code),
+            0,
+        ))
+    }
+
+    /// Every verdict the TLS stack can reach about the certificate itself ends
+    /// the dial. Our own callback never sees these — msquic rejects the chain
+    /// before it runs — so without this they are retried for the full fifteen
+    /// minutes and then reported as a handshake that went unanswered (#141).
+    #[test]
+    fn a_certificate_the_transport_rejects_is_not_retried() {
+        for code in [
+            StatusCode::QUIC_STATUS_BAD_CERTIFICATE,
+            StatusCode::QUIC_STATUS_UNSUPPORTED_CERTIFICATE,
+            StatusCode::QUIC_STATUS_REVOKED_CERTIFICATE,
+            StatusCode::QUIC_STATUS_EXPIRED_CERTIFICATE,
+            StatusCode::QUIC_STATUS_UNKNOWN_CERTIFICATE,
+            StatusCode::QUIC_STATUS_REQUIRED_CERTIFICATE,
+            StatusCode::QUIC_STATUS_CERT_EXPIRED,
+            StatusCode::QUIC_STATUS_CERT_UNTRUSTED_ROOT,
+            StatusCode::QUIC_STATUS_CERT_NO_CERT,
+        ] {
+            assert_eq!(
+                permanent_verdict(&lost(code.clone())),
+                Some(code.clone()),
+                "{code:?} is the same answer on every attempt",
+            );
+            // Reported the same way whether msquic gave it synchronously or as
+            // a shutdown, since `start` can fail either way.
+            assert_eq!(
+                permanent_verdict(&ConnectionStartError::OtherError(msquic::Status::new(
+                    code.clone()
+                ))),
+                Some(code.clone()),
+                "{code:?} however it arrives",
+            );
+        }
+    }
+
+    /// And the failure the fifteen minutes exist for stays retryable. The peer
+    /// binds its relay leg only once an operator has carried the connection id
+    /// across, so until then nothing answers — calling any of this permanent
+    /// would fail every P2P connection that waits on a human.
+    #[test]
+    fn an_unanswered_handshake_is_still_retried() {
+        for e in [
+            lost(StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT),
+            lost(StatusCode::QUIC_STATUS_CONNECTION_IDLE),
+            lost(StatusCode::QUIC_STATUS_CONNECTION_REFUSED),
+            lost(StatusCode::QUIC_STATUS_UNREACHABLE),
+            // Considered and deliberately left retryable: what the half-open
+            // relay edge answers with before both legs are bridged is not
+            // characterised well enough to call an answer.
+            lost(StatusCode::QUIC_STATUS_ALPN_NEG_FAILURE),
+            lost(StatusCode::QUIC_STATUS_VER_NEG_ERROR),
+            // Our own cancellation, and a peer that got far enough to send an
+            // application error code. Neither is a verdict on a certificate.
+            ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByLocal),
+            ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByPeer(0)),
+        ] {
+            assert_eq!(permanent_verdict(&e), None, "{e:?}");
+        }
+    }
 
     /// The three ways there is nothing to pin are told apart, because only one
     /// of them is ordinary and the other two are the proxy answering strangely.

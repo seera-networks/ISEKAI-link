@@ -5,21 +5,21 @@
 
 use std::collections::BTreeMap;
 use std::future::poll_fn;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Bytes;
-use msquic_async::{msquic, Connection, ConnectionEvent, Listener, Registration, StreamType};
+use msquic_async::{Connection, ConnectionEvent, Listener, Registration, StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use isekai_p2p::agent::{ObservedAddress, ObservedAddressWatch};
-use isekai_p2p::peer::install_certificate_check;
+use isekai_p2p::peer::log_connection_stats;
 // Re-exported under the names the viewers and the FFI already import.
 pub use isekai_p2p::peer::{AttestedPeer, Unpinnable};
 use isekai_p2p::LegDirectory;
@@ -28,27 +28,8 @@ use crate::tls::{dev_cert, VideoCert};
 
 /// ALPN for the camera video protocol.
 pub const VIDEO_ALPN: &str = "sample";
-
-/// How long to keep retrying the video handshake before giving up.
-///
-/// This spans an entirely manual gap: the initiator opens its relay leg, and the
-/// peer can only bind *its* leg once a human has carried the connection id
-/// across — reading it off a phone, typing it into the camera server, starting
-/// the camera, pressing bind. Two minutes looked generous and was not: every
-/// field failure we chased for a day ended at exactly this deadline, with the
-/// relay leg still healthy and the operator still typing.
-///
-/// So it is set to a span no operator will lose a race against. Waiting costs
-/// nothing here — the connection retransmits an Initial every few seconds — and
-/// the caller can stop it at any time by cancelling `shutdown`, which is what
-/// the disconnect button does.
-const VIDEO_CONNECT_DEADLINE: Duration = Duration::from_secs(900);
-/// Delay between video handshake attempts.
-const VIDEO_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-/// How often to report what the handshake is doing while it is still unanswered.
-const HANDSHAKE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the heartbeat ticks. See [`spawn_heartbeat`].
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long to wait for the relay leg's observed address before dialing without
@@ -672,19 +653,23 @@ pub async fn receive_frames_with(
         None => None,
     };
 
-    let (reg, config) =
-        video_client_config(registration, verify, candidate.is_some(), pin.is_some())?;
-    let conn = dial_video(
-        &reg,
-        &config,
-        host,
-        port,
-        candidate,
-        verify,
-        pin.as_ref(),
+    // Held for the whole receive: it owns the configuration this connection may
+    // not outlive, and dropping it on any exit path below releases the three
+    // handles in the order msquic wants them released.
+    let session = isekai_p2p::peer::dial(
+        registration,
+        isekai_p2p::peer::DialOptions {
+            alpn: VIDEO_ALPN,
+            host,
+            port,
+            verify,
+            pin,
+            candidate,
+        },
         &shutdown,
     )
     .await?;
+    let conn = session.connection().clone();
 
     let relay_path = (conn.get_local_addr()?, conn.get_remote_addr()?);
     report_path(
@@ -855,39 +840,6 @@ pub async fn receive_frames_with(
     Ok(())
 }
 
-/// Log what the connection is actually doing, which is the difference between
-/// "the migration stalled" and "the migration broke the connection".
-///
-/// `Send.PathMtu` is worth watching when a path has just been opened, since it
-/// has to size itself.
-///
-/// For loss, `send_lost` alone says very little: it counts packets the loss
-/// detector *declared* lost, and `send_spurious_lost` is how many of those
-/// turned out to have arrived after all. A high first number with a high second
-/// is an over-eager loss detector, not a lossy path, and the two want opposite
-/// fixes. `send_congestion` and the byte counters give the other half — whether
-/// the congestion controller is actually backing off, and what throughput that
-/// leaves.
-fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATISTICS, when: &str) {
-    tracing::debug!(
-        when,
-        local = ?conn.get_local_addr().ok(),
-        remote = ?conn.get_remote_addr().ok(),
-        rtt_us = stats.Rtt,
-        send_path_mtu = stats.Send.PathMtu,
-        send_packets = stats.Send.TotalPackets,
-        send_lost = stats.Send.SuspectedLostPackets,
-        send_spurious_lost = stats.Send.SpuriousLostPackets,
-        send_congestion = stats.Send.CongestionCount,
-        send_persistent_congestion = stats.Send.PersistentCongestionCount,
-        send_bytes = stats.Send.TotalBytes,
-        recv_packets = stats.Recv.TotalPackets,
-        recv_dropped = stats.Recv.DroppedPackets,
-        recv_bytes = stats.Recv.TotalBytes,
-        "video connection stats",
-    );
-}
-
 /// Tick once a second, touching nothing but the clock.
 ///
 /// Every other sampler here calls `get_stats`, which msquic serves by queueing
@@ -978,156 +930,6 @@ async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent)
     }
 }
 
-/// Dial the video QUIC, letting a single handshake ride across the peer's
-/// relay-bind gap; retry only as a fallback, until the deadline or `shutdown`.
-///
-/// Over the P2P relay the initiator opens its own leg first and only then does
-/// the peer bind *its* leg — it needs the connection id out of band (e.g. a
-/// human pasting it into the camera server). Until both legs are bridged, the
-/// handshake's packets reach a half-open relay edge and go unanswered. A
-/// completed handshake is itself the readiness signal (both legs are up), and
-/// there is nothing on the control plane to poll — the loopback relay
-/// rendezvous injects no reachable candidate.
-///
-/// The key is to keep **one** connection retransmitting its Initial for the
-/// whole gap (a long `HandshakeIdleTimeoutMs`) rather than firing many
-/// short-lived attempts. Local relay testing showed rapid short attempts
-/// (a few seconds each) leave the relay path wedged so it never recovers even
-/// after the bind lands, whereas a single persistent handshake completes as
-/// soon as the far leg comes up. The retry loop below is therefore a
-/// last-resort fallback for a genuinely failed handshake, not the mechanism
-/// that bridges the gap.
-///
-/// `host` is a *name*, never an address to look up. Every caller dials the relay
-/// bridge on loopback, and the name is the per-endpoint FQDN the listener's relay
-/// certificate is issued for — it exists so the certificate can be validated, and
-/// its only DNS record points back at `127.0.0.1`. Pinning the remote address
-/// below says that outright, and keeps msquic from resolving the name: msquic
-/// resolves with a blocking `getaddrinfo` on the connection's worker thread, and
-/// that worker also drives the relay leg, so a slow resolver takes the leg down
-/// with it. A loopback-only name is exactly what mobile resolvers are slowest
-/// about — DNS64 will not synthesise an AAAA for `127.0.0.0/8`, and resolvers
-/// with rebinding protection refuse to return it at all — which is why this
-/// showed up on iOS long before it would have anywhere else.
-// Each of these is a distinct thing the dial needs and none of them group into
-// anything that would read better as a struct.
-#[allow(clippy::too_many_arguments)]
-async fn dial_video(
-    reg: &Registration,
-    config: &msquic::Configuration,
-    host: &str,
-    port: u16,
-    candidate: Option<ObservedAddress>,
-    // Whether this connection validates at all. Off is dev-only, and then
-    // there is nothing to check the certificate against.
-    verify: bool,
-    pin: Option<&AttestedPeer>,
-    shutdown: &CancellationToken,
-) -> anyhow::Result<Connection> {
-    let deadline = Instant::now() + VIDEO_CONNECT_DEADLINE;
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        let conn = Connection::new(reg)?;
-        // Every attempt builds a fresh connection, so the setup below has to be
-        // redone on each one.
-        conn.set_remote_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
-            .map_err(|e| anyhow::anyhow!("could not pin the relay bridge address: {e}"))?;
-        if let Some(candidate) = candidate {
-            prepare_for_migration(&conn, candidate)?;
-        }
-        // One slot per attempt: a verdict from a connection that has been
-        // dropped says nothing about this one.
-        let refused: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        // The name is checked when this connection validates; the pin is
-        // checked whenever the peer published one, insecure switch included.
-        let check_name = verify && std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_none();
-        if check_name || pin.is_some() {
-            install_certificate_check(
-                &conn,
-                check_name.then(|| host.to_owned()),
-                pin.cloned(),
-                Arc::clone(&refused),
-            );
-        }
-        // The handshake can stay unanswered for a long time by design, and until
-        // it is answered there is nothing else to go on. Report what it is doing
-        // while it waits: whether our packets are still leaving tells a peer
-        // that has not bound its leg apart from a path that has stopped
-        // carrying anything, and those want opposite fixes.
-        let start = conn.start(config, host, port);
-        tokio::pin!(start);
-        let mut probe = tokio::time::interval(HANDSHAKE_PROBE_INTERVAL);
-        probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Carried out of the loop because the failure below has to describe a
-        // connection it has already had to drop.
-        let mut last: Option<(u64, u64)> = None;
-        let result = loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
-                r = &mut start => break r,
-                _ = probe.tick() => match conn.get_stats() {
-                    Ok(stats) => {
-                        last = Some((stats.Send.TotalPackets, stats.Recv.TotalPackets));
-                        log_connection_stats(&conn, &stats, "handshake");
-                    }
-                    Err(e) => tracing::debug!("could not read handshake stats: {e}"),
-                },
-            }
-        };
-        // Checked before the retry decision, because it is the one failure that
-        // retrying cannot help: the peer signed for a key, and this certificate
-        // is not it. Trying again produces the same answer, ~1,700 times, and
-        // the error finally reported would be the relay-leg timeout — which is
-        // what "the operator has not pasted the connection id yet" looks like.
-        // The two want opposite responses.
-        if let Some(reason) = refused.lock().expect("pin verdict lock poisoned").take() {
-            // Deliberately not naming the attestation: the same slot carries a
-            // name mismatch, and pointing an operator at a statement the peer
-            // never published sends them to the wrong problem.
-            anyhow::bail!("the peer's certificate was refused, so this is not the peer it claims to be: {reason}");
-        }
-        match result {
-            Ok(()) => return Ok(conn),
-            Err(e) => {
-                let observed = conn
-                    .get_stats()
-                    .ok()
-                    .map(|s| (s.Send.TotalPackets, s.Recv.TotalPackets))
-                    .or(last);
-                drop(conn);
-                if Instant::now() >= deadline {
-                    // Say what was seen, not what it might mean. The old wording
-                    // asserted the peer had not bound its leg, and a day went
-                    // into chasing that assertion while it was wrong; the packet
-                    // counts distinguish the cases without guessing. Nothing
-                    // received at all is the peer never answering — a leg not
-                    // bridged yet, or an operator who has not finished carrying
-                    // the connection id across.
-                    let seen = match observed {
-                        Some((sent, received)) => {
-                            format!("{sent} packets sent, {received} received")
-                        }
-                        None => "no packet counts available".to_owned(),
-                    };
-                    return Err(anyhow::Error::new(e).context(format!(
-                        "video QUIC handshake to {host}:{port} did not complete within \
-                         {VIDEO_CONNECT_DEADLINE:?} ({attempt} attempts, {seen})"
-                    )));
-                }
-                // Debug, not Display: the transport status is what names the
-                // cause — an untrusted certificate and an unanswered handshake
-                // both read as "connection lost" otherwise.
-                tracing::debug!("video handshake attempt {attempt} failed: {e:?}");
-                tokio::select! {
-                    _ = shutdown.cancelled() => anyhow::bail!("shut down while dialing video"),
-                    _ = sleep(VIDEO_CONNECT_RETRY_DELAY) => {}
-                }
-            }
-        }
-    }
-}
-
 /// Wait briefly for the relay leg's observed address.
 ///
 /// `None` means carry on relay-only: a missing report costs a direct path, not
@@ -1163,72 +965,6 @@ async fn wait_for_observed(
             None
         }
     }
-}
-
-/// Put a video connection on a shared, unconnected socket and offer the relay
-/// leg's address as a direct-path candidate. Must run before `start`.
-///
-/// The order is fixed: `set_unconnected_socket` requires a shared binding, and
-/// an unconnected socket requires a specific — non-wildcard — local address.
-/// That address is deliberately **loopback**: this connection's own traffic
-/// goes to the relay bridge on `127.0.0.1`, and pinning it to a real interface
-/// address instead cannot work on Windows at all. The direct path does not need
-/// it, because `add_candidate_addr` accepts an address that is not bound here
-/// yet — msquic opens the path from the relay leg's binding once the peer's
-/// ADD_ADDRESS arrives (`docs/p2p_mode_migration_plan.md` §2.2.3).
-fn prepare_for_migration(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
-    // All three are required for a direct path to be validated at all — without
-    // them msquic never raises `PathValidated`, whatever candidate is offered.
-    conn.set_share_binding(true)
-        .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
-    conn.set_unconnected_socket(true)
-        .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
-    conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
-    conn.add_candidate_addr(candidate.local, candidate.observed)
-        .map_err(|e| anyhow::anyhow!("could not offer a direct-path candidate: {e}"))?;
-    // Also offer the host address itself. A peer on the same LAN can reach it
-    // directly, while the observed one is only reachable from outside the NAT —
-    // and a NAT that does not hairpin (most of them) drops a packet sent from
-    // inside to its own public address, so without this two peers behind the
-    // same NAT can never find each other. Across the internet this candidate
-    // simply fails to validate and the observed one wins.
-    if candidate.local != candidate.observed {
-        if let Err(e) = conn.add_candidate_addr(candidate.local, candidate.local) {
-            tracing::debug!("could not offer the host candidate: {e}");
-        }
-    }
-    tracing::info!(
-        local = %candidate.local,
-        observed = %candidate.observed,
-        "offered direct-path candidates to the video server",
-    );
-    Ok(())
-}
-
-/// Video client config: ALPN `sample`. With `verify` the peer's certificate is
-/// validated against the dialed server name (the per-endpoint relay cert);
-/// without it validation is **disabled** — dev only, for the self-signed
-/// [`dev_cert`].
-///
-/// The settings themselves moved to `isekai_p2p::peer` unchanged (plan §4.4,
-/// phase 1b): every one of them was chosen for a connection that rides a relay
-/// leg and may migrate off it, which is not a fact about video.
-fn video_client_config(
-    reg: Option<Arc<Registration>>,
-    verify: bool,
-    enable_migration: bool,
-    pinning: bool,
-) -> anyhow::Result<(Arc<Registration>, msquic::Configuration)> {
-    isekai_p2p::peer::client_config(
-        reg,
-        isekai_p2p::peer::ClientOptions {
-            alpn: VIDEO_ALPN,
-            verify,
-            enable_migration,
-            pinning,
-        },
-    )
 }
 
 #[cfg(test)]

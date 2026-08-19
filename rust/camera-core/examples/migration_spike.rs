@@ -1207,13 +1207,13 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
     let alpn = [msquic::BufferRef::from(ALPN)];
     let settings = msquic::Settings::new()
         .set_IdleTimeoutMs(30_000)
-        // As `video_client_config` does, which this is here to reproduce.
+        // As `isekai_p2p::peer::client_config` does, which this reproduces.
         .set_KeepAliveIntervalMs(10_000)
         .set_PeerUnidiStreamCount(100)
         .set_StreamMultiReceiveEnabled()
         .set_ReceiveObservedAddressReports();
     // Two settings differ between this spike (which migrates everywhere) and
-    // camera-core's `video_client_config` (which does not, in the field). Knobs
+    // `isekai_p2p::peer::client_config` (which does not, in the field). Knobs
     // rather than a guess, so each can be ruled in or out on its own.
     //
     // SPIKE_MAX_MTU: the real config caps MaximumMtu at 1248 so a video packet

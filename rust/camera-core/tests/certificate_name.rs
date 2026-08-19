@@ -29,9 +29,10 @@
 //!
 //! The property still holds on those platforms — a certificate for another host
 //! does not get a connection — it is just that their own verifiers are what
-//! enforce it, so this is not the test that shows it. (It also costs the full
-//! retry deadline to find out, since a refusal from msquic's own validation
-//! does not reach the slot `dial_video` checks before retrying.)
+//! enforce it, so this is not the test that shows it. (A refusal from msquic's
+//! own validation still never reaches the slot the dial reads; since #141 it is
+//! classified off the transport's status instead, so finding out no longer
+//! costs the full retry deadline.)
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 

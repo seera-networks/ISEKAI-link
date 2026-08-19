@@ -1,7 +1,7 @@
 //! Gap variant of `relay_e2e`: the initiator starts dialing the video QUIC
 //! *before* the target binds its relay leg, then the bind happens after a delay
 //! (simulating the human pasting the connection id into the server). This is the
-//! scenario `dial_video` targets — the initial video handshake must ride across
+//! scenario `isekai_p2p::peer::dial` targets — the initial video handshake must ride across
 //! the bind gap on a single connection (a long `HandshakeIdleTimeoutMs`) and
 //! complete once both relay legs are up. Run with a `GAP_SECS` larger than a few
 //! seconds to exercise it.
