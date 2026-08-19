@@ -18,12 +18,11 @@
 //!
 //! What is deliberately still in `camera-core`, and why:
 //!
-//! | | |
-//! | --- | --- |
-//! | `video_client_config` | 150 lines whose comments carry the reasoning for the MTU cap, the two keepalives and the handshake idle timeout. Worth moving exactly, not approximately |
-//! | `dial_video`, `install_certificate_check` | tied to `AttestedPeer`, which has to move with them |
-//!
-//! Neither is video-specific in substance. Both are the next slices.
+//! Phase 1b added [`client_config`] and the constants it reads. What is still in
+//! `camera-core`, and is 1c: `dial_video` and `install_certificate_check`, which
+//! are tied to `AttestedPeer` and have to move with it. Not video-specific in
+//! substance either — **and until they move, this layer validates a chain and
+//! nobody checks the name.** See [`ClientOptions::verify`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,7 +132,18 @@ pub struct ClientOptions<'a> {
     /// that offers a different one should fail at the handshake rather than at
     /// the first frame.
     pub alpn: &'a str,
-    /// Validate the peer's certificate. Off is dev-only.
+    /// Let msquic validate the peer's certificate chain. Off is dev-only.
+    ///
+    /// **This is chain validation and nothing else.** Nothing here checks that
+    /// the certificate names the host dialled: on the quictls platforms msquic
+    /// verifies with a bare `X509_verify_cert` and never sets
+    /// `X509_VERIFY_PARAM_set1_host`, so a chain-valid certificate issued for
+    /// *any* name is accepted. That is #134, and what closes it is a
+    /// peer-certificate callback — `camera-core`'s `install_certificate_check`,
+    /// which 1c moves here.
+    ///
+    /// Until then a caller that sets this and installs no callback has #134
+    /// back. `camera-core` installs one; anything new must too.
     pub verify: bool,
     /// Offer a direct path and let the connection use it.
     pub enable_migration: bool,
@@ -278,9 +288,7 @@ pub fn client_config(
     // It is only an escape hatch; never set in production.
     let skip_verify = std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some();
     if verify && skip_verify {
-        tracing::warn!(
-            "ISEKAI_INSECURE_SKIP_VERIFY set: skipping video TLS certificate validation"
-        );
+        tracing::warn!("ISEKAI_INSECURE_SKIP_VERIFY set: skipping peer TLS certificate validation");
     }
     if !verify || skip_verify {
         cred = cred.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);

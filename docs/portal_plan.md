@@ -200,6 +200,14 @@ peer QUIC rather than of video — which is exactly the argument for the layer:
    none of them ever ran and the test hung with nothing to say. One unbounded
    await makes every other bound decorative.
 
+**And one about the moving itself, from 1b.** The comments in these functions
+are the reasoning, so they get extracted and substituted rather than retyped.
+The one constant typed by hand in 1b went in as `from_secs(15)` where the
+original says `from_secs(10)` — a path keepalive whose whole point is that it is
+the only thing still crossing the relay leg once the video is direct, so halving
+it would have cut viewers off a connect TTL into watching. Reading the original
+back is what caught it. **1c hand-moves three more functions.**
+
 And one for the tests rather than the layer, which took three goes to get right:
 **a `Registration` dropped with any live handle blocks in `RegistrationClose`
 forever.** Every one of these hangs a test binary with no message —

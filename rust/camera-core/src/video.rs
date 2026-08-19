@@ -56,12 +56,12 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// it. The report normally lands within a round trip of the leg coming up; if it
 /// does not, streaming over the relay matters more than a direct path.
 const OBSERVED_ADDRESS_WAIT: Duration = Duration::from_secs(3);
-/// How long a video connection may carry nothing before it is closed.
+/// How long a video connection may go without traffic before it is dropped.
 ///
-/// Also the answer to "was this connection still alive?" for anything that
-/// could not watch it — an iOS viewer coming back from the background knows
-/// only how long it was away, and longer than this means the connection is
-/// gone whatever the app still holds. Exported for that.
+/// [`isekai_p2p::peer::IDLE_TIMEOUT`] states it and says why; this is the name
+/// the FFI exports, because an iOS viewer coming back from the background knows
+/// only how long it was away and longer than this means the connection is gone
+/// whatever the app still holds.
 pub const VIDEO_IDLE_TIMEOUT: Duration = isekai_p2p::peer::IDLE_TIMEOUT;
 
 /// How long a migrated path may carry nothing before falling back to the relay.
