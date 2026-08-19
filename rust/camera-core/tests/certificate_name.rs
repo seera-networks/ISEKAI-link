@@ -16,6 +16,24 @@
 //!
 //! One test rather than two, and one `#[test]` in the file: it sets
 //! `SSL_CERT_FILE`, which is process-wide.
+//!
+//! # Why this only runs on the quictls platforms
+//!
+//! `SSL_CERT_FILE` is how the throwaway CA gets trusted, and it is read by the
+//! quictls path — Linux and Android. Windows validates through schannel and
+//! Apple through SecTrust, and **neither has any way to be told about a CA
+//! invented for one test**. There, both certificates below are untrusted, so
+//! the wrong-name one is refused for chain reasons before its name is looked
+//! at: the test would report success while proving nothing, and the right-name
+//! half would fail outright.
+//!
+//! The property still holds on those platforms — a certificate for another host
+//! does not get a connection — it is just that their own verifiers are what
+//! enforce it, so this is not the test that shows it. (It also costs the full
+//! retry deadline to find out, since a refusal from msquic's own validation
+//! does not reach the slot `dial_video` checks before retrying.)
+
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::sync::Arc;
 use std::time::Duration;
