@@ -803,7 +803,8 @@ pub async fn receive_frames_with(
         None => None,
     };
 
-    let (reg, config) = video_client_config(registration, verify, candidate.is_some())?;
+    let (reg, config) =
+        video_client_config(registration, verify, candidate.is_some(), pin.is_some())?;
     let conn = dial_video(
         &reg,
         &config,
@@ -1108,18 +1109,25 @@ async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent)
     }
 }
 
-/// Refuse the handshake unless the certificate is the one `pin` vouches for.
+/// Refuse the handshake unless the certificate names `host` and, where the peer
+/// published one, is the key `pin` vouches for.
+///
+/// Either check can be absent: `host` is `None` when validation is off, and
+/// `pin` is `None` for a peer that has published nothing. At least one is
+/// always present, or this is not installed at all.
 ///
 /// The handler runs on msquic's thread during the handshake and its return
 /// status is the verdict, so everything it needs is copied in beforehand and it
 /// does no I/O.
 ///
-/// A rejection is logged at `warn` and not swallowed: an unattested certificate
-/// on a connection that expected one is either a misconfiguration or the thing
-/// this exists to catch, and both want saying.
+/// A rejection is logged at `warn` and not swallowed: a certificate for the
+/// wrong name, or one on a connection that expected an attested key, is either
+/// a misconfiguration or the thing this exists to catch, and both want saying.
 fn install_certificate_check(
     conn: &Connection,
-    host: String,
+    // The host to hold the certificate against, or `None` when validation is
+    // off and only the pin is left to check.
+    host: Option<String>,
     pin: Option<AttestedPeer>,
     refused: Arc<Mutex<Option<String>>>,
 ) {
@@ -1135,15 +1143,21 @@ fn install_certificate_check(
             // The name first: a certificate for somebody else is somebody
             // else's whatever it carries, and saying so names the right
             // problem.
-            Some(der) => certificate_matches(der, &host).and_then(|()| match &pin {
-                Some(pin) => pin.accepts(der),
-                None => Ok(()),
-            }),
+            Some(der) => host
+                .as_deref()
+                .map_or(Ok(()), |host| certificate_matches(der, host))
+                .and_then(|()| match &pin {
+                    Some(pin) => pin.accepts(der),
+                    None => Ok(()),
+                }),
             None => Err("the peer presented no certificate".to_owned()),
         };
         match verdict {
             Ok(()) if pin.is_none() => {
-                tracing::debug!(host = %host, "the video certificate is for the host dialled");
+                tracing::debug!(
+                    host = host.as_deref().unwrap_or_default(),
+                    "the video certificate is for the host dialled",
+                );
                 Ok(())
             }
             Ok(()) => {
@@ -1162,8 +1176,11 @@ fn install_certificate_check(
             }
             Err(reason) => {
                 tracing::warn!(
-                    peer = pin.as_ref().map(|p| p.peer_endpoint.as_str()).unwrap_or_default(),
-                    host = %host,
+                    peer = pin
+                        .as_ref()
+                        .map(|p| p.peer_endpoint.as_str())
+                        .unwrap_or_default(),
+                    host = host.as_deref().unwrap_or_default(),
                     "refusing the video connection: {reason}",
                 );
                 // Left where the dial can find it. The handshake is about to
@@ -1210,6 +1227,9 @@ fn install_certificate_check(
 /// about — DNS64 will not synthesise an AAAA for `127.0.0.0/8`, and resolvers
 /// with rebinding protection refuse to return it at all — which is why this
 /// showed up on iOS long before it would have anywhere else.
+// Each of these is a distinct thing the dial needs and none of them group into
+// anything that would read better as a struct.
+#[allow(clippy::too_many_arguments)]
 async fn dial_video(
     reg: &Registration,
     config: &msquic::Configuration,
@@ -1237,8 +1257,16 @@ async fn dial_video(
         // One slot per attempt: a verdict from a connection that has been
         // dropped says nothing about this one.
         let refused: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        if verify {
-            install_certificate_check(&conn, host.to_owned(), pin.cloned(), Arc::clone(&refused));
+        // The name is checked when this connection validates; the pin is
+        // checked whenever the peer published one, insecure switch included.
+        let check_name = verify && std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_none();
+        if check_name || pin.is_some() {
+            install_certificate_check(
+                &conn,
+                check_name.then(|| host.to_owned()),
+                pin.cloned(),
+                Arc::clone(&refused),
+            );
         }
         // The handshake can stay unanswered for a long time by design, and until
         // it is answered there is nothing else to go on. Report what it is doing
@@ -1272,10 +1300,10 @@ async fn dial_video(
         // what "the operator has not pasted the connection id yet" looks like.
         // The two want opposite responses.
         if let Some(reason) = refused.lock().expect("pin verdict lock poisoned").take() {
-            anyhow::bail!(
-                "the peer's certificate is not the one it signed for, so this is not the \
-                 peer it claims to be: {reason}"
-            );
+            // Deliberately not naming the attestation: the same slot carries a
+            // name mismatch, and pointing an operator at a statement the peer
+            // never published sends them to the wrong problem.
+            anyhow::bail!("the peer's certificate was refused, so this is not the peer it claims to be: {reason}");
         }
         match result {
             Ok(()) => return Ok(conn),
@@ -1404,6 +1432,7 @@ fn video_client_config(
     reg: Option<Arc<Registration>>,
     verify: bool,
     enable_migration: bool,
+    pinning: bool,
 ) -> anyhow::Result<(Arc<Registration>, msquic::Configuration)> {
     let reg = match reg {
         Some(reg) => reg,
@@ -1530,14 +1559,17 @@ fn video_client_config(
     if !verify || skip_verify {
         cred = cred.set_credential_flags(msquic::CredentialFlags::NO_CERTIFICATE_VALIDATION);
     }
-    if verify && !skip_verify {
+    if (verify && !skip_verify) || pinning {
         // **Added to whatever validation is already happening, not instead of
         // it.** The flags are OR'd, so nothing msquic does is switched off;
         // this asks to be shown the certificate as well, in a form that parses
         // on every platform.
         //
-        // Asked for whenever this connection validates, not only when there is
-        // a key to pin: the name has to be checked here too (#134), and a
+        // Asked for whenever the name has to be checked (#134) **or** there is
+        // a key to pin — including with the insecure switch on. That switch
+        // means "do not validate the certificate"; it has never meant "ignore
+        // what the peer signed for", and msquic raises the indication even with
+        // `NO_CERTIFICATE_VALIDATION`, so the pin can go on holding. A
         // certificate that is never handed over cannot be checked at all.
         cred = cred
             .set_credential_flags(msquic::CredentialFlags::INDICATE_CERTIFICATE_RECEIVED)

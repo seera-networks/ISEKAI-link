@@ -39,7 +39,15 @@ pub fn certificate_matches(der: &[u8], host: &str) -> Result<(), String> {
         return Err("the certificate has no subjectAltName".to_owned());
     };
 
-    let wanted_ip: Option<IpAddr> = host.parse().ok();
+    // `Uri::host()` keeps the brackets on an IPv6 literal (`[::1]`), and
+    // `IpAddr` will not parse those — so without this the address arm can never
+    // match and the SAN's names get compared to a string with brackets in it.
+    let wanted_ip: Option<IpAddr> = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok();
     let mut presented = Vec::new();
     for name in &san.value.general_names {
         match name {
@@ -223,6 +231,16 @@ mod tests {
     #[test]
     fn a_partial_wildcard_matches_nothing() {
         assert!(!dns_matches("w*.example.com", "www.example.com"));
+    }
+
+    /// `Uri::host()` hands back an IPv6 literal with its brackets on, and
+    /// `IpAddr` does not parse those — so a bracketed host would never reach
+    /// the address arm at all.
+    #[test]
+    fn a_bracketed_ipv6_literal_still_matches() {
+        let der = cert_for(vec!["::1".to_owned()]);
+        assert!(certificate_matches(&der, "[::1]").is_ok());
+        assert!(certificate_matches(&der, "::1").is_ok());
     }
 
     /// The video path dials a loopback FQDN in production but a literal address
