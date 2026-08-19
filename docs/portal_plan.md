@@ -180,6 +180,31 @@ pub fn bind_peer_listener(..) -> Result<(Registration, Listener, SocketAddr)>
 If that extraction turns out to be more than a day, do the spike (§7 phase 0)
 against a copy, then extract before phase 1 — but do not ship two copies.
 
+**Three things phase 0 found, all of which belong in the extracted layer.** Each
+cost an unexplained hang before it was understood, and each is a property of
+peer QUIC rather than of video — which is exactly the argument for the layer:
+
+1. **The `Configuration` must outlive the `Connection`.** msquic shuts a
+   connection down when the configuration it was started with is dropped, and
+   the symptom is not a message about configurations — it is `connection
+   shutdown by local` a few milliseconds after a handshake that plainly
+   succeeded. `camera-core` never meets this because its config is a local in
+   the same function as the whole session; anything that *returns* a connection
+   does. The extracted API has to hand both back together.
+2. **The remote address is pinned, not resolved.** `set_remote_addr` before
+   `start`, with the host string used only as the TLS name. `camera-core` does
+   this and records why (a loopback-only name is what mobile resolvers are worst
+   at); a copy that omits it waits out the idle timeout instead of connecting.
+3. **Every await gets a deadline, the handshake first.** Phase 0 had deadlines on
+   its reads and its drain and none on `start`, so when the handshake stalled
+   none of them ever ran and the test hung with nothing to say. One unbounded
+   await makes every other bound decorative.
+
+And one for the tests rather than the layer: a `Registration` dropped with a live
+handle blocks in `RegistrationClose` forever, so a test that fails *before* it
+drains takes the whole binary with it. Close the connection on the failure path,
+not only the happy one.
+
 ### 4.5 Identity, and a protocol identifier
 
 Peer Connect is gated on the Endpoint Token's `protocols` list, and the camera
@@ -232,7 +257,7 @@ having before anyone asks.
 
 | phase | what | done when |
 | --- | --- | --- |
-| **0** | Spike: TCP only, one hard-coded service, no config, no UI. Proves the framing and the stream mapping | a `psql` session works over a real proxy |
+| **0** | Spike: TCP only, one hard-coded service, no config, no UI. Proves the framing and the stream mapping | **done** — `portal-core`, loopback. Against a real proxy is phase 1, which is where the session comes from |
 | **1** | Extract the connection layer (§4.4); move `camera-core` onto it | the camera apps still pass their tests and run on hardware |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |

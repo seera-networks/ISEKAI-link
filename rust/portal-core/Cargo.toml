@@ -1,0 +1,20 @@
+[package]
+name = "portal-core"
+version = "0.1.0"
+edition = "2021"
+
+# Phase 0 of docs/portal_plan.md. TCP only, one service, no config, no UI.
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+msquic-async = { workspace = true }
+# The listener and client configuration helpers. Phase 1 replaces this with the
+# connection layer extracted out of `camera-core` (plan §4.4).
+isekai-link-utils = { workspace = true }
+tokio-util = { workspace = true }
+# The spike's throwaway certificate. Goes with `spike.rs` in phase 1.
+rcgen = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

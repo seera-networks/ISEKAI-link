@@ -1,5 +1,7 @@
 [workspace]
-members = ["agent", "camera-client", "camera-core", "camera-server", "camera-ui", "channel-masque", "isekai-client-ffi", "isekai-p2p", "isekai-p2p-core", "utils", "webrtc-app"]
+members = ["agent", "camera-client", "camera-core", "camera-server", "camera-ui", "channel-masque", "isekai-client-ffi", "isekai-p2p", "isekai-p2p-core", "utils", "webrtc-app",
+    "portal-core",
+]
 resolver = "3"
 package.edition = "2021"
 
@@ -29,6 +31,7 @@ http-body = "1"
 http-body-util = "0.1.3"
 hyper = { version = "1" , default-features = false}
 isekai-link-utils = { path = "utils" }
+portal-core = { path = "portal-core" }
 # Pure-Rust JPEG encoder for the synthetic_server example, so generating test
 # frames does not drag in OpenCV.
 jpeg-encoder = "0.6"
