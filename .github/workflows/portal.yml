@@ -1,0 +1,92 @@
+name: ISEKAI portal
+
+# `portal-core` (docs/portal_plan.md phase 0) landed with nothing building it:
+# migration-spike.yml tests `camera-core`, camera-apps.yml builds the two camera
+# binaries, and the mobile workflows build the FFI crate. So the crate's green
+# checks said nothing about the crate. This is #144.
+#
+# **Linux runs it; the other two only compile it**, and that split is deliberate
+# rather than laziness:
+#
+# * The forwarding itself — `frame`, `client`, `server` — is ordinary async Rust
+#   and has to compile everywhere the camera apps do. `cargo check --all-targets`
+#   says so, including the test binaries.
+# * Running it needs `spike.rs`, which hands msquic a PEM and no PKCS#12. On
+#   Windows the credential path imports a PFX and its fallback goes through an
+#   RSA provider that cannot take rcgen's ECDSA P-256 key — migration-spike.yml
+#   says as much beside its own certificate step, and `camera-core::tls` packages
+#   a bundle for exactly this reason.
+#
+# Packaging one here would be Windows-specific work on scaffolding that phase 1
+# deletes: the extraction in plan §4.4 inherits `camera-core`'s certificate
+# handling along with everything else. So the answer to "does the spike run on
+# Windows" is "it is not asked to", and this file is where that is written down.
+
+on:
+  push:
+    paths:
+      - 'rust/portal-core/**'
+      - 'submodules/msquic-async-rs'
+      - '.github/workflows/portal.yml'
+  pull_request:
+    paths:
+      - 'rust/portal-core/**'
+      - 'submodules/msquic-async-rs'
+      - '.github/workflows/portal.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Forward a TCP service (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # The integration tests stand up a real QUIC connection between the two
+      # halves. They have hung this repository's CI before — see the header of
+      # camera-core/tests/video_loopback.rs and the four ways portal-core's own
+      # tests found — so the timeout above is the backstop, not the plan.
+      - name: Test
+        run: cargo test -p portal-core
+
+  compile:
+    name: Compile (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # `--all-targets` so the test binaries compile too: a `cfg` that only
+      # exists on one platform breaks at compile time, and that is the part
+      # worth catching here.
+      - name: Check
+        run: cargo check -p portal-core --all-targets
