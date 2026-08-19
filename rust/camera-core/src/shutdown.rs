@@ -36,12 +36,11 @@ use msquic_async::Registration;
 ///
 /// Returns whether everything closed within `timeout`.
 pub async fn drain_registration(reg: &Registration, timeout: Duration) -> bool {
-    reg.shutdown();
-    let drained = tokio::time::timeout(timeout, reg.wait_idle()).await.is_ok();
-    if !drained {
-        tracing::warn!(?timeout, "msquic registration still has live handles");
-    }
-    drained
+    // The rule this encodes is not a camera one: a registration dropped with a
+    // live handle blocks forever, whatever the handle was carrying. It lives in
+    // `isekai_p2p::peer` now (plan §4.4 slice 1) and this stays as the name the
+    // camera apps already call.
+    isekai_p2p::peer::drain_registration(reg, timeout).await
 }
 
 /// Wind down both registrations a camera app runs on, then leave the process.
@@ -109,10 +108,9 @@ mod tests {
     async fn drains_once_the_listener_is_dropped() {
         let reg = registration();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let (reg, listener, _bound) = crate::bind_video_listener(Some(reg), addr, None)
-            .expect("bind the video listener");
+        let (reg, listener, _bound) =
+            crate::bind_video_listener(Some(reg), addr, None).expect("bind the video listener");
         drop(listener);
         assert!(drain_registration(&reg, Duration::from_secs(5)).await);
     }
-
 }

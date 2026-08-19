@@ -64,7 +64,7 @@ async fn shouting_service() -> std::net::SocketAddr {
 /// is failing before you get to.
 struct Halves {
     // Before `reg`, deliberately.
-    dialed: spike::SpikeConnection,
+    dialed: isekai_p2p::peer::Dialed,
     shutdown: CancellationToken,
     reg: Arc<Registration>,
 }
@@ -118,7 +118,7 @@ async fn bytes_reach_the_service_and_come_back() {
     let halves = connected(Catalogue::new().with("db", target)).await;
 
     let local = client::forward(
-        halves.dialed.connection.clone(),
+        halves.dialed.connection().clone(),
         "127.0.0.1:0".parse().unwrap(),
         "db".to_owned(),
         halves.shutdown.clone(),
@@ -147,7 +147,7 @@ async fn a_service_that_is_not_offered_gets_no_connection() {
     let halves = connected(Catalogue::new().with("db", target)).await;
 
     let local = client::forward(
-        halves.dialed.connection.clone(),
+        halves.dialed.connection().clone(),
         "127.0.0.1:0".parse().unwrap(),
         "not-offered".to_owned(),
         halves.shutdown.clone(),
@@ -178,7 +178,7 @@ async fn a_service_that_is_not_offered_gets_no_connection() {
     {
         let mut stream = halves
             .dialed
-            .connection
+            .connection()
             .open_outbound_stream(StreamType::Bidirectional, false)
             .await
             .expect("open a stream");
@@ -224,8 +224,7 @@ async fn exchange(client: &mut TcpStream, message: &[u8; 5]) -> [u8; 5] {
 async fn drain(halves: Halves) {
     let reg = Arc::clone(&halves.reg);
     drop(halves);
-    let drained = tokio::time::timeout(Duration::from_secs(5), reg.wait_idle())
-        .await
-        .is_ok();
+    // The same rule `camera-core` follows, from the place that now states it.
+    let drained = isekai_p2p::peer::drain_registration(&reg, Duration::from_secs(5)).await;
     assert!(drained, "the registration still had live handles after 5s");
 }

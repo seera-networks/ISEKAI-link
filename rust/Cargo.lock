@@ -3054,6 +3054,7 @@ dependencies = [
  "axum",
  "base64",
  "isekai-p2p-core",
+ "msquic-async",
  "p256",
  "reqwest",
  "serde",
@@ -4379,6 +4380,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "isekai-link-utils",
+ "isekai-p2p",
  "msquic-async",
  "portal-core",
  "rcgen",

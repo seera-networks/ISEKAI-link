@@ -18,6 +18,8 @@ msquic-async = { workspace = true }
 # The listener and client configuration helpers. Phase 1 replaces this with the
 # connection layer extracted out of `camera-core` (plan §4.4).
 isekai-link-utils = { workspace = true }
+# The rules for holding a peer QUIC connection (`isekai_p2p::peer`).
+isekai-p2p = { workspace = true }
 tokio-util = { workspace = true }
 # The spike's throwaway certificate. Goes with `spike.rs` in phase 1.
 rcgen = { workspace = true, optional = true }

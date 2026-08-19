@@ -15,6 +15,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use isekai_p2p::peer::Dialed;
 use msquic_async::{msquic, Connection, Listener, Registration};
 
 use crate::PORTAL_ALPN;
@@ -44,28 +45,12 @@ pub fn bind(
     Ok((reg, listener, bound))
 }
 
-/// A connection, and the configuration it is not allowed to outlive.
-///
-/// **msquic shuts a connection down when the `Configuration` it was started
-/// with is dropped**, and the symptom is not a message about configurations —
-/// it is `connection shutdown by local` arriving milliseconds after a
-/// handshake that plainly succeeded, followed by a `RegistrationClose` that
-/// blocks forever on the handle left behind.
-///
-/// `camera-core` never meets this because its config is a local in the same
-/// function as the whole session. Anything that hands a connection back to a
-/// caller has to hand this back with it.
-pub struct SpikeConnection {
-    pub connection: Connection,
-    _config: msquic::Configuration,
-}
-
 /// Dial a portal listener on loopback.
 ///
 /// Validation is off, which is the whole reason this is not the real
 /// transport: the certificate above is self-signed and nothing checks who is
 /// on the other end.
-pub async fn dial(reg: &Arc<Registration>, port: u16) -> anyhow::Result<SpikeConnection> {
+pub async fn dial(reg: &Arc<Registration>, port: u16) -> anyhow::Result<Dialed> {
     let alpn = [msquic::BufferRef::from(PORTAL_ALPN)];
     let config = reg.open_configuration(
         &alpn,
@@ -95,8 +80,8 @@ pub async fn dial(reg: &Arc<Registration>, port: u16) -> anyhow::Result<SpikeCon
     .await
     .context("the spike handshake did not complete within ten seconds")?
     .context("failed to open the spike connection")?;
-    Ok(SpikeConnection {
-        connection: conn,
-        _config: config,
-    })
+    // The pairing is `isekai_p2p::peer`'s rule now, not this file's: a
+    // configuration outlives what was started with it, and phase 0 found that
+    // out the hard way so the next consumer would not have to.
+    Ok(Dialed::new(conn, config))
 }

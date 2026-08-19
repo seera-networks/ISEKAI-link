@@ -217,6 +217,13 @@ The extracted layer should own this: a session handle whose `Drop` releases
 everything, and one drain that takes it by value. Leaving it to each caller is
 leaving four ways to hang.
 
+**Phase 1a does the first half of that**: `isekai_p2p::peer::Dialed` pairs a
+connection with the configuration it may not outlive, and
+`drain_registration` moves there from `camera-core::shutdown` — where it never
+belonged, since nothing about it is a camera. Both are rules rather than
+helpers, which is why they went first: each is a way to hang a process that
+every consumer would otherwise rediscover, and phase 0 rediscovered both.
+
 ### 4.5 Identity, and a protocol identifier
 
 Peer Connect is gated on the Endpoint Token's `protocols` list, and the camera
@@ -270,7 +277,9 @@ having before anyone asks.
 | phase | what | done when |
 | --- | --- | --- |
 | **0** | Spike: TCP only, one hard-coded service, no config, no UI. Proves the framing and the stream mapping | **done** — `portal-core`, loopback. Against a real proxy is phase 1, which is where the session comes from |
-| **1** | Extract the connection layer (§4.4); move `camera-core` onto it | the camera apps still pass their tests and run on hardware |
+| **1a** | The rules: `Dialed` and `drain_registration` into `isekai_p2p::peer`; `camera-core` and the spike onto them | **done** |
+| **1b** | `video_client_config` → the layer, ALPN as a parameter | `camera-core` unchanged in behaviour, portal builds its own connection |
+| **1c** | `dial_video`, `install_certificate_check` and `AttestedPeer` → the layer; delete `spike.rs`; portal on a real `InitiatorSession` | the camera apps still pass their tests and run on hardware, and portal forwards over a proxy |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have | a transfer survives the switch |

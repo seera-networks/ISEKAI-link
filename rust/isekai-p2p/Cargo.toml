@@ -27,6 +27,8 @@ time = { workspace = true }
 # Winding the relay leg down when a renewal says this Endpoint is refused
 # (`initiator`).
 tokio-util = { workspace = true }
+# The registration and connection handles `peer` states the rules for.
+msquic-async = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }

@@ -33,7 +33,11 @@ pub use listener::{
 };
 
 /// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.
+pub mod peer;
+
 pub mod agent {
+    /// Holding a peer QUIC connection safely — see [`crate::peer`].
+    pub use crate::peer::{drain_registration, Dialed};
     pub use isekai_p2p_core::attestation::{attest, verify, Attestation, AttestationError};
     pub use isekai_p2p_core::bind::RelayOptions;
     pub use isekai_p2p_core::endpoint::EndpointKey;
