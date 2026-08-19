@@ -18,12 +18,11 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
-use isekai_p2p::agent::{
-    certificate_matches, verify as verify_attestation, Attestation, ObservedAddress,
-    ObservedAddressWatch, PeerConnection,
-};
+use isekai_p2p::agent::{ObservedAddress, ObservedAddressWatch};
+use isekai_p2p::peer::install_certificate_check;
+// Re-exported under the names the viewers and the FFI already import.
+pub use isekai_p2p::peer::{AttestedPeer, Unpinnable};
 use isekai_p2p::LegDirectory;
-use time::OffsetDateTime;
 
 use crate::tls::{dev_cert, VideoCert};
 
@@ -70,111 +69,6 @@ pub const VIDEO_IDLE_TIMEOUT: Duration = isekai_p2p::peer::IDLE_TIMEOUT;
 /// enough to be well inside the 30 s idle timeout that would otherwise take the
 /// whole connection down.
 const MIGRATED_PATH_GRACE: Duration = Duration::from_secs(5);
-
-/// Why a connection has nothing to pin.
-///
-/// Only the first is ordinary. The other two are a connect response that does
-/// not hold together, and saying so is the difference between a peer that has
-/// not adopted this yet and a proxy behaving oddly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unpinnable {
-    /// The peer has published no statement. The transitional default.
-    NoStatement,
-    /// A statement arrived, but the response does not name the peer it should
-    /// have come from — so there is nothing to check it against.
-    NoPeerEndpoint,
-    /// A statement arrived, but the response names no host to dial.
-    NoHost,
-}
-
-impl std::fmt::Display for Unpinnable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoStatement => f.write_str(
-                "the peer published no statement about its key; trusting the proxy about \
-                 which certificate is right",
-            ),
-            Self::NoPeerEndpoint => f.write_str(
-                "the peer signed for its key, but the proxy named no endpoint to check the \
-                 statement against; not pinning",
-            ),
-            Self::NoHost => f.write_str(
-                "the peer signed for its key, but the proxy named no host to dial; not pinning",
-            ),
-        }
-    }
-}
-
-/// What the peer said about its own key, and who it had to be.
-///
-/// Carried together because checking one without the others proves nothing: a
-/// signature is only meaningful once it is known to be *this peer's*, about
-/// *this name*.
-#[derive(Debug, Clone)]
-pub struct AttestedPeer {
-    /// The statement, from the `peer_connect` response.
-    pub attestation: Attestation,
-    /// Who the proxy says is on the other end. The statement has to be signed
-    /// by this Endpoint or it is about somebody else.
-    pub peer_endpoint: String,
-    /// The name being dialed, which is inside the signed text.
-    pub video_host: String,
-}
-
-impl AttestedPeer {
-    /// What a `peer_connect` response says about the peer's key, if anything.
-    ///
-    /// `None` where there is nothing to pin — a peer that has published no
-    /// statement, or a proxy with no certificates configured. That is the
-    /// ordinary case while this is being adopted, and it leaves the connection
-    /// exactly as it was: validated by name and no more.
-    ///
-    /// Called by the initiator, so the peer is the target. `peer_endpoint` is
-    /// what the connect response names it; `target_endpoint` is the same thing
-    /// under the name the listing uses, and is taken when the first is absent.
-    ///
-    /// **The three ways this comes back empty are not the same**, and this is
-    /// the fail-open path of a security control, so it says which. A peer that
-    /// published nothing is ordinary. A response carrying a statement but no
-    /// name to check it against is the proxy answering strangely, and reporting
-    /// that as "the camera published nothing" blames the wrong party.
-    pub fn from_connection(connection: &PeerConnection) -> Result<Self, Unpinnable> {
-        let Some(attestation) = connection.video_attestation.clone() else {
-            return Err(Unpinnable::NoStatement);
-        };
-        let peer_endpoint = connection
-            .peer_endpoint
-            .clone()
-            .or_else(|| connection.target_endpoint.clone())
-            .ok_or(Unpinnable::NoPeerEndpoint)?;
-        let video_host = connection.video_host.clone().ok_or(Unpinnable::NoHost)?;
-        Ok(Self {
-            attestation,
-            peer_endpoint,
-            video_host,
-        })
-    }
-
-    /// Whether `der` is the certificate this peer signed for.
-    ///
-    /// The statement does not carry the key's digest — it does not need to.
-    /// The verifier already has a candidate in front of it, so the digest of
-    /// the presented certificate goes into the signed text and the signature
-    /// either verifies or does not. **Verification and pinning are the same
-    /// operation.**
-    fn accepts(&self, der: &[u8]) -> Result<(), String> {
-        let spki = crate::tls::spki_sha256_of_certificate(der)
-            .ok_or_else(|| "the peer's certificate could not be read".to_owned())?;
-        verify_attestation(
-            &self.attestation,
-            &self.peer_endpoint,
-            &self.video_host,
-            &spki,
-            OffsetDateTime::now_utc(),
-        )
-        .map_err(|e| format!("{e}"))
-    }
-}
 
 /// Bind a video QUIC listener on `addr`.
 ///
@@ -1084,93 +978,6 @@ async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent)
     }
 }
 
-/// Refuse the handshake unless the certificate names `host` and, where the peer
-/// published one, is the key `pin` vouches for.
-///
-/// Either check can be absent: `host` is `None` when validation is off, and
-/// `pin` is `None` for a peer that has published nothing. At least one is
-/// always present, or this is not installed at all.
-///
-/// The handler runs on msquic's thread during the handshake and its return
-/// status is the verdict, so everything it needs is copied in beforehand and it
-/// does no I/O.
-///
-/// A rejection is logged at `warn` and not swallowed: a certificate for the
-/// wrong name, or one on a connection that expected an attested key, is either
-/// a misconfiguration or the thing this exists to catch, and both want saying.
-fn install_certificate_check(
-    conn: &Connection,
-    // The host to hold the certificate against, or `None` when validation is
-    // off and only the pin is left to check.
-    host: Option<String>,
-    pin: Option<AttestedPeer>,
-    refused: Arc<Mutex<Option<String>>>,
-) {
-    conn.set_peer_certificate_received_callback(move |certificate, _flags, _status, _chain| {
-        // `USE_PORTABLE_CERTIFICATES` makes this a `QUIC_BUFFER` of DER. It is
-        // msquic's memory and lives only for this call, so nothing is kept.
-        let der = unsafe {
-            (certificate as *const msquic::ffi::QUIC_BUFFER)
-                .as_ref()
-                .map(|buffer| msquic::BufferRef::from_ffi_ref(buffer).as_bytes())
-        };
-        let verdict = match der {
-            // The name first: a certificate for somebody else is somebody
-            // else's whatever it carries, and saying so names the right
-            // problem.
-            Some(der) => host
-                .as_deref()
-                .map_or(Ok(()), |host| certificate_matches(der, host))
-                .and_then(|()| match &pin {
-                    Some(pin) => pin.accepts(der),
-                    None => Ok(()),
-                }),
-            None => Err("the peer presented no certificate".to_owned()),
-        };
-        match verdict {
-            Ok(()) if pin.is_none() => {
-                tracing::debug!(
-                    host = host.as_deref().unwrap_or_default(),
-                    "the video certificate is for the host dialled",
-                );
-                Ok(())
-            }
-            Ok(()) => {
-                // Said at `info`, and once per handshake. "We are going to
-                // check" and "it held" are different facts, and only the second
-                // one is the protection — an operator who sees the first and
-                // then silence cannot tell which of them happened.
-                tracing::info!(
-                    peer = pin
-                        .as_ref()
-                        .map(|p| p.peer_endpoint.as_str())
-                        .unwrap_or_default(),
-                    "the peer presented the key it signed for; the connection is pinned to it",
-                );
-                Ok(())
-            }
-            Err(reason) => {
-                tracing::warn!(
-                    peer = pin
-                        .as_ref()
-                        .map(|p| p.peer_endpoint.as_str())
-                        .unwrap_or_default(),
-                    host = host.as_deref().unwrap_or_default(),
-                    "refusing the video connection: {reason}",
-                );
-                // Left where the dial can find it. The handshake is about to
-                // fail, and every other reason it fails is worth retrying — so
-                // without this the one answer that means *stop* is retried for
-                // fifteen minutes and then reported as something else entirely.
-                *refused.lock().expect("pin verdict lock poisoned") = Some(reason);
-                Err(msquic::Status::from(
-                    msquic::ffi::QUIC_STATUS_BAD_CERTIFICATE,
-                ))
-            }
-        }
-    });
-}
-
 /// Dial the video QUIC, letting a single handshake ride across the peer's
 /// relay-bind gap; retry only as a fallback, until the deadline or `shutdown`.
 ///
@@ -1428,38 +1235,6 @@ fn video_client_config(
 mod tests {
     use super::*;
 
-    /// The three ways there is nothing to pin are told apart, because only one
-    /// of them is ordinary and the other two are the proxy answering strangely.
-    /// Reporting all of them as "the peer published nothing" blames the camera
-    /// for the proxy's behaviour.
-    #[test]
-    fn not_pinning_says_which_of_the_three_it_is() {
-        let plain: PeerConnection = serde_json::from_str(
-            r#"{"connection_id":"c","state":"relay","listener_id":"pl_1",
-                "peer_endpoint":"ep:b","protocol":"mjpeg","relay_session_id":"s",
-                "candidates":[],"peer_candidates":[]}"#,
-        )
-        .expect("a connect response");
-        assert_eq!(
-            AttestedPeer::from_connection(&plain).unwrap_err(),
-            Unpinnable::NoStatement,
-            "no statement is the ordinary case",
-        );
-
-        let attested: PeerConnection = serde_json::from_str(
-            r#"{"connection_id":"c","state":"relay","listener_id":"pl_1",
-                "peer_endpoint":"ep:b","protocol":"mjpeg","relay_session_id":"s",
-                "candidates":[],"peer_candidates":[],
-                "video_attestation":{"jwk":{},"expires_at":"2099-01-01T00:00:00Z",
-                                     "signature":"x"}}"#,
-        )
-        .expect("a connect response with a statement");
-        assert_eq!(
-            AttestedPeer::from_connection(&attested).unwrap_err(),
-            Unpinnable::NoHost,
-            "a statement with nowhere to dial is not the camera's doing",
-        );
-    }
     use std::net::SocketAddr;
 
     /// Frames published while a send is in flight are superseded, not queued:

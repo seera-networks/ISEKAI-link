@@ -3053,6 +3053,7 @@ dependencies = [
  "argh",
  "axum",
  "base64",
+ "isekai-link-utils",
  "isekai-p2p-core",
  "msquic-async",
  "p256",
