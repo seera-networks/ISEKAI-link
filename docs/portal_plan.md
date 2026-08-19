@@ -200,10 +200,22 @@ peer QUIC rather than of video — which is exactly the argument for the layer:
    none of them ever ran and the test hung with nothing to say. One unbounded
    await makes every other bound decorative.
 
-And one for the tests rather than the layer: a `Registration` dropped with a live
-handle blocks in `RegistrationClose` forever, so a test that fails *before* it
-drains takes the whole binary with it. Close the connection on the failure path,
-not only the happy one.
+And one for the tests rather than the layer, which took three goes to get right:
+**a `Registration` dropped with any live handle blocks in `RegistrationClose`
+forever.** Every one of these hangs a test binary with no message —
+
+- a failing assertion unwinds, so teardown written after it never runs. It has
+  to be in `Drop`, or it is a happy path wearing a teardown's name
+- struct fields drop in declaration order, so a `Registration` declared before
+  the connection goes first and blocks on it
+- waiting for `wait_idle` while still holding the connection waits for something
+  that cannot happen; the drain has to take ownership
+- **a stream still in a local variable counts**, even one a test opened only to
+  read a byte
+
+The extracted layer should own this: a session handle whose `Drop` releases
+everything, and one drain that takes it by value. Leaving it to each caller is
+leaving four ways to hang.
 
 ### 4.5 Identity, and a protocol identifier
 

@@ -26,6 +26,10 @@
 pub mod client;
 pub mod frame;
 pub mod server;
+/// Behind a feature so the insecure dialer is not part of what this crate
+/// offers by default: it validates nothing and generates its own certificate,
+/// which is fine for a loopback test and nowhere else.
+#[cfg(feature = "spike")]
 pub mod spike;
 
 /// The ALPN this speaks. Distinct from the video's `sample`: a connection is

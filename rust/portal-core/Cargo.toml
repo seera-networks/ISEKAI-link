@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 # Phase 0 of docs/portal_plan.md. TCP only, one service, no config, no UI.
+[features]
+default = []
+# The loopback scaffolding in `spike.rs`, and the certificate generator it
+# needs. Phase 1 deletes both.
+spike = ["dep:rcgen"]
+
 [dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true }
@@ -14,7 +20,9 @@ msquic-async = { workspace = true }
 isekai-link-utils = { workspace = true }
 tokio-util = { workspace = true }
 # The spike's throwaway certificate. Goes with `spike.rs` in phase 1.
-rcgen = { workspace = true }
+rcgen = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# The tests are the only thing that wants the scaffolding.
+portal-core = { path = ".", features = ["spike"] }

@@ -14,9 +14,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use msquic_async::StreamType;
 use msquic_async::{msquic, Registration};
 use portal_core::server::Catalogue;
-use portal_core::{client, server, spike};
+use portal_core::{client, frame, server, spike};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -49,12 +50,33 @@ async fn shouting_service() -> std::net::SocketAddr {
     addr
 }
 
+/// **Field order is load-bearing, and `Drop` more so.**
+///
+/// Fields drop in declaration order, so the connection has to come before the
+/// registration or the last `Arc<Registration>` goes first and
+/// `RegistrationClose` blocks on the handle still open — forever, with no
+/// message. And a failing assertion unwinds, so nothing written after it in the
+/// test body runs: the teardown has to be in `Drop` or it is not teardown, it is
+/// a happy path.
+///
+/// This is the trap `camera-core/tests/video_loopback.rs` documents, met from
+/// the other side: there the danger is dropping a registration you made, here it
+/// is failing before you get to.
 struct Halves {
-    reg: Arc<Registration>,
-    shutdown: CancellationToken,
-    // Held, not just used: dropping it drops the `Configuration` inside, and
-    // msquic ends the connection when that goes.
+    // Before `reg`, deliberately.
     dialed: spike::SpikeConnection,
+    shutdown: CancellationToken,
+    reg: Arc<Registration>,
+}
+
+impl Drop for Halves {
+    fn drop(&mut self) {
+        // Stops the accept loop and the serve task, which is what holds the
+        // `Listener`; `shutdown()` then tells msquic to let its handles go so
+        // the close below has nothing to wait on. Neither blocks.
+        self.shutdown.cancel();
+        self.reg.shutdown();
+    }
 }
 
 /// A portal server offering `catalogue`, and a connection to it.
@@ -84,9 +106,9 @@ async fn connected(catalogue: Catalogue) -> Halves {
         .await
         .expect("dial the portal");
     Halves {
-        reg,
-        shutdown,
         dialed,
+        shutdown,
+        reg,
     }
 }
 
@@ -115,9 +137,7 @@ async fn bytes_reach_the_service_and_come_back() {
     assert_eq!(&exchange(&mut client, b"again").await, b"AGAIN");
 
     drop(client);
-    halves.shutdown.cancel();
-    drop(halves.dialed);
-    drain(&halves.reg).await;
+    drain(halves).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -136,9 +156,7 @@ async fn a_service_that_is_not_offered_gets_no_connection() {
     .expect("forward a local port");
 
     // The local accept succeeds — it has to, the refusal has not happened yet —
-    // and then the connection closes without carrying anything. That is what
-    // the status byte buys: without it this would hang until something timed
-    // out, with the application believing it had reached the service.
+    // and then the connection closes without carrying anything.
     let mut client = TcpStream::connect(local)
         .await
         .expect("connect to the forward");
@@ -150,9 +168,31 @@ async fn a_service_that_is_not_offered_gets_no_connection() {
         "the forward should have closed, not answered: {read:?}",
     );
 
-    halves.shutdown.cancel();
-    drop(halves.dialed);
-    drain(&halves.reg).await;
+    // **And the byte itself arrived**, which the assertion above cannot tell
+    // from a stream that was reset — the two look identical to a TCP client,
+    // and that is exactly how a status that never left would go unnoticed.
+    //
+    // In its own scope, because **a `Stream` still in hand is a handle the
+    // registration cannot close** — and the wait below would then time out
+    // pointing at msquic rather than at the line that is still holding it.
+    {
+        let mut stream = halves
+            .dialed
+            .connection
+            .open_outbound_stream(StreamType::Bidirectional, false)
+            .await
+            .expect("open a stream");
+        frame::write_open(&mut stream, "not-offered")
+            .await
+            .expect("write the open");
+        let status = tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut stream))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status");
+        assert_eq!(status, frame::Status::Refused);
+    }
+
+    drain(halves).await;
 }
 
 /// Write five bytes and read five back, on a deadline.
@@ -170,13 +210,20 @@ async fn exchange(client: &mut TcpStream, message: &[u8; 5]) -> [u8; 5] {
     reply
 }
 
-/// Wait for msquic's handles to close before the registration drops.
+/// Release everything, then wait for msquic's handles to close.
 ///
-/// The same two lines `camera_core::shutdown::drain_registration` is, inlined
-/// rather than depended on: it is not a camera thing and phase 1 moves it into
-/// the extracted connection layer, at which point this goes.
-async fn drain(reg: &Registration) {
-    reg.shutdown();
+/// **Takes `Halves` by value**, because waiting while still holding the
+/// connection is waiting for something that cannot happen — `Drop` is what
+/// cancels the tasks and lets the handles go, and it cannot run until the value
+/// does. The `Arc` is cloned out first so there is still a registration to wait
+/// on afterwards.
+///
+/// The wait itself is the two lines `camera_core::shutdown::drain_registration`
+/// is, inlined rather than depended on: it is not a camera thing, and phase 1
+/// moves it into the extracted connection layer.
+async fn drain(halves: Halves) {
+    let reg = Arc::clone(&halves.reg);
+    drop(halves);
     let drained = tokio::time::timeout(Duration::from_secs(5), reg.wait_idle())
         .await
         .is_ok();
