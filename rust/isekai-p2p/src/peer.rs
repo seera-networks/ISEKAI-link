@@ -146,12 +146,12 @@ pub struct ClientOptions<'a> {
     /// the certificate names the host dialled: on the quictls platforms msquic
     /// verifies with a bare `X509_verify_cert` and never sets
     /// `X509_VERIFY_PARAM_set1_host`, so a chain-valid certificate issued for
-    /// *any* name is accepted. That is #134, and what closes it is a
-    /// peer-certificate callback — `camera-core`'s `install_certificate_check`,
-    /// which 1c moves here.
+    /// *any* name is accepted. That is #134, and what closes it is
+    /// [`install_certificate_check`], in this module since 1c-i.
     ///
-    /// Until then a caller that sets this and installs no callback has #134
-    /// back. `camera-core` installs one; anything new must too.
+    /// **Installing it is still the caller's job** until 1c-ii moves the dial
+    /// here. A caller that sets this and installs nothing has #134 back;
+    /// `camera-core` installs it.
     pub verify: bool,
     /// Offer a direct path and let the connection use it.
     pub enable_migration: bool,
@@ -420,7 +420,7 @@ impl AttestedPeer {
     /// either verifies or does not. **Verification and pinning are the same
     /// operation.**
     fn accepts(&self, der: &[u8]) -> Result<(), String> {
-        let spki = isekai_link_utils::cert::spki_sha256_of_certificate(der)
+        let spki = isekai_p2p_core::certificate::spki_sha256_of_certificate(der)
             .ok_or_else(|| "the peer's certificate could not be read".to_owned())?;
         isekai_p2p_core::attestation::verify(
             &self.attestation,
@@ -447,12 +447,32 @@ impl AttestedPeer {
 /// A rejection is logged at `warn` and not swallowed: a certificate for the
 /// wrong name, or one on a connection that expected an attested key, is either
 /// a misconfiguration or the thing this exists to catch, and both want saying.
+/// # The credential must carry `USE_PORTABLE_CERTIFICATES`
+///
+/// **Not a style note.** With it, msquic hands the callback a `QUIC_BUFFER` of
+/// DER, which is what the body casts to. Without it, it hands over the
+/// platform's own handle — an `X509*`, a `PCCERT_CONTEXT` — and the same cast
+/// reads two words of a different object as a pointer and a length. That is
+/// type confusion, not a check that fails.
+///
+/// [`client_config`] sets it whenever `pinning` is asked for, alongside
+/// `INDICATE_CERTIFICATE_RECEIVED`, and a configuration built any other way has
+/// to set both. This is a precondition rather than an assertion because the
+/// flags live on the `Configuration` and this is handed a `Connection`.
+///
+/// 1c-ii removes the question by having the dial install this, so no caller
+/// holds the two halves apart.
 pub fn install_certificate_check(
     conn: &Connection,
     // The host to hold the certificate against, or `None` when validation is
     // off and only the pin is left to check.
     host: Option<String>,
     pin: Option<AttestedPeer>,
+    // **Read this before retrying.** A `Some` here is the one answer that is not
+    // worth another attempt: the certificate was refused, and it will be refused
+    // the same way every time. A caller that takes the slot because the
+    // signature asks for it and never looks at it retries for its whole deadline
+    // and then reports a timeout -- which is #141 with the reason in hand.
     refused: Arc<Mutex<Option<String>>>,
 ) {
     conn.set_peer_certificate_received_callback(move |certificate, _flags, _status, _chain| {

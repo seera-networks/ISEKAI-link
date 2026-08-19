@@ -20,6 +20,7 @@
 //! `channel-masque`), and the MASQUE relay legs build on top of these.
 
 pub mod attestation;
+pub mod certificate;
 pub mod endpoint;
 pub mod hostname;
 /// HTTPS (HTTP/1.1 + HTTP/2) transport for the Identity API.

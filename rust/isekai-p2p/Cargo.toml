@@ -29,9 +29,6 @@ time = { workspace = true }
 tokio-util = { workspace = true }
 # The registration and connection handles `peer` states the rules for.
 msquic-async = { workspace = true }
-# The SPKI digest a peer's attestation is checked against (`peer`), shared with
-# the managed-domain certificate route.
-isekai-link-utils = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }

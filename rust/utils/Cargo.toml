@@ -7,6 +7,9 @@ edition.workspace = true
 anyhow = { workspace = true }
 bytes = { workspace = true }
 channel-masque = { workspace = true }
+# `cert` re-exports the certificate digest from there: everything that consumes
+# it sits below this crate, so it owns it. Default features -- no msquic.
+isekai-p2p-core = { workspace = true }
 # The managed-domain certificate route (`cert`): building the CSR, digesting a
 # key or a chain, and generating the key that stays here.
 rcgen = { workspace = true }
