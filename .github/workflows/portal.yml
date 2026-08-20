@@ -5,20 +5,21 @@ name: ISEKAI portal
 # binaries, and the mobile workflows build the FFI crate. So the crate's green
 # checks said nothing about the crate. This is #144.
 #
-# **Linux and macOS run the tests; Windows compiles them** — #155, and not for
-# the reason it first looked like.
+# **All three platforms run the tests.** Windows did not, for two different
+# reasons, and #155 was the second.
 #
-# On some windows-latest runners the loopback handshake never completes: the
-# dial sits until its budget and the test fails at exactly 30s, where a healthy
-# run takes 0.08s. It is binary — milliseconds or never — and it is the
-# *runner*, not the tests. Twenty consecutive runs passed on one machine while
-# two consecutive runs failed on another, ten of those twenty serially, which
-# is what finally ruled out the ordering the first three attempts were built
-# around.
+# The test dialled `localhost`. The listener is bound on `127.0.0.1`, and on
+# Windows `localhost` resolves to `::1` first — so a handshake that went there
+# completed never rather than slowly, which is the shape it failed in: exactly
+# the budget, or 0.08s, and nothing in between. It was intermittent because
+# which address a machine hands back is a property of the machine, which is also
+# why it passed 21 times on one runner and failed twice on another, and 20 times
+# on a developer's Windows box.
 #
-# So the tests are not the thing that is wrong, and a gate that is red or green
-# by machine is worse than an honest exclusion. Windows compiles them until
-# somebody can look at it on a Windows box; #155 has the tally.
+# `spike.rs` carried a comment predicting this and was only ever run on Linux.
+# The test dials a literal now, as `camera-core/tests/video_loopback.rs` always
+# has — and that file has never failed on `windows-latest`, which is what said
+# the runner image was not the problem.
 #
 # Before that it was the certificate: `spike.rs` handed msquic a PEM and no
 # PKCS#12, and the Windows credential path's no-PFX fallback cannot take an
@@ -80,7 +81,7 @@ jobs:
       # says for the same reason.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, windows-latest, macos-14]
     defaults:
       run:
         working-directory: rust
@@ -106,29 +107,28 @@ jobs:
       # about them without a proxy -- so this is what says they still build.
       - name: Build the binaries
         run: cargo build -p portal-server -p portal-client
-
-  compile:
-    name: Compile (windows-latest)
-    runs-on: windows-latest
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: rust
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
-        shell: pwsh
-        working-directory: submodules/msquic-async-rs/seera-msquic
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      # `--all-targets` so the test binaries compile too: a `cfg` that only
-      # exists on one platform breaks at compile time, and that is the part
-      # worth catching here. Running them is #155.
-      - name: Check
-        run: cargo check -p portal-core -p portal-server -p portal-client --all-targets
+      # **#155's evidence, kept until the tally says so.** The failure was
+      # intermittent -- about two runs in three on a bad machine, none on a good
+      # one -- so a green run proves nothing on its own and one observation sent
+      # me after the wrong cause twice. Ten runs each way; delete this step once
+      # it has been clean for a while.
+      - name: '#155: ten runs each way'
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          for mode in parallel serial; do
+            threads=""
+            if [ "$mode" = serial ]; then threads="--test-threads=1"; fi
+            pass=0
+            fail=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if cargo test -q -p portal-core --test tcp_loopback -- $threads >/dev/null 2>&1; then
+                pass=$((pass+1))
+              else
+                fail=$((fail+1))
+              fi
+            done
+            echo "$mode: $pass passed, $fail failed"
+          done
 

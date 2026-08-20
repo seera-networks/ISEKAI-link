@@ -183,14 +183,23 @@ async fn connected(catalogue: Catalogue) -> Halves {
         }
     });
 
-    // `localhost` is the TLS name only — the dial pins the remote address
-    // itself — and validation is off because the listener above is presenting
-    // the self-signed fallback.
+    // **`127.0.0.1`, not `localhost`** — this is #155. The listener above is
+    // bound on `127.0.0.1`, and on Windows `localhost` resolves to `::1` first;
+    // a handshake that goes there completes never rather than slowly, which is
+    // the shape this failed in. `spike.rs` carried a comment predicting exactly
+    // that and was only ever run on Linux, so it was never tested.
+    //
+    // A literal cannot be resolved, so nothing here depends on whether
+    // `set_remote_addr` is enough to stop msquic trying. `video_loopback.rs`
+    // dials a literal for the same reason and has never failed on Windows.
+    //
+    // Validation is off because the listener is presenting the self-signed
+    // fallback, so the name is not doing anything else here either.
     let session = tokio::time::timeout(
         DIAL_BUDGET,
         transport::connect(
             Some(reg.clone()),
-            "localhost",
+            "127.0.0.1",
             bound.port(),
             transport::ConnectOptions::default(),
             &shutdown,
