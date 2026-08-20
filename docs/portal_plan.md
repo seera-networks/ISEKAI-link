@@ -118,6 +118,20 @@ portal-client    the side with the local ports (an `InitiatorSession`)
 `portal-core` depends on `isekai-p2p` exactly as `camera-core` does. The two
 core crates do not depend on each other.
 
+**And 1c-iii-a found the thing that makes that work.** `camera-core::tls` — the
+key this device holds, the CSR that gets it signed, the bundle the listener
+presents, the dev fallback, the PKCS#12 Windows needs — is 550 lines of which
+*nothing* is about video except the names. `portal-server` needs all of it, so
+it moved to `isekai_p2p::endpoint_cert`.
+
+Placing it settled a question 1c-i left open. `isekai-p2p` and
+`isekai-link-utils` are siblings above `isekai-p2p-core`, and the certificate
+module wanted pieces from both — `secret::write_secret` from one, the CSR
+builder and the key digest from the other. Neither sibling may reach across, so
+what they share went down: `isekai_p2p_core::certificate` owns asking for a
+certificate as well as reading one, and `isekai-link-utils::cert` re-exports it
+for the §7.4 route. The rule stays *dependencies point down*.
+
 ### 4.3 The service catalogue — the one real decision
 
 **The initiator must not be able to name a host and port.**
@@ -299,7 +313,9 @@ having before anyone asks.
 | **1b** | `video_client_config` → the layer, ALPN as a parameter | **done** — the settings and their reasoning moved verbatim; `camera-core` delegates |
 | **1c-i** | `AttestedPeer`, `Unpinnable` and `install_certificate_check` → the layer | **done** — `camera-core` re-exports the names its viewers and FFI import |
 | **1c-ii** | `dial_video` → the layer, with the rules from 1a enforced rather than stated: a session handle whose `Drop` releases everything, a drain that takes ownership, and the certificate check installed by the dial rather than by the caller. #141 is classified here | **done** — `peer::dial` returns a `PeerSession`; #141 classified off the transport status. Run on Windows hardware: video as before, and the switch to the direct path |
-| **1c-iii** | delete `spike.rs`; portal on a real `InitiatorSession` | portal forwards over a proxy |
+| **1c-iii-a** | the Endpoint's relay certificate → the layer | **done** — `isekai_p2p::endpoint_cert`; `camera-core::tls` re-exports the names its apps spell |
+| **1c-iii-b** | `portal-core` opens the session both ways: a `ListenerSession` that relays to a portal listener, an `InitiatorSession` that dials it | the loopback test runs over the real types |
+| **1c-iii-c** | delete `spike.rs`; `portal-server` and `portal-client` | portal forwards over a proxy |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have | a transfer survives the switch |

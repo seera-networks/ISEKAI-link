@@ -15,25 +15,10 @@ tracing = { workspace = true }
 msquic-async = { workspace = true }
 isekai-link-utils = { workspace = true }
 isekai-p2p = { workspace = true }
-# Dev self-signed certificate for the video ("sample" ALPN) QUIC listener.
-rcgen = { workspace = true }
-# The PKCS#12 blob Windows loads credentials from (`tls`). The SPKI digests it
-# is compared against come from `isekai-link-utils::cert`, which the
-# managed-domain route shares.
-base64 = { workspace = true }
 # The privacy policy and the record of agreeing to it (`privacy`).
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
-
-# Windows only, and only to package that dev certificate as PKCS#12: msquic's
-# Windows credential path imports a PFX blob, and its no-PFX fallback goes
-# through an RSA provider that cannot take rcgen's ECDSA P-256 key (see
-# src/tls.rs). Vendored so the build does not depend on an OpenSSL installed on
-# the machine. Off Windows the PEM path is used and OpenSSL is never linked —
-# which is the point of confining this to a target-specific dependency.
-[target.'cfg(windows)'.dependencies]
-openssl = { version = "0.10.66", features = ["vendored"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

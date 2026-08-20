@@ -1061,13 +1061,11 @@ name = "camera-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "bytes",
  "isekai-link-utils",
  "isekai-p2p",
  "jpeg-encoder",
  "msquic-async",
- "openssl",
  "rcgen",
  "serde",
  "serde_json",
@@ -3055,7 +3053,9 @@ dependencies = [
  "base64",
  "isekai-p2p-core",
  "msquic-async",
+ "openssl",
  "p256",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",

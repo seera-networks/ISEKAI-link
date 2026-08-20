@@ -34,6 +34,7 @@ pub use listener::{
 // Documented by its own module header, which is where the rules are written
 // down. An outer doc comment here would be concatenated in front of that one
 // and resolved in *this* scope, so every `[`dial`]` in it would break.
+pub mod endpoint_cert;
 pub mod peer;
 
 /// Re-exports of the `isekai-p2p-core` items that appear in this crate's API.

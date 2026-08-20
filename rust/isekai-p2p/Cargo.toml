@@ -29,11 +29,24 @@ time = { workspace = true }
 tokio-util = { workspace = true }
 # The registration and connection handles `peer` states the rules for.
 msquic-async = { workspace = true }
+# The key this Endpoint keeps and the dev certificate it falls back to
+# (`endpoint_cert`).
+rcgen = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Windows only, and only to package a certificate as PKCS#12: msquic's Windows
+# credential path imports a PFX blob, and its no-PFX fallback goes through an
+# RSA provider that cannot take rcgen's ECDSA P-256 key (see
+# src/endpoint_cert.rs). Vendored so the build does not depend on an OpenSSL
+# installed on the machine. Off Windows the PEM path is used and OpenSSL is
+# never linked -- which is the point of confining this to a target-specific
+# dependency.
+[target.'cfg(windows)'.dependencies]
+openssl = { version = "0.10.66", features = ["vendored"] }
 
 [dev-dependencies]
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
