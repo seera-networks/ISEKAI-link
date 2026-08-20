@@ -17,8 +17,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use isekai_p2p::agent::ObservedAddress;
 use isekai_p2p::endpoint_cert::{dev_cert, EndpointCert};
-use isekai_p2p::peer::{dial, DialOptions, PeerSession};
+use isekai_p2p::peer::{dial, AttestedPeer, DialOptions, PeerSession};
 use msquic_async::{Listener, Registration};
 use tokio_util::sync::CancellationToken;
 
@@ -80,23 +81,46 @@ pub fn bind(
     Ok((reg, listener, local))
 }
 
+/// What [`connect`] needs beyond the address.
+///
+/// The three things a session knows and a loopback test does not.
+#[derive(Default)]
+pub struct ConnectOptions {
+    /// Validate the peer's certificate chain, and hold it against the host.
+    ///
+    /// Off is dev-only, and then there is nothing to check the certificate
+    /// against. The loopback test uses it because the listener there presents
+    /// the self-signed fallback; over a proxy it is on whenever the proxy names
+    /// a host to dial.
+    pub verify: bool,
+    /// What the peer signed for about its own key, from the connect response.
+    ///
+    /// `None` is ordinary while this is being adopted and leaves the connection
+    /// on name validation alone.
+    pub pin: Option<AttestedPeer>,
+    /// How the proxy sees this session's relay leg. `Some` offers it as a
+    /// direct-path candidate and turns migration on.
+    pub candidate: Option<ObservedAddress>,
+}
+
 /// Dial a portal listener.
 ///
 /// `host` is a **name**, never an address to resolve — [`dial`] says why at
 /// length, and the whole of it applies here: over a proxy this dials the local
 /// relay bridge on loopback and the name is only ever what the certificate is
 /// held against.
-///
-/// `verify` off is dev-only, and then there is nothing to check the certificate
-/// against. It is what the loopback test uses, because the listener there is
-/// presenting the self-signed fallback.
 pub async fn connect(
     reg: Option<Arc<Registration>>,
     host: &str,
     port: u16,
-    verify: bool,
+    opts: ConnectOptions,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<PeerSession> {
+    let ConnectOptions {
+        verify,
+        pin,
+        candidate,
+    } = opts;
     dial(
         reg,
         DialOptions {
@@ -104,12 +128,8 @@ pub async fn connect(
             host,
             port,
             verify,
-            // Nothing to pin until a proxy names the peer and hands over what
-            // it signed for; that arrives with the session in 1c-iii-c.
-            pin: None,
-            // And no direct-path candidate until there is a relay leg to have
-            // one observed on.
-            candidate: None,
+            pin,
+            candidate,
         },
         shutdown,
     )

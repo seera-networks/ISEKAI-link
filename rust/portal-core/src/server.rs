@@ -32,6 +32,16 @@ const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10)
 pub struct Catalogue(HashMap<String, SocketAddr>);
 
 impl Catalogue {
+    /// Whether it offers nothing, which is a server with no reason to run.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many services it offers.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

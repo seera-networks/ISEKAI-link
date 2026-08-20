@@ -4374,6 +4374,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argh",
+ "isekai-p2p",
+ "portal-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "portal-core"
 version = "0.1.0"
 dependencies = [
@@ -4381,6 +4395,20 @@ dependencies = [
  "isekai-link-utils",
  "isekai-p2p",
  "msquic-async",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "portal-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argh",
+ "isekai-p2p",
+ "portal-core",
  "tokio",
  "tokio-util",
  "tracing",

@@ -32,6 +32,8 @@ on:
   push:
     paths:
       - 'rust/portal-core/**'
+      - 'rust/portal-server/**'
+      - 'rust/portal-client/**'
       # What the forwarding now rides on. `transport` dials with
       # `isekai_p2p::peer` and binds with `isekai-link-utils`, and nothing else
       # in CI compiles `portal-core` -- migration-spike.yml tests `camera-core`
@@ -48,6 +50,8 @@ on:
   pull_request:
     paths:
       - 'rust/portal-core/**'
+      - 'rust/portal-server/**'
+      - 'rust/portal-client/**'
       # What the forwarding now rides on. `transport` dials with
       # `isekai_p2p::peer` and binds with `isekai-link-utils`, and nothing else
       # in CI compiles `portal-core` -- migration-spike.yml tests `camera-core`
@@ -95,6 +99,10 @@ jobs:
       # tests found — so the timeout above is the backstop, not the plan.
       - name: Test
         run: cargo test -p portal-core
+      # The binaries are not covered by the tests -- there is nothing to test
+      # about them without a proxy -- so this is what says they still build.
+      - name: Build the binaries
+        run: cargo build -p portal-server -p portal-client
 
   compile:
     name: Compile (windows-latest)
@@ -119,4 +127,4 @@ jobs:
       # exists on one platform breaks at compile time, and that is the part
       # worth catching here. Running them is #155.
       - name: Check
-        run: cargo check -p portal-core --all-targets
+        run: cargo check -p portal-core -p portal-server -p portal-client --all-targets

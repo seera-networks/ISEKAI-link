@@ -336,7 +336,7 @@ having before anyone asks.
 | **1c-iii-a** | the Endpoint's relay certificate → the layer | **done** — `isekai_p2p::endpoint_cert`; `camera-core::tls` re-exports the names its apps spell |
 | **1c-iii-b** | `spike.rs` → `transport.rs`: portal binds and dials with the connection layer, not its own copy | **done** — the loopback test runs over `peer::dial`, on Linux and macOS; Windows compiles it (#155) |
 | **1c-iii-c-i** | the loop that drives a `ListenerSession` → the layer | **done** — `isekai_p2p::listener::run`; `camera-core` calls it and keeps the command type's name |
-| **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | portal forwards over a proxy |
+| **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **built** — needs a proxy to verify; the catalogue is still arguments, which is phase 2 |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have | a transfer survives the switch |
@@ -391,3 +391,51 @@ a new component and being this one, grown.
    interactive forward turns out to matter, QUIC's stream priorities are the
    answer before more connections are.
 4. **`isekai-portal-v1` in the Identity API** — who, and when (§4.5).
+
+## 8. Running it against a proxy
+
+Phase 1c-iii-c-ii builds the two binaries; this is the exchange they need, and
+it is the camera's (spec §13) with the last step removed.
+
+**The client says who it is.** No network call — it generates the key if there
+is none and prints the Endpoint ID:
+
+```
+portal-client --identity-url … --proxy-url … --auth0-token … \
+              --key client.pem --whoami
+ep:40d25d…
+```
+
+**The server offers services and authorises that Endpoint.** `--service` is
+`name=host:port`, and the target never crosses the wire (§4.3):
+
+```
+portal-server --identity-url … --proxy-url … --auth0-token … \
+              --key server.pem --register \
+              --service db=127.0.0.1:5432 \
+              --allow ep:40d25d…
+listener id : pl_…
+endpoint id : ep:…
+capability  : eyJ…   (for ep:40d25d…)
+```
+
+**The client connects and maps local ports.** `--map` is `port:service`, and
+nothing about it reaches the server:
+
+```
+portal-client … --key client.pem --register \
+              --listener pl_… --capability eyJ… --map 5432:db
+connection id: …
+127.0.0.1:5432 -> db
+```
+
+Then `psql -h 127.0.0.1 -p 5432`, or whatever the service is.
+
+**Nobody carries a connection id across**, which is the difference from the
+camera server: `portal-server` runs `AcceptPolicy::AutoNotify`, so the listener
+binds whatever the proxy says is waiting. The connection id is printed for
+diagnostics only.
+
+The protocol string defaults to `isekai-portal-v1` on both sides, which is §4.5's
+external dependency: the Identity API has to issue tokens carrying it, or the
+connect is refused before any of this is reached.

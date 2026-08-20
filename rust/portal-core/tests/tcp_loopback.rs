@@ -172,7 +172,7 @@ async fn connected(catalogue: Catalogue) -> Halves {
             Some(reg.clone()),
             "localhost",
             bound.port(),
-            false,
+            transport::ConnectOptions::default(),
             &shutdown,
         ),
     )
