@@ -5,21 +5,22 @@ name: ISEKAI portal
 # binaries, and the mobile workflows build the FFI crate. So the crate's green
 # checks said nothing about the crate. This is #144.
 #
-# **All three platforms run the tests as of phase 1c-iii-b.** They did not
-# before, and the reason is worth keeping because it is what changed rather than
-# what was decided: running them needed `spike.rs`, which handed msquic a PEM and
-# no PKCS#12. On Windows the credential path imports a PFX and its fallback goes
-# through an RSA provider that cannot take rcgen's ECDSA P-256 key — so the
-# listener could not start, and this file said Windows was "not asked to" run
-# them rather than doing Windows-specific work on scaffolding phase 1 would
-# delete.
+# **Linux and macOS run the tests; Windows compiles them**, and the Windows
+# half is a known failure rather than a decision — see #155.
 #
-# `transport.rs` replaced that scaffolding with `isekai_p2p::endpoint_cert`,
-# which packages the bundle for exactly this reason — the same path
-# `camera-core`'s video listener has taken on Windows all along, and which
-# `video_loopback.rs` exercises there in migration-spike.yml. So the constraint
-# is gone rather than worked around, and #152's "except portal-core on Windows"
-# goes with it.
+# It used to be a decision. Running them needed `spike.rs`, which handed msquic a
+# PEM and no PKCS#12, and on Windows the credential path's no-PFX fallback goes
+# through an RSA provider that cannot take rcgen's ECDSA P-256 key, so the
+# listener could not start at all. Phase 1c-iii-b replaced that with
+# `isekai_p2p::endpoint_cert`, which packages the bundle -- the same path
+# `camera-core`'s video listener takes on Windows, exercised there by
+# `video_loopback.rs`.
+#
+# That removed the reason, and macOS went from compiling the tests to running
+# them. Windows did not: whichever of the two integration tests runs second has
+# a dial that never completes, and raising its budget only lengthens the wait.
+# #155 has the evidence. Until it is understood, asking Windows to run them
+# would be asking for a red check that says nothing new.
 #
 # The Windows job also builds vendored OpenSSL, which is what packaging that
 # bundle costs. Making it optional was considered and rejected: with the feature
@@ -72,7 +73,7 @@ jobs:
       # says for the same reason.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        os: [ubuntu-latest, macos-14]
     defaults:
       run:
         working-directory: rust
@@ -92,8 +93,30 @@ jobs:
       # halves. They have hung this repository's CI before — see the header of
       # camera-core/tests/video_loopback.rs and the four ways portal-core's own
       # tests found — so the timeout above is the backstop, not the plan.
-      #
-      # `--all-targets` is not needed to compile the test binaries here: running
-      # them does that, on every platform now.
       - name: Test
         run: cargo test -p portal-core
+
+  compile:
+    name: Compile (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # `--all-targets` so the test binaries compile too: a `cfg` that only
+      # exists on one platform breaks at compile time, and that is the part
+      # worth catching here. Running them is #155.
+      - name: Check
+        run: cargo check -p portal-core --all-targets

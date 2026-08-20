@@ -322,7 +322,7 @@ having before anyone asks.
 | **1c-i** | `AttestedPeer`, `Unpinnable` and `install_certificate_check` → the layer | **done** — `camera-core` re-exports the names its viewers and FFI import |
 | **1c-ii** | `dial_video` → the layer, with the rules from 1a enforced rather than stated: a session handle whose `Drop` releases everything, a drain that takes ownership, and the certificate check installed by the dial rather than by the caller. #141 is classified here | **done** — `peer::dial` returns a `PeerSession`; #141 classified off the transport status. Run on Windows hardware: video as before, and the switch to the direct path |
 | **1c-iii-a** | the Endpoint's relay certificate → the layer | **done** — `isekai_p2p::endpoint_cert`; `camera-core::tls` re-exports the names its apps spell |
-| **1c-iii-b** | `spike.rs` → `transport.rs`: portal binds and dials with the connection layer, not its own copy | **done** — the loopback test runs over `peer::dial`, and on all three platforms |
+| **1c-iii-b** | `spike.rs` → `transport.rs`: portal binds and dials with the connection layer, not its own copy | **done** — the loopback test runs over `peer::dial`, on Linux and macOS; Windows compiles it (#155) |
 | **1c-iii-c** | the session: a `ListenerSession` that relays to the portal listener, an `InitiatorSession` that dials it, and the two binaries | portal forwards over a proxy |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
