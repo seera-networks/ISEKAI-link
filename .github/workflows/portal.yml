@@ -99,31 +99,46 @@ jobs:
       # tests found — so the timeout above is the backstop, not the plan.
       - name: Test
         run: cargo test -p portal-core
-      # **#155, one experiment.** The same two tests, serially and with the
-      # dial talking. Whichever way this goes it halves the search:
+      # **#155, measured rather than sampled.** The failure is intermittent --
+      # about two runs in three on windows-latest -- and one observation cannot
+      # tell the hypotheses apart. Two of them reading as "deterministic" sent
+      # me after the wrong cause twice.
       #
-      # * passes serially -> the tests interfere through something
-      #   process-global, and serialising them is a real fix rather than a
-      #   workaround
-      # * fails serially  -> the second dial fails on its own account, and the
-      #   log below says why
+      # So: ten runs each way, and a tally.
       #
-      # Ruled out already: the runtime shape (current-thread fails the same
-      # way), msquic's API table (opened once, closed at process exit), the
-      # certificate (the listener starts and the passing test reads a status
-      # back), and two registrations per se (`video_loopback.rs` does that on
-      # Windows and passes, through the same `peer::dial`).
+      # * serial clean, parallel not -> the tests interfere through something
+      #   process-global, and serialising them is a real fix
+      # * both fail at a similar rate -> the second dial fails on its own
+      #   account, and interference is out
       #
-      # `continue-on-error` because this is a measurement, not a gate.
-      - name: '#155: the same tests, serially and with logs'
-        # `always()`, because the step above failing is exactly when this is
-        # worth having -- without it the job stops at the failure and the
-        # measurement never runs.
+      # Ruled out already: the runtime shape (current-thread fails at the same
+      # rate), msquic's API table (opened once, closed at process exit by a
+      # dtor), the certificate (the listener starts, and the passing test opens
+      # a stream and reads a status back), and two registrations in one process
+      # (`video_loopback.rs` does that on Windows, through the same
+      # `peer::dial`, and passes).
+      #
+      # `always()` because the step above failing is the case this exists for;
+      # `continue-on-error` because it is a measurement and not a gate.
+      - name: '#155: ten runs each way'
         if: always()
         continue-on-error: true
-        env:
-          RUST_LOG: isekai_p2p::peer=debug,msquic_async=debug
-        run: cargo test -p portal-core --test tcp_loopback -- --test-threads=1 --nocapture
+        shell: bash
+        run: |
+          for mode in parallel serial; do
+            threads=""
+            if [ "$mode" = serial ]; then threads="--test-threads=1"; fi
+            pass=0
+            fail=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if cargo test -q -p portal-core --test tcp_loopback -- $threads >/dev/null 2>&1; then
+                pass=$((pass+1))
+              else
+                fail=$((fail+1))
+              fi
+            done
+            echo "$mode: $pass passed, $fail failed"
+          done
       # The binaries are not covered by the tests -- there is nothing to test
       # about them without a proxy -- so this is what says they still build.
       - name: Build the binaries
