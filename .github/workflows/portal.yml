@@ -31,11 +31,33 @@ on:
   push:
     paths:
       - 'rust/portal-core/**'
+      # What the forwarding now rides on. `transport` dials with
+      # `isekai_p2p::peer` and binds with `isekai-link-utils`, and nothing else
+      # in CI compiles `portal-core` -- migration-spike.yml tests `camera-core`
+      # and `isekai-p2p`, camera-apps.yml builds the two camera binaries. So
+      # without these a breaking change to `peer::dial` or to the listener
+      # helper leaves portal broken and green until someone happens to touch its
+      # directory, which is the #144 hole this file exists to close with the
+      # dependency edge moved one crate over.
+      - 'rust/isekai-p2p/**'
+      - 'rust/isekai-p2p-core/**'
+      - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/portal.yml'
   pull_request:
     paths:
       - 'rust/portal-core/**'
+      # What the forwarding now rides on. `transport` dials with
+      # `isekai_p2p::peer` and binds with `isekai-link-utils`, and nothing else
+      # in CI compiles `portal-core` -- migration-spike.yml tests `camera-core`
+      # and `isekai-p2p`, camera-apps.yml builds the two camera binaries. So
+      # without these a breaking change to `peer::dial` or to the listener
+      # helper leaves portal broken and green until someone happens to touch its
+      # directory, which is the #144 hole this file exists to close with the
+      # dependency edge moved one crate over.
+      - 'rust/isekai-p2p/**'
+      - 'rust/isekai-p2p-core/**'
+      - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/portal.yml'
   workflow_dispatch:

@@ -26,8 +26,22 @@ use tokio_util::sync::CancellationToken;
 ///
 /// **The dial's own deadline is fifteen minutes**
 /// (`isekai_p2p::peer::CONNECT_DEADLINE`), which is right for a peer whose relay
-/// leg an operator is still bringing up and wrong for two halves of one process:
-/// a listener that never binds would otherwise hang this until CI gave up.
+/// leg an operator is still bringing up and wrong for two halves of one process.
+///
+/// **It bounds the dial, not the process**, and the first version of this
+/// comment claimed otherwise. Timing out panics, panicking unwinds, and
+/// unwinding drops the last `Arc<Registration>` while the spawned server task
+/// still holds the `Listener`. [`Teardown`] cancels and calls `shutdown()` on
+/// the way out, but the unwind has no await in it, so the task is not
+/// necessarily polled before that last drop — and then `RegistrationClose`
+/// waits on a handle nobody is going to release.
+///
+/// Measured rather than reasoned about: pointing the dial at a port nothing
+/// listens on hangs past three minutes under the default test threads, and
+/// aborts under `--test-threads=1`. So this turns "fifteen minutes and then
+/// something bad" into "ten seconds and then something bad", and the job
+/// timeout is still the backstop. Worth having and not worth mistaking for a
+/// fix.
 const DIAL_BUDGET: Duration = Duration::from_secs(10);
 
 /// Uppercases whatever it is sent, so a reply proves both directions rather
@@ -75,7 +89,33 @@ struct Halves {
     /// `None` only after [`drain`] has taken it, which is the last thing that
     /// happens to a `Halves`.
     session: Option<isekai_p2p::peer::PeerSession>,
+    teardown: Teardown,
+}
+
+/// Cancels the tasks and lets msquic release its handles, whenever it is
+/// dropped.
+///
+/// **Separate from [`Halves`] because it has to exist before the dial does.**
+/// Everything that can go wrong between binding the listener and holding a
+/// connection — a handshake that never completes, a certificate the listener
+/// cannot present — ends in a panic, and a panic that leaves the server task
+/// holding the `Listener` turns the registration's own drop into an
+/// uninterruptible `RegistrationClose`. Owning the cancel from the first line
+/// means that path runs teardown too.
+struct Teardown {
     shutdown: CancellationToken,
+    reg: Arc<Registration>,
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        // Stops the accept loop and the serve task, which is what holds the
+        // `Listener`; `shutdown()` then tells msquic to let its handles go so
+        // the close has nothing to wait on. Neither blocks, which is the whole
+        // reason they are what `Drop` does and the waiting is not.
+        self.shutdown.cancel();
+        self.reg.shutdown();
+    }
 }
 
 impl Halves {
@@ -84,19 +124,6 @@ impl Halves {
             .as_ref()
             .expect("the session is only taken by `drain`")
             .connection()
-    }
-}
-
-impl Drop for Halves {
-    fn drop(&mut self) {
-        // Stops the accept loop and the serve task, which is what holds the
-        // `Listener`; `shutdown()` then tells msquic to let its handles go so
-        // the close has nothing to wait on. Neither blocks, which is the whole
-        // reason they are what `Drop` does and the waiting is not.
-        self.shutdown.cancel();
-        if let Some(session) = &self.session {
-            session.registration().shutdown();
-        }
     }
 }
 
@@ -111,6 +138,11 @@ async fn connected(catalogue: Catalogue) -> Halves {
         transport::bind(Some(reg.clone()), "127.0.0.1:0".parse().unwrap(), None)
             .expect("bind the portal listener");
     let shutdown = CancellationToken::new();
+    // Before the dial, so a failure between here and `Halves` still tears down.
+    let teardown = Teardown {
+        shutdown: shutdown.clone(),
+        reg: reg.clone(),
+    };
 
     let serving = shutdown.clone();
     tokio::spawn(async move {
@@ -142,7 +174,7 @@ async fn connected(catalogue: Catalogue) -> Halves {
     .expect("dial the portal");
     Halves {
         session: Some(session),
-        shutdown,
+        teardown,
     }
 }
 
@@ -155,7 +187,7 @@ async fn bytes_reach_the_service_and_come_back() {
         halves.connection().clone(),
         "127.0.0.1:0".parse().unwrap(),
         "db".to_owned(),
-        halves.shutdown.clone(),
+        halves.teardown.shutdown.clone(),
     )
     .await
     .expect("forward a local port");
@@ -184,7 +216,7 @@ async fn a_service_that_is_not_offered_gets_no_connection() {
         halves.connection().clone(),
         "127.0.0.1:0".parse().unwrap(),
         "not-offered".to_owned(),
-        halves.shutdown.clone(),
+        halves.teardown.shutdown.clone(),
     )
     .await
     .expect("forward a local port");
@@ -256,7 +288,7 @@ async fn exchange(client: &mut TcpStream, message: &[u8; 5]) -> [u8; 5] {
 /// handles. `Halves::drop` does it too, on the path where an assertion failed
 /// and this was never reached.
 async fn drain(mut halves: Halves) {
-    halves.shutdown.cancel();
+    halves.teardown.shutdown.cancel();
     let session = halves.session.take().expect("drained once");
     drop(halves);
     let drained = session.drain(Duration::from_secs(5)).await;
