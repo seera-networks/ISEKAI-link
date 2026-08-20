@@ -116,6 +116,10 @@ jobs:
       #
       # `continue-on-error` because this is a measurement, not a gate.
       - name: '#155: the same tests, serially and with logs'
+        # `always()`, because the step above failing is exactly when this is
+        # worth having -- without it the job stops at the failure and the
+        # measurement never runs.
+        if: always()
         continue-on-error: true
         env:
           RUST_LOG: isekai_p2p::peer=debug,msquic_async=debug
