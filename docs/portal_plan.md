@@ -298,7 +298,7 @@ having before anyone asks.
 | **1a** | The rules: `Dialed` and `drain_registration` into `isekai_p2p::peer`; `camera-core` and the spike onto them | **done** — `Dialed` superseded by `PeerSession` in 1c-ii |
 | **1b** | `video_client_config` → the layer, ALPN as a parameter | **done** — the settings and their reasoning moved verbatim; `camera-core` delegates |
 | **1c-i** | `AttestedPeer`, `Unpinnable` and `install_certificate_check` → the layer | **done** — `camera-core` re-exports the names its viewers and FFI import |
-| **1c-ii** | `dial_video` → the layer, with the rules from 1a enforced rather than stated: a session handle whose `Drop` releases everything, a drain that takes ownership, and the certificate check installed by the dial rather than by the caller. #141 is classified here | **done** — `peer::dial` returns a `PeerSession`; #141 classified off the transport status. Not yet run on hardware |
+| **1c-ii** | `dial_video` → the layer, with the rules from 1a enforced rather than stated: a session handle whose `Drop` releases everything, a drain that takes ownership, and the certificate check installed by the dial rather than by the caller. #141 is classified here | **done** — `peer::dial` returns a `PeerSession`; #141 classified off the transport status. Run on Windows hardware: video as before, and the switch to the direct path |
 | **1c-iii** | delete `spike.rs`; portal on a real `InitiatorSession` | portal forwards over a proxy |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |

@@ -55,8 +55,15 @@ const DIALED: &str = "right.test";
 /// The name the certificate in the failing half is for.
 const OTHER: &str = "wrong.test";
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_certificate_for_another_host_does_not_get_a_connection() {
+/// Not `#[tokio::test]`: the environment is settled before the runtime exists.
+///
+/// `set_var` is a data race against every other thread in the process, which is
+/// why Rust 2024 makes it `unsafe` — and a multi-threaded runtime has its
+/// workers running by the time a `#[tokio::test]` body starts. `isekai-p2p-core`
+/// is edition 2024 already, so this is also what stops compiling when
+/// `camera-core` follows.
+#[test]
+fn a_certificate_for_another_host_does_not_get_a_connection() {
     let ca = Authority::new("ISEKAI link test CA");
     let ca_file = std::env::temp_dir().join(format!("isekai-test-ca-{}.pem", std::process::id()));
     std::fs::write(&ca_file, &ca.pem).expect("write the CA");
@@ -66,26 +73,32 @@ async fn a_certificate_for_another_host_does_not_get_a_connection() {
     // anything — and it leaks in from the environment on a developer machine.
     std::env::remove_var("ISEKAI_INSECURE_SKIP_VERIFY");
 
-    let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default()).unwrap());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime, once the environment is settled")
+        .block_on(async {
+            let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default()).unwrap());
 
-    // ── The half that must fail ─────────────────────────────────────────────
-    let refusal = dial_against(&reg, ca.issue(OTHER), DIALED).await;
-    let refusal = refusal.expect_err("a certificate for another host must not connect");
-    let refusal = format!("{refusal:#}");
-    assert!(
-        refusal.contains(OTHER) && refusal.contains(DIALED),
-        "the refusal should say which name arrived and which was wanted: {refusal}",
-    );
+            // ── The half that must fail ──────────────────────────────────────
+            let refusal = dial_against(&reg, ca.issue(OTHER), DIALED).await;
+            let refusal = refusal.expect_err("a certificate for another host must not connect");
+            let refusal = format!("{refusal:#}");
+            assert!(
+                refusal.contains(OTHER) && refusal.contains(DIALED),
+                "the refusal should say which name arrived and which was wanted: {refusal}",
+            );
 
-    // ── The same setup, one name different ──────────────────────────────────
-    //
-    // Without this the first half would also pass if nothing connected at all —
-    // a broken CA, a listener that never binds, a handshake that fails for its
-    // own reasons.
-    dial_against(&reg, ca.issue(DIALED), DIALED)
-        .await
-        .expect("the certificate for the dialed host must connect");
+            // ── The same setup, one name different ───────────────────────────
+            //
+            // Without this the first half would also pass if nothing connected at
+            // all — a broken CA, a listener that never binds, a handshake that
+            // fails for its own reasons.
+            dial_against(&reg, ca.issue(DIALED), DIALED)
+                .await
+                .expect("the certificate for the dialed host must connect");
 
-    let _ = std::fs::remove_file(&ca_file);
-    camera_core::shutdown::drain_registration(&reg, Duration::from_secs(5)).await;
+            let _ = std::fs::remove_file(&ca_file);
+            camera_core::shutdown::drain_registration(&reg, Duration::from_secs(5)).await;
+        });
 }

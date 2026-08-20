@@ -60,8 +60,18 @@ const REFUSAL_BUDGET: Duration = Duration::from_secs(30);
 /// here to show the harness works, not to measure anything.
 const CONNECT_BUDGET: Duration = Duration::from_secs(60);
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_chain_the_client_cannot_build_is_refused_at_once() {
+/// Not `#[tokio::test]`: the environment is settled before the runtime exists.
+///
+/// `set_var` is a data race against every other thread in the process, which is
+/// why Rust 2024 makes it `unsafe` — and a multi-threaded runtime has its
+/// workers running by the time a `#[tokio::test]` body starts. `isekai-p2p-core`
+/// is edition 2024 already, so this is also what stops compiling when
+/// `camera-core` follows.
+///
+/// Nothing above `block_on` needs a runtime: generating a CA is `rcgen` and a
+/// file write.
+#[test]
+fn a_chain_the_client_cannot_build_is_refused_at_once() {
     let trusted = Authority::new("ISEKAI link test CA");
     // Freshly generated, so it is in no store anywhere — not this test's, and
     // not the system's. That is what makes the failing half fail for the one
@@ -76,48 +86,54 @@ async fn a_chain_the_client_cannot_build_is_refused_at_once() {
     // anything — and it leaks in from the environment on a developer machine.
     std::env::remove_var("ISEKAI_INSECURE_SKIP_VERIFY");
 
-    let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default()).unwrap());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime, once the environment is settled")
+        .block_on(async {
+            let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default()).unwrap());
 
-    // ── The half that must fail, and must fail quickly ──────────────────────
-    let refusal = tokio::time::timeout(
-        REFUSAL_BUDGET,
-        dial_against(&reg, stranger.issue(DIALED), DIALED),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "still dialling after {REFUSAL_BUDGET:?}: a chain the client cannot build is being \
-             retried rather than classified, which is #141 and costs a viewer fifteen minutes \
-             of a spinner",
-        )
-    })
-    .expect_err("a certificate from an unknown CA must not connect");
-    let refusal = format!("{refusal:#}");
-    assert!(
-        refusal.contains("TLS alert 48"),
-        "the refusal should name the alert the transport actually sent — 48 is `unknown_ca`, \
-         the one msquic has no status name for and the one this platform sends for every way \
-         this chain can fail: {refusal}",
-    );
-    assert!(
-        !refusal.contains("did not complete within"),
-        "reported as a handshake that went unanswered, which is the failure #141 describes: \
-         {refusal}",
-    );
+            // ── The half that must fail, and must fail quickly ───────────────
+            let refusal = tokio::time::timeout(
+                REFUSAL_BUDGET,
+                dial_against(&reg, stranger.issue(DIALED), DIALED),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "still dialling after {REFUSAL_BUDGET:?}: a chain the client cannot build is \
+                     being retried rather than classified, which is #141 and costs a viewer \
+                     fifteen minutes of a spinner",
+                )
+            })
+            .expect_err("a certificate from an unknown CA must not connect");
+            let refusal = format!("{refusal:#}");
+            assert!(
+                refusal.contains("TLS alert 48"),
+                "the refusal should name the alert the transport actually sent — 48 is \
+                 `unknown_ca`, the one msquic has no status name for and the one this platform \
+                 sends for every way this chain can fail: {refusal}",
+            );
+            assert!(
+                !refusal.contains("did not complete within"),
+                "reported as a handshake that went unanswered, which is the failure #141 \
+                 describes: {refusal}",
+            );
 
-    // ── The same certificate from the CA the client has ─────────────────────
-    //
-    // Without this the first half would also pass if nothing connected at all —
-    // a listener that never binds, a name that does not match, a handshake that
-    // fails for its own reasons and happens to be quick about it.
-    tokio::time::timeout(
-        CONNECT_BUDGET,
-        dial_against(&reg, trusted.issue(DIALED), DIALED),
-    )
-    .await
-    .expect("the trusted half connected within a minute")
-    .expect("the certificate from the trusted CA must connect");
+            // ── The same certificate from the CA the client has ──────────────
+            //
+            // Without this the first half would also pass if nothing connected at
+            // all — a listener that never binds, a name that does not match, a
+            // handshake that fails for its own reasons and is quick about it.
+            tokio::time::timeout(
+                CONNECT_BUDGET,
+                dial_against(&reg, trusted.issue(DIALED), DIALED),
+            )
+            .await
+            .expect("the trusted half connected within a minute")
+            .expect("the certificate from the trusted CA must connect");
 
-    let _ = std::fs::remove_file(&ca_file);
-    camera_core::shutdown::drain_registration(&reg, Duration::from_secs(5)).await;
+            let _ = std::fs::remove_file(&ca_file);
+            camera_core::shutdown::drain_registration(&reg, Duration::from_secs(5)).await;
+        });
 }

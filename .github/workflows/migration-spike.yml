@@ -29,9 +29,14 @@ on:
       # coverage the real-connection paths have. Narrower paths meant a change
       # to `src/video.rs` ran none of them.
       - 'rust/camera-core/**'
-      # The peer layer camera-core sits on, tested by the same step because
-      # nothing else in CI does either.
+      # And what camera-core sits on, all the way down, tested by the same step
+      # because nothing else in CI tests any of it: `camera-apps.yml` fires on
+      # `rust/**` but only builds, and `portal.yml` covers `portal-core` alone.
+      # `isekai-p2p-core` is here by name because that is where the digest and
+      # the hostname check live -- the parts a certificate is asked about.
       - 'rust/isekai-p2p/**'
+      - 'rust/isekai-p2p-core/**'
+      - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/migration-spike.yml'
   pull_request:
@@ -42,9 +47,14 @@ on:
       # coverage the real-connection paths have. Narrower paths meant a change
       # to `src/video.rs` ran none of them.
       - 'rust/camera-core/**'
-      # The peer layer camera-core sits on, tested by the same step because
-      # nothing else in CI does either.
+      # And what camera-core sits on, all the way down, tested by the same step
+      # because nothing else in CI tests any of it: `camera-apps.yml` fires on
+      # `rust/**` but only builds, and `portal.yml` covers `portal-core` alone.
+      # `isekai-p2p-core` is here by name because that is where the digest and
+      # the hostname check live -- the parts a certificate is asked about.
       - 'rust/isekai-p2p/**'
+      - 'rust/isekai-p2p-core/**'
+      - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/migration-spike.yml'
   workflow_dispatch:
