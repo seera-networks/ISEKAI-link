@@ -39,10 +39,17 @@ use tokio_util::sync::CancellationToken;
 /// Measured rather than reasoned about: pointing the dial at a port nothing
 /// listens on hangs past three minutes under the default test threads, and
 /// aborts under `--test-threads=1`. So this turns "fifteen minutes and then
-/// something bad" into "ten seconds and then something bad", and the job
+/// something bad" into "half a minute and then something bad", and the job
 /// timeout is still the backstop. Worth having and not worth mistaking for a
 /// fix.
-const DIAL_BUDGET: Duration = Duration::from_secs(10);
+///
+/// **Thirty seconds rather than ten**, because ten made this a latency
+/// assertion and not a backstop: a `windows-latest` runner with both tests in
+/// flight took longer than that for a loopback handshake, and the same commit
+/// passed on the other run. Nothing here has an opinion about how fast a
+/// handshake should be — only that a wait which is never going to end should
+/// end.
+const DIAL_BUDGET: Duration = Duration::from_secs(30);
 
 /// Uppercases whatever it is sent, so a reply proves both directions rather
 /// than just one — an echo would pass even if the two copies were crossed.
