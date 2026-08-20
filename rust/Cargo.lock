@@ -4380,6 +4380,7 @@ dependencies = [
  "anyhow",
  "argh",
  "isekai-p2p",
+ "msquic-async",
  "portal-core",
  "tokio",
  "tokio-util",

@@ -65,6 +65,22 @@ impl Catalogue {
         self
     }
 
+    /// [`with`](Self::with) for a name that came from outside the program.
+    ///
+    /// The assertion above is right for a catalogue written in code, where a
+    /// bad name is a bug. It is wrong for one built from a command line or the
+    /// file phase 2 adds, where a bad name is a typo and deserves a message
+    /// rather than a panic.
+    pub fn try_with(self, name: &str, target: SocketAddr) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !name.is_empty() && name.len() <= crate::frame::MAX_NAME,
+            "a service name must be 1..={} bytes, and `{name}` is {}",
+            crate::frame::MAX_NAME,
+            name.len(),
+        );
+        Ok(self.with(name, target))
+    }
+
     fn look_up(&self, name: &str) -> Option<SocketAddr> {
         self.0.get(name).copied()
     }

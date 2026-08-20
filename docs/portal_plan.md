@@ -339,7 +339,7 @@ having before anyone asks.
 | **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **built** — needs a proxy to verify; the catalogue is still arguments, which is phase 2 |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
-| **4** | Direct-path migration and the RTT/path reporting the camera apps have | a transfer survives the switch |
+| **4** | Direct-path migration and the RTT/path reporting the camera apps have. The client offers a candidate as of 1c-iii-c-ii; what is missing is the listener advertising its leg's binding, which is `camera-core::video::advertise_direct_path` and moves with this | a transfer survives the switch |
 | **5** | Packaging: a CLI that is pleasant (`portal-client --map 5432:db`), logging, `--help` that explains the catalogue | somebody else can use it from the README alone |
 
 Mobile (FFI) is deliberately last and not scheduled: the desktop shape has to

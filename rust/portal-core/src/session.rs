@@ -31,6 +31,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use isekai_p2p::agent::RelayOptions;
@@ -41,6 +42,7 @@ use isekai_p2p::{
     issue_endpoint_token, proxy_client, AcceptPolicy, InitiatorSession, ListenerSession, P2pConfig,
     SignalingEvent,
 };
+use msquic_async::{msquic, Registration};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -59,12 +61,21 @@ pub struct ServerInfo {
 }
 
 /// A running portal server.
+///
+/// Holds what leaving needs: the task driving the session, so [`close`] can
+/// wait for it to withdraw the Peer Listener, and the registration, so nothing
+/// else drops the last reference to it while a `Listener` is still open.
+///
+/// [`close`]: Self::close
 pub struct ServerHandle {
     /// What to tell the client.
     pub info: ServerInfo,
     commands: mpsc::Sender<ListenerCommand>,
     /// Bindings and departures, for anything that wants to report them.
     pub signaling: broadcast::Sender<SignalingEvent>,
+    running: tokio::task::JoinHandle<()>,
+    shutdown: CancellationToken,
+    reg: Arc<Registration>,
 }
 
 impl ServerHandle {
@@ -90,7 +101,40 @@ impl ServerHandle {
             .await
             .map_err(|_| anyhow::anyhow!("the listener session dropped the request"))?
     }
+
+    /// Stop, withdraw the Peer Listener, and wait for msquic.
+    ///
+    /// **Cancelling is not leaving.** `listener::run` withdraws the listener on
+    /// its way out, and a process that cancels and returns immediately drops
+    /// the runtime first — so the listener is never withdrawn and lingers for
+    /// its whole lease, with anyone who tries to reach it connecting to
+    /// nothing. Waiting for the task is what makes the difference.
+    ///
+    /// Then the drain, for the reason [`Connected::close`] gives: a registration
+    /// dropped while a `Listener` or an accepted connection is still open blocks
+    /// in `RegistrationClose` and nothing says why.
+    pub async fn close(self) {
+        let Self {
+            running,
+            shutdown,
+            reg,
+            ..
+        } = self;
+        shutdown.cancel();
+        if tokio::time::timeout(CLOSE_TIMEOUT, running).await.is_err() {
+            tracing::warn!("the listener session did not finish within {CLOSE_TIMEOUT:?}");
+        }
+        if !isekai_p2p::peer::drain_registration(&reg, DRAIN_TIMEOUT).await {
+            tracing::warn!("msquic still had live handles after {DRAIN_TIMEOUT:?}");
+        }
+    }
 }
+
+/// How long [`ServerHandle::close`] waits for the session to withdraw itself.
+///
+/// It is one proxy request; longer than this means the proxy is not answering,
+/// and the listener expires on its own either way.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Stand a portal server up: a listener the relay forwards to, and a session
 /// that tells the proxy about it.
@@ -173,12 +217,21 @@ pub async fn serve(
 
     let (commands, cmd_rx) = mpsc::channel(8);
     let (signaling, _) = broadcast::channel(32);
-    tokio::spawn(run(session, cmd_rx, policy, signaling.clone(), shutdown));
+    let running = tokio::spawn(run(
+        session,
+        cmd_rx,
+        policy,
+        signaling.clone(),
+        shutdown.clone(),
+    ));
 
     Ok(ServerHandle {
         info,
         commands,
         signaling,
+        running,
+        shutdown,
+        reg,
     })
 }
 
@@ -191,21 +244,45 @@ pub struct Connected {
     pub session: InitiatorSession,
     /// The peer connection the forwards run over.
     pub peer: PeerSession,
+    /// Cancelled by [`close`](Self::close) before it waits, so the forwards let
+    /// their handles go. Without it the drain has nothing to wait for but a
+    /// stream nobody is going to drop.
+    shutdown: CancellationToken,
 }
 
 impl Connected {
-    /// Report the connection closed and take the relay leg down.
+    /// Stop the forwards, wait for msquic, report the connection closed, and
+    /// take the relay leg down.
     ///
-    /// Worth doing rather than dropping: the listener finds who is waiting by
-    /// listing connections in state `relay`, so one nobody reports occupies its
-    /// leg until the proxy expires it.
+    /// **The order is the whole of it.** `client::forward` spawns tasks holding
+    /// `Connection` and `Stream` clones, and a registration dropped with any of
+    /// those still live blocks in `RegistrationClose` uninterruptibly — so
+    /// cancelling and then *waiting* is what makes Ctrl-C during a transfer end
+    /// the process instead of wedging it.
+    ///
+    /// Reporting is worth doing rather than dropping for a different reason:
+    /// the listener finds who is waiting by listing connections in state
+    /// `relay`, so one nobody reports occupies its leg until the proxy expires
+    /// it.
     pub async fn close(self) {
-        let Self { session, peer } = self;
-        // The QUIC first: it rides the leg the session is about to remove.
-        drop(peer);
+        let Self {
+            session,
+            peer,
+            shutdown,
+        } = self;
+        shutdown.cancel();
+        if !peer.drain(DRAIN_TIMEOUT).await {
+            tracing::warn!("msquic still had live handles after {DRAIN_TIMEOUT:?}");
+        }
         session.close().await;
     }
 }
+
+/// How long [`Connected::close`] waits for msquic to let its handles go.
+///
+/// Generous next to what it is waiting for — cancelled tasks dropping a
+/// connection — and short enough that a client leaving does not look hung.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Connect to a portal server and open the peer QUIC to it.
 ///
@@ -217,6 +294,13 @@ pub async fn connect(
     listener_id: &str,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Connected> {
+    // **One registration for both, and it has to be made here.** msquic looks
+    // bindings up per registration, so a relay leg on one and the peer QUIC on
+    // another can never share a binding: `set_share_binding` finds nothing, the
+    // candidate offered below never validates, and the direct path silently
+    // does not happen (`docs/p2p_mode_migration_plan.md` §2.2.3, §2.4).
+    // `serve` does the same thing from the other end.
+    let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default())?);
     let session = InitiatorSession::connect_with_options(
         cfg,
         capability,
@@ -225,7 +309,7 @@ pub async fn connect(
         "127.0.0.1:0".parse().expect("valid loopback addr"),
         RelayOptions {
             unconnected: true,
-            registration: None,
+            registration: Some(reg.clone()),
         },
     )
     .await
@@ -260,10 +344,17 @@ pub async fn connect(
     // Resolved before the dial: a candidate has to be offered before `start`,
     // and the handshake can take a long time by design, so there is no useful
     // "add it later".
+    //
+    // **Nothing probes it yet**, and that is the plan rather than an oversight:
+    // the other end has to advertise its own leg's binding
+    // (`camera-core::video::advertise_direct_path` is the camera's), which is
+    // phase 4 along with the path reporting. Offered anyway because the client
+    // half is what has to happen before `start` and there is nowhere later to
+    // put it.
     let candidate = wait_for_observed(&session, shutdown).await;
 
     let peer = transport::connect(
-        None,
+        Some(reg),
         &host,
         session.local_addr.port(),
         transport::ConnectOptions {
@@ -275,7 +366,11 @@ pub async fn connect(
     )
     .await?;
 
-    Ok(Connected { session, peer })
+    Ok(Connected {
+        session,
+        peer,
+        shutdown: shutdown.clone(),
+    })
 }
 
 /// Wait briefly for the relay leg's observed address.

@@ -22,18 +22,21 @@ use tokio_util::sync::CancellationToken;
 /// Map local TCP ports onto a portal server's services over ISEKAI link.
 #[derive(FromArgs)]
 struct Args {
-    /// identity API base URL (HTTPS), e.g. https://identity.isekai.link:8443
+    /// identity API base URL (HTTPS), e.g. https://identity.isekai.link:8443.
+    /// Not needed with --whoami
     #[argh(option)]
-    identity_url: String,
+    identity_url: Option<String>,
     /// reach the Identity API over HTTP/3 instead of HTTP/1.1 + HTTP/2
     #[argh(switch)]
     identity_http3: bool,
-    /// proxy base URL, e.g. https://proxy.isekai.link:8443
+    /// proxy base URL, e.g. https://proxy.isekai.link:8443. Not needed with
+    /// --whoami
     #[argh(option)]
-    proxy_url: String,
-    /// auth0 access token, used only to obtain the Endpoint Token
+    proxy_url: Option<String>,
+    /// auth0 access token, used only to obtain the Endpoint Token. Not needed
+    /// with --whoami
     #[argh(option)]
-    auth0_token: String,
+    auth0_token: Option<String>,
     /// P2P protocol string
     #[argh(option, default = "String::from(\"isekai-portal-v1\")")]
     protocol: String,
@@ -62,8 +65,8 @@ struct Args {
     /// the address to bind mapped ports on. Loopback by default, because a
     /// forward reachable from the network is a second open door onto the
     /// server's services
-    #[argh(option, default = "String::from(\"127.0.0.1\")")]
-    bind: String,
+    #[argh(option, default = "std::net::IpAddr::from([127, 0, 0, 1])")]
+    bind: std::net::IpAddr,
 }
 
 #[tokio::main]
@@ -81,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let maps = maps(&args.map, &args.bind)?;
+    let maps = maps(&args.map, args.bind)?;
     if maps.is_empty() {
         anyhow::bail!("nothing to forward; pass at least one --map port:service");
     }
@@ -95,10 +98,10 @@ async fn main() -> anyhow::Result<()> {
         .context("--capability is required (the server issues it for this Endpoint)")?;
 
     let cfg = P2pConfig {
-        identity_url: args.identity_url,
+        identity_url: args.identity_url.context("--identity-url is required")?,
         identity_http3: args.identity_http3,
-        proxy_url: args.proxy_url,
-        auth0_token: args.auth0_token,
+        proxy_url: args.proxy_url.context("--proxy-url is required")?,
+        auth0_token: args.auth0_token.context("--auth0-token is required")?,
         auth0: None,
         protocol: args.protocol,
         register: args.register,
@@ -125,25 +128,46 @@ async fn main() -> anyhow::Result<()> {
         println!("{forwarding} -> {service}");
     }
 
-    // The session holds the relay leg; the peer connection rides it. Ending is
-    // what `close` is for -- see `portal_core::session::Connected`.
+    // **Both ways this can end without us**, and watching only one of them is
+    // the worse failure: the forwarded ports stay bound over a connection that
+    // is gone, so anything connecting to them is accepted and then goes quiet
+    // rather than being refused.
     //
-    // Bound rather than awaited inline: `ended()` hands back an owned token, and
-    // a temporary inside the `select!` is dropped before it is polled.
+    // `ended` is the proxy withdrawing the session -- a revoked Grant, a lease
+    // that could not be renewed. The connection ending is the server exiting.
+    //
+    // `ended()` is bound rather than awaited inline because it hands back an
+    // owned token, and a temporary inside the `select!` is dropped before it is
+    // polled.
     let ended = connected.session.ended();
+    let peer = connected.peer.connection().clone();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = ended.cancelled() => {
             tracing::warn!("the session ended; the forwards are going with it");
         }
+        _ = closed(&peer) => {
+            tracing::warn!("the peer connection closed; the forwards are going with it");
+        }
     }
-    shutdown.cancel();
     connected.close().await;
     Ok(())
 }
 
+/// Resolves when the peer connection is no longer usable.
+///
+/// Its event stream ending is the signal: msquic reports the shutdown as an
+/// event and then the stream errors, so this needs no timer of its own.
+async fn closed(conn: &msquic_async::Connection) {
+    while std::future::poll_fn(|cx| conn.poll_event(cx)).await.is_ok() {}
+}
+
 /// Parse `port:name` into the local address to bind and the service to ask for.
-fn maps(maps: &[String], bind: &str) -> anyhow::Result<Vec<(SocketAddr, String)>> {
+///
+/// The address is assembled rather than formatted and re-parsed, which is what
+/// lets `--bind ::1` work: an IPv6 address needs brackets in a `host:port`
+/// string and does not have them here.
+fn maps(maps: &[String], bind: std::net::IpAddr) -> anyhow::Result<Vec<(SocketAddr, String)>> {
     maps.iter()
         .map(|m| {
             let (port, service) = m
@@ -152,10 +176,7 @@ fn maps(maps: &[String], bind: &str) -> anyhow::Result<Vec<(SocketAddr, String)>
             let port: u16 = port
                 .parse()
                 .with_context(|| format!("`{port}` is not a port"))?;
-            let local: SocketAddr = format!("{bind}:{port}")
-                .parse()
-                .with_context(|| format!("`{bind}:{port}` is not an address"))?;
-            Ok((local, service.to_owned()))
+            Ok((SocketAddr::new(bind, port), service.to_owned()))
         })
         .collect()
 }

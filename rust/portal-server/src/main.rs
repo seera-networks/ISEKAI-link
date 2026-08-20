@@ -149,7 +149,10 @@ async fn main() -> anyhow::Result<()> {
             },
         }
     }
-    shutdown.cancel();
+    // Not just `shutdown.cancel()`: returning from `main` drops the runtime, and
+    // the session withdraws the Peer Listener on its way out. Cancel-and-return
+    // leaves it listed for its whole lease, pointing at a process that is gone.
+    server.close().await;
     Ok(())
 }
 
@@ -163,7 +166,7 @@ fn catalogue(services: &[String]) -> anyhow::Result<Catalogue> {
         let target: SocketAddr = target
             .parse()
             .with_context(|| format!("`{target}` is not a host:port"))?;
-        catalogue = catalogue.with(name, target);
+        catalogue = catalogue.try_with(name, target)?;
     }
     Ok(catalogue)
 }
