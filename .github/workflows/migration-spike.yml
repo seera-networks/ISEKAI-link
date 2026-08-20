@@ -14,23 +14,36 @@ name: P2P migration Phase 0 spike
 # Linux only, and "a real-IP source can reach a loopback destination" is a kernel
 # behaviour, not a portable guarantee. `fail-fast: false` so one platform's answer
 # never hides another's.
+#
+# **It has since become the crate test runner too**, for `camera-core` and
+# `isekai-p2p`, because nothing else in CI runs either one's tests and both turn
+# out to have the same kind of question in them — see the test step below. The
+# name is the spike; the scope is wider than the name.
 
 on:
   push:
     paths:
-      - 'rust/camera-core/examples/migration_spike.rs'
-      - 'rust/camera-core/Cargo.toml'
-      # The peer layer the spike's own subject sits on, tested by the step
-      # below because nothing else in CI does.
+      # The whole crate, not just the spike: the `cargo test -p camera-core`
+      # step below is the only thing in CI that runs camera-core's tests, and
+      # `tests/untrusted_chain.rs` and `tests/video_loopback.rs` are the only
+      # coverage the real-connection paths have. Narrower paths meant a change
+      # to `src/video.rs` ran none of them.
+      - 'rust/camera-core/**'
+      # The peer layer camera-core sits on, tested by the same step because
+      # nothing else in CI does either.
       - 'rust/isekai-p2p/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/migration-spike.yml'
   pull_request:
     paths:
-      - 'rust/camera-core/examples/migration_spike.rs'
-      - 'rust/camera-core/Cargo.toml'
-      # The peer layer the spike's own subject sits on, tested by the step
-      # below because nothing else in CI does.
+      # The whole crate, not just the spike: the `cargo test -p camera-core`
+      # step below is the only thing in CI that runs camera-core's tests, and
+      # `tests/untrusted_chain.rs` and `tests/video_loopback.rs` are the only
+      # coverage the real-connection paths have. Narrower paths meant a change
+      # to `src/video.rs` ran none of them.
+      - 'rust/camera-core/**'
+      # The peer layer camera-core sits on, tested by the same step because
+      # nothing else in CI does either.
       - 'rust/isekai-p2p/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/migration-spike.yml'
