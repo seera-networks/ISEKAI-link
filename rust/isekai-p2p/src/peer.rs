@@ -631,8 +631,17 @@ impl PeerSession {
     /// `submodules/msquic-async-rs/docs/registration-wait-idle-design.md` §7,
     /// which is also why [`drain_registration`] does not touch it.
     ///
-    /// `false` if the timeout ran out with handles still live, which is a leak
-    /// worth logging rather than a reason to keep waiting.
+    /// `false` if the timeout ran out with handles still live.
+    ///
+    /// **And then the registration is deliberately leaked.** `false` says a
+    /// tracked handle is still open, and that is exactly the state in which
+    /// dropping the last `Arc<Registration>` blocks in `RegistrationClose` —
+    /// uninterruptibly, with no message. Returning `false` and then hanging on
+    /// the way out would make this function the fifth way to hang rather than
+    /// the answer to four of them, and it would hang *hardest* in the case the
+    /// return value exists to report. So the handle is forgotten instead: one
+    /// leaked registration that the caller can log, assert on, or `_exit`
+    /// past, rather than a process that stops here and says nothing.
     pub async fn drain(self, timeout: Duration) -> bool {
         let Self {
             connection,
@@ -641,7 +650,17 @@ impl PeerSession {
         } = self;
         drop(connection);
         let drained = drain_registration(&registration, timeout).await;
-        drop(config);
+        if drained {
+            // Only now: msquic-async's contract puts the configuration after
+            // `wait_idle` rather than before
+            // (`submodules/msquic-async-rs/docs/registration-wait-idle-design.md`
+            // §7), and the registration is safe to close with nothing left in
+            // it.
+            drop(config);
+        } else {
+            std::mem::forget(config);
+            std::mem::forget(registration);
+        }
         drained
     }
 }
@@ -858,8 +877,8 @@ pub async fn dial(
     }
 }
 
-/// The transport's own verdict on a failed handshake, when that verdict will
-/// read the same on every attempt.
+/// The TLS alert a handshake was refused with, when that refusal will read the
+/// same on every attempt.
 ///
 /// **This is #141.** The `refused` slot [`install_certificate_check`] writes
 /// into only ever carries verdicts *our* callback reached. A chain msquic
@@ -869,17 +888,47 @@ pub async fn dial(
 /// transient one: a peer that has not bridged its relay leg. A CI run spent
 /// fifteen minutes and 1,767 attempts on a status that was in the first one.
 ///
-/// **The list is only the certificate statuses, and deliberately so.** #141
-/// asks whether anything else the transport reports is being retried when it
-/// cannot succeed, and the two candidates are ALPN and version negotiation —
-/// both of which are answers rather than silence. They are left retryable
-/// because the asymmetry is not close: a status wrongly called permanent is a
-/// viewer that fails where it used to work, while one wrongly called transient
-/// is the behaviour we have today. A certificate verdict is safe to call
-/// because nothing that happens inside this deadline changes it; what the
-/// half-open relay edge answers with before both legs are bridged has not been
-/// characterised well enough to say the same.
-fn permanent_verdict(e: &ConnectionStartError) -> Option<msquic::StatusCode> {
+/// # Alerts, not the statuses msquic gives names to
+///
+/// A handshake the local TLS stack rejects closes with
+/// `QuicErrorCodeToStatus(QUIC_ERROR_CRYPTO_ERROR(alert))`, which is
+/// `QUIC_STATUS_TLS_ALERT(alert)` — so **the only certificate verdicts that can
+/// reach here are alerts**, and reading the alert back out is what makes the
+/// list complete.
+///
+/// Matching msquic's named statuses instead looks equivalent and is not, in the
+/// one direction that matters. On the quictls platforms — Linux and Android,
+/// where msquic ORs `USE_TLS_BUILTIN_CERTIFICATE_VALIDATION` in itself — a
+/// chain that does not verify goes through `ssl_x509err2alert`, and
+/// `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `DEPTH_ZERO_SELF_SIGNED_CERT` and
+/// `SELF_SIGNED_CERT_IN_CHAIN` all come out as `unknown_ca` (48). **msquic has
+/// no named status for that alert**, so a `StatusCode` list silently misses the
+/// most ordinary refusal there is on two of our four platforms — and looks
+/// comprehensive while doing it. Darwin and Windows report the same certificate
+/// as `bad_certificate` (42), which is why #141's log shows a status with a
+/// name: it was captured on macOS.
+///
+/// `QUIC_STATUS_CERT_EXPIRED`, `QUIC_STATUS_CERT_UNTRUSTED_ROOT` and
+/// `QUIC_STATUS_CERT_NO_CERT` are not in this list because they cannot appear
+/// here at all: they are a different range (`CERT_ERROR_BASE`, and Windows
+/// crypto `HRESULT`s) that msquic produces only as the deferred-validation
+/// `ValidationResult`, never as a close status. An earlier version of this
+/// function matched them, which is what made it read as though untrusted roots
+/// were covered.
+///
+/// # What is deliberately left retryable
+///
+/// #141 also asks whether anything else the transport reports is being retried
+/// when it cannot succeed. The candidates are ALPN and version negotiation,
+/// which are answers rather than silence, and `decrypt_error` (51), which is
+/// raised for handshake signatures as well as certificate ones. They are left
+/// retryable because the asymmetry is not close: a status wrongly called
+/// permanent is a viewer that fails where it used to work, while one wrongly
+/// called transient is the behaviour we have today. What a half-open relay edge
+/// answers with before both legs are bridged is not characterised well enough
+/// to say otherwise — and the tests below pin the transient side too, so
+/// narrowing this later is a test change rather than a guess.
+fn permanent_verdict(e: &ConnectionStartError) -> Option<CertificateAlert> {
     let status = match e {
         ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByTransport(status, _)) => {
             status
@@ -891,29 +940,54 @@ fn permanent_verdict(e: &ConnectionStartError) -> Option<msquic::StatusCode> {
         // attempt reads the same.
         _ => return None,
     };
-    let code = status.try_as_status_code().ok()?;
-    is_permanent(&code).then_some(code)
+    let alert = tls_alert(status)?;
+    matches!(
+        alert,
+        // What the TLS stack made of the certificate: bad, unsupported,
+        // revoked, expired, unknown.
+        42..=46
+            // No path to a trusted root. The one with no name in msquic, and
+            // the ordinary one on Linux and Android.
+            | 48
+            // A peer that presented nothing where one was required. Not
+            // something that changes inside this deadline either.
+            | 116
+    )
+    .then_some(CertificateAlert(alert))
 }
 
-/// Whether a status is a certificate the far end will present again.
-fn is_permanent(code: &msquic::StatusCode) -> bool {
-    use msquic::StatusCode::*;
-    matches!(
-        code,
-        // What the TLS stack made of the certificate itself.
-        QUIC_STATUS_BAD_CERTIFICATE
-            | QUIC_STATUS_UNSUPPORTED_CERTIFICATE
-            | QUIC_STATUS_REVOKED_CERTIFICATE
-            | QUIC_STATUS_EXPIRED_CERTIFICATE
-            | QUIC_STATUS_UNKNOWN_CERTIFICATE
-            | QUIC_STATUS_CERT_EXPIRED
-            | QUIC_STATUS_CERT_UNTRUSTED_ROOT
-            // The two "there wasn't one": a peer that presented nothing where
-            // one was required. Renewing a certificate is not something that
-            // happens inside this deadline either.
-            | QUIC_STATUS_REQUIRED_CERTIFICATE
-            | QUIC_STATUS_CERT_NO_CERT
-    )
+/// The alert a handshake was closed with, if it was closed with one.
+///
+/// `QUIC_STATUS_CLOSE_NOTIFY` is `QUIC_STATUS_TLS_ALERT(0)` on every platform,
+/// so the alert is the distance from it — which is how this stays right without
+/// knowing whether the platform's `QUIC_STATUS` is an errno-shaped `u32` or an
+/// `HRESULT`. Anything outside 0..=255 of it is not an alert at all.
+fn tls_alert(status: &msquic::Status) -> Option<u8> {
+    u8::try_from(status.0.wrapping_sub(msquic::ffi::QUIC_STATUS_CLOSE_NOTIFY)).ok()
+}
+
+/// A TLS alert that refuses the peer's certificate, for the operator who has to
+/// read it.
+///
+/// Named rather than numbered because the one that matters most has no name in
+/// msquic to borrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CertificateAlert(u8);
+
+impl std::fmt::Display for CertificateAlert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self.0 {
+            42 => "bad_certificate",
+            43 => "unsupported_certificate",
+            44 => "certificate_revoked",
+            45 => "certificate_expired",
+            46 => "certificate_unknown",
+            48 => "unknown_ca",
+            116 => "certificate_required",
+            _ => "certificate refused",
+        };
+        write!(f, "{name} (TLS alert {})", self.0)
+    }
 }
 
 /// Put the connection on a shared, unconnected socket and offer the relay
@@ -994,47 +1068,95 @@ pub fn log_connection_stats(conn: &Connection, stats: &msquic::ffi::QUIC_STATIST
 mod tests {
     use super::*;
 
+    use msquic::ffi::QUIC_STATUS;
     use msquic::StatusCode;
 
-    fn lost(code: StatusCode) -> ConnectionStartError {
-        ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByTransport(
-            msquic::Status::new(code),
-            0,
+    /// A close status carrying `alert`, built the way msquic builds one.
+    fn alert(alert: u8) -> ConnectionStartError {
+        lost(msquic::Status::from(
+            msquic::ffi::QUIC_STATUS_CLOSE_NOTIFY.wrapping_add(alert as QUIC_STATUS),
         ))
     }
 
-    /// Every verdict the TLS stack can reach about the certificate itself ends
-    /// the dial. Our own callback never sees these — msquic rejects the chain
-    /// before it runs — so without this they are retried for the full fifteen
-    /// minutes and then reported as a handshake that went unanswered (#141).
+    fn lost(status: msquic::Status) -> ConnectionStartError {
+        ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByTransport(status, 0))
+    }
+
+    /// The arithmetic that reads an alert back out of a close status, pinned
+    /// against the statuses msquic names itself.
+    ///
+    /// **This is the part that is not the same on every platform.**
+    /// `QUIC_STATUS` is an errno-shaped `u32` on Linux and Android and a signed
+    /// `HRESULT` on Windows, so "the distance from `CLOSE_NOTIFY`" has to hold
+    /// for both — and nothing else here would notice if it did not.
     #[test]
-    fn a_certificate_the_transport_rejects_is_not_retried() {
-        for code in [
-            StatusCode::QUIC_STATUS_BAD_CERTIFICATE,
-            StatusCode::QUIC_STATUS_UNSUPPORTED_CERTIFICATE,
-            StatusCode::QUIC_STATUS_REVOKED_CERTIFICATE,
-            StatusCode::QUIC_STATUS_EXPIRED_CERTIFICATE,
-            StatusCode::QUIC_STATUS_UNKNOWN_CERTIFICATE,
-            StatusCode::QUIC_STATUS_REQUIRED_CERTIFICATE,
-            StatusCode::QUIC_STATUS_CERT_EXPIRED,
-            StatusCode::QUIC_STATUS_CERT_UNTRUSTED_ROOT,
-            StatusCode::QUIC_STATUS_CERT_NO_CERT,
+    fn the_alert_is_read_back_out_of_the_status() {
+        for (status, expected) in [
+            (msquic::ffi::QUIC_STATUS_CLOSE_NOTIFY, 0),
+            (msquic::ffi::QUIC_STATUS_BAD_CERTIFICATE, 42),
+            (msquic::ffi::QUIC_STATUS_UNSUPPORTED_CERTIFICATE, 43),
+            (msquic::ffi::QUIC_STATUS_REVOKED_CERTIFICATE, 44),
+            (msquic::ffi::QUIC_STATUS_EXPIRED_CERTIFICATE, 45),
+            (msquic::ffi::QUIC_STATUS_UNKNOWN_CERTIFICATE, 46),
+            (msquic::ffi::QUIC_STATUS_REQUIRED_CERTIFICATE, 116),
         ] {
             assert_eq!(
-                permanent_verdict(&lost(code.clone())),
-                Some(code.clone()),
-                "{code:?} is the same answer on every attempt",
-            );
-            // Reported the same way whether msquic gave it synchronously or as
-            // a shutdown, since `start` can fail either way.
-            assert_eq!(
-                permanent_verdict(&ConnectionStartError::OtherError(msquic::Status::new(
-                    code.clone()
-                ))),
-                Some(code.clone()),
-                "{code:?} however it arrives",
+                tls_alert(&msquic::Status::from(status)),
+                Some(expected),
+                "{status} should read as alert {expected}",
             );
         }
+
+        // And a status from another range is not mistaken for one. The three
+        // `QUIC_STATUS_CERT_*` values are exactly that — msquic produces them
+        // as a deferred-validation result, never as a close status — and an
+        // earlier version of this file listed them as terminal, which is what
+        // made it look as though untrusted roots were covered.
+        for status in [
+            msquic::ffi::QUIC_STATUS_CERT_EXPIRED,
+            msquic::ffi::QUIC_STATUS_CERT_UNTRUSTED_ROOT,
+            msquic::ffi::QUIC_STATUS_CERT_NO_CERT,
+            msquic::ffi::QUIC_STATUS_CONNECTION_TIMEOUT,
+        ] {
+            assert_eq!(
+                tls_alert(&msquic::Status::from(status)),
+                None,
+                "{status} is not a TLS alert",
+            );
+        }
+    }
+
+    /// Every alert that refuses the peer's certificate ends the dial. Our own
+    /// callback never sees these — msquic rejects the chain before it runs — so
+    /// without this they are retried for the full fifteen minutes and then
+    /// reported as a handshake that went unanswered (#141).
+    #[test]
+    fn a_certificate_the_transport_rejects_is_not_retried() {
+        for a in [42, 43, 44, 45, 46, 48, 116] {
+            assert_eq!(
+                permanent_verdict(&alert(a)),
+                Some(CertificateAlert(a)),
+                "alert {a} is the same answer on every attempt",
+            );
+        }
+    }
+
+    /// **`unknown_ca` deserves its own test**, because it is the one with no
+    /// `QUIC_STATUS` name to match on and the one Linux and Android actually
+    /// send: quictls maps `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`,
+    /// `DEPTH_ZERO_SELF_SIGNED_CERT` and `SELF_SIGNED_CERT_IN_CHAIN` to it, so
+    /// it is what an untrusted root looks like on two of our four platforms.
+    /// The first version of this classification matched msquic's named statuses
+    /// and missed it, while listing three `QUIC_STATUS_CERT_*` values that can
+    /// never be a close status.
+    #[test]
+    fn an_untrusted_root_is_refused_by_the_name_it_actually_arrives_under() {
+        let verdict = permanent_verdict(&alert(48)).expect("unknown_ca is terminal");
+        assert_eq!(
+            verdict.to_string(),
+            "unknown_ca (TLS alert 48)",
+            "and it is reported by a name, since msquic has none to borrow",
+        );
     }
 
     /// And the failure the fifteen minutes exist for stays retryable. The peer
@@ -1044,15 +1166,28 @@ mod tests {
     #[test]
     fn an_unanswered_handshake_is_still_retried() {
         for e in [
-            lost(StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT),
-            lost(StatusCode::QUIC_STATUS_CONNECTION_IDLE),
-            lost(StatusCode::QUIC_STATUS_CONNECTION_REFUSED),
-            lost(StatusCode::QUIC_STATUS_UNREACHABLE),
+            lost(msquic::Status::new(
+                StatusCode::QUIC_STATUS_CONNECTION_TIMEOUT,
+            )),
+            lost(msquic::Status::new(StatusCode::QUIC_STATUS_CONNECTION_IDLE)),
+            lost(msquic::Status::new(
+                StatusCode::QUIC_STATUS_CONNECTION_REFUSED,
+            )),
+            lost(msquic::Status::new(StatusCode::QUIC_STATUS_UNREACHABLE)),
             // Considered and deliberately left retryable: what the half-open
             // relay edge answers with before both legs are bridged is not
             // characterised well enough to call an answer.
-            lost(StatusCode::QUIC_STATUS_ALPN_NEG_FAILURE),
-            lost(StatusCode::QUIC_STATUS_VER_NEG_ERROR),
+            lost(msquic::Status::new(
+                StatusCode::QUIC_STATUS_ALPN_NEG_FAILURE,
+            )),
+            lost(msquic::Status::new(StatusCode::QUIC_STATUS_VER_NEG_ERROR)),
+            // Alerts that are not about the peer's certificate. `decrypt_error`
+            // is raised for handshake signatures too, and `close_notify` is an
+            // orderly shutdown.
+            alert(0),
+            alert(40),
+            alert(51),
+            alert(80),
             // Our own cancellation, and a peer that got far enough to send an
             // application error code. Neither is a verdict on a certificate.
             ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByLocal),

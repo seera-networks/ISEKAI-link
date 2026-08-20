@@ -20,12 +20,18 @@ on:
     paths:
       - 'rust/camera-core/examples/migration_spike.rs'
       - 'rust/camera-core/Cargo.toml'
+      # The peer layer the spike's own subject sits on, tested by the step
+      # below because nothing else in CI does.
+      - 'rust/isekai-p2p/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/migration-spike.yml'
   pull_request:
     paths:
       - 'rust/camera-core/examples/migration_spike.rs'
       - 'rust/camera-core/Cargo.toml'
+      # The peer layer the spike's own subject sits on, tested by the step
+      # below because nothing else in CI does.
+      - 'rust/isekai-p2p/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/migration-spike.yml'
   workflow_dispatch:
@@ -70,7 +76,15 @@ jobs:
         # that test hung forever, and nothing said so because nothing ran it.
         # Now that it terminates, the integration tests run too — they are the
         # only coverage the loopback path has.
-        run: cargo test -p camera-core
+        #
+        # `isekai-p2p` is here for the same reason and on the same matrix: it
+        # is the peer layer `camera-core` sits on, nothing else in CI runs its
+        # tests, and what it classifies is `QUIC_STATUS` — an errno-shaped
+        # `u32` on Linux and Android, a signed `HRESULT` on Windows. That is
+        # the same "not a portable guarantee" this job's header is about, and
+        # a Linux-only answer to it is how #141's first fix missed the platform
+        # its own issue was reported from.
+        run: cargo test -p camera-core -p isekai-p2p
 
       - name: Run the spike
         id: spike
