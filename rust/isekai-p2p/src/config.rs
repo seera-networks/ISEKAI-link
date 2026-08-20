@@ -26,11 +26,11 @@ use crate::auth::Auth0TokenSource;
 /// session lives, and all of this is what it takes.
 #[derive(Clone)]
 pub struct P2pConfig {
-    /// Identity API base URL (HTTPS), e.g. `https://identity.isekai.link:8443`.
+    /// Identity API base URL (HTTPS), e.g. `https://identity.isekai.tools:9443`.
     pub identity_url: String,
     /// Reach the Identity API over HTTP/3 (QUIC) instead of HTTP/1.1 + HTTP/2.
     pub identity_http3: bool,
-    /// Proxy base URL, e.g. `https://proxy.isekai.link:8443`.
+    /// Proxy base URL, e.g. `https://tokyo.link.isekai.tools:8443`.
     pub proxy_url: String,
     /// Auth0 access token — used **only** to obtain the Endpoint Token from the
     /// Identity API. It is never sent to the proxy.

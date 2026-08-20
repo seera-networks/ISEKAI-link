@@ -52,7 +52,7 @@ struct Keygen {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "token")]
 struct Token {
-    /// identity API base URL (HTTPS only, e.g. https://identity.isekai.link:8443)
+    /// identity API base URL (HTTPS only, e.g. https://identity.isekai.tools:9443)
     #[argh(option)]
     identity_url: String,
     /// talk to the Identity API over HTTP/3 (QUIC) instead of HTTP/1.1 + HTTP/2
@@ -79,7 +79,7 @@ struct Token {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "create-listener")]
 struct CreateListener {
-    /// proxy base URL (e.g. https://proxy.isekai.link:8443)
+    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)
@@ -100,7 +100,7 @@ struct CreateListener {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "issue-capability")]
 struct IssueCapability {
-    /// proxy base URL (e.g. https://proxy.isekai.link:8443)
+    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)
@@ -127,7 +127,7 @@ struct IssueCapability {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "connect")]
 struct Connect {
-    /// proxy base URL (e.g. https://proxy.isekai.link:8443)
+    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)
@@ -162,7 +162,7 @@ struct Connect {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "get-connection")]
 struct GetConnection {
-    /// proxy base URL (e.g. https://proxy.isekai.link:8443)
+    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)
@@ -180,7 +180,7 @@ struct GetConnection {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "report-state")]
 struct ReportState {
-    /// proxy base URL (e.g. https://proxy.isekai.link:8443)
+    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)

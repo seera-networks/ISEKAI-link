@@ -4,7 +4,7 @@
 //! offers. Phase 1c-iii-c-ii of `docs/portal_plan.md`.
 //!
 //! ```text
-//! portal-client --identity-url … --proxy-url … --key ep.pem \
+//! portal-client --auth0-token … --key ep.pem \
 //!               --listener pl_… --capability … --map 5432:db
 //! ```
 //!
@@ -22,17 +22,22 @@ use tokio_util::sync::CancellationToken;
 /// Map local TCP ports onto a portal server's services over ISEKAI link.
 #[derive(FromArgs)]
 struct Args {
-    /// identity API base URL (HTTPS), e.g. https://identity.isekai.link:8443.
-    /// Not needed with --whoami
-    #[argh(option)]
-    identity_url: Option<String>,
+    /// identity API base URL (HTTPS). Defaults to the deployment the camera
+    /// apps use
+    #[argh(
+        option,
+        default = "String::from(\"https://identity.isekai.tools:9443\")"
+    )]
+    identity_url: String,
     /// reach the Identity API over HTTP/3 instead of HTTP/1.1 + HTTP/2
     #[argh(switch)]
     identity_http3: bool,
-    /// proxy base URL, e.g. https://proxy.isekai.link:8443. Not needed with
-    /// --whoami
-    #[argh(option)]
-    proxy_url: Option<String>,
+    /// proxy base URL. Defaults to the deployment the camera apps use
+    #[argh(
+        option,
+        default = "String::from(\"https://tokyo.link.isekai.tools:8443\")"
+    )]
+    proxy_url: String,
     /// auth0 access token, used only to obtain the Endpoint Token. Not needed
     /// with --whoami
     #[argh(option)]
@@ -98,9 +103,9 @@ async fn main() -> anyhow::Result<()> {
         .context("--capability is required (the server issues it for this Endpoint)")?;
 
     let cfg = P2pConfig {
-        identity_url: args.identity_url.context("--identity-url is required")?,
+        identity_url: args.identity_url,
         identity_http3: args.identity_http3,
-        proxy_url: args.proxy_url.context("--proxy-url is required")?,
+        proxy_url: args.proxy_url,
         auth0_token: args.auth0_token.context("--auth0-token is required")?,
         auth0: None,
         protocol: args.protocol,

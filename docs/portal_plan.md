@@ -336,7 +336,7 @@ having before anyone asks.
 | **1c-iii-a** | the Endpoint's relay certificate → the layer | **done** — `isekai_p2p::endpoint_cert`; `camera-core::tls` re-exports the names its apps spell |
 | **1c-iii-b** | `spike.rs` → `transport.rs`: portal binds and dials with the connection layer, not its own copy | **done** — the loopback test runs over `peer::dial`, on Linux and macOS; Windows compiles it (#155) |
 | **1c-iii-c-i** | the loop that drives a `ListenerSession` → the layer | **done** — `isekai_p2p::listener::run`; `camera-core` calls it and keeps the command type's name |
-| **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **built** — needs a proxy to verify; the catalogue is still arguments, which is phase 2 |
+| **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **done** — forwards over a real proxy; the catalogue is still arguments, which is phase 2 |
 | **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have. The client offers a candidate as of 1c-iii-c-ii; what is missing is the listener advertising its leg's binding, which is `camera-core::video::advertise_direct_path` and moves with this | a transfer survives the switch |
@@ -401,17 +401,19 @@ it is the camera's (spec §13) with the last step removed.
 is none and prints the Endpoint ID:
 
 ```
-portal-client --identity-url … --proxy-url … --auth0-token … \
-              --key client.pem --whoami
+portal-client --auth0-token … --key client.pem --whoami
 ep:40d25d…
 ```
+
+The Identity and proxy URLs default to the deployment the camera apps use
+(`identity.isekai.tools:9443`, `tokyo.link.isekai.tools:8443`); `--identity-url`
+and `--proxy-url` are there for another one.
 
 **The server offers services and authorises that Endpoint.** `--service` is
 `name=host:port`, and the target never crosses the wire (§4.3):
 
 ```
-portal-server --identity-url … --proxy-url … --auth0-token … \
-              --key server.pem --register \
+portal-server --auth0-token … --key server.pem --register \
               --service db=127.0.0.1:5432 \
               --allow ep:40d25d…
 listener id : pl_…
@@ -423,7 +425,7 @@ capability  : eyJ…   (for ep:40d25d…)
 nothing about it reaches the server:
 
 ```
-portal-client … --key client.pem --register \
+portal-client --auth0-token … --key client.pem --register \
               --listener pl_… --capability eyJ… --map 5432:db
 connection id: …
 127.0.0.1:5432 -> db

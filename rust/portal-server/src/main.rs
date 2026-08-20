@@ -5,7 +5,7 @@
 //! `docs/portal_plan.md`.
 //!
 //! ```text
-//! portal-server --identity-url … --proxy-url … --key ep.pem \
+//! portal-server --auth0-token … --key ep.pem \
 //!               --service db=10.0.0.5:5432 --allow ep:abc…
 //! ```
 //!
@@ -32,14 +32,21 @@ use tokio_util::sync::CancellationToken;
 /// Forward local TCP services to authorised peers over ISEKAI link.
 #[derive(FromArgs)]
 struct Args {
-    /// identity API base URL (HTTPS), e.g. https://identity.isekai.link:8443
-    #[argh(option)]
+    /// identity API base URL (HTTPS). Defaults to the deployment the camera
+    /// apps use
+    #[argh(
+        option,
+        default = "String::from(\"https://identity.isekai.tools:9443\")"
+    )]
     identity_url: String,
     /// reach the Identity API over HTTP/3 instead of HTTP/1.1 + HTTP/2
     #[argh(switch)]
     identity_http3: bool,
-    /// proxy base URL, e.g. https://proxy.isekai.link:8443
-    #[argh(option)]
+    /// proxy base URL. Defaults to the deployment the camera apps use
+    #[argh(
+        option,
+        default = "String::from(\"https://tokyo.link.isekai.tools:8443\")"
+    )]
     proxy_url: String,
     /// auth0 access token, used only to obtain the Endpoint Token
     #[argh(option)]

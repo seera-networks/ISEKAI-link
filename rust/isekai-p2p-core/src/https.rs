@@ -19,7 +19,7 @@ pub struct HttpsTransport {
 
 impl HttpsTransport {
     /// Build a transport for the service at `base_url`
-    /// (e.g. `https://identity.isekai.link:8443`).
+    /// (e.g. `https://identity.isekai.tools:9443`).
     ///
     /// Honors `ISEKAI_INSECURE_SKIP_VERIFY` the same way the msquic transport
     /// does, so a development server with a self-signed certificate (`DEV_CERT`)
