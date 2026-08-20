@@ -1,0 +1,56 @@
+#!/bin/sh
+# Refuse a commit that would add a private key.
+#
+# `.gitignore` stops a key being picked up by accident, and that is not enough:
+# `git add -A` stages what was written *before* the rule arrived, and a rule
+# added after the fact does not un-stage anything. Both have happened here —
+# `*-video-tls.pem` carries a comment about the round before, and a portal run's
+# keys reached a pull request in #158.
+#
+# Install once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# `git commit --no-verify` skips it. The CI job in
+# `.github/workflows/secrets.yml` does not, which is the point of having both.
+
+set -eu
+
+# The staged content, not the working tree: what is committed is what matters.
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "$staged" ] || exit 0
+
+found=''
+for path in $staged; do
+    # Skip anything git considers binary; a key is text.
+    if git diff --cached --numstat -- "$path" | grep -q '^-'; then
+        continue
+    fi
+    if git show ":$path" 2>/dev/null | awk '
+        /-----BEGIN( [A-Z0-9]+)* PRIVATE KEY-----/ { seen = 1; next }
+        # A body line, which is what tells a key from a string that names one.
+        # `endpoint_cert.rs` writes "-----BEGIN PRIVATE KEY-----\ntruncated" in
+        # a test and must stay committable.
+        seen && /^[A-Za-z0-9+/=]{40,}$/ { exit 1 }
+        { seen = 0 }
+    '; then
+        continue
+    fi
+    found="$found $path"
+done
+
+[ -n "$found" ] || exit 0
+
+echo "refusing to commit a private key:" >&2
+for path in $found; do
+    echo "  $path" >&2
+done
+cat >&2 <<'MSG'
+
+If this key is a secret, it is now on this machine's index and nowhere else --
+`git restore --staged <path>` and add it to .gitignore.
+
+If it genuinely belongs in the repository, commit with --no-verify and say why
+in the message; the CI job will need the same exception adding to it.
+MSG
+exit 1
