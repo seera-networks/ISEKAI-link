@@ -38,7 +38,7 @@ use bytes::Bytes;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use http::{Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::KeyPair;
 use serde::Deserialize;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tower_http::auth::AddAuthorizationLayer;
@@ -457,6 +457,10 @@ async fn get(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Only the tests build certificates here now: the CSR builder moved to
+    // `isekai-p2p-core` in phase 1c-iii-a and took the last non-test use with it.
+    use rcgen::CertificateParams;
 
     fn key() -> KeyPair {
         KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate a key")
