@@ -23,6 +23,14 @@ on:
       - 'rust/isekai-p2p/**'
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
+      # And the rest of the FFI's graph, which stops one edge short otherwise:
+      # `isekai-link-utils` pulls `channel-masque`, and it and `isekai-p2p-core`
+      # pull `h3-util` from `submodules/tonic-h3`. `Cargo.lock` because a
+      # transitive crate that will not cross-compile for the NDK usually arrives
+      # as a lockfile-only `cargo update`.
+      - 'rust/channel-masque/**'
+      - 'rust/Cargo.lock'
+      - 'submodules/tonic-h3'
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'android/**'
@@ -40,6 +48,14 @@ on:
       - 'rust/isekai-p2p/**'
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
+      # And the rest of the FFI's graph, which stops one edge short otherwise:
+      # `isekai-link-utils` pulls `channel-masque`, and it and `isekai-p2p-core`
+      # pull `h3-util` from `submodules/tonic-h3`. `Cargo.lock` because a
+      # transitive crate that will not cross-compile for the NDK usually arrives
+      # as a lockfile-only `cargo update`.
+      - 'rust/channel-masque/**'
+      - 'rust/Cargo.lock'
+      - 'submodules/tonic-h3'
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'android/**'

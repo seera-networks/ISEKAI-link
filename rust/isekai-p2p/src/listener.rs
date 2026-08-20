@@ -961,6 +961,16 @@ pub async fn run(
     let mut stream: Option<mpsc::Receiver<ListenerEvent>> = None;
     let mut resubscribe_delay = RESUBSCRIBE_DELAY;
     let mut resubscribe_at = tokio::time::Instant::now();
+    // Whether the stream currently open has ever delivered anything.
+    //
+    // **This is what "it worked" means**, and the backoff below is wrong
+    // without it. A `subscribe()` that succeeds and then ends at once — a proxy
+    // crash-looping, an intermediary that closes the response immediately — is
+    // not a working stream, and treating it as one retries as fast as the round
+    // trip allows, forever, spending a nonce per attempt out of a capped store
+    // (see `RESUBSCRIBE_MAX_DELAY`). The proxy sends keepalives, so a stream
+    // that is up says so.
+    let mut stream_delivered = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -973,7 +983,9 @@ pub async fn run(
                     Ok(events) => {
                         tracing::info!("signaling: event stream open");
                         stream = Some(events);
-                        resubscribe_delay = RESUBSCRIBE_DELAY;
+                        // Not reset here: opening is not working. The first
+                        // event is what says the stream is real.
+                        stream_delivered = false;
                         // Rebuilding the interval is what makes the next line
                         // matter: `interval` completes its first tick at once,
                         // so a reconcile runs now and picks up anything that
@@ -999,15 +1011,27 @@ pub async fn run(
             event = async { stream.as_mut().expect("guarded").recv().await },
                     if stream.is_some() => {
                 match event {
-                    Some(ListenerEvent::Keepalive) => {}
-                    Some(_) => poll.reset_immediately(),
+                    Some(ListenerEvent::Keepalive) => stream_delivered = true,
+                    Some(_) => {
+                        stream_delivered = true;
+                        poll.reset_immediately();
+                    }
                     None => {
                         tracing::info!("signaling: event stream ended; polling until it returns");
                         stream = None;
                         // A stream that worked and then ended is worth trying
                         // again straight away — the usual reason is the proxy
-                        // restarting. Only repeated failures back off.
-                        resubscribe_at = tokio::time::Instant::now();
+                        // restarting. One that never delivered anything is a
+                        // failure wearing a success's clothes, and backs off
+                        // like one.
+                        if stream_delivered {
+                            resubscribe_delay = RESUBSCRIBE_DELAY;
+                            resubscribe_at = tokio::time::Instant::now();
+                        } else {
+                            resubscribe_delay =
+                                (resubscribe_delay * 2).min(RESUBSCRIBE_MAX_DELAY);
+                            resubscribe_at = tokio::time::Instant::now() + resubscribe_delay;
+                        }
                         // And, as above, the first tick of a fresh interval is
                         // immediate: the listener goes back to reading rather
                         // than waiting out a period it has no reason to.
