@@ -99,6 +99,27 @@ jobs:
       # tests found — so the timeout above is the backstop, not the plan.
       - name: Test
         run: cargo test -p portal-core
+      # **#155, one experiment.** The same two tests, serially and with the
+      # dial talking. Whichever way this goes it halves the search:
+      #
+      # * passes serially -> the tests interfere through something
+      #   process-global, and serialising them is a real fix rather than a
+      #   workaround
+      # * fails serially  -> the second dial fails on its own account, and the
+      #   log below says why
+      #
+      # Ruled out already: the runtime shape (current-thread fails the same
+      # way), msquic's API table (opened once, closed at process exit), the
+      # certificate (the listener starts and the passing test reads a status
+      # back), and two registrations per se (`video_loopback.rs` does that on
+      # Windows and passes, through the same `peer::dial`).
+      #
+      # `continue-on-error` because this is a measurement, not a gate.
+      - name: '#155: the same tests, serially and with logs'
+        continue-on-error: true
+        env:
+          RUST_LOG: isekai_p2p::peer=debug,msquic_async=debug
+        run: cargo test -p portal-core --test tcp_loopback -- --test-threads=1 --nocapture
       # The binaries are not covered by the tests -- there is nothing to test
       # about them without a proxy -- so this is what says they still build.
       - name: Build the binaries
