@@ -5,16 +5,13 @@
 //! the framing and the stream mapping hold up; everything the plan lists after
 //! this is deliberately absent.
 //!
-//! Two things it does not do yet, and both are on purpose:
+//! One thing it does not do yet, and it is on purpose:
 //!
-//! * **It does not open the P2P session.** The pieces for that —
-//!   `isekai_p2p::InitiatorSession` and `ListenerSession`, the relay leg, the
-//!   pin, the paired-Endpoint check — are built and running in the camera apps.
-//!   Wiring them in is phase 1's job, after the connection layer is extracted
-//!   out of `camera-core` (plan §4.4) rather than copied into a second place.
-//! * **It has no transport of its own.** [`spike`] stands up a plain loopback
-//!   QUIC connection so the framing can be exercised end to end today. It is
-//!   the first thing phase 1 deletes.
+//! * **It does not open the P2P session.** [`transport`] dials a peer with the
+//!   real connection layer as of phase 1c-iii-b, but what puts a proxy in front
+//!   of it — `isekai_p2p::InitiatorSession` and `ListenerSession`, the relay
+//!   leg, the pin, the paired-Endpoint check — is 1c-iii-c. Until then the only
+//!   caller is the loopback test.
 //!
 //! ```text
 //!   client                                   server
@@ -26,11 +23,7 @@
 pub mod client;
 pub mod frame;
 pub mod server;
-/// Behind a feature so the insecure dialer is not part of what this crate
-/// offers by default: it validates nothing and generates its own certificate,
-/// which is fine for a loopback test and nowhere else.
-#[cfg(feature = "spike")]
-pub mod spike;
+pub mod transport;
 
 /// The ALPN this speaks. Distinct from the video's `sample`: a connection is
 /// one or the other, and a peer that offers neither should fail at the

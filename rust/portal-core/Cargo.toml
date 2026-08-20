@@ -4,31 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 # Phase 0 of docs/portal_plan.md. TCP only, one service, no config, no UI.
-[features]
-default = []
-# The loopback scaffolding in `spike.rs`, and the certificate generator it
-# needs. Phase 1 deletes both.
-spike = ["dep:rcgen", "dep:isekai-p2p"]
-
 [dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 msquic-async = { workspace = true }
-# The listener and client configuration helpers. Phase 1 replaces this with the
-# connection layer extracted out of `camera-core` (plan §4.4).
+# Standing up the listener: the credential loading and its Windows PKCS#12
+# branch (`transport::bind`). The *client* configuration came out of
+# `camera-core` into `isekai-p2p` in phase 1b and is used from there.
 isekai-link-utils = { workspace = true }
-# The rules for holding a peer QUIC connection (`isekai_p2p::peer`). Optional
-# for the same reason `rcgen` is: only `spike.rs` uses it, and a default build
-# should not compile the whole P2P and Identity tree for code it leaves out.
-# Phase 1c makes this a plain dependency, when the forwarding itself needs a
-# session.
-isekai-p2p = { workspace = true, optional = true }
+# The connection layer `transport` dials with, and the certificate it presents
+# (`isekai_p2p::peer`, `isekai_p2p::endpoint_cert`). A plain dependency since
+# phase 1c-iii-b: the forwarding's own transport is this, not scaffolding
+# behind a feature.
+isekai-p2p = { workspace = true }
 tokio-util = { workspace = true }
-# The spike's throwaway certificate. Goes with `spike.rs` in phase 1.
-rcgen = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-# The tests are the only thing that wants the scaffolding.
-portal-core = { path = ".", features = ["spike"] }

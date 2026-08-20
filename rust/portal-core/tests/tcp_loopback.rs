@@ -17,10 +17,18 @@ use std::time::Duration;
 use msquic_async::StreamType;
 use msquic_async::{msquic, Registration};
 use portal_core::server::Catalogue;
-use portal_core::{client, frame, server, spike};
+use portal_core::{client, frame, server, transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+
+/// How long the loopback handshake may take before the test says so itself.
+///
+/// **The dial's own deadline is fifteen minutes**
+/// (`isekai_p2p::peer::CONNECT_DEADLINE`), which is right for a peer whose relay
+/// leg an operator is still bringing up and wrong for two halves of one process:
+/// a listener that never binds would otherwise hang this until CI gave up.
+const DIAL_BUDGET: Duration = Duration::from_secs(10);
 
 /// Uppercases whatever it is sent, so a reply proves both directions rather
 /// than just one — an echo would pass even if the two copies were crossed.
@@ -99,8 +107,9 @@ async fn connected(catalogue: Catalogue) -> Halves {
         .with_test_writer()
         .try_init();
     let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default()).unwrap());
-    let (_reg, listener, bound) = spike::bind(Some(reg.clone()), "127.0.0.1:0".parse().unwrap())
-        .expect("bind the portal listener");
+    let (_reg, listener, bound) =
+        transport::bind(Some(reg.clone()), "127.0.0.1:0".parse().unwrap(), None)
+            .expect("bind the portal listener");
     let shutdown = CancellationToken::new();
 
     let serving = shutdown.clone();
@@ -115,9 +124,22 @@ async fn connected(catalogue: Catalogue) -> Halves {
         }
     });
 
-    let session = spike::dial(&reg, bound.port())
-        .await
-        .expect("dial the portal");
+    // `localhost` is the TLS name only — the dial pins the remote address
+    // itself — and validation is off because the listener above is presenting
+    // the self-signed fallback.
+    let session = tokio::time::timeout(
+        DIAL_BUDGET,
+        transport::connect(
+            Some(reg.clone()),
+            "localhost",
+            bound.port(),
+            false,
+            &shutdown,
+        ),
+    )
+    .await
+    .expect("the loopback handshake completed inside its budget")
+    .expect("dial the portal");
     Halves {
         session: Some(session),
         shutdown,

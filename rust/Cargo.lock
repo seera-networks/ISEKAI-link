@@ -4382,8 +4382,6 @@ dependencies = [
  "isekai-link-utils",
  "isekai-p2p",
  "msquic-async",
- "portal-core",
- "rcgen",
  "tokio",
  "tokio-util",
  "tracing",

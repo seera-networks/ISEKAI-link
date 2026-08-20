@@ -5,35 +5,27 @@ name: ISEKAI portal
 # binaries, and the mobile workflows build the FFI crate. So the crate's green
 # checks said nothing about the crate. This is #144.
 #
-# **Linux runs it; the other two only compile it**, and that split is deliberate
-# rather than laziness:
+# **All three platforms run the tests as of phase 1c-iii-b.** They did not
+# before, and the reason is worth keeping because it is what changed rather than
+# what was decided: running them needed `spike.rs`, which handed msquic a PEM and
+# no PKCS#12. On Windows the credential path imports a PFX and its fallback goes
+# through an RSA provider that cannot take rcgen's ECDSA P-256 key — so the
+# listener could not start, and this file said Windows was "not asked to" run
+# them rather than doing Windows-specific work on scaffolding phase 1 would
+# delete.
 #
-# * The forwarding itself — `frame`, `client`, `server` — is ordinary async Rust
-#   and has to compile everywhere the camera apps do. `cargo check --all-targets`
-#   says so, including the test binaries.
-# * Running it needs `spike.rs`, which hands msquic a PEM and no PKCS#12. On
-#   Windows the credential path imports a PFX and its fallback goes through an
-#   RSA provider that cannot take rcgen's ECDSA P-256 key — migration-spike.yml
-#   says as much beside its own certificate step, and `isekai_p2p::endpoint_cert`
-#   packages a bundle for exactly this reason.
+# `transport.rs` replaced that scaffolding with `isekai_p2p::endpoint_cert`,
+# which packages the bundle for exactly this reason — the same path
+# `camera-core`'s video listener has taken on Windows all along, and which
+# `video_loopback.rs` exercises there in migration-spike.yml. So the constraint
+# is gone rather than worked around, and #152's "except portal-core on Windows"
+# goes with it.
 #
-# Packaging one here would be Windows-specific work on scaffolding that phase 1
-# deletes: the extraction in plan §4.4 inherits the camera's certificate
-# handling along with everything else. So the answer to "does the spike run on
-# Windows" is "it is not asked to", and this file is where that is written down.
-#
-# **The Windows job does now build vendored OpenSSL**, which reads like the
-# opposite of the paragraph above and is not. `endpoint_cert` moved into
-# `isekai-p2p` (plan §4.4, phase 1c-iii-a), and on Windows a crate that packages
-# a certificate needs OpenSSL to do it — so every dependent inherits the build,
-# `portal-core` included, since its dev-dependency turns the `spike` feature on.
-#
-# Making it optional was considered and rejected: with the feature off, the
-# bundle is silently `None` and msquic takes the RSA fallback that cannot load
-# the key. That fails at runtime with `ASN1 bad tag value met` — the very bug
-# the paragraph above exists to describe — instead of at compile time. A slower
-# Windows job beats a credential that only fails on a user's machine, and
-# `portal-server` will present a certificate of its own in 1c-iii-c anyway.
+# The Windows job also builds vendored OpenSSL, which is what packaging that
+# bundle costs. Making it optional was considered and rejected: with the feature
+# off the bundle is silently `None`, msquic takes the RSA fallback again, and the
+# failure moves from a slow CI job to `ASN1 bad tag value met` on a user's
+# machine.
 
 on:
   push:
@@ -50,9 +42,15 @@ on:
 
 jobs:
   test:
-    name: Forward a TCP service (ubuntu)
-    runs-on: ubuntu-latest
+    name: Forward a TCP service (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      # One platform's answer never hides another's, as migration-spike.yml
+      # says for the same reason.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
     defaults:
       run:
         working-directory: rust
@@ -72,34 +70,8 @@ jobs:
       # halves. They have hung this repository's CI before — see the header of
       # camera-core/tests/video_loopback.rs and the four ways portal-core's own
       # tests found — so the timeout above is the backstop, not the plan.
+      #
+      # `--all-targets` is not needed to compile the test binaries here: running
+      # them does that, on every platform now.
       - name: Test
         run: cargo test -p portal-core
-
-  compile:
-    name: Compile (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-14]
-    defaults:
-      run:
-        working-directory: rust
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
-        shell: pwsh
-        working-directory: submodules/msquic-async-rs/seera-msquic
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      # `--all-targets` so the test binaries compile too: a `cfg` that only
-      # exists on one platform breaks at compile time, and that is the part
-      # worth catching here.
-      - name: Check
-        run: cargo check -p portal-core --all-targets
