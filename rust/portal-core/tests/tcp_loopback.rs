@@ -10,6 +10,26 @@
 //! `camera-core/tests/video_loopback.rs` documents at length: `RegistrationClose`
 //! is a synchronous, uninterruptible wait on every handle derived from it, so
 //! dropping one while a connection is live hangs the process with no way out.
+//!
+//! # Why these are current-thread tests
+//!
+//! They were `multi_thread`, and on `windows-latest` whichever of the two ran
+//! second had a dial that never completed — #155. The mechanism is one this
+//! repository had already written down somewhere else: `get_stats` is served by
+//! queueing an operation to msquic's connection worker and **blocking the
+//! calling thread** until it runs (`camera_core::video::spawn_heartbeat` says
+//! so), and `peer::dial`'s handshake probe calls it every second *while the
+//! handshake is in flight*.
+//!
+//! `receive_frames` samples the same way but only after its dial has returned,
+//! which is why `video_loopback.rs` never met this. Two multi-threaded runtimes
+//! on a two-core runner, each making a blocking call into a different
+//! registration's worker once a second, is enough to starve the future being
+//! reported on.
+//!
+//! A current-thread runtime is what `video_loopback.rs` uses, and there is
+//! nothing here that wants worker threads: every task in the forward is async
+//! all the way down.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -185,7 +205,7 @@ async fn connected(catalogue: Catalogue) -> Halves {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn bytes_reach_the_service_and_come_back() {
     let target = shouting_service().await;
     let halves = connected(Catalogue::new().with("db", target)).await;
@@ -213,7 +233,7 @@ async fn bytes_reach_the_service_and_come_back() {
     drain(halves).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_service_that_is_not_offered_gets_no_connection() {
     let target = shouting_service().await;
     // The catalogue offers `db`, and the forward below asks for something else.

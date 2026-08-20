@@ -5,22 +5,22 @@ name: ISEKAI portal
 # binaries, and the mobile workflows build the FFI crate. So the crate's green
 # checks said nothing about the crate. This is #144.
 #
-# **Linux and macOS run the tests; Windows compiles them**, and the Windows
-# half is a known failure rather than a decision — see #155.
+# **All three platforms run the tests.** Windows did not until #155: whichever
+# of the two integration tests ran second had a dial that never completed, and
+# raising its budget only lengthened the wait.
 #
-# It used to be a decision. Running them needed `spike.rs`, which handed msquic a
-# PEM and no PKCS#12, and on Windows the credential path's no-PFX fallback goes
-# through an RSA provider that cannot take rcgen's ECDSA P-256 key, so the
-# listener could not start at all. Phase 1c-iii-b replaced that with
-# `isekai_p2p::endpoint_cert`, which packages the bundle -- the same path
-# `camera-core`'s video listener takes on Windows, exercised there by
-# `video_loopback.rs`.
+# The cause was `multi_thread` test runtimes. `get_stats` is served by queueing
+# an operation to msquic's connection worker and blocking the calling thread
+# until it runs, and `peer::dial`'s handshake probe calls it every second while
+# the handshake is still in flight -- so two runtimes on a two-core runner, each
+# blocking into a different registration's worker, starved the future being
+# reported on. `camera-core`'s equivalent tests are current-thread and never met
+# it. `tcp_loopback.rs` says all of this at the top.
 #
-# That removed the reason, and macOS went from compiling the tests to running
-# them. Windows did not: whichever of the two integration tests runs second has
-# a dial that never completes, and raising its budget only lengthens the wait.
-# #155 has the evidence. Until it is understood, asking Windows to run them
-# would be asking for a red check that says nothing new.
+# Before that it was the certificate: `spike.rs` handed msquic a PEM and no
+# PKCS#12, and the Windows credential path's no-PFX fallback cannot take an
+# ECDSA P-256 key, so the listener could not start at all. Phase 1c-iii-b
+# replaced that with `isekai_p2p::endpoint_cert`, which packages the bundle.
 #
 # The Windows job also builds vendored OpenSSL, which is what packaging that
 # bundle costs. Making it optional was considered and rejected: with the feature
@@ -77,7 +77,7 @@ jobs:
       # says for the same reason.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, windows-latest, macos-14]
     defaults:
       run:
         working-directory: rust
@@ -104,27 +104,3 @@ jobs:
       - name: Build the binaries
         run: cargo build -p portal-server -p portal-client
 
-  compile:
-    name: Compile (windows-latest)
-    runs-on: windows-latest
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: rust
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
-        shell: pwsh
-        working-directory: submodules/msquic-async-rs/seera-msquic
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      # `--all-targets` so the test binaries compile too: a `cfg` that only
-      # exists on one platform breaks at compile time, and that is the part
-      # worth catching here. Running them is #155.
-      - name: Check
-        run: cargo check -p portal-core -p portal-server -p portal-client --all-targets
