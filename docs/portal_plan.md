@@ -50,8 +50,8 @@ Almost all of it. This section is the argument for the shape of §4.
 | Pairing, Grants, the camera list | `isekai-p2p-core::proxy`, `isekai-p2p::initiator` | yes |
 | Peer Connect, relay legs, lease renewal | `isekai-p2p::{initiator,listener}` | yes |
 | Direct-path candidates and migration | `isekai-p2p-core::observed`, `camera-core::video` | **extract** (§4.4) |
-| Endpoint certificate by CSR | `camera-core::tls`, `isekai-link-utils::cert` | yes |
-| Key attestation and pinning | `isekai-p2p-core::attestation`, `camera-core::video` | **extract** |
+| Endpoint certificate by CSR | `isekai-p2p::endpoint_cert` | yes — extracted in 1c-iii-a |
+| Key attestation and pinning | `isekai-p2p-core::attestation`, `isekai-p2p::peer` | yes — extracted in 1c-i |
 | The paired-Endpoint check | `camera-core::paired` | yes |
 | Hostname checking | `isekai-p2p-core::hostname` | yes |
 | Privacy consent | `camera-core::privacy` | **no** — see §8 |

@@ -230,7 +230,7 @@ fn write_key(path: &Path, pem: &str) -> anyhow::Result<()> {
 ///
 /// All three live in `isekai-p2p-core` — the CSR builder and the key digest
 /// went down in phase 1c-iii, the certificate digest in 1c-i. `isekai-p2p`'s
-/// [`endpoint_cert`](isekai_p2p_core::certificate) module needs them too, and
+/// `isekai_p2p::endpoint_cert` module needs them too, and
 /// the two crates are siblings: neither may reach across, so what they share
 /// sits underneath.
 ///

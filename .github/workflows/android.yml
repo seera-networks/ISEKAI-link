@@ -15,6 +15,14 @@ on:
     paths:
       - 'rust/isekai-client-ffi/**'
       - 'rust/camera-core/**'
+      # The layer the FFI reaches through. 550 lines of certificate handling --
+      # `cfg(windows)` branches, `rcgen`, the PKCS#12 packaging -- moved out of
+      # `camera-core` into these in phase 1c-iii-a, so watching only
+      # `camera-core` would leave a broken cross-compile green until someone
+      # happened to touch it. Same hole #144 is about, with the code moved.
+      - 'rust/isekai-p2p/**'
+      - 'rust/isekai-p2p-core/**'
+      - 'rust/utils/**'
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'android/**'
@@ -24,6 +32,14 @@ on:
     paths:
       - 'rust/isekai-client-ffi/**'
       - 'rust/camera-core/**'
+      # The layer the FFI reaches through. 550 lines of certificate handling --
+      # `cfg(windows)` branches, `rcgen`, the PKCS#12 packaging -- moved out of
+      # `camera-core` into these in phase 1c-iii-a, so watching only
+      # `camera-core` would leave a broken cross-compile green until someone
+      # happened to touch it. Same hole #144 is about, with the code moved.
+      - 'rust/isekai-p2p/**'
+      - 'rust/isekai-p2p-core/**'
+      - 'rust/utils/**'
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'android/**'

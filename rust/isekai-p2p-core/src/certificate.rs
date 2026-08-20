@@ -18,7 +18,7 @@ use rcgen::{CertificateParams, KeyPair};
 
 /// The SPKI digest of a certificate, base64url without padding.
 ///
-/// The same value `isekai_link_utils::cert::spki_sha256` computes for a key,
+/// The same value [`spki_sha256`] computes for a key,
 /// arrived at from the other side: a certificate presented in a handshake.
 /// Comparing the two is what makes a statement about a key into a statement
 /// about *this connection*.

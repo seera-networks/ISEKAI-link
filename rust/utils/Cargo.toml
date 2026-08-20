@@ -10,12 +10,12 @@ channel-masque = { workspace = true }
 # `cert` re-exports the certificate digest from there: everything that consumes
 # it sits below this crate, so it owns it. Default features -- no msquic.
 isekai-p2p-core = { workspace = true }
-# The managed-domain certificate route (`cert`): building the CSR, digesting the
-# key, and generating the key that stays here. Digesting a *certificate* went to
-# `isekai-p2p-core` above, and `x509-parser` went with it -- nothing in this
-# crate parses one any more.
+# The managed-domain certificate route (`cert`) generates the key that stays
+# here. Everything else it used to do went down to `isekai-p2p-core` in phases
+# 1c-i and 1c-iii-a -- digesting a key or a certificate, and building the CSR --
+# and `x509-parser` and `sha2` went with it. `base64` stays for the PEM and JWT
+# handling elsewhere in the crate.
 rcgen = { workspace = true }
-sha2 = { workspace = true }
 base64 = { workspace = true }
 h3-util = { workspace = true }
 http = { workspace = true }
