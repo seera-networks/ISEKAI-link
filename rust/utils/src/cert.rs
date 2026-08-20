@@ -272,20 +272,9 @@ pub fn spki_sha256(key: &KeyPair) -> String {
 
 /// The SPKI digest of a certificate, arrived at from the other side.
 ///
-/// The same value [`spki_sha256`] computes for a key, taken from a certificate
-/// instead — a chain that was issued, or one presented in a handshake.
-///
-/// `None` for anything that will not parse: a certificate that cannot be read
-/// is not one that matched.
-pub fn spki_sha256_of_certificate(der: &[u8]) -> Option<String> {
-    use base64::Engine as _;
-    use sha2::{Digest as _, Sha256};
-    use x509_parser::prelude::*;
-
-    let (_, certificate) = X509Certificate::from_der(der).ok()?;
-    let digest = Sha256::digest(certificate.tbs_certificate.subject_pki.raw);
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest))
-}
+/// Lives in `isekai-p2p-core` now: everything that consumes it is below this
+/// crate, and the peer layer was reaching up here for eight lines.
+pub use isekai_p2p_core::certificate::spki_sha256_of_certificate;
 
 // ── the §7.4 routes ──────────────────────────────────────────────────────────
 
