@@ -226,49 +226,17 @@ fn write_key(path: &Path, pem: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A PKCS#10 certificate request for `hostname`, signed by `key`.
+/// Asking for a certificate, and reading the key out of one.
 ///
-/// One `dNSName` SAN and **no other extension request at all** — rcgen omits the
-/// attribute entirely when neither `keyUsage` nor `extendedKeyUsage` is set, so
-/// what goes on the wire is the SAN and nothing more. That satisfies §8.6.2
-/// rule 7 (and §7.4.2, which adopts it) by having nothing to permit rather than
-/// by asking for the permitted things.
-pub fn certificate_request(key: &KeyPair, hostname: &str) -> anyhow::Result<String> {
-    let mut params = CertificateParams::new(vec![hostname.to_owned()])
-        .context("failed to build the certificate request parameters")?;
-    // **The CN has to be the hostname, even though nothing reads it as a name.**
-    // The proxy does not check the subject — the CA takes the name from the SAN
-    // — but ACME order validation checks that whatever CN is present is also in
-    // the SAN, and rcgen's default is `CN=rcgen self signed cert`. Left alone,
-    // every request is refused with
-    //
-    //   common name `rcgen self signed cert` is missing from the CSR's
-    //   subjectAltName extension
-    //
-    // which names the CN and so reads like a subject problem, when what it is
-    // asking for is agreement with the SAN.
-    let mut dn = rcgen::DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, hostname);
-    params.distinguished_name = dn;
-    let csr = params
-        .serialize_request(key)
-        .context("failed to sign the certificate request")?;
-    csr.pem()
-        .context("failed to encode the certificate request")
-}
-
-/// SHA-256 of `key`'s SubjectPublicKeyInfo, base64url without padding.
+/// All three live in `isekai-p2p-core` — the CSR builder and the key digest
+/// went down in phase 1c-iii, the certificate digest in 1c-i. `isekai-p2p`'s
+/// [`endpoint_cert`](isekai_p2p_core::certificate) module needs them too, and
+/// the two crates are siblings: neither may reach across, so what they share
+/// sits underneath.
 ///
-/// The proxy reports the same value for what it has issued and cached, so
-/// comparing them answers "is the certificate it holds still one this device
-/// can use" — which nothing else can answer, since only this device has the key.
-pub fn spki_sha256(key: &KeyPair) -> String {
-    use base64::Engine as _;
-    use sha2::{Digest as _, Sha256};
-
-    let digest = Sha256::digest(key.public_key_der());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
+/// Re-exported here because the §7.4 managed-domain route below is the other
+/// consumer, and it reads better beside the routes that use it.
+pub use isekai_p2p_core::certificate::{certificate_request, spki_sha256};
 
 /// The SPKI digest of a certificate, arrived at from the other side.
 ///

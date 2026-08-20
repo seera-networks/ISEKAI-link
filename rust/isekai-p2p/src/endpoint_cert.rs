@@ -370,7 +370,7 @@ pub struct DevCert {
     pub cert_pem: String,
     pub key_pem: String,
     /// Base64 (standard alphabet) PKCS#12 with an empty password, in the shape
-    /// [`isekai_link_utils::make_msquic_async_listener`] expects, or `None`
+    /// `isekai_link_utils::make_msquic_async_listener` expects, or `None`
     /// where this build does not produce one (everywhere but Windows — see the
     /// module docs).
     pub pkcs12: Option<String>,

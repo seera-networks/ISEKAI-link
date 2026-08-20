@@ -32,6 +32,10 @@ msquic-async = { workspace = true }
 # The key this Endpoint keeps and the dev certificate it falls back to
 # (`endpoint_cert`).
 rcgen = { workspace = true }
+# The PKCS#12 blob is carried as base64 (`endpoint_cert`). Only the Windows
+# path builds one, but `base64` is cheap and pure Rust, so it is not worth a
+# target section -- unlike `openssl` below, which is.
+base64 = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }
@@ -50,5 +54,4 @@ openssl = { version = "0.10.66", features = ["vendored"] }
 
 [dev-dependencies]
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
-base64 = { workspace = true }
 p256 = { workspace = true }

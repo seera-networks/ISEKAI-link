@@ -14,13 +14,26 @@ name: ISEKAI portal
 # * Running it needs `spike.rs`, which hands msquic a PEM and no PKCS#12. On
 #   Windows the credential path imports a PFX and its fallback goes through an
 #   RSA provider that cannot take rcgen's ECDSA P-256 key — migration-spike.yml
-#   says as much beside its own certificate step, and `camera-core::tls` packages
-#   a bundle for exactly this reason.
+#   says as much beside its own certificate step, and `isekai_p2p::endpoint_cert`
+#   packages a bundle for exactly this reason.
 #
 # Packaging one here would be Windows-specific work on scaffolding that phase 1
-# deletes: the extraction in plan §4.4 inherits `camera-core`'s certificate
+# deletes: the extraction in plan §4.4 inherits the camera's certificate
 # handling along with everything else. So the answer to "does the spike run on
 # Windows" is "it is not asked to", and this file is where that is written down.
+#
+# **The Windows job does now build vendored OpenSSL**, which reads like the
+# opposite of the paragraph above and is not. `endpoint_cert` moved into
+# `isekai-p2p` (plan §4.4, phase 1c-iii-a), and on Windows a crate that packages
+# a certificate needs OpenSSL to do it — so every dependent inherits the build,
+# `portal-core` included, since its dev-dependency turns the `spike` feature on.
+#
+# Making it optional was considered and rejected: with the feature off, the
+# bundle is silently `None` and msquic takes the RSA fallback that cannot load
+# the key. That fails at runtime with `ASN1 bad tag value met` — the very bug
+# the paragraph above exists to describe — instead of at compile time. A slower
+# Windows job beats a credential that only fails on a user's machine, and
+# `portal-server` will present a certificate of its own in 1c-iii-c anyway.
 
 on:
   push:

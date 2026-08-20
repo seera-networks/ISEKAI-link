@@ -124,6 +124,14 @@ presents, the dev fallback, the PKCS#12 Windows needs — is 550 lines of which
 *nothing* is about video except the names. `portal-server` needs all of it, so
 it moved to `isekai_p2p::endpoint_cert`.
 
+It also costs something, and the cost is stated rather than hidden: on Windows a
+crate that packages a certificate needs OpenSSL, so every `isekai-p2p` dependent
+now builds a vendored copy. Making that optional would mean a build with the
+feature off producing a `None` bundle and msquic silently taking the RSA
+fallback that cannot load an ECDSA key — a runtime failure on a user's machine
+instead of a slower CI job. `portal.yml`'s header records the trade where the
+claim it appears to contradict lives.
+
 Placing it settled a question 1c-i left open. `isekai-p2p` and
 `isekai-link-utils` are siblings above `isekai-p2p-core`, and the certificate
 module wanted pieces from both — `secret::write_secret` from one, the CSR
