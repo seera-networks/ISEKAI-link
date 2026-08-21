@@ -69,7 +69,7 @@ use tokio_util::sync::CancellationToken;
 /// passed on the other run. Nothing here has an opinion about how fast a
 /// handshake should be — only that a wait which is never going to end should
 /// end.
-const DIAL_BUDGET: Duration = Duration::from_secs(30);
+const DIAL_BUDGET: Duration = Duration::from_secs(180);
 
 /// Uppercases whatever it is sent, so a reply proves both directions rather
 /// than just one — an echo would pass even if the two copies were crossed.
@@ -195,6 +195,11 @@ async fn connected(catalogue: Catalogue) -> Halves {
     //
     // Validation is off because the listener is presenting the self-signed
     // fallback, so the name is not doing anything else here either.
+    // Timed, because #155 turned on a distinction the budget alone cannot make.
+    // Three times I called this failure "binary -- milliseconds or never", and
+    // that was an inference from three numbers that were all just the budget.
+    // What the log says is only "longer than the budget". So: print it.
+    let began = std::time::Instant::now();
     let session = tokio::time::timeout(
         DIAL_BUDGET,
         transport::connect(
@@ -208,6 +213,7 @@ async fn connected(catalogue: Catalogue) -> Halves {
     .await
     .expect("the loopback handshake completed inside its budget")
     .expect("dial the portal");
+    eprintln!("#155: the dial took {:?}", began.elapsed());
     Halves {
         session: Some(session),
         teardown,

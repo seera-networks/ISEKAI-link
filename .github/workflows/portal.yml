@@ -102,7 +102,7 @@ jobs:
       # camera-core/tests/video_loopback.rs and the four ways portal-core's own
       # tests found — so the timeout above is the backstop, not the plan.
       - name: Test
-        run: cargo test -p portal-core
+        run: cargo test -p portal-core -- --nocapture
       # The binaries are not covered by the tests -- there is nothing to test
       # about them without a proxy -- so this is what says they still build.
       - name: Build the binaries
