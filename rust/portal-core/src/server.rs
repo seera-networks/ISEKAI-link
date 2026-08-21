@@ -93,8 +93,8 @@ impl Catalogue {
     ///
     /// If `name` is one [`crate::frame::write_open`] would refuse to send, which
     /// would leave an entry here that nothing could ever ask for. Loud because
-    /// this is built in code; phase 2's file loader validates before it gets
-    /// here, so a bad config is a message rather than a panic.
+    /// this is built in code; [`crate::config`] validates before it gets here,
+    /// so a bad file is a message rather than a panic.
     pub fn with(mut self, name: &str, protocol: Protocol, target: SocketAddr) -> Self {
         assert!(
             !name.is_empty() && name.len() <= crate::frame::MAX_NAME,
@@ -109,9 +109,8 @@ impl Catalogue {
     /// [`with`](Self::with) for a name that came from outside the program.
     ///
     /// The assertion above is right for a catalogue written in code, where a
-    /// bad name is a bug. It is wrong for one built from a command line or the
-    /// file phase 2 adds, where a bad name is a typo and deserves a message
-    /// rather than a panic.
+    /// bad name is a bug. It is wrong for one read out of a file, where a bad
+    /// name is a typo and deserves a message rather than a panic.
     pub fn try_with(
         self,
         name: &str,
@@ -187,15 +186,23 @@ async fn forward_one(mut stream: msquic_async::Stream, catalogue: Catalogue) -> 
         // Said here rather than sent: the caller gets one answer for every way
         // of being refused, and the operator gets the name and the reason.
         Lookup::WrongProtocol(protocol) => {
+            // `?service`, not `%service`: the name is whatever the peer sent
+            // -- any UTF-8, newlines and terminal escapes included -- and this
+            // is the log the operator reads to tell the two refusals apart. A
+            // name that can forge a line in it is a name that can lie about
+            // which refusal happened. `Debug` on a `&str` escapes it.
             tracing::warn!(
-                service = %service,
+                ?service,
                 offered_as = %protocol,
                 "refusing a TCP request for a service offered over another protocol",
             );
             return refuse(stream, Status::Refused).await;
         }
         Lookup::Unknown => {
-            tracing::warn!(service = %service, "refusing a request for a service that is not offered");
+            tracing::warn!(
+                ?service,
+                "refusing a request for a service that is not offered"
+            );
             return refuse(stream, Status::Refused).await;
         }
     };

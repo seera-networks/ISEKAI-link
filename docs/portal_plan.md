@@ -178,7 +178,18 @@ target   = "10.0.0.1:53"
 
 The target never crosses the wire. An `OPEN` for a name that is not in the file
 is refused, and the refusal is the same whether the name is unknown or the
-protocol is wrong — there is nothing to be learned by probing.
+protocol is wrong.
+
+**`Unreachable` is the limit of that, and it is deliberate.** A service that is
+offered over TCP and whose target does not answer gets a third status, because
+"the far side is down, retrying is reasonable" is worth saying and `Refused`
+does not say it. The cost is that a peer which gets `Unreachable` for `db` has
+learned `db` exists — so what probing cannot map is *which* refused names are
+offered under another protocol, not the whole catalogue. Timing separates them
+too: a refusal is immediate and a dead target takes the connect deadline.
+
+An earlier draft of this paragraph said "there is nothing to be learned by
+probing", which was not true of the protocol as built.
 
 **Built in phase 2** as `portal-core::config`. Both ways of missing come back
 through one `Catalogue::look_up`, which is what keeps their answers identical

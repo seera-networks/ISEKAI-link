@@ -60,6 +60,10 @@ pub fn parse(text: &str) -> anyhow::Result<Catalogue> {
         "the service catalogue offers nothing; add a [service.<name>] section",
     );
     let mut catalogue = Catalogue::new();
+    // Whether anything in the file can be served today. Decided after the loop
+    // rather than before it, so a file with one bad protocol string is told
+    // about the typo rather than about the consequence of it.
+    let mut any_tcp = false;
     for (name, entry) in file.service {
         let protocol = match entry.protocol.as_str() {
             "tcp" => Protocol::Tcp,
@@ -76,17 +80,32 @@ pub fn parse(text: &str) -> anyhow::Result<Catalogue> {
                 entry.target,
             )
         })?;
+        any_tcp |= protocol == Protocol::Tcp;
         catalogue = catalogue
             .try_with(&name, protocol, target)
             .with_context(|| format!("service `{name}`"))?;
     }
+    anyhow::ensure!(
+        any_tcp,
+        "the service catalogue offers only UDP services, and UDP is not served \
+         until phase 3 of docs/portal_plan.md. As it stands this would register \
+         an Endpoint, open a listener, and refuse every request",
+    );
     Ok(catalogue)
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct File {
     /// `#[serde(default)]` so an empty file reaches the message above rather
     /// than a missing-field error about a table nobody wrote.
+    ///
+    /// And `deny_unknown_fields` above it, because without that `[services.db]`
+    /// or `[srevice.db]` is *discarded*: the file parses, the remaining
+    /// sections load, and the server offers a subset of what the operator
+    /// wrote with nothing said. A catalogue that silently offers less is the
+    /// benign direction of a mistake whose other direction is offering more,
+    /// and neither should be silent.
     #[serde(default)]
     service: BTreeMap<String, ServiceEntry>,
 }
@@ -162,6 +181,18 @@ mod tests {
                 r#"[service.db]
                    protocol = "tcp""#,
                 "target",
+            ),
+            (
+                r#"[srevice.db]
+                   protocol = "tcp"
+                   target = "10.0.0.5:5432""#,
+                "srevice",
+            ),
+            (
+                r#"[service.dns]
+                   protocol = "udp"
+                   target = "10.0.0.1:53""#,
+                "only UDP",
             ),
             (
                 r#"[service.db]

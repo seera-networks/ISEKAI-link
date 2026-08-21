@@ -1,9 +1,8 @@
 //! ISEKAI portal — forwarding a TCP service over the P2P session.
 //!
-//! **Phase 0 of `docs/portal_plan.md`.** TCP only, a catalogue built in code,
-//! no configuration file, no UI, no UDP. What it exists to answer is whether
-//! the framing and the stream mapping hold up; everything the plan lists after
-//! this is deliberately absent.
+//! TCP only, and no UI. The catalogue is a file as of phase 2
+//! ([`config`]); UDP is phase 3, and a UDP service parses today and is refused
+//! until then.
 //!
 //! [`session`] opens the P2P session both ways as of phase 1c-iii-c-ii, so
 //! `portal-server` and `portal-client` reach each other over a proxy. What is

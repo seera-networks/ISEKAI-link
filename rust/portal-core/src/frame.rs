@@ -41,6 +41,11 @@ pub enum Status {
     /// The service exists and its target did not answer. Separate from
     /// `Refused` because it says something about the far side rather than
     /// about the request, and retrying is reasonable.
+    ///
+    /// **This is the one thing probing can learn**, and the trade is
+    /// deliberate: a peer that gets this for `db` knows `db` is offered over
+    /// TCP. What stays hidden is which *refused* names exist under another
+    /// protocol — plan §4.3 states the boundary.
     Unreachable = 2,
 }
 
