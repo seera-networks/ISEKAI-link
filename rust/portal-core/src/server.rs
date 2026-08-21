@@ -26,10 +26,51 @@ const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10)
 /// two Endpoints may talk, not what they may reach. See `docs/portal_plan.md`
 /// §4.3.
 ///
-/// Phase 0 builds this in code. Phase 2 loads it from a file, and the type does
-/// not have to change for that.
+/// Built from a file since phase 2 — see [`crate::config`]. Still buildable in
+/// code, which is what the tests do.
 #[derive(Debug, Default, Clone)]
-pub struct Catalogue(HashMap<String, SocketAddr>);
+pub struct Catalogue(HashMap<String, Service>);
+
+/// What a service speaks.
+///
+/// Carried per service rather than assumed, because asking for a UDP service
+/// over a TCP stream has to be refused — and refused *identically* to asking
+/// for a name that does not exist. See [`Catalogue::look_up`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Service {
+    protocol: Protocol,
+    target: SocketAddr,
+}
+
+/// What the catalogue says about a name, for the operator's log.
+///
+/// **The wire does not carry this distinction** — every arm but `Found` is one
+/// [`Status::Refused`], because telling them apart would let a caller map the
+/// catalogue by asking (plan §4.3). The operator gets the reason; the caller
+/// gets a byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lookup {
+    Found(SocketAddr),
+    /// The name is offered, over another protocol.
+    WrongProtocol(Protocol),
+    /// No such name.
+    Unknown,
+}
 
 impl Catalogue {
     /// Whether it offers nothing, which is a server with no reason to run.
@@ -54,14 +95,14 @@ impl Catalogue {
     /// would leave an entry here that nothing could ever ask for. Loud because
     /// this is built in code; phase 2's file loader validates before it gets
     /// here, so a bad config is a message rather than a panic.
-    pub fn with(mut self, name: &str, target: SocketAddr) -> Self {
+    pub fn with(mut self, name: &str, protocol: Protocol, target: SocketAddr) -> Self {
         assert!(
             !name.is_empty() && name.len() <= crate::frame::MAX_NAME,
             "a service name must be 1..={} bytes, and `{name}` is {}",
             crate::frame::MAX_NAME,
             name.len(),
         );
-        self.0.insert(name.to_owned(), target);
+        self.0.insert(name.to_owned(), Service { protocol, target });
         self
     }
 
@@ -71,18 +112,33 @@ impl Catalogue {
     /// bad name is a bug. It is wrong for one built from a command line or the
     /// file phase 2 adds, where a bad name is a typo and deserves a message
     /// rather than a panic.
-    pub fn try_with(self, name: &str, target: SocketAddr) -> anyhow::Result<Self> {
+    pub fn try_with(
+        self,
+        name: &str,
+        protocol: Protocol,
+        target: SocketAddr,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !name.is_empty() && name.len() <= crate::frame::MAX_NAME,
             "a service name must be 1..={} bytes, and `{name}` is {}",
             crate::frame::MAX_NAME,
             name.len(),
         );
-        Ok(self.with(name, target))
+        Ok(self.with(name, protocol, target))
     }
 
-    fn look_up(&self, name: &str) -> Option<SocketAddr> {
-        self.0.get(name).copied()
+    /// What is offered under `name` over `protocol`.
+    ///
+    /// Takes the protocol rather than leaving the caller to compare, so that a
+    /// name offered over the other one cannot be reached by accident — and so
+    /// that both ways of missing come back through one function, which is what
+    /// keeps their answers on the wire identical.
+    pub fn look_up(&self, name: &str, protocol: Protocol) -> Lookup {
+        match self.0.get(name) {
+            Some(service) if service.protocol == protocol => Lookup::Found(service.target),
+            Some(service) => Lookup::WrongProtocol(service.protocol),
+            None => Lookup::Unknown,
+        }
     }
 }
 
@@ -125,11 +181,23 @@ async fn refuse(mut stream: msquic_async::Stream, status: Status) -> anyhow::Res
 
 async fn forward_one(mut stream: msquic_async::Stream, catalogue: Catalogue) -> anyhow::Result<()> {
     let service = read_open(&mut stream).await?;
-    let Some(target) = catalogue.look_up(&service) else {
+    // A stream is a TCP forward; UDP arrives another way (phase 3).
+    let target = match catalogue.look_up(&service, Protocol::Tcp) {
+        Lookup::Found(target) => target,
         // Said here rather than sent: the caller gets one answer for every way
-        // of being refused, and the operator gets the name that was asked for.
-        tracing::warn!(service = %service, "refusing a request for a service that is not offered");
-        return refuse(stream, Status::Refused).await;
+        // of being refused, and the operator gets the name and the reason.
+        Lookup::WrongProtocol(protocol) => {
+            tracing::warn!(
+                service = %service,
+                offered_as = %protocol,
+                "refusing a TCP request for a service offered over another protocol",
+            );
+            return refuse(stream, Status::Refused).await;
+        }
+        Lookup::Unknown => {
+            tracing::warn!(service = %service, "refusing a request for a service that is not offered");
+            return refuse(stream, Status::Refused).await;
+        }
     };
 
     let target_stream = match tokio::time::timeout(CONNECT_DEADLINE, TcpStream::connect(target))

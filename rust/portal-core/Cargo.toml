@@ -19,6 +19,11 @@ isekai-link-utils = { workspace = true }
 # behind a feature.
 isekai-p2p = { workspace = true }
 tokio-util = { workspace = true }
+# The service catalogue's file (`config`). What may be reached is the one thing
+# this crate must not let the caller decide, so where it is written down and how
+# it is parsed are part of the security story -- see plan 4.3.
+serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

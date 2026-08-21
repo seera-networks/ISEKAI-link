@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! portal-server --auth0-token … --key ep.pem \
-//!               --service db=10.0.0.5:5432 --allow ep:abc…
+//!               --config portal-server.toml --allow ep:abc…
 //! ```
 //!
 //! # The target never crosses the wire
@@ -18,15 +18,14 @@
 //! Grant says *these two Endpoints may talk*; it says nothing about what may be
 //! reached, and it was never meant to.
 //!
-//! `--service` is where phase 2 puts a file instead.
+//! The catalogue is that file, and reading it is `portal_core::config`, which
+//! is where the format and the reasoning live.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
 use argh::FromArgs;
 use isekai_p2p::{load_or_generate_key, AcceptPolicy, P2pConfig};
-use portal_core::server::Catalogue;
 use tokio_util::sync::CancellationToken;
 
 /// Forward local TCP services to authorised peers over ISEKAI link.
@@ -70,9 +69,10 @@ struct Args {
     /// to a QUIC stack
     #[argh(option)]
     cert_key: Option<PathBuf>,
-    /// a service to offer, as `name=host:port`. Repeatable
+    /// path to the service catalogue -- see `portal-core::config` for the
+    /// format
     #[argh(option)]
-    service: Vec<String>,
+    config: PathBuf,
     /// an Endpoint ID to issue a capability for at startup, printed on stdout.
     /// Repeatable
     #[argh(option)]
@@ -89,10 +89,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args: Args = argh::from_env();
 
-    let catalogue = catalogue(&args.service)?;
-    if catalogue.is_empty() {
-        anyhow::bail!("no services offered; pass at least one --service name=host:port");
-    }
+    // Read before anything else touches the network: a typo in the catalogue
+    // should cost a message, not a registered Endpoint and a listener nobody
+    // can use.
+    let catalogue = portal_core::config::load(&args.config)?;
 
     let cert_key = args.cert_key.clone().unwrap_or_else(|| {
         let mut path = args.key.clone();
@@ -161,19 +161,4 @@ async fn main() -> anyhow::Result<()> {
     // leaves it listed for its whole lease, pointing at a process that is gone.
     server.close().await;
     Ok(())
-}
-
-/// Parse `name=host:port` into the catalogue.
-fn catalogue(services: &[String]) -> anyhow::Result<Catalogue> {
-    let mut catalogue = Catalogue::new();
-    for service in services {
-        let (name, target) = service
-            .split_once('=')
-            .with_context(|| format!("--service wants `name=host:port`, got `{service}`"))?;
-        let target: SocketAddr = target
-            .parse()
-            .with_context(|| format!("`{target}` is not a host:port"))?;
-        catalogue = catalogue.try_with(name, target)?;
-    }
-    Ok(catalogue)
 }

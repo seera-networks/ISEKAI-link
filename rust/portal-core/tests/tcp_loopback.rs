@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use msquic_async::StreamType;
 use msquic_async::{msquic, Registration};
-use portal_core::server::Catalogue;
+use portal_core::server::{Catalogue, Protocol};
 use portal_core::{client, frame, server, transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -223,7 +223,7 @@ async fn connected(catalogue: Catalogue) -> Halves {
 #[tokio::test]
 async fn bytes_reach_the_service_and_come_back() {
     let target = shouting_service().await;
-    let halves = connected(Catalogue::new().with("db", target)).await;
+    let halves = connected(Catalogue::new().with("db", Protocol::Tcp, target)).await;
 
     let local = client::forward(
         halves.connection().clone(),
@@ -248,11 +248,60 @@ async fn bytes_reach_the_service_and_come_back() {
     drain(halves).await;
 }
 
+/// **A service offered over the other protocol is refused the same way** as one
+/// that does not exist (plan §4.3). The unit test in `config` checks the
+/// catalogue's answer; this checks the byte, because the property is about what
+/// a caller can learn by asking and only the wire says that.
+#[tokio::test]
+async fn a_udp_service_is_refused_exactly_as_an_unknown_one_is() {
+    let target = shouting_service().await;
+    // Offered, but not over TCP -- and TCP is what a stream is.
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    let mut stream = halves
+        .connection()
+        .open_outbound_stream(StreamType::Bidirectional, false)
+        .await
+        .expect("open a stream");
+    frame::write_open(&mut stream, "dns")
+        .await
+        .expect("write the open");
+    let offered_as_udp =
+        tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut stream))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status");
+    drop(stream);
+
+    let mut stream = halves
+        .connection()
+        .open_outbound_stream(StreamType::Bidirectional, false)
+        .await
+        .expect("open a stream");
+    frame::write_open(&mut stream, "no-such-thing")
+        .await
+        .expect("write the open");
+    let never_heard_of =
+        tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut stream))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status");
+    drop(stream);
+
+    assert_eq!(offered_as_udp, frame::Status::Refused);
+    assert_eq!(
+        offered_as_udp, never_heard_of,
+        "a caller must not be able to tell a wrong-protocol service from a missing one",
+    );
+
+    drain(halves).await;
+}
+
 #[tokio::test]
 async fn a_service_that_is_not_offered_gets_no_connection() {
     let target = shouting_service().await;
     // The catalogue offers `db`, and the forward below asks for something else.
-    let halves = connected(Catalogue::new().with("db", target)).await;
+    let halves = connected(Catalogue::new().with("db", Protocol::Tcp, target)).await;
 
     let local = client::forward(
         halves.connection().clone(),

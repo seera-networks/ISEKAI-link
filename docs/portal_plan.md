@@ -180,6 +180,17 @@ The target never crosses the wire. An `OPEN` for a name that is not in the file
 is refused, and the refusal is the same whether the name is unknown or the
 protocol is wrong — there is nothing to be learned by probing.
 
+**Built in phase 2** as `portal-core::config`. Both ways of missing come back
+through one `Catalogue::look_up`, which is what keeps their answers identical
+rather than leaving two call sites to agree; the operator's log tells them
+apart and the wire does not. `tcp_loopback.rs` asserts the two bytes are the
+same over a real connection, because that is where the property lives.
+
+`protocol = "udp"` parses so the format does not change under anyone when phase
+3 lands; until then such a service is refused like any other miss. And `target`
+is an address rather than a name: resolving one would put a DNS answer in
+charge of where traffic goes, which is a different decision from this one.
+
 This is the split `agent_access_spec_draft.md` §3.1 argues for, one layer down:
 what is coarse (may these two Endpoints talk, over which protocol) lives in the
 middle, and what is fine (which services, at which addresses) lives on the
@@ -337,7 +348,7 @@ having before anyone asks.
 | **1c-iii-b** | `spike.rs` → `transport.rs`: portal binds and dials with the connection layer, not its own copy | **done** — the loopback test runs over `peer::dial`, on Linux and macOS; Windows compiles it (#155) |
 | **1c-iii-c-i** | the loop that drives a `ListenerSession` → the layer | **done** — `isekai_p2p::listener::run`; `camera-core` calls it and keeps the command type's name |
 | **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **done** — forwards over a real proxy; the catalogue is still arguments, which is phase 2 |
-| **2** | The catalogue, the config file, refusals | phase 0 with a file instead of a constant |
+| **2** | The catalogue, the config file, refusals | **done** — `portal-core::config`; `portal-server --config`. UDP entries parse and are refused until phase 3 |
 | **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have. The client offers a candidate as of 1c-iii-c-ii; what is missing is the listener advertising its leg's binding, which is `camera-core::video::advertise_direct_path` and moves with this | a transfer survives the switch |
 | **5** | Packaging: a CLI that is pleasant (`portal-client --map 5432:db`), logging, `--help` that explains the catalogue | somebody else can use it from the README alone |
@@ -409,12 +420,23 @@ The Identity and proxy URLs default to the deployment the camera apps use
 (`identity.isekai.tools:9443`, `tokyo.link.isekai.tools:8443`); `--identity-url`
 and `--proxy-url` are there for another one.
 
-**The server offers services and authorises that Endpoint.** `--service` is
-`name=host:port`, and the target never crosses the wire (§4.3):
+**The server offers services and authorises that Endpoint.** The catalogue is
+the file in §4.3, and the target never crosses the wire:
+
+```toml
+# portal-server.toml
+[service.db]
+protocol = "tcp"
+target   = "127.0.0.1:5432"
+```
+
+It is read before anything touches the network, so a typo costs a message
+naming the service rather than a registered Endpoint and a listener nobody can
+use.
 
 ```
 portal-server --auth0-token … --key server.pem --register \
-              --service db=127.0.0.1:5432 \
+              --config portal-server.toml \
               --allow ep:40d25d…
 listener id : pl_…
 endpoint id : ep:…
