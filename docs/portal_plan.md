@@ -103,6 +103,14 @@ stream would add head-of-line blocking that the application does not expect.
   for a datagram service and silently splitting one is worse than losing it.
   `isekai-p2p-core::transport`'s MTU floor (#102) is what bounds this; the
   number belongs in one constant with the arithmetic written out beside it.
+
+  **The bound this leaves is about 1200 bytes, and it is not raisable.** The
+  peer connection's 1248-byte MTU is a floor msquic will not go under, so a
+  larger UDP payload cannot cross a portal forward at all. The case to know is
+  DNS: EDNS0 commonly advertises 1232, so a large response is dropped with no
+  truncation bit and no ICMP, and a stub resolver waits out a timeout rather
+  than retrying over TCP. Phase 3's criterion is therefore a DNS query whose
+  response fits — which is the ordinary case, not a contrived one.
 - **Backpressure.** Streams have flow control; datagrams have none. Each UDP
   session gets a bounded queue and drops the oldest on overflow, with a counter.
   Unbounded buffering here is how a memory leak looks in production.
@@ -361,7 +369,7 @@ having before anyone asks.
 | **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **done** — forwards over a real proxy |
 | **2** | The catalogue, the config file, refusals | **done** — `portal-core::config`; `portal-server --config`. UDP entries parse and are refused until phase 3 |
 | **3a** | UDP's two bounds, with no sockets in them: the wire, the size limit and its arithmetic, the drop-oldest queue, the counters | **done** — `portal-core::datagram` |
-| **3b** | The sockets: a session per (source, service), one UDP socket each, the idle sweep, and the datagram pump both ways | a DNS query answers over the forward |
+| **3b** | The sockets: a session per (source, service), one UDP socket each, the idle sweep, and the datagram pump both ways | a DNS query whose response fits (see §4.1) answers over the forward |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have. The client offers a candidate as of 1c-iii-c-ii; what is missing is the listener advertising its leg's binding, which is `camera-core::video::advertise_direct_path` and moves with this | a transfer survives the switch |
 | **5** | Packaging: a CLI that is pleasant (`portal-client --map 5432:db`), logging, `--help` that explains the catalogue | somebody else can use it from the README alone |
 

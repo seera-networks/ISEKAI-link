@@ -665,6 +665,9 @@ pub async fn receive_frames_with(
             verify,
             pin,
             candidate,
+            // The video carries frames on unidirectional streams and never a
+            // datagram; advertising otherwise would only invite them.
+            datagrams: false,
         },
         &shutdown,
     )

@@ -132,6 +132,14 @@ pub struct ClientOptions<'a> {
     pub enable_migration: bool,
     /// Ask to be shown the peer's certificate, so a caller can check it.
     pub pinning: bool,
+    /// Advertise that this end will receive QUIC datagrams.
+    ///
+    /// **Off means the *peer* may not send them.** `max_datagram_frame_size` is
+    /// what a receiver advertises, so leaving this unset denies the other
+    /// direction: msquic-async answers `DgramSendError::Denied` and nothing
+    /// leaves. The camera does not use datagrams and pays nothing for that;
+    /// portal's UDP forwarding needs both directions and so needs this.
+    pub datagrams: bool,
 }
 
 /// A client configuration for a peer QUIC connection.
@@ -152,6 +160,7 @@ pub fn client_config(
         verify,
         enable_migration,
         pinning,
+        datagrams,
     } = opts;
     let reg = match reg {
         Some(reg) => reg,
@@ -193,6 +202,13 @@ pub fn client_config(
         .set_MaximumMtu(1248)
         .set_PeerUnidiStreamCount(100)
         .set_StreamMultiReceiveEnabled();
+    // Asked for by whoever will receive them, which is why it is an option
+    // rather than always on: this advertises to the *peer* that it may send.
+    let settings = if datagrams {
+        settings.set_DatagramReceiveEnabled()
+    } else {
+        settings
+    };
     // NAT-traversal mode is what makes the peer probe our candidate address and
     // report a `PathValidated` for the direct path; the observed-address reports
     // are the other half of the exchange.
@@ -687,6 +703,8 @@ pub struct DialOptions<'a> {
     /// How the proxy sees this session's relay leg. `Some` offers it as a
     /// direct-path candidate and turns migration on.
     pub candidate: Option<ObservedAddress>,
+    /// Receive QUIC datagrams — see [`ClientOptions::datagrams`].
+    pub datagrams: bool,
 }
 
 /// Dial a peer, letting a single handshake ride across its relay-bind gap;
@@ -747,6 +765,7 @@ pub async fn dial(
         verify,
         pin,
         candidate,
+        datagrams,
     } = opts;
     // Both flags are read off the same options the loop below reads, rather
     // than passed in beside them: a caller that asked to pin and got a
@@ -759,6 +778,7 @@ pub async fn dial(
             verify,
             enable_migration: candidate.is_some(),
             pinning: pin.is_some(),
+            datagrams,
         },
     )?;
     let deadline = Instant::now() + CONNECT_DEADLINE;

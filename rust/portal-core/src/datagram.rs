@@ -15,6 +15,26 @@
 //! plan says will bite: the size bound and the queue bound. The sockets, the
 //! session table's lifetime and the idle sweep are 3b.
 //!
+//! # Where a session id comes from
+//!
+//! **The datagram header is only an id, and that is deliberate**: it says which
+//! session a payload belongs to and nothing else, because at this size every
+//! byte is one the payload does not get.
+//!
+//! So the binding from id to service is made on a stream, not here. A UDP
+//! forward opens one, sends [`crate::frame::write_open`] with the service name
+//! and the id the client allocated, and reads a status — after which the stream
+//! is the session's lifetime handle and the datagrams carry the id alone.
+//! Closing it ends the session; an id that arrives without one has no service
+//! to belong to and is counted [`Drops::unknown_session`].
+//!
+//! That is also why there is no version byte here when [`crate::frame`] has
+//! one: the version was agreed on the stream that opened the session, and
+//! paying for it again in every datagram would buy nothing.
+//!
+//! 3b builds that exchange; the shape is settled now because a wire is cheap to
+//! change before it carries anything.
+//!
 //! # Neither bound may be silent
 //!
 //! A datagram service that quietly truncates is worse than one that quietly
@@ -53,6 +73,21 @@ pub const HEADER: usize = 4;
 /// sender checks this constant first so the refusal is counted here rather than
 /// arriving as an error from three layers down, and handles `TooBig` anyway
 /// because the runtime value is the one that is true.
+///
+/// # What this rules out, said plainly
+///
+/// **A UDP payload over about 1200 bytes cannot cross a portal forward**, and
+/// raising this constant does not change that — the true limit is the peer
+/// connection's, and its 1248-byte MTU is itself a floor msquic will not go
+/// under. Splitting is not an option either; §4.1 is explicit that a datagram
+/// service which silently splits is worse than one which silently loses.
+///
+/// The case to know about is DNS: EDNS0 commonly advertises a 1232-byte buffer,
+/// so a large response can exceed this and be dropped — with no truncation bit
+/// and no ICMP, which leaves a stub resolver waiting for a timeout instead of
+/// retrying over TCP. A resolver configured for a smaller buffer, or one that
+/// falls back on timeout, is fine. This is a property of forwarding UDP inside
+/// a relayed QUIC connection rather than something phase 3 can fix.
 pub const MAX_PAYLOAD: usize = 1180;
 
 /// How many datagrams a session may hold before the oldest is dropped.
@@ -110,6 +145,18 @@ pub struct Drops {
     pub unknown_session: AtomicU64,
 }
 
+/// What [`Queue::push`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Push {
+    /// Taken, and the reader will see it.
+    Queued,
+    /// Taken, and the oldest was dropped to make room — count it.
+    Evicted,
+    /// Refused: the session has ended. Count it; the payload is gone either
+    /// way, and the difference from `Queued` is the whole point of saying so.
+    Closed,
+}
+
 /// A bounded queue of datagrams for one session.
 ///
 /// Not an `mpsc`: the bound has to drop the **oldest**, and a channel's sender
@@ -138,20 +185,31 @@ impl Queue {
 
     /// Add `payload`, dropping the oldest if the queue is full.
     ///
-    /// Returns whether anything was dropped to make room, so the caller can
-    /// count it against the session it happened to.
-    pub fn push(&self, payload: Bytes) -> bool {
-        let dropped = {
+    /// The answer says which of the three things happened, because two of them
+    /// are losses and a caller that cannot tell them apart cannot count them —
+    /// which is the thing this module exists to prevent.
+    pub fn push(&self, payload: Bytes) -> Push {
+        let outcome = {
             let mut waiting = self.waiting.lock().expect("datagram queue lock poisoned");
-            let dropped = waiting.len() >= QUEUE_DEPTH;
-            if dropped {
+            // Checked under the same lock as the push, so a sweep that closes
+            // between the two cannot leave a payload in a queue whose reader
+            // has gone. Without this the datagram is neither delivered nor
+            // counted: it sits there until the last `Arc` drops.
+            if self.closed.load(Ordering::Acquire) {
+                Push::Closed
+            } else if waiting.len() >= QUEUE_DEPTH {
                 waiting.pop_front();
+                waiting.push_back(payload);
+                Push::Evicted
+            } else {
+                waiting.push_back(payload);
+                Push::Queued
             }
-            waiting.push_back(payload);
-            dropped
         };
-        self.arrived.notify_one();
-        dropped
+        if outcome != Push::Closed {
+            self.arrived.notify_one();
+        }
+        outcome
     }
 
     /// The next datagram, waiting for one if the queue is empty.
@@ -231,13 +289,15 @@ mod tests {
     async fn a_full_queue_drops_the_oldest_and_says_so() {
         let queue = Queue::new();
         for i in 0..QUEUE_DEPTH {
-            assert!(
-                !queue.push(Bytes::from(vec![i as u8])),
-                "still has room at {i}"
+            assert_eq!(
+                queue.push(Bytes::from(vec![i as u8])),
+                Push::Queued,
+                "still has room at {i}",
             );
         }
-        assert!(
+        assert_eq!(
             queue.push(Bytes::from_static(b"newest")),
+            Push::Evicted,
             "the queue is full, so something had to go",
         );
 
@@ -246,6 +306,18 @@ mod tests {
             first[0], 1,
             "the datagram that had been waiting longest is the one that went",
         );
+    }
+
+    /// **A datagram that arrives after the sweep is a loss like any other**, and
+    /// has to be counted like one. Taking it into a queue nobody is reading
+    /// would report it delivered and then lose it — a third silent hole in a
+    /// module whose whole subject is not having any.
+    #[tokio::test]
+    async fn a_closed_queue_refuses_rather_than_swallows() {
+        let queue = Queue::new();
+        queue.close();
+        assert_eq!(queue.push(Bytes::from_static(b"too late")), Push::Closed);
+        assert!(queue.pop().await.is_none(), "and nothing was kept");
     }
 
     #[tokio::test]

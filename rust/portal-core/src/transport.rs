@@ -130,6 +130,10 @@ pub async fn connect(
             verify,
             pin,
             candidate,
+            // **Both directions or neither.** This advertises that we will
+            // receive datagrams, which is what lets the *server* answer a UDP
+            // forward at all -- without it every reply is denied at zero bytes.
+            datagrams: true,
         },
         shutdown,
     )
