@@ -4393,6 +4393,7 @@ name = "portal-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "isekai-link-utils",
  "isekai-p2p",
  "msquic-async",

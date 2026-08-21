@@ -358,9 +358,10 @@ having before anyone asks.
 | **1c-iii-a** | the Endpoint's relay certificate → the layer | **done** — `isekai_p2p::endpoint_cert`; `camera-core::tls` re-exports the names its apps spell |
 | **1c-iii-b** | `spike.rs` → `transport.rs`: portal binds and dials with the connection layer, not its own copy | **done** — the loopback test runs over `peer::dial`, on Linux and macOS; Windows compiles it (#155) |
 | **1c-iii-c-i** | the loop that drives a `ListenerSession` → the layer | **done** — `isekai_p2p::listener::run`; `camera-core` calls it and keeps the command type's name |
-| **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **done** — forwards over a real proxy; the catalogue is still arguments, which is phase 2 |
+| **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **done** — forwards over a real proxy |
 | **2** | The catalogue, the config file, refusals | **done** — `portal-core::config`; `portal-server --config`. UDP entries parse and are refused until phase 3 |
-| **3** | UDP: datagrams, session table, idle sweep, size and queue bounds | a DNS query answers over the forward |
+| **3a** | UDP's two bounds, with no sockets in them: the wire, the size limit and its arithmetic, the drop-oldest queue, the counters | **done** — `portal-core::datagram` |
+| **3b** | The sockets: a session per (source, service), one UDP socket each, the idle sweep, and the datagram pump both ways | a DNS query answers over the forward |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have. The client offers a candidate as of 1c-iii-c-ii; what is missing is the listener advertising its leg's binding, which is `camera-core::video::advertise_direct_path` and moves with this | a transfer survives the switch |
 | **5** | Packaging: a CLI that is pleasant (`portal-client --map 5432:db`), logging, `--help` that explains the catalogue | somebody else can use it from the README alone |
 

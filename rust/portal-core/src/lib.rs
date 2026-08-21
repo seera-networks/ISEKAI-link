@@ -18,6 +18,7 @@
 
 pub mod client;
 pub mod config;
+pub mod datagram;
 pub mod frame;
 pub mod server;
 pub mod session;
