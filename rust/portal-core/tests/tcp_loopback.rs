@@ -69,7 +69,7 @@ use tokio_util::sync::CancellationToken;
 /// passed on the other run. Nothing here has an opinion about how fast a
 /// handshake should be — only that a wait which is never going to end should
 /// end.
-const DIAL_BUDGET: Duration = Duration::from_secs(180);
+const DIAL_BUDGET: Duration = Duration::from_secs(30);
 
 /// Uppercases whatever it is sent, so a reply proves both directions rather
 /// than just one — an echo would pass even if the two copies were crossed.
