@@ -484,6 +484,41 @@ impl MyApp {
             consent: camera_ui::ConsentGate::new("camera-server", japanese),
         }
         .with_stored_auth0()
+        .with_p2p_autostart()
+    }
+
+    /// `P2P_AUTOSTART=1` opens the P2P listener immediately, the same as
+    /// clicking "Open" — for running this headless (e.g. a systemd unit that
+    /// starts it post-reboot, with no one there to click). Mirrors
+    /// `CAMERA_AUTOSTART` above, which does the same for the "Start" button.
+    ///
+    /// Only fires when a previous sign-in was actually restored: opening
+    /// without one would just fail on the first Identity API call with a
+    /// token error, and a daemon with no GUI in front of it should say why it
+    /// didn't start rather than spend a request finding out.
+    fn with_p2p_autostart(mut self) -> Self {
+        if std::env::var_os("P2P_AUTOSTART").is_some() {
+            if self.auth0_source.is_some() {
+                // `register` defaults to true for a fresh key's first-ever
+                // open; an existing key file means this Endpoint already
+                // registered on some earlier run, and registering it again
+                // gets a hard 409 that kills the P2P task (while `is_open`
+                // stays stuck true from the synchronous flag below, since
+                // that isn't conditioned on the task actually succeeding) --
+                // a real restart hazard this surfaced, not specific to
+                // autostart alone.
+                if std::path::Path::new(&self.key_path).exists() {
+                    self.register = false;
+                }
+                self.open_p2p();
+            } else {
+                *self.log_shared.lock().unwrap() =
+                    "P2P_AUTOSTART set, but no signed-in session was restored from \
+                     camera-server-auth0.json — sign in once interactively first."
+                        .to_string();
+            }
+        }
+        self
     }
 
     /// Pick up the tokens a previous sign-in left, so a camera that has been
