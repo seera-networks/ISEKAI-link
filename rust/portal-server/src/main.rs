@@ -36,7 +36,43 @@ use isekai_p2p::{load_or_generate_key, AcceptPolicy, P2pConfig};
 use tokio_util::sync::CancellationToken;
 
 /// Forward local TCP and UDP services to authorised peers over ISEKAI link.
+///
+/// A peer asks for a service **by name**. What each name means is this file's
+/// business and never crosses the wire, so a caller cannot reach anything the
+/// catalogue does not offer.
 #[derive(FromArgs)]
+#[argh(
+    example = "\
+portal-server --auth0-token $TOKEN --key ./portal-server.pem --register \\
+              --config ./portal-server.toml --allow ep_1a2b3c...",
+    note = "\
+The catalogue (--config), which is the whole of what may be reached:
+
+  [service.db]
+  protocol = \"tcp\"
+  target   = \"10.0.0.5:5432\"
+
+  [service.dns]
+  protocol = \"udp\"
+  target   = \"10.0.0.1:53\"
+
+`target` is an address, never a hostname: resolving one would put a DNS answer
+in charge of where forwarded traffic goes. `--example-config` writes a starter
+file to stdout.
+
+UDP payloads over about 1200 bytes are dropped rather than split, and counted.
+The case to know is a large DNS response; docs/portal.md has the arithmetic.
+",
+    note = "\
+Getting a peer connected takes one exchange, because the proxy will not let two
+Endpoints talk until a Grant says so:
+
+  1. the peer runs `portal-client --whoami` and tells you its Endpoint ID;
+  2. you pass that to --allow, and this prints a capability;
+  3. you give the peer that capability and the listener id printed here.
+
+Both are printed on stdout at startup."
+)]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
     /// apps use
@@ -54,9 +90,10 @@ struct Args {
         default = "String::from(\"https://tokyo.link.isekai.tools:8443\")"
     )]
     proxy_url: String,
-    /// auth0 access token, used only to obtain the Endpoint Token
+    /// auth0 access token, used only to obtain the Endpoint Token. Not needed
+    /// with --example-config
     #[argh(option)]
-    auth0_token: String,
+    auth0_token: Option<String>,
     /// P2P protocol string
     #[argh(option, default = "String::from(\"isekai-portal-v1\")")]
     protocol: String,
@@ -67,8 +104,10 @@ struct Args {
     /// device display name recorded at registration
     #[argh(option)]
     device_name: Option<String>,
-    /// path to this Endpoint's signing key; generated if absent
-    #[argh(option)]
+    /// path to this Endpoint's signing key. Generated on first use; keep it,
+    /// because a new one is a new Endpoint ID and every capability issued for
+    /// the old one stops meaning anything. Not needed with --example-config
+    #[argh(option, default = "PathBuf::from(\"portal-server.pem\")")]
     key: PathBuf,
     /// path to the certificate key this device keeps. Defaults to the Endpoint
     /// key's name with `-portal-cert` appended -- a separate key on purpose,
@@ -76,10 +115,13 @@ struct Args {
     /// to a QUIC stack
     #[argh(option)]
     cert_key: Option<PathBuf>,
-    /// path to the service catalogue -- see `portal-core::config` for the
-    /// format
-    #[argh(option)]
+    /// path to the service catalogue: what may be reached, and under what
+    /// name. See the note below, or --example-config
+    #[argh(option, default = "PathBuf::from(\"portal-server.toml\")")]
     config: PathBuf,
+    /// print a starter catalogue on stdout and exit
+    #[argh(switch)]
+    example_config: bool,
     /// an Endpoint ID to issue a capability for at startup, printed on stdout.
     /// Repeatable
     #[argh(option)]
@@ -91,10 +133,26 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // **`info` when `RUST_LOG` says nothing**, which is not a default so much as
+    // a fix: `from_default_env()` on an unset variable builds a filter that
+    // passes nothing, so every `warn!` in the forwarding — a service refused, a
+    // target that will not answer, a datagram too large — went nowhere unless
+    // the operator already knew to ask. A tool whose failures are silent until
+    // you set an environment variable is not one somebody else can use.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
     let args: Args = argh::from_env();
+
+    if args.example_config {
+        // Before the key, the token and the catalogue: this is what somebody
+        // runs when they have none of the three yet.
+        print!("{}", portal_core::config::EXAMPLE);
+        return Ok(());
+    }
 
     // Read before anything else touches the network: a typo in the catalogue
     // should cost a message, not a registered Endpoint and a listener nobody
@@ -115,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
         identity_url: args.identity_url,
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url,
-        auth0_token: args.auth0_token,
+        auth0_token: args.auth0_token.context("--auth0-token is required")?,
         auth0: None,
         protocol: args.protocol,
         register: args.register,

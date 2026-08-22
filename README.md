@@ -65,6 +65,11 @@ Monitor and control equipment across networks.
 ### 🧪 Remote developer access
 Access local devices or services securely from anywhere.
 
+**This one you can run today: [ISEKAI portal](docs/portal.md).** Map a local
+port onto a TCP or UDP service behind someone else's NAT — `psql -h 127.0.0.1`
+into a database on another network, with no firewall rule and no reachable
+address on either side.
+
 ---
 
 ## 🔧 Under the hood

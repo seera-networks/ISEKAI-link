@@ -23,7 +23,44 @@ use tokio_util::sync::CancellationToken;
 
 /// Map local TCP and UDP ports onto a portal server's services over ISEKAI
 /// link.
+///
+/// A service is asked for **by name**. Which local port stands for which name
+/// is this machine's business and nothing about it is sent, so the mapping can
+/// be whatever suits you.
 #[derive(FromArgs)]
+#[argh(
+    example = "\
+portal-client --key ./portal-client.pem --whoami
+
+portal-client --auth0-token $TOKEN --key ./portal-client.pem \\
+              --listener pl_1a2b3c... --capability cap_4d5e6f... \\
+              --map 5432:db --map udp:5353:dns",
+    note = "\
+--map takes `port:service`, or `udp:port:service` for a UDP one. TCP without
+the prefix. Repeatable, and the port is yours to choose:
+
+  --map 5432:db           reach `db` at 127.0.0.1:5432
+  --map 15432:db          the same service on a port that is free
+  --map udp:5353:dns      reach `dns` at 127.0.0.1:5353
+
+The protocol has to be said and cannot be guessed: the server looks a name up
+under a protocol, so asking for `dns` over TCP is refused with the same answer
+as a name that does not exist.
+
+Forwarded ports bind to loopback unless --bind says otherwise, because a
+forward reachable from your network is a second door onto the server's
+services.
+",
+    note = "\
+The server's operator has to let you in first, because the proxy will not let
+two Endpoints talk until a Grant says so:
+
+  1. run --whoami and send them the Endpoint ID it prints;
+  2. they run portal-server --allow <that id>, which prints a capability;
+  3. pass that capability and their listener id to --capability and --listener.
+
+--whoami needs nothing but --key, and makes no network call."
+)]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
     /// apps use
@@ -55,16 +92,18 @@ struct Args {
     /// device display name recorded at registration
     #[argh(option)]
     device_name: Option<String>,
-    /// path to this Endpoint's signing key; generated if absent
-    #[argh(option)]
+    /// path to this Endpoint's signing key. Generated on first use; keep it,
+    /// because a new one is a new Endpoint ID and the capability you were
+    /// issued stops meaning anything
+    #[argh(option, default = "PathBuf::from(\"portal-client.pem\")")]
     key: PathBuf,
     /// print this Endpoint's ID and exit -- what the server needs for --allow
     #[argh(switch)]
     whoami: bool,
-    /// the server's listener id
+    /// the server's listener id, which its operator prints at startup
     #[argh(option)]
     listener: Option<String>,
-    /// the capability the server issued for this Endpoint
+    /// the capability the server issued for this Endpoint -- see --whoami
     #[argh(option)]
     capability: Option<String>,
     /// a local port to map onto a service, as `port:name` or
@@ -80,8 +119,17 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // **`info` when `RUST_LOG` says nothing**, which is not a default so much as
+    // a fix: `from_default_env()` on an unset variable builds a filter that
+    // passes nothing, so every `warn!` in the forwarding — a service refused, a
+    // target that will not answer, a datagram too large — went nowhere unless
+    // the operator already knew to ask. A tool whose failures are silent until
+    // you set an environment variable is not one somebody else can use.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
     let args: Args = argh::from_env();
 
