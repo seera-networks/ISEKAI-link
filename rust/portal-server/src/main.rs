@@ -182,18 +182,20 @@ struct Args {
 /// connects *through*, and standing one up to ask would put a second row under
 /// this Endpoint for every client that then looks one up.
 async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Result<()> {
-    let cfg = config(args, tokens, load_or_generate_key(&args.key)?).await?;
+    let cfg = config(args, tokens).await?;
     grant_admin(args, &cfg).await
 }
 
 /// The P2P configuration these arguments describe, authenticated however this
 /// installation is.
-async fn config(
-    args: &Args,
-    tokens: &std::path::Path,
-    key: isekai_p2p::agent::EndpointKey,
-) -> anyhow::Result<P2pConfig> {
+async fn config(args: &Args, tokens: &std::path::Path) -> anyhow::Result<P2pConfig> {
+    // **Authentication first, then the key.** The struct literal this replaced
+    // evaluated the token before the key, so a run with neither a sign-in nor a
+    // token bailed without writing anything; passing the key in as an argument
+    // quietly reversed that and left a new Endpoint identity on disk before
+    // failing.
     let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
+    let key = load_or_generate_key(&args.key)?;
     Ok(P2pConfig {
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
@@ -341,7 +343,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tracing::info!(path = %args.key.display(), "generating a new Endpoint key");
     }
 
-    let cfg = config(&args, &tokens, load_or_generate_key(&args.key)?).await?;
+    let cfg = config(&args, &tokens).await?;
 
     let shutdown = CancellationToken::new();
     // `AutoNotify` rather than `Manual`: there is no operator watching a window

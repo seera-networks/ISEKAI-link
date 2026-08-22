@@ -84,7 +84,8 @@ somewhere else.
 ## 0. Sign in, once per machine
 
 ```sh
-portal-server --login          # or portal-client --login
+portal-server --login          # on the machine with the services
+portal-client --login          # on the machine with the local ports
 ```
 
 ```
@@ -98,8 +99,14 @@ Waiting…
 ```
 
 Open it, confirm the code, and that machine is signed in for good: the tokens
-land beside the Endpoint key (`portal-server-auth0.json`) and **refresh
-themselves from then on**. No command after this needs a token.
+land beside the Endpoint key and **refresh themselves from then on**. No command
+after this needs a token.
+
+**Each binary has its own store**, because each is a separate Endpoint with its
+own key — `portal-server-auth0.json` beside `portal-server.pem`,
+`portal-client-auth0.json` beside `portal-client.pem`. So a machine running both
+signs in twice, and a non-default `--key` has to be passed to `--login` as well,
+since that is what the name is derived from.
 
 **This is what lets a server be left running.** An Endpoint Token lasts minutes
 and is reissued for the life of the session, and each reissue needs a current

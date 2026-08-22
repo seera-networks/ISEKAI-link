@@ -198,6 +198,17 @@ async fn main() -> anyhow::Result<()> {
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn run(args: Args) -> anyhow::Result<()> {
+    let tokens = args
+        .auth0_tokens
+        .clone()
+        .unwrap_or_else(|| portal_core::login::tokens_beside(&args.key));
+    // **Before the key**, which signing in does not need — and a corrupt
+    // `portal-client.pem` should not block the one command that has nothing to
+    // do with it. `portal-server` orders these the same way.
+    if args.login {
+        return portal_core::login::sign_in(&tokens).await;
+    }
+
     // **Said out loud, because a generated key looks exactly like a loaded one
     // until it fails.** `--key` has a default, so running from a different
     // directory than last time silently makes a *second* Endpoint — and the
@@ -212,14 +223,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         // ask the other side for a capability, and it costs nothing to answer.
         println!("{}", key.endpoint_id());
         return Ok(());
-    }
-
-    let tokens = args
-        .auth0_tokens
-        .clone()
-        .unwrap_or_else(|| portal_core::login::tokens_beside(&args.key));
-    if args.login {
-        return portal_core::login::sign_in(&tokens).await;
     }
 
     if let Some(code) = &args.pair {
