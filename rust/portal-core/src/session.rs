@@ -376,12 +376,11 @@ pub async fn connect(
     // and the handshake can take a long time by design, so there is no useful
     // "add it later".
     //
-    // **Nothing probes it yet**, and that is the plan rather than an oversight:
-    // the other end has to advertise its own leg's binding
-    // (`camera-core::video::advertise_direct_path` is the camera's), which is
-    // phase 4 along with the path reporting. Offered anyway because the client
-    // half is what has to happen before `start` and there is nowhere later to
-    // put it.
+    // **And it is probed, as of phase 4.** `serve` above advertises the other
+    // end's leg binding, which is the half this offer was waiting for — until
+    // it landed, this candidate said where we could be reached to a peer with
+    // no address to send to. `crate::path` is what happens once a path
+    // validates.
     let candidate = wait_for_observed(&session, shutdown).await;
 
     let peer = transport::connect(

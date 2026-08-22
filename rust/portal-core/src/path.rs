@@ -50,9 +50,10 @@
 //!
 //! `camera-client` has a person and a Migrate button. A portal has an operator
 //! who started a process and went away, so a direct path that waits to be asked
-//! is a direct path that never gets used. Preferring on validation is the whole
-//! difference between the two callers, and it is why this file exists rather
-//! than `camera-core`'s loop being made to serve both.
+//! is a direct path that never gets used. Preferring as soon as there is
+//! something to prefer is the whole difference between the two callers, and it
+//! is why this file exists rather than `camera-core`'s loop being made to serve
+//! both — and it is also why the ordering above bit here and not there.
 //!
 //! # What tells us a preferred path has gone bad
 //!
@@ -82,7 +83,7 @@ use std::time::Duration;
 use msquic_async::{Connection, ConnectionEvent};
 use tokio_util::sync::CancellationToken;
 
-use isekai_p2p::direct_path::prefer_path;
+use isekai_p2p::direct_path::{prefer_path, RELAY_PATH_ID};
 use isekai_p2p::peer::log_connection_stats;
 
 /// How often the connection's counters are reported.
@@ -117,10 +118,11 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
         (Ok(local), Ok(remote)) => (local, remote),
         _ => {
             tracing::warn!(
-                "could not read the relay path's addresses; staying on the relay and \
-                 watching only for the connection to end",
+                "could not read the relay path's addresses; no path can be preferred \
+                 without them, so every path that turns up is held as backup and the \
+                 relay keeps the traffic",
             );
-            drain_events(&conn, &shutdown).await;
+            stay_on_the_relay(&conn, &shutdown).await;
             return;
         }
     };
@@ -260,10 +262,37 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                 preferred = None;
                 prefer_path(&conn, relay, relay, &direct);
             }
-            ConnectionEvent::PathStatusChanged { .. } => {
-                // The peer's view of a path, which this end does not act on: it
-                // decides for itself which path to send on.
-                tracing::debug!("the peer changed a path's status");
+            ConnectionEvent::PathStatusChanged {
+                path_id,
+                local_address,
+                peer_address,
+                is_active,
+            } => {
+                // **The peer's declaration moves this end too**, which is not
+                // what it looks like: a PATH_BACKUP arriving clears this side's
+                // own `Path->IsActive`, so a path the peer demotes stops
+                // carrying our traffic whatever we decided. Bookkeeping rather
+                // than a fight — re-declaring it available would be arguing with
+                // the end that has a reason.
+                //
+                // What must not happen is `preferred` staying behind, because
+                // it is what labels the per-second stats: the operator would
+                // read `direct` off a connection running on the relay, which is
+                // the failure this whole file was written for.
+                let pair = (local_address, peer_address);
+                if !is_active && preferred == Some(pair) {
+                    tracing::warn!(
+                        path_id, local = %local_address, remote = %peer_address,
+                        "the peer declared the path we were using backup; \
+                         forwarding is on the relay again",
+                    );
+                    preferred = None;
+                } else {
+                    tracing::debug!(
+                        path_id, local = %local_address, remote = %peer_address, is_active,
+                        "the peer changed a path's status",
+                    );
+                }
             }
             _ => {}
         }
@@ -282,19 +311,43 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-/// Consume events until the connection ends, acting on none of them.
+/// Stay on the relay, and hold every path that turns up as backup.
 ///
-/// The fallback for a connection whose own addresses could not be read: there is
-/// nothing sensible to compare a path against, so the relay is kept — but the
-/// events still have to be drained, because this is also how the caller learns
+/// The fallback for a connection whose own addresses could not be read. Without
+/// them there is nothing to compare a path against, so none can be preferred —
+/// but **doing nothing is not the same as staying on the relay**, and that
+/// distinction is this function's whole reason for existing rather than being a
+/// `while` loop over events.
+///
+/// A path is active the moment msquic adds it. Left alone it sits alongside the
+/// relay, `QuicConnChoosePath` picks between them at random, and the warning
+/// above says "staying on the relay" while half the traffic goes over a path
+/// nothing chose — the one case in this module that really does split. Demoting
+/// needs only the path id, which the event carries, so it costs nothing to be
+/// right here.
+///
+/// The events have to be drained regardless: this is also how the caller learns
 /// the connection closed.
-async fn drain_events(conn: &Connection, shutdown: &CancellationToken) {
+async fn stay_on_the_relay(conn: &Connection, shutdown: &CancellationToken) {
     loop {
-        tokio::select! {
+        let event = tokio::select! {
             _ = shutdown.cancelled() => return,
-            event = std::future::poll_fn(|cx| conn.poll_event(cx)) => if event.is_err() {
-                return;
-            },
+            event = std::future::poll_fn(|cx| conn.poll_event(cx)) => event,
+        };
+        let Ok(event) = event else { return };
+        if let ConnectionEvent::PathAdded { path_id, .. } = event {
+            // `path_id` 0 is the relay path itself, which must stay available —
+            // and it is never announced by this event anyway, since the path the
+            // handshake ran on was never probed.
+            if path_id != RELAY_PATH_ID {
+                if let Err(e) = conn.set_path_status(path_id, false) {
+                    tracing::warn!(
+                        path_id,
+                        "could not hold a new path as backup; it will carry traffic \
+                         that nothing chose to put on it: {e}",
+                    );
+                }
+            }
         }
     }
 }

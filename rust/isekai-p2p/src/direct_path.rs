@@ -248,7 +248,7 @@ fn apply(conn: &Connection, address: ObservedAddress) {
 /// There is no event that names it: `PathAdded` reports paths that were opened
 /// after a probe validated, and the path the handshake ran on was never probed.
 /// It is `Paths[0]`, whose path id is 0.
-const RELAY_PATH_ID: u32 = 0;
+pub const RELAY_PATH_ID: u32 = 0;
 
 /// What a request to move onto a path turns into.
 ///
