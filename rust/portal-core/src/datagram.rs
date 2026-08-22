@@ -74,12 +74,22 @@ pub const HEADER: usize = 4;
 /// arriving as an error from three layers down, and handles `TooBig` anyway
 /// because the runtime value is the one that is true.
 ///
-/// **And the runtime value is now readable rather than only discoverable.**
-/// `ConnectionEvent::DatagramStateChanged` carries `max_send_length` and
-/// `send_enabled`, so the real limit can be tracked as MTU discovery raises it
-/// instead of being guessed conservatively — and a peer that will not receive
-/// datagrams at all is knowable at connect time rather than one `Denied` per
-/// datagram, which is how phase 3a's bug hid. Not used here yet: #172.
+/// **The runtime value is watched rather than adopted**, which is the decision
+/// worth stating. `ConnectionEvent::DatagramStateChanged` carries the real
+/// `max_send_length`, and [`crate::path`] compares it against this constant on
+/// every connection: below it is a warning, because payloads between the two
+/// would be accepted here and refused by the connection.
+///
+/// It is not *raised* to match, and that is deliberate. This number is a promise
+/// `docs/portal.md` makes to whoever runs a forward — "about 1200 bytes" — and
+/// msquic's limit grows as MTU discovery probes upward, differently on
+/// different networks. Following it would leave a DNS forward working from one
+/// place and silently losing responses from another, which is worse than a
+/// bound that is the same everywhere and slightly low.
+///
+/// The event's other half, `send_enabled`, is why a peer that will not receive
+/// datagrams at all is now said once at connect time rather than as one
+/// `Denied` per datagram — which is how phase 3a's bug hid.
 ///
 /// # What this rules out, said plainly
 ///
