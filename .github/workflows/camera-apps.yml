@@ -344,12 +344,26 @@ jobs:
 
       # One archive per platform rather than loose binaries, so what is attached
       # says which platform it came from after it has been downloaded.
+      # **The executable bit has to be put back before zipping.**
+      # `upload-artifact` does not preserve permissions — everything arrives
+      # `644` — so the launchers and the binaries under `bin/` come back
+      # unrunnable, the zip records that, and the first thing anyone does with
+      # the download fails with `Permission denied`. Found by review of the
+      # portal copy of this job (#170), which fixed it by zipping in the build
+      # job instead; this one keeps its shape and repairs the modes, which is
+      # the smaller change to a path that has already shipped.
+      #
+      # Nothing on Windows needs a bit, and `chmod` on those files is harmless.
       - name: Package each platform
         run: |
           set -euo pipefail
           mkdir -p release
           for dir in artifacts/*/; do
             name="$(basename "$dir")"
+            # `find`, not `[ -d bin ] && chmod`: under `set -e` that list
+            # fails the job on a Windows bundle, which has no `bin/`.
+            find "$dir" -maxdepth 1 -type f -name 'camera-*' -exec chmod 0755 {} +
+            find "$dir/bin" -type f -exec chmod 0755 {} + 2>/dev/null || true
             (cd "$dir" && zip -r "$GITHUB_WORKSPACE/release/$name.zip" .)
           done
           ls -l release

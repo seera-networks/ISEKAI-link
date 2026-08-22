@@ -175,8 +175,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # **Not Windows-only**, however much it looks it: on Linux this installs
+      # `liblttng-ust-dev` and `libnuma-dev`, which the ubuntu image does not
+      # carry and msquic's CMake stops without. The `test` job above runs it
+      # unconditionally for the same reason.
       - name: Prepare machine for seera-msquic
-        if: runner.os == 'Windows'
         run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
@@ -202,10 +205,29 @@ jobs:
         shell: pwsh
         run: scripts/bundle-apps.ps1 rust/target/release dist portal-${{ matrix.os }} portal-server portal-client
 
+      # **Zipped here rather than in the release job**, because
+      # `upload-artifact` does not preserve file permissions — everything comes
+      # back `644`. The launcher and the binaries would arrive without their
+      # executable bit, the archive would record that, and `./portal-server`,
+      # which is the first command `docs/portal.md` gives, would answer
+      # `Permission denied`. Inside a zip the mode is part of the entry; the
+      # zip's own bit is nobody's business.
+      - name: Archive (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: cd dist && zip -r "portal-${{ matrix.os }}.zip" "portal-${{ matrix.os }}"
+
+      # The same shape — one top-level directory named after the platform — so
+      # the page's `unzip … && cd …` reads the same on every platform. Nothing
+      # here needs a permission bit.
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/portal-${{ matrix.os }}" -DestinationPath "dist/portal-${{ matrix.os }}.zip"
+
       - uses: actions/upload-artifact@v4
         with:
           name: portal-${{ matrix.os }}
-          path: dist/
+          path: dist/portal-${{ matrix.os }}.zip
           if-no-files-found: error
 
   release:
@@ -216,34 +238,42 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The archives are already zips — see the bundle job — so this only
+      # collects them.
       - uses: actions/download-artifact@v4
         with:
           pattern: portal-*
           path: artifacts
-
-      # One archive per platform, so what is attached says which platform it
-      # came from after it has been downloaded.
-      - name: Package each platform
-        run: |
-          set -euo pipefail
-          mkdir -p release
-          for dir in artifacts/*/; do
-            name="$(basename "$dir")"
-            (cd "$dir" && zip -r "$GITHUB_WORKSPACE/release/$name.zip" .)
-          done
-          ls -l release
+          merge-multiple: true
+      - run: ls -l artifacts
 
       # Attach to the release if there is one, create it if there is not — the
       # order the tag and the release arrive in depends on whether a person
       # pushed a tag or cut the release from the UI, and `camera-apps.yml`'s
-      # header records what assuming one of them cost. `--clobber` so re-running
-      # replaces what it uploaded last time.
+      # header records what assuming one of them cost.
+      #
+      # **`--repo` on every call, and it is not decoration.** This job has no
+      # checkout, so there are no git remotes for `gh` to read a repository
+      # from, and it does not fall back to `$GITHUB_REPOSITORY`: without it
+      # every call fails with "could not determine base repo", the bundles build
+      # and nothing is attached. `camera-apps.yml` passes it for exactly this
+      # reason and this copy had dropped it.
+      #
+      # `--clobber` so re-running replaces what it uploaded last time.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          gh release view "$tag" >/dev/null 2>&1 \
-            || gh release create "$tag" --title "$tag" --generate-notes
-          gh release upload "$tag" release/*.zip --clobber
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; attaching to it"
+            gh release upload "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" --clobber artifacts/*.zip
+          else
+            echo "no release $GITHUB_REF_NAME yet; creating it"
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              artifacts/*.zip
+          fi
