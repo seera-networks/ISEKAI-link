@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
 #
-# Package the camera apps with the libraries they need to run somewhere else.
+# Package binaries with the libraries they need to run somewhere else.
 #
-#   scripts/bundle-camera-apps.sh <release-dir> <output-dir> <bundle-name>
+#   scripts/bundle-apps.sh <release-dir> <output-dir> <bundle-name> <app>...
 #
-# The problem this solves: `camera-server` and `camera-client` link against
-# OpenCV 4.11+, which no current Ubuntu packages, and against `libmsquic.so`,
-# which exists only inside cargo's build-script output directory. A binary on
-# its own runs on the machine that built it and nowhere else.
+# The problem this solves: **every binary in this workspace links against
+# `libmsquic`, which exists only inside cargo's build-script output directory**
+# under a path with a build hash in it. Nothing installs it and nothing puts it
+# on the loader's path, so `cargo run` works and the binary it built does not:
+#
+#   ./target/release/portal-server --help
+#   error while loading shared libraries: libmsquic.so.2
+#
+# The camera apps add OpenCV 4.11+, which no current Ubuntu packages. Same
+# answer either way, which is why this takes the app names rather than knowing
+# them: walk the dynamic dependencies, copy them in beside the binaries, and put
+# a launcher in front that points the loader at them.
 #
 # So the same thing the server's Dockerfile does for its release tarball: walk
 # the dynamic dependencies, copy them in beside the binaries, and put a launcher
 # in front that points the loader at them.
 #
 #   <bundle-name>/
-#   ├── camera-server      launcher
-#   ├── camera-client      launcher
+#   ├── <app>              launcher, one per app
 #   ├── bin/               the binaries
-#   └── lib/               libmsquic, OpenCV, and what those pull in
+#   └── lib/               libmsquic and whatever else they pull in
 #
 # **Two families are deliberately left out.** The C runtime, because mixing a
 # bundled glibc with the host's loader is what breaks tarballs like this one.
@@ -26,11 +33,13 @@
 # machine, and a bundled copy is how a window ends up never appearing.
 set -euo pipefail
 
-release_dir=${1:?usage: bundle-camera-apps.sh <release-dir> <output-dir> <bundle-name>}
-out_dir=${2:?usage: bundle-camera-apps.sh <release-dir> <output-dir> <bundle-name>}
-name=${3:?usage: bundle-camera-apps.sh <release-dir> <output-dir> <bundle-name>}
-
-apps=(camera-server camera-client)
+usage='usage: bundle-apps.sh <release-dir> <output-dir> <bundle-name> <app>...'
+release_dir=${1:?${usage}}
+out_dir=${2:?${usage}}
+name=${3:?${usage}}
+shift 3
+[ $# -gt 0 ] || { echo "${usage}" >&2; echo "name at least one app to bundle" >&2; exit 1; }
+apps=("$@")
 stage="${out_dir}/${name}"
 rm -rf "${stage}"
 mkdir -p "${stage}/bin" "${stage}/lib"

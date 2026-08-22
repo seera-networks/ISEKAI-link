@@ -305,27 +305,21 @@ jobs:
       # each platform ships the libraries with it.
       - name: Bundle with the libraries (Linux, macOS)
         if: runner.os != 'Windows'
-        run: scripts/bundle-camera-apps.sh rust/target/release dist camera-apps-${{ matrix.os }}
+        run: scripts/bundle-apps.sh rust/target/release dist camera-apps-${{ matrix.os }} camera-server camera-client
 
       # Windows resolves a DLL from the directory the executable is in before
       # anywhere else, so beside the binaries is all this needs — no launcher
       # and no load-command rewriting.
+      # The binaries and msquic.dll are the shared part; OpenCV is the camera's
+      # own. Sharing the first half means `portal.yml`, which bundles only on a
+      # tag, is riding a script this job exercises on every push.
       - name: Bundle with the DLLs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $stage = "dist/camera-apps-${{ matrix.os }}"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item rust/target/release/camera-server.exe, rust/target/release/camera-client.exe $stage
+          scripts/bundle-apps.ps1 rust/target/release dist camera-apps-${{ matrix.os }} camera-server camera-client
           # OpenCV's own DLLs and everything vcpkg built them against.
-          Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" $stage
-          # libmsquic is built by seera-msquic's build script and never
-          # installed, so it is found by searching cargo's output.
-          $msquic = Get-ChildItem -Path rust/target/release/build -Recurse -Filter msquic.dll `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $msquic) { throw "msquic.dll not found under rust/target/release/build" }
-          Copy-Item $msquic.FullName $stage
-          Get-ChildItem $stage | Format-Table Name, Length
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" "dist/camera-apps-${{ matrix.os }}"
 
       - uses: actions/upload-artifact@v4
         with:

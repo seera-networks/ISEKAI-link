@@ -28,7 +28,25 @@ Two programs:
 You need an **Auth0 access token** for the ISEKAI deployment, on both machines.
 Everything else — Endpoint keys, certificates — is generated on first use.
 
-Build and run from the workspace:
+### Download a release
+
+Grab the archive for your platform from
+[Releases](https://github.com/seera-networks/ISEKAI-link/releases), unpack it,
+and run it from anywhere:
+
+```sh
+unzip portal-ubuntu-latest.zip
+cd portal-ubuntu-latest
+./portal-server --help
+./portal-client --help
+```
+
+The archive carries the libraries these need — `libmsquic` above all, which
+nothing installs — so it runs on a machine that has never built this. On Linux
+and macOS the two names at the top level are launchers that point the loader at
+the bundled `lib/`; on Windows the DLLs sit beside the executables.
+
+### Or build it
 
 ```sh
 cd rust
@@ -36,27 +54,25 @@ cargo run --release -p portal-server -- --help
 cargo run --release -p portal-client -- --help
 ```
 
-The rest of this page writes `portal-server` and `portal-client` for those two,
-and every command runs from `rust/` — which is also where the key files and
-`portal-server.toml` end up by default.
-
-**`cargo run` rather than the built binary, and that is not laziness.** msquic
-is a shared library built into `target/…/build/seera-msquic-*/out/lib`, and
-nothing puts it on the loader's path: `cargo run` adds it, and
-`./target/release/portal-server` fails at start with
+**`cargo run`, and not the binary it produces.** msquic is a shared library
+built into `target/…/build/seera-msquic-*/out/lib` and nothing puts it on the
+loader's path — `cargo run` adds it for the run, and
+`./target/release/portal-server` fails at startup with
 
 ```
 error while loading shared libraries: libmsquic.so.2
 ```
 
-To run one directly, tell the loader where it is:
+To get a binary you can move, build the same archive the release does:
 
 ```sh
-export LD_LIBRARY_PATH="$(dirname "$(find target/release/build -name libmsquic.so.2 | head -1)")"
-./target/release/portal-server --help
+cargo build --release -p portal-server -p portal-client
+cd .. && scripts/bundle-apps.sh rust/target/release dist portal portal-server portal-client
 ```
 
-An install layout that does not need this is #167.
+The rest of this page writes `portal-server` and `portal-client` for whichever
+of these you are using, and every command runs from wherever the key files and
+`portal-server.toml` should live.
 
 The binaries default to the public deployment (`identity.isekai.tools`,
 `tokyo.link.isekai.tools`); `--identity-url` and `--proxy-url` point them
