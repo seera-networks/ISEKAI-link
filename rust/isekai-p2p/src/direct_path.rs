@@ -282,6 +282,15 @@ pub enum PathPreference {
 /// no multipath — and it stays empty for a path that only ever validated, which
 /// is exactly the pre-multipath camera.
 ///
+/// **"Empty" is the caller's claim, not an observation, and it is only true once
+/// `PathAdded` has had its chance.** msquic raises `PathValidated` first and
+/// `PathAdded` for the same path a fraction of a millisecond later, so a caller
+/// that asks here the moment a path validates is told `Switch` about a peer that
+/// does have multipath — and then performs the pre-multipath switch onto a path
+/// that is about to be declared backup. `camera-core` never met this because a
+/// person presses its button long afterwards; `portal-core::path` met it on the
+/// first hardware run and waits for the id rather than asking early.
+///
 /// Everything known and not preferred is declared backup, not just the path
 /// being left. Two candidates are offered whenever the observed address differs
 /// from the host one, and both can validate on the same LAN, so "the other path"

@@ -6,19 +6,45 @@
 //! path carries traffic.
 //!
 //! ```text
-//!   PathAdded      ─▶ held as backup      (or it starts carrying traffic unasked)
-//!   PathValidated  ─▶ preferred           (nobody is here to press a button)
-//!   PathRemoved    ─▶ back to the relay   (if it was the one being preferred)
+//!   PathValidated  ─▶ wait a moment for a path id
+//!   PathAdded      ─▶ preferred, by path id      (the peer has multipath)
+//!   …no PathAdded  ─▶ preferred, by address pair (it does not)
+//!   PathRemoved    ─▶ back to the relay          (if it was the preferred one)
 //! ```
 //!
-//! # Held as backup first, and that ordering is the whole safety of it
+//! # Which event decides, and why it is not the obvious one
 //!
-//! msquic makes a path active the moment it is added, and `QuicConnChoosePath`
-//! picks at random among the active ones. So a portal that advertised and
-//! offered candidates without this would not stay on the relay until it chose —
-//! it would start splitting traffic across a path nothing has decided to trust,
-//! and the operator's log would still say relay. Everything else here is
-//! optional; this is not.
+//! **`PathValidated` arrives first and cannot be acted on.** It carries the
+//! addresses and no path id, and every multipath operation needs the id — so a
+//! preference made there is necessarily the *other* kind, the pre-multipath
+//! `activate_path` switch. Hardware said so on the first run: `PathValidated`,
+//! a switch logged as "the peer has no multipath", and then `PathAdded` for the
+//! same path 140µs later, which is the peer having multipath. The connection was
+//! switched onto a path that was then declared backup, leaving this end
+//! believing it was on the direct path while msquic sent over the relay.
+//!
+//! So the id is what decides. `PathAdded` is raised when a path completes
+//! validation *and* multipath was negotiated, so its arrival is the answer to
+//! both questions at once — which path, and which operation. A peer without
+//! multipath never sends one, and that is what [`MULTIPATH_GRACE`] is waiting
+//! to find out.
+//!
+//! **An empty path table does not mean "no multipath"; it means "not yet".**
+//! `isekai_p2p::direct_path::preference_for` reads it as the former, which is
+//! correct once `PathAdded` has had its chance and wrong before — the whole of
+//! the bug above.
+//!
+//! # There is a window, and it belongs to msquic
+//!
+//! A path is active from the moment msquic adds it, and `QuicConnChoosePath`
+//! picks at random among active paths, so between the addition and this loop
+//! being polled the connection may send over a path nothing has chosen. Nothing
+//! local can act sooner than the event that announces it. What this loop can do
+//! is close the window immediately rather than leave the path active while
+//! waiting for something else, which is why preferring happens in the same arm
+//! that learns the id — and why `prefer_path` demotes before it promotes, so
+//! the failure leaves every path backup and `Paths[0]`, the relay, carrying
+//! traffic.
 //!
 //! # It prefers on its own, and the camera does not
 //!
@@ -66,6 +92,16 @@ use isekai_p2p::peer::log_connection_stats;
 /// is the only way a migration that went wrong can be read out of a log.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a validated path may go without a `PathAdded` before it is treated
+/// as a path on a connection whose peer has no multipath.
+///
+/// **Measured rather than guessed**: on hardware the two events were 140µs
+/// apart, both raised by msquic out of the same completion. A second is four
+/// orders of magnitude of headroom, and it is only ever *spent* by a peer that
+/// has no multipath — where the cost is one more second on the relay before the
+/// old switch, on a connection that is working the whole time.
+const MULTIPATH_GRACE: Duration = Duration::from_secs(1);
+
 /// Watch `conn`'s paths and keep it on the best one, until the connection ends.
 ///
 /// **Returns when the connection is no longer usable**, which is what makes this
@@ -96,6 +132,10 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
     // `None` is the relay. Held so that `PathRemoved` can tell "the path we are
     // using has gone" from "a path we were not using has gone".
     let mut preferred: Option<(SocketAddr, SocketAddr)> = None;
+    // A pair that validated and has no path id yet, and when to stop waiting
+    // for one. See the module header: this is the whole of how "the peer has no
+    // multipath" is told from "`PathAdded` has not arrived yet".
+    let mut awaiting_id: Option<((SocketAddr, SocketAddr), tokio::time::Instant)> = None;
 
     // The reporting the camera apps have, with the one thing they cannot say
     // added: which path the numbers are about. `get_stats` is sampled here
@@ -120,6 +160,21 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                 }
                 continue;
             }
+            // Nothing to wait for unless a pair has validated without an id.
+            _ = sleep_until(awaiting_id.map(|(_, at)| at)) => {
+                let (pair, _) = awaiting_id.take().expect("only armed with a pair");
+                // No `PathAdded` in all that time, so the peer negotiated no
+                // multipath and the old switch is the only operation there is.
+                // `direct` is empty, which is what makes `prefer_path` choose it.
+                tracing::info!(
+                    local = %pair.0, remote = %pair.1,
+                    "no path id after {MULTIPATH_GRACE:?}; the peer has no multipath",
+                );
+                if prefer_path(&conn, pair, relay, &direct) {
+                    preferred = Some(pair);
+                }
+                continue;
+            }
             event = std::future::poll_fn(|cx| conn.poll_event(cx)) => event,
         };
         let Ok(event) = event else {
@@ -133,50 +188,61 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                 local_address,
                 peer_address,
             } => {
-                if (local_address, peer_address) == relay {
+                let pair = (local_address, peer_address);
+                if pair == relay {
                     continue;
                 }
-                // **Before anything else looks at it.** See the module header:
-                // msquic has already made this path active, and until it is put
-                // back to backup the connection is sending on a path nothing
-                // has decided to trust.
-                if let Err(e) = conn.set_path_status(path_id, false) {
-                    tracing::warn!(
-                        path_id,
-                        "could not hold the new path as backup; it will carry traffic \
-                         before it is asked to: {e}",
+                // **The event that decides**, because it is the one carrying the
+                // id every multipath operation needs — and because its existence
+                // is what says the peer has multipath at all. Recorded before
+                // the call, since `prefer_path` looks this path up in here.
+                direct.insert(pair, path_id);
+                if awaiting_id.is_some_and(|(waiting, _)| waiting == pair) {
+                    awaiting_id = None;
+                }
+                if preferred == Some(pair) {
+                    continue;
+                }
+                if prefer_path(&conn, pair, relay, &direct) {
+                    preferred = Some(pair);
+                    tracing::info!(
+                        path_id, local = %local_address, remote = %peer_address,
+                        "forwarding moved onto the direct path; the relay stays as backup",
                     );
                 }
-                direct.insert((local_address, peer_address), path_id);
-                tracing::info!(
-                    path_id, local = %local_address, remote = %peer_address,
-                    "a direct path was added and is being held as backup",
-                );
             }
             ConnectionEvent::PathValidated {
                 local_address,
                 remote_address,
             } => {
-                if (local_address, remote_address) == relay {
+                let pair = (local_address, remote_address);
+                if pair == relay || preferred == Some(pair) || direct.contains_key(&pair) {
                     continue;
                 }
-                if preferred == Some((local_address, remote_address)) {
-                    continue;
-                }
-                if prefer_path(&conn, (local_address, remote_address), relay, &direct) {
-                    preferred = Some((local_address, remote_address));
-                    tracing::info!(
-                        local = %local_address, remote = %remote_address,
-                        "forwarding moved onto the direct path; the relay stays as backup",
-                    );
-                }
+                // **Not acted on here**, however tempting: this event has no
+                // path id, so preferring now can only mean the pre-multipath
+                // switch — which is the wrong operation whenever a `PathAdded`
+                // for the same path is a fraction of a millisecond behind. The
+                // module header has what that cost on hardware.
+                tracing::info!(
+                    local = %local_address, remote = %remote_address,
+                    "a direct path validated; waiting up to {MULTIPATH_GRACE:?} for its id",
+                );
+                awaiting_id = Some((pair, tokio::time::Instant::now() + MULTIPATH_GRACE));
             }
             ConnectionEvent::PathRemoved {
                 path_id,
                 local_address,
                 peer_address,
             } => {
-                direct.remove(&(local_address, peer_address));
+                let pair = (local_address, peer_address);
+                direct.remove(&pair);
+                if awaiting_id.is_some_and(|(waiting, _)| waiting == pair) {
+                    // Validated, then abandoned before it was ever preferred:
+                    // waiting out the grace would end in switching onto a path
+                    // that no longer exists.
+                    awaiting_id = None;
+                }
                 if preferred != Some((local_address, peer_address)) {
                     tracing::debug!(
                         path_id, local = %local_address, remote = %peer_address,
@@ -201,6 +267,18 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
             }
             _ => {}
         }
+    }
+}
+
+/// Wait until `deadline`, or forever if there is none.
+///
+/// `select!` needs a future in every arm whether or not anything is armed, and
+/// "forever" is the honest spelling of nothing to wait for — a zero-length sleep
+/// would make the arm ready on every poll and spin the loop.
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
