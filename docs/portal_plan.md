@@ -49,7 +49,7 @@ Almost all of it. This section is the argument for the shape of §4.
 | Endpoint keys, Endpoint IDs, PoP | `isekai-p2p-core::endpoint`, `pop` | yes |
 | Pairing, Grants, the camera list | `isekai-p2p-core::proxy`, `isekai-p2p::initiator` | yes |
 | Peer Connect, relay legs, lease renewal | `isekai-p2p::{initiator,listener}` | yes |
-| Direct-path candidates and migration | `isekai-p2p-core::observed`, `camera-core::video` | **extract** (§4.4) |
+| Direct-path candidates and migration | `isekai-p2p::direct_path` | yes — extracted in phase 4 |
 | Endpoint certificate by CSR | `isekai-p2p::endpoint_cert` | yes — extracted in 1c-iii-a |
 | Key attestation and pinning | `isekai-p2p-core::attestation`, `isekai-p2p::peer` | yes — extracted in 1c-i |
 | The paired-Endpoint check | `camera-core::paired` | yes |
@@ -375,6 +375,7 @@ having before anyone asks.
 | **3a** | UDP's two bounds, with no sockets in them: the wire, the size limit and its arithmetic, the drop-oldest queue, the counters | **done** — `portal-core::datagram` |
 | **3b** | The sockets: a session per (source, service), one UDP socket each, the idle sweep, and the datagram pump both ways | **done** — `portal-core::udp`; **a DNS query answers over a real proxy**, which is this row's own criterion. Loopback covers the round trip, two sources not being crossed, a payload at the limit, the sweep and the refusal parity; the size bound above is the one thing hardware cannot make go away |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have. The client offers a candidate as of 1c-iii-c-ii; what is missing is the listener advertising its leg's binding, which is `camera-core::video::advertise_direct_path` and moves with this | a transfer survives the switch |
+| | **The advertisement moved to `isekai_p2p::direct_path`** — both halves of it, since neither is any use alone. What portal does *with* a path is `portal-core::path`, and it differs from the camera's: no button to wait for, so it prefers on validation, and `PathRemoved` rather than a byte watchdog is what sends it back (the camera's counts frames; a connection-level counter cannot see a dead preferred path under multipath) | a transfer survives the switch **on hardware** — a loopback connection has no direct path to move onto |
 | **5** | Packaging: a CLI that is pleasant (`portal-client --map 5432:db`), logging, `--help` that explains the catalogue | somebody else can use it from the README alone |
 
 Mobile (FFI) is deliberately last and not scheduled: the desktop shape has to

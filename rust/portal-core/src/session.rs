@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use isekai_p2p::agent::RelayOptions;
+use isekai_p2p::direct_path::{self, RelayLegs};
 use isekai_p2p::endpoint_cert;
 use isekai_p2p::listener::{run, ListenerCommand};
 use isekai_p2p::peer::{AttestedPeer, PeerSession};
@@ -190,6 +191,18 @@ pub async fn serve(
         portal_addr,
     };
 
+    // **The half that was missing**, and without which nothing gets off the
+    // relay. `transport::connect` has offered a direct-path candidate since
+    // 1c-iii-c-ii, but a candidate only says where *we* may be reached; the peer
+    // has no address to send to until this end advertises its leg's binding.
+    // One half alone is a connection that stays relayed with nothing in either
+    // log to say why — see [`isekai_p2p::direct_path`].
+    //
+    // Taken before the accept loop starts, because `run` below consumes the
+    // session. `PerConnection` and not `Single`: a portal server can be serving
+    // several peers, each on a leg of its own, and handing a connection another
+    // peer's binding advertises a path it cannot reach.
+    let legs = RelayLegs::PerConnection(session.legs());
     let accepting = shutdown.clone();
     tokio::spawn(async move {
         loop {
@@ -199,6 +212,7 @@ pub async fn serve(
                     Ok(conn) => {
                         let catalogue = catalogue.clone();
                         let serving = accepting.clone();
+                        direct_path::advertise(conn.clone(), legs.clone(), serving.clone());
                         // One task per peer: a forward that stalls must not
                         // stop the next peer being accepted.
                         tokio::spawn(async move {

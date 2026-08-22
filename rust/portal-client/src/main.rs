@@ -171,20 +171,17 @@ async fn main() -> anyhow::Result<()> {
         _ = ended.cancelled() => {
             tracing::warn!("the session ended; the forwards are going with it");
         }
-        _ = closed(&peer) => {
+        // **Both jobs, one task.** This moves the forwards onto a direct path
+        // when one turns up, and returns when the connection is no longer
+        // usable — which is what this arm is here for. They cannot be two
+        // tasks: a connection's events are a single queue, so a second poller
+        // would take events belonging to the first.
+        _ = portal_core::path::keep_on_the_best_path(peer, shutdown.clone()) => {
             tracing::warn!("the peer connection closed; the forwards are going with it");
         }
     }
     connected.close().await;
     Ok(())
-}
-
-/// Resolves when the peer connection is no longer usable.
-///
-/// Its event stream ending is the signal: msquic reports the shutdown as an
-/// event and then the stream errors, so this needs no timer of its own.
-async fn closed(conn: &msquic_async::Connection) {
-    while std::future::poll_fn(|cx| conn.poll_event(cx)).await.is_ok() {}
 }
 
 /// Parse `port:name` or `udp:port:name` into what to bind and what to ask for.

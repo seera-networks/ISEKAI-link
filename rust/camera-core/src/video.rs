@@ -19,10 +19,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use isekai_p2p::agent::{ObservedAddress, ObservedAddressWatch};
+// The path arithmetic and the two ways of moving onto a path went to the
+// layer with the rest of the direct-path machinery in phase 4; what stays
+// here is when this app asks for a move, which is a camera question.
+use isekai_p2p::direct_path::prefer_path;
 use isekai_p2p::peer::log_connection_stats;
 // Re-exported under the names the viewers and the FFI already import.
 pub use isekai_p2p::peer::{AttestedPeer, Unpinnable};
-use isekai_p2p::LegDirectory;
 
 use crate::tls::{dev_cert, VideoCert};
 
@@ -149,7 +152,11 @@ pub async fn serve_frames_with(
             accepted = listener.accept() => match accepted {
                 Ok(conn) => {
                     if let Some(legs) = &opts.legs {
-                        advertise_direct_path(conn.clone(), legs.clone(), shutdown.clone());
+                        isekai_p2p::direct_path::advertise(
+                            conn.clone(),
+                            legs.clone(),
+                            shutdown.clone(),
+                        );
                     }
                     tokio::spawn(push_frames(conn, frames.subscribe()));
                 }
@@ -170,163 +177,11 @@ pub async fn serve_frames_with(
 
 /// How an accepted connection is told which binding to punch to.
 ///
-/// Two situations, and which one applies is not a detail: a listener with one
-/// leg can hand its address to anybody, and a listener with several cannot.
-#[derive(Clone)]
-pub enum RelayLegs {
-    /// One leg serves everybody, so every connection gets its address.
-    ///
-    /// What a single-viewer harness has. Wrong for a listener serving several
-    /// peers: each has a leg of its own, with a binding of its own.
-    Single(ObservedAddressWatch),
-    /// Legs told apart by the address a connection arrives from
-    /// ([`LegDirectory`]).
-    PerConnection(LegDirectory),
-}
-
-/// How long to wait for the leg a connection arrived on to identify itself.
-///
-/// The leg records its forwarding socket when it creates one, which is when the
-/// peer's first packet arrives — before the video handshake this connection has
-/// just finished. So it is normally already there and this is for the race, not
-/// for the usual case.
-const LEG_LOOKUP_WAIT: Duration = Duration::from_secs(3);
-const LEG_LOOKUP_POLL: Duration = Duration::from_millis(50);
-
-/// Tell `conn` about the binding of the leg **it** arrived on, so the peer can
-/// punch a direct path to it and migrate off the relay.
-///
-/// **Which leg matters, and used not to be answerable.** Every leg delivers
-/// here, and each has its own binding, so handing a connection the wrong leg's
-/// address advertises a path the peer cannot reach — it stays on the relay, and
-/// nothing says why. Worse, before this the newest address replaced whatever a
-/// connection had, so a second viewer arriving re-pointed the first viewer's
-/// connection at the new leg and stopped its relay traffic.
-///
-/// The answer is the address the connection came *from*: a leg forwards what it
-/// receives from a socket of its own, so that socket's address names the leg
-/// (see [`LegDirectory`]). What replaced the bug in between — take the first
-/// address offered and never change it — was right only while legs came up in
-/// the order their peers connected, which `Manual`, two near-simultaneous
-/// viewers, and a leg that reconnects all break.
-///
-/// Failures are logged, not fatal: an Endpoint that cannot advertise a direct
-/// path simply keeps streaming over the relay.
-fn advertise_direct_path(conn: Connection, legs: RelayLegs, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        let Some(mut observed) = leg_of(&conn, &legs, &shutdown).await else {
-            return;
-        };
-        // Applied once, and the `break` is what says so. Not because a later
-        // address might be somebody else's — this now knows whose leg it is
-        // watching — but because the binding is by then attached to the
-        // connection, and a second `add_bound_addr` fails with
-        // `QUIC_STATUS_ADDRESS_IN_USE`. So a leg that reconnects onto a new
-        // binding is not re-advertised; the peer keeps the path it validated.
-        loop {
-            if let Some(address) = *observed.borrow_and_update() {
-                apply_direct_path(&conn, address);
-                break;
-            }
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                changed = observed.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// The watch belonging to the leg `conn` came in on.
-///
-/// `None` means there is no direct path to advertise to this connection, and
-/// says which of the two reasons it is: a connection that did not come through
-/// a leg at all, or a leg that never identified itself in time.
-async fn leg_of(
-    conn: &Connection,
-    legs: &RelayLegs,
-    shutdown: &CancellationToken,
-) -> Option<ObservedAddressWatch> {
-    let directory = match legs {
-        RelayLegs::Single(observed) => return Some(observed.clone()),
-        RelayLegs::PerConnection(directory) => directory,
-    };
-    let peer = match conn.get_remote_addr() {
-        Ok(peer) => peer,
-        Err(e) => {
-            tracing::warn!("could not read a connection's peer address; staying relay-only: {e}");
-            return None;
-        }
-    };
-    let deadline = tokio::time::Instant::now() + LEG_LOOKUP_WAIT;
-    loop {
-        if let Some(observed) = directory.leg_for(peer) {
-            return Some(observed);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            // Two different things, and only one of them is fine.
-            //
-            // With no leg claiming any address, this is a connection that did
-            // not come through a relay — something dialled the video listener
-            // directly — and relay-only is the right answer.
-            //
-            // With legs claiming addresses and none of them this one, the way a
-            // leg is identified has stopped working (see `LegDirectory`), and
-            // *every* connection is about to quietly lose its direct path. Said
-            // loudly, because the symptom on its own is only that migration
-            // never happens.
-            match directory.claimed() {
-                0 => tracing::debug!(%peer, "no relay leg has reported; staying relay-only"),
-                claimed => tracing::warn!(
-                    %peer,
-                    claimed,
-                    "no relay leg claims this connection, though others are claimed; \
-                     staying relay-only",
-                ),
-            }
-            return None;
-        }
-        tokio::select! {
-            _ = shutdown.cancelled() => return None,
-            _ = tokio::time::sleep(LEG_LOOKUP_POLL) => {}
-        }
-    }
-}
-
-fn apply_direct_path(conn: &Connection, address: ObservedAddress) {
-    if let Err(e) = conn.add_bound_addr(address.local) {
-        tracing::warn!(
-            local = %address.local,
-            "could not add the relay leg's binding to the video connection; \
-             staying relay-only: {e}",
-        );
-        return;
-    }
-    if let Err(e) = conn.add_observed_addr(address.local, address.observed) {
-        tracing::warn!(
-            local = %address.local,
-            observed = %address.observed,
-            "could not advertise the observed address; staying relay-only: {e}",
-        );
-        return;
-    }
-    // Advertise the host address too — see the note in `prepare_for_migration`:
-    // a peer on the same LAN can only reach us there, because a NAT that does
-    // not hairpin drops packets sent from inside to its own public address.
-    if address.local != address.observed {
-        if let Err(e) = conn.add_observed_addr(address.local, address.local) {
-            tracing::debug!("could not advertise the host address: {e}");
-        }
-    }
-    tracing::info!(
-        local = %address.local,
-        observed = %address.observed,
-        "advertised a direct path to the video client",
-    );
-}
+/// The name the camera apps and the FFI already import; it and everything it
+/// drives are [`isekai_p2p::direct_path`] as of phase 4, because getting a peer
+/// connection off the relay has nothing to do with video and portal needs every
+/// line of it.
+pub use isekai_p2p::direct_path::RelayLegs;
 
 /// Push the newest frame to one client, for as long as it keeps up with itself.
 ///
@@ -451,75 +306,6 @@ async fn push_one(conn: &Connection, frame: &[u8]) -> anyhow::Result<()> {
     stream.write_all(frame).await?;
     poll_fn(|cx| stream.poll_finish_write(cx)).await?;
     Ok(())
-}
-
-/// The connection's first path — the relay one — as msquic numbers it.
-///
-/// There is no event that names it: `PathAdded` reports paths that were opened
-/// after a probe validated, and the path the handshake ran on was never probed.
-/// It is `Paths[0]`, whose path id is 0.
-const RELAY_PATH_ID: u32 = 0;
-
-/// What a request to move onto a path turns into.
-///
-/// The two arms are the two worlds this has to work in at once, and which one
-/// applies is decided by the peer rather than by us: multipath is negotiated, so
-/// a viewer that has been updated still talks to cameras that have not.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PathPreference {
-    /// Multipath: say which path carries traffic, and keep the rest warm.
-    ///
-    /// This is the operation that replaces switching, and it does two things at
-    /// once. To the peer it sends PATH_AVAILABLE / PATH_BACKUP; locally it flips
-    /// `Path->IsActive`, and `QuicConnChoosePath` picks at random among the
-    /// active paths — so a path left available is a path this side really does
-    /// send on. Declaring exactly one available is what makes "which path are we
-    /// using" answerable.
-    ///
-    /// A path declared backup is still bound, still validated and still pinged
-    /// by the path keepalive, so it does not decay while it waits — which is the
-    /// whole of risk #24. That is the difference from switching: nothing is torn
-    /// down, so coming back costs nothing.
-    Declare { available: u32, backup: Vec<u32> },
-    /// The peer never sent a `PathAdded`, so it has no multipath and the only
-    /// operation available is the old switch.
-    Switch,
-}
-
-/// Turn a request to move onto `wanted` into the operation to perform.
-///
-/// `direct_paths` is what `PathAdded` has named so far. Empty means the peer has
-/// no multipath — and it stays empty for a path that only ever validated, which
-/// is exactly the pre-multipath camera.
-///
-/// Everything known and not preferred is declared backup, not just the path
-/// being left. Two candidates are offered whenever the observed address differs
-/// from the host one, and both can validate on the same LAN, so "the other path"
-/// is not always one path.
-fn preference_for(
-    wanted: (SocketAddr, SocketAddr),
-    relay_path: (SocketAddr, SocketAddr),
-    direct_paths: &BTreeMap<(SocketAddr, SocketAddr), u32>,
-) -> PathPreference {
-    if direct_paths.is_empty() {
-        return PathPreference::Switch;
-    }
-    let available = if wanted == relay_path {
-        RELAY_PATH_ID
-    } else {
-        match direct_paths.get(&wanted) {
-            Some(id) => *id,
-            // Validated but never added: the peer has multipath for some other
-            // path and not for this one, which should not happen — switching is
-            // still better than doing nothing.
-            None => return PathPreference::Switch,
-        }
-    };
-    let backup = std::iter::once(RELAY_PATH_ID)
-        .chain(direct_paths.values().copied())
-        .filter(|id| *id != available)
-        .collect();
-    PathPreference::Declare { available, backup }
 }
 
 /// What happened to the video connection's path.
@@ -733,7 +519,7 @@ pub async fn receive_frames_with(
                              direct path; going back to the relay path",
                         );
                         migrated_since = None;
-                        if prefer_path(&conn, relay_path, relay_path, &direct_paths).is_ok() {
+                        if prefer_path(&conn, relay_path, relay_path, &direct_paths) {
                             report_path(&path_events, PathEvent::Activated {
                                 local: relay_path.0,
                                 remote: relay_path.1,
@@ -808,7 +594,7 @@ pub async fn receive_frames_with(
             request = async { migrate.as_mut().unwrap().recv().await }, if migrate.is_some() => {
                 match request {
                     Some((local, remote)) => {
-                        if prefer_path(&conn, (local, remote), relay_path, &direct_paths).is_ok() {
+                        if prefer_path(&conn, (local, remote), relay_path, &direct_paths) {
                             // Watch a move *away* from the relay; a move back to
                             // it is the recovery, not something to time out.
                             migrated_since = ((local, remote) != relay_path).then(Instant::now);
@@ -872,60 +658,6 @@ fn spawn_heartbeat(shutdown: CancellationToken) {
     });
 }
 
-/// Move the connection onto `wanted`, by whichever operation the peer supports.
-///
-/// Errors are logged rather than returned upward: a connection that cannot be
-/// moved keeps streaming on the path it is already on, which is worse than the
-/// caller asked for and much better than dropping the video. `Err(())` says only
-/// that nothing changed, so the caller does not report a move that did not
-/// happen.
-fn prefer_path(
-    conn: &Connection,
-    wanted: (SocketAddr, SocketAddr),
-    relay_path: (SocketAddr, SocketAddr),
-    direct_paths: &BTreeMap<(SocketAddr, SocketAddr), u32>,
-) -> Result<(), ()> {
-    let (local, remote) = wanted;
-    match preference_for(wanted, relay_path, direct_paths) {
-        PathPreference::Declare { available, backup } => {
-            // Demote first. Promoting first would leave a window with two
-            // active paths, and msquic picks among them at random — so traffic
-            // would split across both, which is the state this whole call
-            // exists to avoid. The other order leaves a window with none, and
-            // `QuicConnChoosePath` falls back to `Paths[0]`, the relay: still a
-            // working path, which is the safe side to be wrong on.
-            for id in &backup {
-                if let Err(e) = conn.set_path_status(*id, false) {
-                    tracing::warn!(path_id = id, "could not declare a path backup: {e}");
-                }
-            }
-            match conn.set_path_status(available, true) {
-                Ok(()) => {
-                    tracing::info!(
-                        %local, %remote, path_id = available, ?backup,
-                        "declared a path available; every path stays active",
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::warn!(%local, %remote, "could not declare a path available: {e}");
-                    Err(())
-                }
-            }
-        }
-        PathPreference::Switch => match conn.activate_path(local, remote) {
-            Ok(()) => {
-                tracing::info!(%local, %remote, "activated path (the peer has no multipath)");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!(%local, %remote, "could not activate path: {e}");
-                Err(())
-            }
-        },
-    }
-}
-
 async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent) {
     tracing::info!("video path: {event:?}");
     if let Some(events) = events {
@@ -974,8 +706,6 @@ async fn wait_for_observed(
 mod tests {
     use super::*;
 
-    use std::net::SocketAddr;
-
     /// Frames published while a send is in flight are superseded, not queued:
     /// the next send takes the newest and skips the rest. Without this a slow
     /// client works through a backlog, and every frame in it is latency.
@@ -1011,93 +741,5 @@ mod tests {
         let (tx, mut rx) = watch::channel::<Option<Bytes>>(None);
         drop(tx);
         assert_eq!(next_frame(&mut rx).await, None);
-    }
-
-    fn pair(port: u16) -> (SocketAddr, SocketAddr) {
-        (
-            SocketAddr::from(([192, 168, 1, 59], port)),
-            SocketAddr::from(([203, 0, 113, 5], port)),
-        )
-    }
-
-    /// The relay pair, standing in for the loopback bridge the video connection
-    /// actually runs over.
-    fn relay() -> (SocketAddr, SocketAddr) {
-        (
-            SocketAddr::from(([127, 0, 0, 1], 5000)),
-            SocketAddr::from(([127, 0, 0, 1], 5001)),
-        )
-    }
-
-    /// A camera without multipath never sends `PathAdded`, so there are no path
-    /// ids and the only thing that can be done is what was always done.
-    ///
-    /// This is the mixed pair, and it is not hypothetical: cameras and viewers
-    /// are updated separately, so an updated viewer meets old cameras for as
-    /// long as the rollout takes.
-    #[test]
-    fn a_peer_without_multipath_still_gets_the_old_switch() {
-        assert_eq!(
-            preference_for(pair(1000), relay(), &BTreeMap::new()),
-            PathPreference::Switch,
-        );
-    }
-
-    /// With multipath, moving onto the direct path declares it available and the
-    /// relay backup — and the relay is *kept*, which is the whole difference.
-    #[test]
-    fn moving_onto_the_direct_path_declares_the_relay_backup() {
-        let direct = BTreeMap::from([(pair(1000), 1)]);
-        assert_eq!(
-            preference_for(pair(1000), relay(), &direct),
-            PathPreference::Declare {
-                available: 1,
-                backup: vec![RELAY_PATH_ID],
-            },
-        );
-    }
-
-    /// And going back is the same operation with the preference reversed, not a
-    /// different one — there is nothing to switch back to, because nothing was
-    /// left.
-    #[test]
-    fn going_back_to_the_relay_is_the_same_operation_reversed() {
-        let direct = BTreeMap::from([(pair(1000), 1)]);
-        assert_eq!(
-            preference_for(relay(), relay(), &direct),
-            PathPreference::Declare {
-                available: RELAY_PATH_ID,
-                backup: vec![1],
-            },
-        );
-    }
-
-    /// Both candidates can validate at once — the host address and the observed
-    /// one, which is what happens on the LAN behind the peer's own NAT — so
-    /// "the other path" is not always a single path. Everything not preferred
-    /// is declared backup, or the peer is left with two available paths and a
-    /// preference that says nothing.
-    #[test]
-    fn every_path_that_is_not_preferred_is_declared_backup() {
-        let direct = BTreeMap::from([(pair(1000), 1), (pair(2000), 2)]);
-        assert_eq!(
-            preference_for(pair(2000), relay(), &direct),
-            PathPreference::Declare {
-                available: 2,
-                backup: vec![RELAY_PATH_ID, 1],
-            },
-        );
-    }
-
-    /// A pair that validated but was never added has no id to declare anything
-    /// about. Switching is worse than declaring and much better than ignoring
-    /// the request.
-    #[test]
-    fn a_path_with_no_id_falls_back_to_switching() {
-        let direct = BTreeMap::from([(pair(1000), 1)]);
-        assert_eq!(
-            preference_for(pair(9999), relay(), &direct),
-            PathPreference::Switch,
-        );
     }
 }

@@ -236,7 +236,7 @@ async fn role_client(reg: &Arc<Registration>) -> anyhow::Result<String> {
     let bridge = Bridge::start(loopback(video_port)).await?;
 
     let conn = shared_binding_conn(reg, loopback(0))?;
-    // SPIKE_UNREACHABLE_FIRST reproduces `prepare_for_migration`'s ordering:
+    // SPIKE_UNREACHABLE_FIRST reproduces `direct_path::prepare`'s ordering:
     // the *observed* address goes first and the host address second. Behind a
     // NAT that does not hairpin, that first candidate is unreachable from here —
     // and the spike has always offered the good one first, so the order itself

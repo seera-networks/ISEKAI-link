@@ -791,7 +791,7 @@ pub async fn dial(
         conn.set_remote_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
             .map_err(|e| anyhow::anyhow!("could not pin the relay bridge address: {e}"))?;
         if let Some(candidate) = candidate {
-            prepare_for_migration(&conn, candidate)?;
+            crate::direct_path::prepare(&conn, candidate)?;
         }
         // One slot per attempt: a verdict from a connection that has been
         // dropped says nothing about this one.
@@ -1008,47 +1008,6 @@ impl std::fmt::Display for CertificateAlert {
         };
         write!(f, "{name} (TLS alert {})", self.0)
     }
-}
-
-/// Put the connection on a shared, unconnected socket and offer the relay
-/// leg's address as a direct-path candidate. Must run before `start`.
-///
-/// The order is fixed: `set_unconnected_socket` requires a shared binding, and
-/// an unconnected socket requires a specific — non-wildcard — local address.
-/// That address is deliberately **loopback**: this connection's own traffic
-/// goes to the relay bridge on `127.0.0.1`, and pinning it to a real interface
-/// address instead cannot work on Windows at all. The direct path does not need
-/// it, because `add_candidate_addr` accepts an address that is not bound here
-/// yet — msquic opens the path from the relay leg's binding once the peer's
-/// ADD_ADDRESS arrives (`docs/p2p_mode_migration_plan.md` §2.2.3).
-fn prepare_for_migration(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
-    // All three are required for a direct path to be validated at all — without
-    // them msquic never raises `PathValidated`, whatever candidate is offered.
-    conn.set_share_binding(true)
-        .map_err(|e| anyhow::anyhow!("could not share the UDP binding: {e}"))?;
-    conn.set_unconnected_socket(true)
-        .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
-    conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
-    conn.add_candidate_addr(candidate.local, candidate.observed)
-        .map_err(|e| anyhow::anyhow!("could not offer a direct-path candidate: {e}"))?;
-    // Also offer the host address itself. A peer on the same LAN can reach it
-    // directly, while the observed one is only reachable from outside the NAT —
-    // and a NAT that does not hairpin (most of them) drops a packet sent from
-    // inside to its own public address, so without this two peers behind the
-    // same NAT can never find each other. Across the internet this candidate
-    // simply fails to validate and the observed one wins.
-    if candidate.local != candidate.observed {
-        if let Err(e) = conn.add_candidate_addr(candidate.local, candidate.local) {
-            tracing::debug!("could not offer the host candidate: {e}");
-        }
-    }
-    tracing::info!(
-        local = %candidate.local,
-        observed = %candidate.observed,
-        "offered direct-path candidates to the peer",
-    );
-    Ok(())
 }
 
 /// Log what the connection is actually doing, which is the difference between

@@ -31,9 +31,10 @@ pub use listener::{
     AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,
     MAX_CONCURRENT_PEERS,
 };
-// Documented by its own module header, which is where the rules are written
-// down. An outer doc comment here would be concatenated in front of that one
-// and resolved in *this* scope, so every `[`dial`]` in it would break.
+// Documented by their own module headers, which is where the rules are written
+// down. An outer doc comment here would be concatenated in front of those and
+// resolved in *this* scope, so every `[`dial`]` in it would break.
+pub mod direct_path;
 pub mod endpoint_cert;
 pub mod peer;
 

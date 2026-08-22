@@ -25,7 +25,7 @@
 //!
 //! The two sides are set up the way the shipping code sets them up, because the
 //! answers are only worth having if they are about that arrangement: the viewer
-//! makes `prepare_for_migration`'s four calls before `start` — shared binding,
+//! makes `direct_path::prepare`'s four calls before `start` — shared binding,
 //! unconnected socket, a *loopback* local address, and the leg's address as a
 //! candidate — and the camera makes `apply_direct_path`'s two afterwards,
 //! claiming the leg's binding and advertising it.
@@ -238,12 +238,12 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
 
     // The viewer's leg comes first, because what it is for is to be named as a
     // candidate — and a candidate has to be offered before `start`, which is
-    // also the order `prepare_for_migration` fixes in the shipping code.
+    // also the order `direct_path::prepare` fixes in the shipping code.
     let client_leg = relay_leg(reg, &proxy).await.context("the viewer's leg")?;
     let client_leg_addr = client_leg.addr;
 
     let client = Connection::new(reg).context("client connection")?;
-    // The same four calls `prepare_for_migration` makes, in the order it makes
+    // The same four calls `direct_path::prepare` makes, in the order it makes
     // them. Multipath adds a reason for the first one: it identifies a
     // connection by its source connection id, which only a shared binding gives
     // a non-zero length.

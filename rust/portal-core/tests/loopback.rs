@@ -692,6 +692,44 @@ async fn a_reused_session_id_is_refused() {
     drain(halves).await;
 }
 
+/// **The path watcher is also how the client learns the peer went away**, and
+/// that dual job is load-bearing: a connection's events are a single queue, so
+/// `portal-client` cannot both watch paths and separately watch for closure —
+/// it dropped its own `closed()` loop for this. If this ever stopped returning,
+/// the client would sit with its ports bound over a connection that is gone,
+/// accepting connections and answering nothing.
+///
+/// There is no direct path on a loopback connection, so what is asserted here is
+/// only the half a loopback can show. The preferring itself is a hardware check.
+#[tokio::test]
+async fn the_path_watcher_returns_when_the_connection_ends() {
+    let target = shouting_service().await;
+    let halves = connected(Catalogue::new().with("db", Protocol::Tcp, target)).await;
+
+    // **One watcher, and the same one throughout.** Spawning a second to check
+    // the second half would put two pollers on one event queue, which is the
+    // thing this module says must not happen — and a `JoinHandle` dropped after
+    // a timeout detaches rather than aborts, so the first would still be there.
+    let mut watching = tokio::spawn(portal_core::path::keep_on_the_best_path(
+        halves.connection().clone(),
+        // Its own token, so what ends this is the connection and not the
+        // teardown — the cancel arm would pass this test for the wrong reason.
+        CancellationToken::new(),
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut watching)
+            .await
+            .is_err(),
+        "the watcher returned while the connection was still usable",
+    );
+
+    drain(halves).await;
+    tokio::time::timeout(Duration::from_secs(10), watching)
+        .await
+        .expect("the watcher noticed the connection end within ten seconds")
+        .expect("the watcher did not panic");
+}
+
 /// **A TCP service is refused over UDP exactly as an unknown name is**, which
 /// is the §4.3 property in the direction 3b added. The stream half of it is
 /// asserted above; this is the same question asked with the kinds swapped, and
