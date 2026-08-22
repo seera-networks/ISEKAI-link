@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use isekai_p2p::agent::RelayOptions;
-use isekai_p2p::agent::{Grant, PairingCode, ReachableListener};
+use isekai_p2p::agent::{PairingCode, ReachableListener};
 use isekai_p2p::direct_path::{self, RelayLegs};
 use isekai_p2p::endpoint_cert;
 use isekai_p2p::listener::{run, ListenerCommand};
@@ -114,49 +114,18 @@ impl ServerHandle {
     /// there is at most one live code per (Endpoint, protocol), so asking again
     /// is how you replace one nobody used rather than how you accumulate them.
     ///
+    /// **Listing and revoking grants are deliberately not here.** They are
+    /// Endpoint-token calls on [`isekai_p2p::proxy_client`] and need no
+    /// listener — and putting them on a running server would mean standing one
+    /// up to ask, which adds a second listener under this Endpoint for every
+    /// client that then looks one up. `portal-server --grants` and `--revoke`
+    /// take that path instead.
+    ///
     /// [`issue_capability`]: Self::issue_capability
     pub async fn show_pairing_code(&self, ttl: Option<u64>) -> anyhow::Result<PairingCode> {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(ListenerCommand::ShowPairingCode { ttl, reply })
-            .await
-            .map_err(|_| anyhow::anyhow!("the listener session has stopped"))?;
-        answer
-            .await
-            .map_err(|_| anyhow::anyhow!("the listener session dropped the request"))?
-    }
-
-    /// Who may reach this Endpoint, and since when.
-    ///
-    /// Grants outlive listeners, so this is the only place the answer exists:
-    /// nothing about a running server says who paired with it three restarts
-    /// ago.
-    pub async fn grants(&self) -> anyhow::Result<Vec<Grant>> {
-        let (reply, answer) = oneshot::channel();
-        self.commands
-            .send(ListenerCommand::ListGrants { reply })
-            .await
-            .map_err(|_| anyhow::anyhow!("the listener session has stopped"))?;
-        answer
-            .await
-            .map_err(|_| anyhow::anyhow!("the listener session dropped the request"))?
-    }
-
-    /// Take a grant away.
-    ///
-    /// **The counterpart [`show_pairing_code`] needs to exist.** A permission
-    /// that stands until revoked, with no way to revoke it, is worse than one
-    /// that expires — and a Grant surviving restarts means there is no
-    /// accidental expiry to fall back on.
-    ///
-    /// [`show_pairing_code`]: Self::show_pairing_code
-    pub async fn revoke_grant(&self, grant_id: &str) -> anyhow::Result<()> {
-        let (reply, answer) = oneshot::channel();
-        self.commands
-            .send(ListenerCommand::RevokeGrant {
-                grant_id: grant_id.to_owned(),
-                reply,
-            })
             .await
             .map_err(|_| anyhow::anyhow!("the listener session has stopped"))?;
         answer
@@ -424,7 +393,7 @@ pub async fn connect(
             listener_id,
         } => connect_on_a_capability(cfg, capability, listener_id, reg.clone()).await?,
     };
-    open_the_peer_connection(cfg, session, reg, shutdown).await
+    open_the_peer_connection(session, reg, shutdown).await
 }
 
 /// Find the listener this client is paired with, and connect to it.
@@ -467,29 +436,58 @@ async fn connect_on_a_grant(
 
 /// The one listener `peer` names, or the only one there is.
 ///
-/// Separate and taking a slice so the awkward cases — none, several — can be
-/// tested without a proxy, because they are the ones a caller meets and the
-/// message is the whole of what they get.
+/// Separate and taking a slice so the awkward cases can be tested without a
+/// proxy, because they are the ones a caller meets and the message is the whole
+/// of what they get.
+///
+/// **An Endpoint can be listed more than once, and it is not an ambiguity.**
+/// A server killed without withdrawing — `kill -9`, a panic, an error on the
+/// way up — leaves its listener listed until the lease expires, so a restart
+/// puts two rows there under one Endpoint ID. Treating that as "which did you
+/// mean?" would break the reconnect this whole mechanism exists for, and
+/// `--peer` could not answer it: both rows have the same owner. The newest
+/// lease wins, which is `camera_core::one_per_camera`'s answer to the same
+/// thing.
 fn choose_listener<'a>(
     reachable: &'a [ReachableListener],
     protocol: &str,
     peer: Option<&str>,
 ) -> anyhow::Result<&'a ReachableListener> {
-    let matching: Vec<&ReachableListener> = reachable
+    let mut matching: Vec<&ReachableListener> = reachable
         .iter()
         .filter(|l| l.protocol == protocol)
         .filter(|l| peer.is_none_or(|want| l.owner_endpoint == want))
         .collect();
+    // Latest deadline first, so the first row for an owner is the live one.
+    matching.sort_by(|a, b| {
+        b.expires_at
+            .cmp(&a.expires_at)
+            .then_with(|| a.listener_id.cmp(&b.listener_id))
+    });
+    let mut seen = std::collections::HashSet::new();
+    matching.retain(|l| seen.insert(l.owner_endpoint.as_str()));
+
     match matching.as_slice() {
         [one] => Ok(one),
         [] if peer.is_some() => anyhow::bail!(
-            "no portal server reachable at `{}`. Pair with it first (--pair), or check \
-             the Endpoint ID",
+            "nothing reachable at `{}`. If the server is running, check the Endpoint ID; \
+             if you have never paired with it, ask its operator for a code",
             peer.unwrap_or_default(),
         ),
+        // **The likely cause first.** A grant outlives the listener it was made
+        // against, so "not reachable" almost always means the server is not
+        // running — and telling someone to pair again sends them to an operator
+        // for something they already have.
         [] => anyhow::bail!(
-            "no portal server is reachable. Pair with one first: the operator runs \
-             `portal-server --pair` and you run `portal-client --pair <code>`",
+            "no portal server is reachable. The usual reason is that it is not running; \
+             if you have never paired with one, its operator shows a code with \
+             `portal-server --pair` and you redeem it with `--pair <code>`",
+        ),
+        several if peer.is_some() => anyhow::bail!(
+            "`{}` has {} listeners on this protocol and none of them is stale, which \
+             should not happen",
+            peer.unwrap_or_default(),
+            several.len(),
         ),
         several => anyhow::bail!(
             "paired with {} portal servers; name one with --peer: {}",
@@ -529,12 +527,10 @@ async fn connect_on_a_capability(
 /// candidate, and the datagram pump. The same whichever way the session was
 /// authorized, which is why it is here and not duplicated in both.
 async fn open_the_peer_connection(
-    cfg: &P2pConfig,
     session: InitiatorSession,
     reg: Arc<Registration>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Connected> {
-    let _ = cfg;
     // A *name*, never an address: it is the per-endpoint FQDN the peer's relay
     // certificate is issued for, and its only DNS record points back at
     // loopback. `None` means the proxy has relay certificates disabled, and
@@ -676,6 +672,25 @@ mod tests {
         assert_eq!(found.listener_id, "pl_portal");
     }
 
+    /// **A server that was killed leaves its listener listed**, so a restart
+    /// puts the same Endpoint there twice. That is the reconnect this whole
+    /// mechanism exists for, and reading it as an ambiguity would break it —
+    /// `--peer` cannot choose between two rows with one owner.
+    #[test]
+    fn a_stale_listener_does_not_make_its_own_endpoint_ambiguous() {
+        let mut reachable = [
+            listener("ep:aaa", "isekai-portal-v1", "pl_killed"),
+            listener("ep:aaa", "isekai-portal-v1", "pl_running"),
+        ];
+        reachable[0].expires_at = "2026-01-01T00:00:00Z".to_owned();
+        reachable[1].expires_at = "2026-01-01T00:05:00Z".to_owned();
+        let found = choose_listener(&reachable, "isekai-portal-v1", None).expect("the live one");
+        assert_eq!(
+            found.listener_id, "pl_running",
+            "the newest lease is the one still being renewed",
+        );
+    }
+
     /// **The awkward cases are the whole reason this is a function.** Each one
     /// is something a person meets, and the message is all they get — so each
     /// says what to do rather than what went wrong.
@@ -686,7 +701,10 @@ mod tests {
             "{:#}",
             choose_listener(&none, "isekai-portal-v1", None).expect_err("nothing to reach")
         );
-        assert!(err.contains("--pair"), "says how to fix it: {err}");
+        assert!(
+            err.contains("not running"),
+            "names the likely cause before the unlikely one: {err}",
+        );
 
         let err = format!(
             "{:#}",
@@ -695,6 +713,10 @@ mod tests {
         assert!(
             err.contains("ep:zzz"),
             "names the peer that was asked for: {err}",
+        );
+        assert!(
+            !err.contains("--peer"),
+            "and does not suggest the flag that was already given: {err}",
         );
 
         let two = [

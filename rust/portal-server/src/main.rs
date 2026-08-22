@@ -154,6 +154,64 @@ struct Args {
     capability_ttl: Option<u64>,
 }
 
+/// Answer `--grants` and `--revoke`, which need no listener.
+///
+/// **Its own path, and it exits.** These are questions about who may reach this
+/// Endpoint, and the answer lives on the proxy — a Peer Listener is what a peer
+/// connects *through*, and standing one up to ask would put a second row under
+/// this Endpoint for every client that then looks one up.
+async fn administer_grants(args: &Args) -> anyhow::Result<()> {
+    let cfg = P2pConfig {
+        identity_url: args.identity_url.clone(),
+        identity_http3: args.identity_http3,
+        proxy_url: args.proxy_url.clone(),
+        auth0_token: args
+            .auth0_token
+            .clone()
+            .context("--auth0-token is required")?,
+        auth0: None,
+        protocol: args.protocol.clone(),
+        register: args.register,
+        device_name: args.device_name.clone(),
+        token_ttl: None,
+        key: load_or_generate_key(&args.key)?,
+    };
+    grant_admin(args, &cfg).await
+}
+
+async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
+    let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
+    let proxy = isekai_p2p::proxy_client(cfg, &token)?;
+
+    if let Some(grant_id) = &args.revoke {
+        proxy
+            .revoke_grant(grant_id)
+            .await
+            .with_context(|| format!("revoke {grant_id}"))?;
+        println!("revoked     : {grant_id}");
+    }
+    if args.grants {
+        let grants = proxy.list_grants().await.context("list grants")?;
+        if grants.is_empty() {
+            println!("Nobody is paired with this Endpoint.");
+        }
+        for grant in &grants {
+            println!(
+                "grant       : {}  {}  ({}{})",
+                grant.grant_id,
+                grant.allowed_endpoint,
+                grant.origin,
+                grant
+                    .label
+                    .as_deref()
+                    .map(|l| format!(", {l}"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // **stderr, and `info` unless `RUST_LOG` says otherwise.**
@@ -178,12 +236,43 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args: Args = argh::from_env();
+    // **Every path out of `run` goes through the same wind-down**, which is the
+    // only shape that works here: `PeerDirectory`, the sessions and the
+    // one-shot commands all open control-plane transports on the shared msquic
+    // registration, and a process that returns while those handles are live
+    // drops the registration into `RegistrationClose` and aborts. Hardware
+    // found it twice — once after a successful pairing, once on a connect that
+    // was correctly refused — and both times the exit code contradicted what
+    // had been printed a line earlier.
+    let outcome = run(args).await;
+    if !isekai_p2p::agent::shutdown_msquic(SHUTDOWN_TIMEOUT).await {
+        tracing::debug!("msquic still had live handles on the way out");
+    }
+    outcome
+}
 
+/// How long to wait for msquic before leaving it to the operating system.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn run(args: Args) -> anyhow::Result<()> {
     if args.example_config {
         // Before the key, the token and the catalogue: this is what somebody
         // runs when they have none of the three yet.
         print!("{}", portal_core::config::EXAMPLE);
         return Ok(());
+    }
+
+    // **Before the catalogue and before any listener**, because neither is
+    // needed to answer them: grants belong to this Endpoint rather than to a
+    // listener (spec §8.8), so listing and revoking are Endpoint-token calls on
+    // the control plane and nothing more.
+    //
+    // Standing a listener up for them would be worse than wasteful. A second
+    // listener on this Endpoint and protocol is exactly what a client on a
+    // grant then has to choose between, so an operator asking "who is in?"
+    // would be making the connections they are asking about ambiguous.
+    if args.grants || args.revoke.is_some() {
+        return administer_grants(&args).await;
     }
 
     // Read before anything else touches the network: a typo in the catalogue
@@ -243,43 +332,18 @@ async fn main() -> anyhow::Result<()> {
     // capability path needs it by hand, and only until the connect it is for.
     println!("listener id : {}", server.info.listener_id);
 
-    if let Some(grant_id) = &args.revoke {
-        server
-            .revoke_grant(grant_id)
-            .await
-            .with_context(|| format!("revoke {grant_id}"))?;
-        println!("revoked     : {grant_id}");
-    }
-
-    if args.grants {
-        let grants = server.grants().await.context("list grants")?;
-        if grants.is_empty() {
-            println!("\nNobody is paired with this Endpoint.");
-        } else {
-            println!();
-            for grant in &grants {
-                println!(
-                    "grant       : {}  {}  ({}{})",
-                    grant.grant_id,
-                    grant.allowed_endpoint,
-                    grant.origin,
-                    grant
-                        .label
-                        .as_deref()
-                        .map(|l| format!(", {l}"))
-                        .unwrap_or_default(),
-                );
-            }
-        }
-        server.close().await;
-        return Ok(());
-    }
-
     if args.pair {
-        let code = server
-            .show_pairing_code(args.pairing_ttl)
-            .await
-            .context("mint a pairing code")?;
+        // **`close()` on the way out of a failure, not `?`.** A listener this
+        // process registered and did not withdraw stays listed for its whole
+        // lease, and since phase 6 that is not merely untidy: it is a second row
+        // under this Endpoint for every client that connects on a grant.
+        let code = match server.show_pairing_code(args.pairing_ttl).await {
+            Ok(code) => code,
+            Err(e) => {
+                server.close().await;
+                return Err(e.context("mint a pairing code"));
+            }
+        };
         println!("\npairing code: {}", code.code);
         println!(
             "  or the URI: {}",
@@ -292,10 +356,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     for endpoint in &args.allow {
-        let capability = server
-            .issue_capability(endpoint, args.capability_ttl)
-            .await
-            .with_context(|| format!("issue a capability for {endpoint}"))?;
+        let capability = match server.issue_capability(endpoint, args.capability_ttl).await {
+            Ok(capability) => capability,
+            Err(e) => {
+                server.close().await;
+                return Err(e.context(format!("issue a capability for {endpoint}")));
+            }
+        };
         println!("\ncapability  : {capability}   (for {endpoint})");
         println!("One-shot, and it expires -- give the client this and the listener id now.");
     }

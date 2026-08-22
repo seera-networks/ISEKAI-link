@@ -159,7 +159,25 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args: Args = argh::from_env();
+    // **Every path out of `run` goes through the same wind-down**, which is the
+    // only shape that works here: `PeerDirectory`, the sessions and the
+    // one-shot commands all open control-plane transports on the shared msquic
+    // registration, and a process that returns while those handles are live
+    // drops the registration into `RegistrationClose` and aborts. Hardware
+    // found it twice — once after a successful pairing, once on a connect that
+    // was correctly refused — and both times the exit code contradicted what
+    // had been printed a line earlier.
+    let outcome = run(args).await;
+    if !isekai_p2p::agent::shutdown_msquic(SHUTDOWN_TIMEOUT).await {
+        tracing::debug!("msquic still had live handles on the way out");
+    }
+    outcome
+}
 
+/// How long to wait for msquic before leaving it to the operating system.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn run(args: Args) -> anyhow::Result<()> {
     // **Said out loud, because a generated key looks exactly like a loaded one
     // until it fails.** `--key` has a default, so running from a different
     // directory than last time silently makes a *second* Endpoint — and the
@@ -177,19 +195,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(code) = &args.pair {
-        let cfg = config(&args, key)?;
-        let code = isekai_p2p::agent::pairing_code_from_input(code);
-        let directory = isekai_p2p::PeerDirectory::open(&cfg)
-            .await
-            .context("open the proxy control plane")?;
-        let grant = directory
-            .pair(&code, args.label.as_deref())
-            .await
-            .context("redeem the pairing code")?;
-        println!("paired with : {}", grant.owner_endpoint);
-        println!("grant       : {}", grant.grant_id);
-        println!("\nConnect with --map alone; the listener is found for you.");
-        return Ok(());
+        return redeem(&args, key, code).await;
     }
 
     let maps = maps(&args.map, args.bind)?;
@@ -279,6 +285,29 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     connected.close().await;
+    Ok(())
+}
+
+/// Redeem a pairing code, and say what it paired with.
+async fn redeem(
+    args: &Args,
+    key: isekai_p2p::agent::EndpointKey,
+    code: &str,
+) -> anyhow::Result<()> {
+    let cfg = config(args, key)?;
+    // Whatever was scanned, pasted or typed: a URI from a QR, or the eight
+    // characters with or without their dash.
+    let code = isekai_p2p::agent::pairing_code_from_input(code);
+    let directory = isekai_p2p::PeerDirectory::open(&cfg)
+        .await
+        .context("open the proxy control plane")?;
+    let grant = directory
+        .pair(&code, args.label.as_deref())
+        .await
+        .context("redeem the pairing code")?;
+    println!("paired with : {}", grant.owner_endpoint);
+    println!("grant       : {}", grant.grant_id);
+    println!("\nConnect with --map alone; the listener is found for you.");
     Ok(())
 }
 

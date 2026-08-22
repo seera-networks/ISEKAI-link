@@ -131,7 +131,7 @@ portal-client --auth0-token "$TOKEN" --register --pair K7QM-3XPD
 
 ```
 paired with : ep:9z8y7x…
-grant       : g_5f6a7b…
+grant       : gr_5f6a7b…
 
 Connect with --map alone; the listener is found for you.
 ```
@@ -229,12 +229,16 @@ portal-server --auth0-token "$TOKEN" --grants
 ```
 
 ```
-grant       : g_5f6a7b…  ep:4d5e6f…  (pairing, masa's laptop)
+grant       : gr_5f6a7b…  ep:4d5e6f…  (pairing, masa's laptop)
 ```
 
 ```sh
-portal-server --auth0-token "$TOKEN" --revoke g_5f6a7b…
+portal-server --auth0-token "$TOKEN" --revoke gr_5f6a7b…
 ```
+
+Both answer and exit without serving anything. That is not just tidiness: a
+second Peer Listener under this Endpoint is one more row for every client that
+looks one up, so asking "who is in?" must not put one there.
 
 A grant stands until revoked, so this is the counterpart of pairing and not an
 afterthought. Grants belong to the Endpoint rather than to a listener, so they
