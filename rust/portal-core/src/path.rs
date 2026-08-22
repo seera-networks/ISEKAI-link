@@ -72,9 +72,14 @@
 //!
 //! So the transport's own judgement is what is used: msquic raises `PathRemoved`
 //! when it abandons a path, and that is when the relay is preferred again.
-//! **The gap that leaves is a path msquic keeps and does not carry**, and there
-//! is no local signal for it — the honest state of this is that hardware has to
-//! say whether it happens.
+//! **The gap that leaves is a path msquic keeps and does not carry.**
+//!
+//! There *is* a signal for it now, and this does not use it yet:
+//! `Connection::get_path_statistics` reports RTT and network statistics **per
+//! path**, where `get_stats` only ever describes the first one — which is
+//! exactly why the connection-level counters above cannot see a dead preferred
+//! path. A watchdog on the preferred path's own numbers is the thing this
+//! paragraph said did not exist. Adopting it is #172.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

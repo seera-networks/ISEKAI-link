@@ -74,6 +74,13 @@ pub const HEADER: usize = 4;
 /// arriving as an error from three layers down, and handles `TooBig` anyway
 /// because the runtime value is the one that is true.
 ///
+/// **And the runtime value is now readable rather than only discoverable.**
+/// `ConnectionEvent::DatagramStateChanged` carries `max_send_length` and
+/// `send_enabled`, so the real limit can be tracked as MTU discovery raises it
+/// instead of being guessed conservatively — and a peer that will not receive
+/// datagrams at all is knowable at connect time rather than one `Denied` per
+/// datagram, which is how phase 3a's bug hid. Not used here yet: #172.
+///
 /// # What this rules out, said plainly
 ///
 /// **A UDP payload over about 1200 bytes cannot cross a portal forward**, and
