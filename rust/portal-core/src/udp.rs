@@ -48,7 +48,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -110,6 +110,17 @@ pub struct Sessions {
     /// What was lost, and why. Read by anything that wants to report it; the
     /// pump logs a summary when the connection ends.
     pub drops: Drops,
+    /// Sessions that could not be opened — refused, unreachable, or a stream
+    /// that failed.
+    ///
+    /// **Separate from [`Drops`], which counts datagrams.** This counts
+    /// conversations that never started, and it exists because the first one is
+    /// logged and the rest are not: a `--map udp:5353:dsn` with the name
+    /// misspelt is refused on every datagram the application sends, and a
+    /// `warn!` each would bury everything else the forward has to say. What is
+    /// lost with them is counted where losses are — the queued payloads go
+    /// through [`Sessions::end`] and `abandon` like any other.
+    pub open_failures: AtomicU64,
 }
 
 /// What [`Sessions::accept`] made of an id the peer chose.
@@ -156,6 +167,7 @@ impl Sessions {
             next: AtomicU32::new(1),
             idle,
             drops: Drops::default(),
+            open_failures: AtomicU64::new(0),
         });
         tokio::spawn({
             let sessions = Arc::clone(&sessions);
@@ -187,13 +199,17 @@ impl Sessions {
         // **Reported once, here, rather than never.** Nothing else reads these
         // counters yet, and a drop that is counted into a number nobody prints
         // is a drop that was not counted.
-        if self.drops.any() {
+        let failed_opens = self.open_failures.load(Ordering::Relaxed);
+        if self.drops.any() || failed_opens != 0 {
             tracing::info!(
                 oversize = self.drops.oversize.load(Ordering::Relaxed),
                 overflow = self.drops.overflow.load(Ordering::Relaxed),
                 unknown_session = self.drops.unknown_session.load(Ordering::Relaxed),
                 malformed = self.drops.malformed.load(Ordering::Relaxed),
-                "UDP forwarding dropped datagrams on this connection",
+                unsent = self.drops.unsent.load(Ordering::Relaxed),
+                sessions_full = self.drops.sessions_full.load(Ordering::Relaxed),
+                failed_opens,
+                "UDP forwarding lost traffic on this connection",
             );
         }
         // Every session's reader learns the connection has gone rather than
@@ -245,8 +261,23 @@ impl Sessions {
                 self.oversize(session, payload.len());
                 false
             }
+            // **Counted, not merely logged.** `Denied` here is not one lost
+            // datagram: it says the peer never advertised that it would
+            // receive any, so every reply on every session of this connection
+            // goes the same way — on sessions that answered `Ready`. A forward
+            // that looks perfect and delivers nothing was exactly what phase
+            // 3a's review caught, and a drop with no counter is how it stayed
+            // invisible.
             Err(e) => {
-                tracing::debug!(session, "a datagram was not sent: {e}");
+                if self.drops.unsent.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        session,
+                        "the connection would not take a datagram: {e}; \
+                         further ones on this connection are counted, not logged",
+                    );
+                } else {
+                    tracing::debug!(session, "a datagram was not sent: {e}");
+                }
                 false
             }
         }
@@ -380,6 +411,7 @@ pub async fn serve(
     service: &str,
     target: SocketAddr,
     mut stream: msquic_async::Stream,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let socket = match bind_toward(target).await {
         Ok(socket) => socket,
@@ -395,6 +427,7 @@ pub async fn serve(
             return crate::server::refuse(stream, Status::Refused).await;
         }
         Accept::Full => {
+            sessions.drops.sessions_full.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 service,
                 limit = MAX_SESSIONS,
@@ -403,13 +436,31 @@ pub async fn serve(
             return crate::server::refuse(stream, Status::Refused).await;
         }
     };
-    write_status(&mut stream, Status::Ready).await?;
+    if let Err(e) = write_status(&mut stream, Status::Ready).await {
+        // **The entry went in before the status and has to come back out on
+        // this path.** `accept` above inserted it deliberately early, so that
+        // the client's first datagram — which follows `Ready` immediately — has
+        // somewhere to land. A status that never leaves, because the peer reset
+        // the stream or the connection went, would otherwise leave that entry
+        // for the life of the connection: a thousand of them and `accept`
+        // answers `Full` to every new session, which the client reports as the
+        // service not being offered.
+        sessions.end(id);
+        return Err(e);
+    }
     tracing::debug!(service, id, %target, "a UDP session opened");
 
     let mut buf = vec![0_u8; RECV_BUFFER];
     let mut unexpected = [0_u8; 1];
     let ended = loop {
         tokio::select! {
+            // **Not only the pump's table drain.** That runs once, when the
+            // pump stops; a stream accepted just before the cancel whose
+            // `accept` lands after it would otherwise sit here for the whole
+            // idle timeout holding a `Stream` and a `Connection` clone — which
+            // is precisely the `RegistrationClose` wedge `server::serve` says
+            // cancelling prevents.
+            _ = shutdown.cancelled() => break "the server is leaving".to_owned(),
             // From the peer, out to the target.
             payload = queue.pop() => match payload {
                 Some(payload) => if let Err(e) = socket.send(&payload).await {
@@ -521,16 +572,18 @@ pub async fn forward(
             }
 
             let Some((id, inbound)) = sessions.open() else {
-                sessions
-                    .drops
-                    .unknown_session
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    %from,
-                    service = %service,
-                    limit = MAX_SESSIONS,
-                    "not opening another UDP session; the datagram was dropped",
-                );
+                // Its own counter, not `unknown_session`: that one is the
+                // ordinary race with the sweep, and this one means the forward
+                // has stopped taking new sources altogether.
+                if sessions.drops.sessions_full.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        %from,
+                        service = %service,
+                        limit = MAX_SESSIONS,
+                        "not opening another UDP session; further datagrams \
+                         turned away on this connection are counted, not logged",
+                    );
+                }
                 continue;
             };
             let outbound = Queue::new();
@@ -582,7 +635,24 @@ async fn session(
     )
     .await
     {
-        tracing::warn!(%from, service = %service, "the UDP forward failed: {e:#}");
+        // **Said once per connection and counted every time**, for the same
+        // reason an oversize payload is. A `--map udp:5353:dsn` with the name
+        // misspelt is refused on *every* datagram the application sends —
+        // there is no negative caching here, deliberately, because a refusal
+        // is also what a momentarily full server answers and holding a source
+        // off after one would turn a transient into an outage. So the cost of
+        // a wrong map is one stream open per datagram, bounded by
+        // `MAX_SESSIONS`, and one log line rather than a flood.
+        if sessions.open_failures.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::warn!(
+                %from,
+                service = %service,
+                "the UDP forward failed: {e:#}; further failures on this \
+                 connection are counted, not logged",
+            );
+        } else {
+            tracing::debug!(%from, service = %service, "the UDP forward failed: {e:#}");
+        }
     }
 
     sessions.end(id);

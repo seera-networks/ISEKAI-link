@@ -602,9 +602,15 @@ async fn an_oversize_datagram_is_dropped_and_counted() {
 #[tokio::test]
 async fn a_quiet_session_is_swept_and_the_next_datagram_opens_another() {
     let target = shouting_datagram_service().await;
+    // **A second, not the 300ms this had first.** The sweep applies to the
+    // second exchange below too, which has to open a stream, read a status and
+    // reach the service inside it — so a runner that stalls once turns a
+    // correct forward into a session swept mid-flight and a ten-second timeout.
+    // A second is still nothing next to the wait below and leaves no such race
+    // on any machine that can run the rest of this suite.
     let halves = connected_with_idle(
         Catalogue::new().with("dns", Protocol::Udp, target),
-        Duration::from_millis(300),
+        Duration::from_secs(1),
     )
     .await;
 
@@ -622,10 +628,10 @@ async fn a_quiet_session_is_swept_and_the_next_datagram_opens_another() {
     assert_eq!(&say(&client, b"hello").await, b"HELLO");
     assert_eq!(halves.sessions().len(), 1);
 
-    // Generous next to the 300ms sweep, and it asserts on the table rather than
-    // on the clock: this waits for the session to go, and fails by timing out
+    // Generous next to the sweep, and it asserts on the table rather than on
+    // the clock: this waits for the session to go, and fails by timing out
     // rather than by racing.
-    let swept = tokio::time::timeout(Duration::from_secs(10), async {
+    let swept = tokio::time::timeout(Duration::from_secs(20), async {
         while !halves.sessions().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

@@ -181,8 +181,9 @@ pub async fn serve(
         };
         let catalogue = catalogue.clone();
         let sessions = Arc::clone(&sessions);
+        let forwarding = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = forward_one(stream, catalogue, sessions).await {
+            if let Err(e) = forward_one(stream, catalogue, sessions, forwarding).await {
                 // At debug: a client that goes away mid-forward is ordinary,
                 // and the interesting refusals are logged where they are made.
                 tracing::debug!("a forwarded connection ended: {e:#}");
@@ -207,6 +208,7 @@ async fn forward_one(
     mut stream: msquic_async::Stream,
     catalogue: Catalogue,
     sessions: Arc<Sessions>,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let open = read_open(&mut stream).await?;
     let service = open.service().to_owned();
@@ -248,7 +250,7 @@ async fn forward_one(
     };
     // From here the stream carries no bytes: it is the session's lifetime
     // handle and the payloads are datagrams.
-    crate::udp::serve(sessions, session, &service, target, stream).await
+    crate::udp::serve(sessions, session, &service, target, stream, shutdown).await
 }
 
 /// One forwarded TCP connection, from the status byte to the last byte copied.

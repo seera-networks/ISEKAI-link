@@ -152,6 +152,22 @@ pub struct Drops {
     /// this protocol does not have, which is worth being able to tell apart
     /// when a forward is misbehaving.
     pub malformed: AtomicU64,
+    /// Datagrams the connection would not take: `Denied`, a lost connection, or
+    /// anything else msquic answers with.
+    ///
+    /// **`Denied` is the one to have a counter for.** It means the peer never
+    /// advertised that it would receive datagrams, so it is not one datagram
+    /// lost — it is every datagram in that direction, on a session that
+    /// answered `Ready`. Without this the forward looks perfect and delivers
+    /// nothing, with `total()` at zero.
+    pub unsent: AtomicU64,
+    /// Datagrams dropped because the connection already has as many sessions
+    /// open as it may.
+    ///
+    /// Not `unknown_session`: that one is ordinary and this one means the
+    /// forward has stopped accepting new sources, which is the difference
+    /// between a summary an operator can skip and one they cannot.
+    pub sessions_full: AtomicU64,
 }
 
 impl Drops {
@@ -162,11 +178,31 @@ impl Drops {
     }
 
     /// Everything lost, however.
+    ///
+    /// **Every field is in here, and adding one means adding it here too.** A
+    /// counter this misses is a loss that reports as no loss at all, which is
+    /// worse than not counting it — `any()` is what a test and an operator both
+    /// ask first.
     pub fn total(&self) -> u64 {
-        self.oversize.load(Ordering::Relaxed)
-            + self.overflow.load(Ordering::Relaxed)
-            + self.unknown_session.load(Ordering::Relaxed)
-            + self.malformed.load(Ordering::Relaxed)
+        let Self {
+            oversize,
+            overflow,
+            unknown_session,
+            malformed,
+            unsent,
+            sessions_full,
+        } = self;
+        [
+            oversize,
+            overflow,
+            unknown_session,
+            malformed,
+            unsent,
+            sessions_full,
+        ]
+        .into_iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .sum()
     }
 }
 
