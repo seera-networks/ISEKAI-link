@@ -198,10 +198,11 @@ pub async fn serve(
                 accepted = listener.accept() => match accepted {
                     Ok(conn) => {
                         let catalogue = catalogue.clone();
+                        let serving = accepting.clone();
                         // One task per peer: a forward that stalls must not
                         // stop the next peer being accepted.
                         tokio::spawn(async move {
-                            if let Err(e) = crate::server::serve(conn, catalogue).await {
+                            if let Err(e) = crate::server::serve(conn, catalogue, serving).await {
                                 tracing::warn!("portal connection ended: {e:#}");
                             }
                         });
@@ -244,6 +245,15 @@ pub struct Connected {
     pub session: InitiatorSession,
     /// The peer connection the forwards run over.
     pub peer: PeerSession,
+    /// Every UDP forward over this connection, and the one task allowed to
+    /// receive its datagrams.
+    ///
+    /// **Owned here rather than by each forward**, because there is one datagram
+    /// queue per connection and a second reader would take datagrams belonging
+    /// to the first ([`crate::udp`]). Pass `Arc::clone` to each
+    /// [`crate::udp::forward`]; do not keep one of your own past
+    /// [`close`](Self::close), which drops this before it waits for msquic.
+    pub sessions: Arc<crate::udp::Sessions>,
     /// Cancelled by [`close`](Self::close) before it waits, so the forwards let
     /// their handles go. Without it the drain has nothing to wait for but a
     /// stream nobody is going to drop.
@@ -268,9 +278,16 @@ impl Connected {
         let Self {
             session,
             peer,
+            sessions,
             shutdown,
         } = self;
         shutdown.cancel();
+        // **Dropped before the wait, not after it.** `Sessions` holds a
+        // `Connection` clone of its own, and the drain below is a wait for
+        // msquic to have no live handles left — one held by a value still in
+        // scope is one that will never be released, and the wait would time out
+        // pointing at msquic rather than at this line.
+        drop(sessions);
         if !peer.drain(DRAIN_TIMEOUT).await {
             tracing::warn!("msquic still had live handles after {DRAIN_TIMEOUT:?}");
         }
@@ -366,9 +383,11 @@ pub async fn connect(
     )
     .await?;
 
+    let sessions = crate::udp::Sessions::start(peer.connection().clone(), shutdown.clone());
     Ok(Connected {
         session,
         peer,
+        sessions,
         shutdown: shutdown.clone(),
     })
 }

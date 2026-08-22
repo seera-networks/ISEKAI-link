@@ -13,7 +13,7 @@
 //!
 //! What is here is the part with no sockets in it, which is also the part the
 //! plan says will bite: the size bound and the queue bound. The sockets, the
-//! session table's lifetime and the idle sweep are 3b.
+//! session table and the idle sweep are [`crate::udp`].
 //!
 //! # Where a session id comes from
 //!
@@ -22,7 +22,7 @@
 //! byte is one the payload does not get.
 //!
 //! So the binding from id to service is made on a stream, not here. A UDP
-//! forward opens one, sends [`crate::frame::write_open`] with the service name
+//! forward opens one, sends [`crate::frame::Open::Udp`] with the service name
 //! and the id the client allocated, and reads a status — after which the stream
 //! is the session's lifetime handle and the datagrams carry the id alone.
 //! Closing it ends the session; an id that arrives without one has no service
@@ -32,8 +32,8 @@
 //! one: the version was agreed on the stream that opened the session, and
 //! paying for it again in every datagram would buy nothing.
 //!
-//! 3b builds that exchange; the shape is settled now because a wire is cheap to
-//! change before it carries anything.
+//! 3b built that exchange as described, which is what the shape being settled
+//! ahead of it was for.
 //!
 //! # Neither bound may be silent
 //!
@@ -131,18 +131,43 @@ pub fn decode(datagram: &Bytes) -> Option<(u32, Bytes)> {
 
 /// What was dropped and why, for the operator.
 ///
-/// Plain atomics rather than methods: the callers in 3b increment the one that
-/// applies, and there is nothing here worth hiding behind a setter. Two of the
-/// three are the plan's; all three exist because the alternative to counting a
-/// drop is a service that loses data silently.
+/// Plain atomics rather than methods: [`crate::udp`] increments the one that
+/// applies, and there is nothing here worth hiding behind a setter. Two of them
+/// are the plan's; the rest exist because the alternative to counting a drop is
+/// a service that loses data silently.
 #[derive(Debug, Default)]
 pub struct Drops {
     /// Payloads that would not fit in one datagram.
     pub oversize: AtomicU64,
     /// Datagrams discarded because a session's queue was full.
     pub overflow: AtomicU64,
-    /// Datagrams for a session that is not in the table.
+    /// Datagrams with nowhere to go: a session that was swept while the peer
+    /// was still sending, which is ordinary; one that was never opened, which
+    /// is not; and whatever was still queued when a session ended.
     pub unknown_session: AtomicU64,
+    /// Datagrams too short to carry a session id.
+    ///
+    /// Separate from `unknown_session` because they mean different things: that
+    /// one is a race with the sweep and this one is a peer sending something
+    /// this protocol does not have, which is worth being able to tell apart
+    /// when a forward is misbehaving.
+    pub malformed: AtomicU64,
+}
+
+impl Drops {
+    /// Whether anything at all was lost, which is the question an operator asks
+    /// first and the only one a zero answers.
+    pub fn any(&self) -> bool {
+        self.total() != 0
+    }
+
+    /// Everything lost, however.
+    pub fn total(&self) -> u64 {
+        self.oversize.load(Ordering::Relaxed)
+            + self.overflow.load(Ordering::Relaxed)
+            + self.unknown_session.load(Ordering::Relaxed)
+            + self.malformed.load(Ordering::Relaxed)
+    }
 }
 
 /// What [`Queue::push`] did.
@@ -240,9 +265,34 @@ impl Queue {
     }
 
     /// End the session: [`pop`](Self::pop) drains what is left and then stops.
+    ///
+    /// For the case where a reader is still there to drain it. When there is
+    /// not, [`abandon`](Self::abandon) is the honest one.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.arrived.notify_waiters();
+    }
+
+    /// [`close`](Self::close) when nobody is left to read, returning how many
+    /// datagrams went with it.
+    ///
+    /// **The difference is whether the loss is counted.** A session's reader is
+    /// gone by the time the session is removed from the table, so anything the
+    /// peer pushed in the moment before that removal is waiting for a reader
+    /// that has already left: `close` alone would leave it to be freed when the
+    /// last `Arc` drops, delivered to nobody and counted by nobody. That is the
+    /// same silent hole `push` returning [`Push::Closed`] exists to prevent,
+    /// one instant earlier.
+    pub fn abandon(&self) -> usize {
+        self.closed.store(true, Ordering::Release);
+        let discarded = {
+            let mut waiting = self.waiting.lock().expect("datagram queue lock poisoned");
+            let discarded = waiting.len();
+            waiting.clear();
+            discarded
+        };
+        self.arrived.notify_waiters();
+        discarded
     }
 }
 
@@ -335,6 +385,25 @@ mod tests {
             "and then it ends, which is how a reader tells a finished session \
              from a quiet one",
         );
+    }
+
+    /// **The other end of the same question `close` answers.** When a reader is
+    /// there, closing must not discard what has arrived; when there is not,
+    /// keeping it would be a loss nobody counts. The two differ only in whether
+    /// anyone is left to drain, so they are two methods and not one guess.
+    #[tokio::test]
+    async fn abandoning_says_how_much_went_with_it() {
+        let queue = Queue::new();
+        queue.push(Bytes::from_static(b"one"));
+        queue.push(Bytes::from_static(b"two"));
+        assert_eq!(queue.abandon(), 2, "and the caller can count them");
+        assert!(queue.pop().await.is_none(), "nothing was kept");
+        assert_eq!(
+            queue.push(Bytes::from_static(b"later")),
+            Push::Closed,
+            "and it is closed, like `close`",
+        );
+        assert_eq!(queue.abandon(), 0, "with nothing left to lose twice");
     }
 
     #[tokio::test]

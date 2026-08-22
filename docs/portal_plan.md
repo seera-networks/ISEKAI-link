@@ -202,13 +202,17 @@ probing", which was not true of the protocol as built.
 **Built in phase 2** as `portal-core::config`. Both ways of missing come back
 through one `Catalogue::look_up`, which is what keeps their answers identical
 rather than leaving two call sites to agree; the operator's log tells them
-apart and the wire does not. `tcp_loopback.rs` asserts the two bytes are the
-same over a real connection, because that is where the property lives.
+apart and the wire does not. `loopback.rs` asserts the two bytes are the same
+over a real connection, because that is where the property lives — in both
+directions since 3b, since a TCP service asked for over UDP is the same miss.
 
-`protocol = "udp"` parses so the format does not change under anyone when phase
-3 lands; until then such a service is refused like any other miss. And `target`
-is an address rather than a name: resolving one would put a DNS answer in
-charge of where traffic goes, which is a different decision from this one.
+**Which protocol is asked for is on the wire as of 3b**, and it has to be: the
+lookup takes the protocol, so before there were two kinds of open the server
+could assume `Tcp` and now it cannot. That is the open frame's kind byte, and
+the reason the version went to 2.
+
+`target` is an address rather than a name: resolving one would put a DNS answer
+in charge of where traffic goes, which is a different decision from this one.
 
 This is the split `agent_access_spec_draft.md` §3.1 argues for, one layer down:
 what is coarse (may these two Endpoints talk, over which protocol) lives in the
@@ -369,7 +373,7 @@ having before anyone asks.
 | **1c-iii-c-ii** | the session both ways, and `portal-server` / `portal-client` | **done** — forwards over a real proxy |
 | **2** | The catalogue, the config file, refusals | **done** — `portal-core::config`; `portal-server --config`. UDP entries parse and are refused until phase 3 |
 | **3a** | UDP's two bounds, with no sockets in them: the wire, the size limit and its arithmetic, the drop-oldest queue, the counters | **done** — `portal-core::datagram` |
-| **3b** | The sockets: a session per (source, service), one UDP socket each, the idle sweep, and the datagram pump both ways | a DNS query whose response fits (see §4.1) answers over the forward |
+| **3b** | The sockets: a session per (source, service), one UDP socket each, the idle sweep, and the datagram pump both ways | **done** — `portal-core::udp`; loopback covers the round trip, two sources not being crossed, a payload at the limit, and the refusal parity. A DNS query over a real proxy is the hardware check (§4.1) |
 | **4** | Direct-path migration and the RTT/path reporting the camera apps have. The client offers a candidate as of 1c-iii-c-ii; what is missing is the listener advertising its leg's binding, which is `camera-core::video::advertise_direct_path` and moves with this | a transfer survives the switch |
 | **5** | Packaging: a CLI that is pleasant (`portal-client --map 5432:db`), logging, `--help` that explains the catalogue | somebody else can use it from the README alone |
 

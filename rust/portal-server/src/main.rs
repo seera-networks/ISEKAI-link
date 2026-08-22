@@ -20,6 +20,13 @@
 //!
 //! The catalogue is that file, and reading it is `portal_core::config`, which
 //! is where the format and the reasoning live.
+//!
+//! # UDP services carry a size limit the file cannot raise
+//!
+//! `protocol = "udp"` is forwarded as of phase 3b, up to about 1200 bytes per
+//! datagram; anything larger is dropped and counted rather than split.
+//! `portal_core::datagram::MAX_PAYLOAD` has the arithmetic and the case to know
+//! about, which is a large DNS response.
 
 use std::path::PathBuf;
 
@@ -28,7 +35,7 @@ use argh::FromArgs;
 use isekai_p2p::{load_or_generate_key, AcceptPolicy, P2pConfig};
 use tokio_util::sync::CancellationToken;
 
-/// Forward local TCP services to authorised peers over ISEKAI link.
+/// Forward local TCP and UDP services to authorised peers over ISEKAI link.
 #[derive(FromArgs)]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera

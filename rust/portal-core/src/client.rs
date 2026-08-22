@@ -1,4 +1,8 @@
 //! The side with the local ports: a TCP accept in, a QUIC stream out.
+//!
+//! The UDP half of the same job is [`crate::udp`], which is a different shape —
+//! sessions rather than connections, and both of its ends in one module for the
+//! reason its header gives.
 
 use std::net::SocketAddr;
 
@@ -6,14 +10,17 @@ use msquic_async::{Connection, StreamType};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::frame::{read_status, write_open, Status};
+use crate::frame::{read_status, write_open, Open, Status};
 
 /// How long to wait for the peer's answer to an open request.
 ///
 /// Longer than the server's own connect deadline, so a target that is merely
 /// slow is reported as unreachable by the side that knows why, rather than as a
 /// timeout by the side that does not.
-const STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+///
+/// Shared with [`crate::udp`]: it is a property of how long the far side may
+/// take to answer, which does not depend on what is being opened.
+pub(crate) const STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Listen on `local` and forward every connection to `service` over `conn`.
 ///
@@ -77,7 +84,13 @@ async fn forward_one(conn: Connection, mut tcp: TcpStream, service: &str) -> any
     let mut stream = conn
         .open_outbound_stream(StreamType::Bidirectional, false)
         .await?;
-    write_open(&mut stream, service).await?;
+    write_open(
+        &mut stream,
+        &Open::Tcp {
+            service: service.to_owned(),
+        },
+    )
+    .await?;
     // Waited for before any application bytes move. A refusal that arrived
     // after the local application had already written would leave it believing
     // it had spoken to the service.

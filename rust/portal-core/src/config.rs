@@ -29,12 +29,22 @@
 //! from this one, and not one to make by accepting a string that happens to
 //! parse either way.
 //!
-//! # UDP parses and is not served yet
+//! # UDP is served as of phase 3b
 //!
-//! `protocol = "udp"` is accepted here so the file format does not change under
-//! anyone when phase 3 lands. Until it does, asking for such a service over a
-//! stream is refused — with the same answer as a name that does not exist, for
-//! the reason [`crate::server::Lookup`] gives.
+//! `protocol = "udp"` was accepted and refused from phase 2, so that the file
+//! format would not change under anyone when phase 3 landed. It has, and it did
+//! not: a file written for phase 2 means today what it meant then, and a
+//! catalogue of nothing but UDP services is now a server with work to do rather
+//! than one that would refuse everything.
+//!
+//! What has not changed is that asking for a service over the protocol it is
+//! *not* offered under is refused, with the same answer as a name that does not
+//! exist — see [`crate::server::Lookup`].
+//!
+//! **One thing the file does not say is how large a datagram may be.** UDP
+//! services are forwarded up to [`crate::datagram::MAX_PAYLOAD`] and anything
+//! over that is dropped, which no entry here can raise; the constant's own
+//! documentation says why, and DNS is the case to know about.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -60,10 +70,6 @@ pub fn parse(text: &str) -> anyhow::Result<Catalogue> {
         "the service catalogue offers nothing; add a [service.<name>] section",
     );
     let mut catalogue = Catalogue::new();
-    // Whether anything in the file can be served today. Decided after the loop
-    // rather than before it, so a file with one bad protocol string is told
-    // about the typo rather than about the consequence of it.
-    let mut any_tcp = false;
     for (name, entry) in file.service {
         let protocol = match entry.protocol.as_str() {
             "tcp" => Protocol::Tcp,
@@ -80,17 +86,10 @@ pub fn parse(text: &str) -> anyhow::Result<Catalogue> {
                 entry.target,
             )
         })?;
-        any_tcp |= protocol == Protocol::Tcp;
         catalogue = catalogue
             .try_with(&name, protocol, target)
             .with_context(|| format!("service `{name}`"))?;
     }
-    anyhow::ensure!(
-        any_tcp,
-        "the service catalogue offers only UDP services, and UDP is not served \
-         until phase 3 of docs/portal_plan.md. As it stands this would register \
-         an Endpoint, open a listener, and refuse every request",
-    );
     Ok(catalogue)
 }
 
@@ -160,6 +159,29 @@ mod tests {
         assert_eq!(catalogue.look_up("nothing", Protocol::Tcp), Lookup::Unknown);
     }
 
+    /// **Phase 2 rejected this file outright**, because a server offering only
+    /// UDP would have registered an Endpoint, opened a listener and refused
+    /// every request. 3b serves them, so the rejection went — and a file written
+    /// under the old rule still means exactly what it meant then.
+    #[test]
+    fn a_catalogue_of_nothing_but_udp_is_a_server_with_work_to_do() {
+        let catalogue = parse(
+            r#"[service.dns]
+               protocol = "udp"
+               target = "10.0.0.1:53""#,
+        )
+        .expect("a UDP-only catalogue is served as of phase 3b");
+        assert_eq!(
+            catalogue.look_up("dns", Protocol::Udp),
+            Lookup::Found("10.0.0.1:53".parse().unwrap()),
+        );
+        assert_eq!(
+            catalogue.look_up("dns", Protocol::Tcp),
+            Lookup::WrongProtocol(Protocol::Udp),
+            "and it is still not reachable over the other protocol",
+        );
+    }
+
     /// A file is written by hand, so every way of getting it wrong is a message
     /// naming the service rather than a panic or a silent omission.
     #[test]
@@ -187,12 +209,6 @@ mod tests {
                    protocol = "tcp"
                    target = "10.0.0.5:5432""#,
                 "srevice",
-            ),
-            (
-                r#"[service.dns]
-                   protocol = "udp"
-                   target = "10.0.0.1:53""#,
-                "only UDP",
             ),
             (
                 r#"[service.db]

@@ -1,14 +1,21 @@
 //! The side with the services: a QUIC stream in, a TCP connection out.
+//!
+//! And since phase 3b, a stream in and a *UDP session* out — the catalogue
+//! lookup and the refusal are the same for both, so they are made here, and
+//! [`crate::udp`] takes it from the status byte onwards.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use msquic_async::Connection;
 use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 
 use tokio::io::AsyncWriteExt as _;
 
-use crate::frame::{read_open, write_status, Status};
+use crate::frame::{read_open, write_status, Open, Status};
+use crate::udp::Sessions;
 
 /// How long to wait for a target to accept before answering `Unreachable`.
 ///
@@ -141,13 +148,30 @@ impl Catalogue {
     }
 }
 
-/// Serve forwarding requests on `conn` until it ends.
+/// Serve forwarding requests on `conn` until it ends or `shutdown` fires.
 ///
-/// Each inbound stream is one forwarded TCP connection and gets its own task,
-/// so a slow target holds up nothing else.
-pub async fn serve(conn: Connection, catalogue: Catalogue) -> anyhow::Result<()> {
+/// Each inbound stream is one forward — a TCP connection or a UDP session — and
+/// gets its own task, so a slow target holds up nothing else.
+///
+/// **`shutdown` is not only tidiness.** The datagram pump and every session task
+/// hold a `Connection` clone, and a registration dropped while any of those is
+/// live blocks in `RegistrationClose` with nothing to say; cancelling is what
+/// lets them go before the wait starts.
+pub async fn serve(
+    conn: Connection,
+    catalogue: Catalogue,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    // One per connection, before the first stream is accepted: msquic-async has
+    // a single datagram queue per connection, so this is the only thing that may
+    // read it. [`crate::udp`] says more.
+    let sessions = Sessions::start(conn.clone(), shutdown.clone());
     loop {
-        let stream = match conn.accept_inbound_stream().await {
+        let accepted = tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            accepted = conn.accept_inbound_stream() => accepted,
+        };
+        let stream = match accepted {
             Ok(stream) => stream,
             // The connection ending is how this loop is meant to finish.
             Err(e) => {
@@ -156,8 +180,9 @@ pub async fn serve(conn: Connection, catalogue: Catalogue) -> anyhow::Result<()>
             }
         };
         let catalogue = catalogue.clone();
+        let sessions = Arc::clone(&sessions);
         tokio::spawn(async move {
-            if let Err(e) = forward_one(stream, catalogue).await {
+            if let Err(e) = forward_one(stream, catalogue, sessions).await {
                 // At debug: a client that goes away mid-forward is ordinary,
                 // and the interesting refusals are logged where they are made.
                 tracing::debug!("a forwarded connection ended: {e:#}");
@@ -172,16 +197,24 @@ pub async fn serve(conn: Connection, catalogue: Catalogue) -> anyhow::Result<()>
 /// that was never finished aborts both directions, so the status can be reset
 /// away and the caller sees "the stream ended before the status" instead of the
 /// refusal the byte exists to carry.
-async fn refuse(mut stream: msquic_async::Stream, status: Status) -> anyhow::Result<()> {
+pub(crate) async fn refuse(mut stream: msquic_async::Stream, status: Status) -> anyhow::Result<()> {
     write_status(&mut stream, status).await?;
     stream.shutdown().await?;
     Ok(())
 }
 
-async fn forward_one(mut stream: msquic_async::Stream, catalogue: Catalogue) -> anyhow::Result<()> {
-    let service = read_open(&mut stream).await?;
-    // A stream is a TCP forward; UDP arrives another way (phase 3).
-    let target = match catalogue.look_up(&service, Protocol::Tcp) {
+async fn forward_one(
+    mut stream: msquic_async::Stream,
+    catalogue: Catalogue,
+    sessions: Arc<Sessions>,
+) -> anyhow::Result<()> {
+    let open = read_open(&mut stream).await?;
+    let service = open.service().to_owned();
+    // **The lookup is protocol-aware and both kinds come through it**, which is
+    // what keeps a UDP service unreachable from a TCP request and the other way
+    // round. Before 3b this argument was the constant `Tcp` because a stream was
+    // the only way to ask for anything; now the request says which.
+    let target = match catalogue.look_up(&service, open.protocol()) {
         Lookup::Found(target) => target,
         // Said here rather than sent: the caller gets one answer for every way
         // of being refused, and the operator gets the name and the reason.
@@ -193,20 +226,37 @@ async fn forward_one(mut stream: msquic_async::Stream, catalogue: Catalogue) -> 
             // which refusal happened. `Debug` on a `&str` escapes it.
             tracing::warn!(
                 ?service,
+                asked_for = %open.protocol(),
                 offered_as = %protocol,
-                "refusing a TCP request for a service offered over another protocol",
+                "refusing a request for a service offered over another protocol",
             );
             return refuse(stream, Status::Refused).await;
         }
         Lookup::Unknown => {
             tracing::warn!(
                 ?service,
+                asked_for = %open.protocol(),
                 "refusing a request for a service that is not offered"
             );
             return refuse(stream, Status::Refused).await;
         }
     };
 
+    let session = match open {
+        Open::Tcp { .. } => return forward_tcp(stream, &service, target).await,
+        Open::Udp { session, .. } => session,
+    };
+    // From here the stream carries no bytes: it is the session's lifetime
+    // handle and the payloads are datagrams.
+    crate::udp::serve(sessions, session, &service, target, stream).await
+}
+
+/// One forwarded TCP connection, from the status byte to the last byte copied.
+async fn forward_tcp(
+    mut stream: msquic_async::Stream,
+    service: &str,
+    target: SocketAddr,
+) -> anyhow::Result<()> {
     let target_stream = match tokio::time::timeout(CONNECT_DEADLINE, TcpStream::connect(target))
         .await
         .unwrap_or_else(|_| {
@@ -219,7 +269,7 @@ async fn forward_one(mut stream: msquic_async::Stream, catalogue: Catalogue) -> 
         Err(e) => {
             // Apart from `Refused` because it says something about the far side
             // rather than about the request, and asking again is reasonable.
-            tracing::warn!(service = %service, %target, "the target did not answer: {e}");
+            tracing::warn!(service, %target, "the target did not answer: {e}");
             return refuse(stream, Status::Unreachable).await;
         }
     };
@@ -232,7 +282,7 @@ async fn forward_one(mut stream: msquic_async::Stream, catalogue: Catalogue) -> 
     let (from_client, to_client) =
         tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await?;
     tracing::debug!(
-        service = %service,
+        service,
         %target,
         from_client,
         to_client,

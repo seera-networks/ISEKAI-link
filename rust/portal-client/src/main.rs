@@ -1,11 +1,12 @@
 //! The side with the local ports.
 //!
-//! Connects to a portal server and maps local TCP ports onto the services it
-//! offers. Phase 1c-iii-c-ii of `docs/portal_plan.md`.
+//! Connects to a portal server and maps local ports onto the services it
+//! offers. Phase 1c-iii-c-ii of `docs/portal_plan.md`, and UDP since 3b.
 //!
 //! ```text
 //! portal-client --auth0-token … --key ep.pem \
-//!               --listener pl_… --capability … --map 5432:db
+//!               --listener pl_… --capability … \
+//!               --map 5432:db --map udp:5353:dns
 //! ```
 //!
 //! **The local ports are this side's own business** (plan §4.3): nothing about
@@ -17,9 +18,11 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use argh::FromArgs;
 use isekai_p2p::{load_or_generate_key, P2pConfig};
+use portal_core::server::Protocol;
 use tokio_util::sync::CancellationToken;
 
-/// Map local TCP ports onto a portal server's services over ISEKAI link.
+/// Map local TCP and UDP ports onto a portal server's services over ISEKAI
+/// link.
 #[derive(FromArgs)]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -64,7 +67,8 @@ struct Args {
     /// the capability the server issued for this Endpoint
     #[argh(option)]
     capability: Option<String>,
-    /// a local port to map onto a service, as `port:name`. Repeatable
+    /// a local port to map onto a service, as `port:name` or
+    /// `udp:port:name`. TCP without the prefix. Repeatable
     #[argh(option)]
     map: Vec<String>,
     /// the address to bind mapped ports on. Loopback by default, because a
@@ -121,16 +125,32 @@ async fn main() -> anyhow::Result<()> {
         .context("connect to the portal server")?;
     println!("connection id: {}", connected.session.connection_id());
 
-    for (local, service) in maps {
-        let forwarding = portal_core::client::forward(
-            connected.peer.connection().clone(),
-            local,
-            service.clone(),
-            shutdown.clone(),
-        )
-        .await
-        .with_context(|| format!("forward {local} to `{service}`"))?;
-        println!("{forwarding} -> {service}");
+    for (protocol, local, service) in maps {
+        let forwarding = match protocol {
+            Protocol::Tcp => {
+                portal_core::client::forward(
+                    connected.peer.connection().clone(),
+                    local,
+                    service.clone(),
+                    shutdown.clone(),
+                )
+                .await
+            }
+            // `Arc::clone` and not a binding kept here: `Connected::close`
+            // drops the last one before it waits for msquic, and one held by
+            // this loop would make that wait time out.
+            Protocol::Udp => {
+                portal_core::udp::forward(
+                    std::sync::Arc::clone(&connected.sessions),
+                    local,
+                    service.clone(),
+                    shutdown.clone(),
+                )
+                .await
+            }
+        }
+        .with_context(|| format!("forward {protocol} {local} to `{service}`"))?;
+        println!("{protocol} {forwarding} -> {service}");
     }
 
     // **Both ways this can end without us**, and watching only one of them is
@@ -167,21 +187,36 @@ async fn closed(conn: &msquic_async::Connection) {
     while std::future::poll_fn(|cx| conn.poll_event(cx)).await.is_ok() {}
 }
 
-/// Parse `port:name` into the local address to bind and the service to ask for.
+/// Parse `port:name` or `udp:port:name` into what to bind and what to ask for.
 ///
 /// The address is assembled rather than formatted and re-parsed, which is what
 /// lets `--bind ::1` work: an IPv6 address needs brackets in a `host:port`
 /// string and does not have them here.
-fn maps(maps: &[String], bind: std::net::IpAddr) -> anyhow::Result<Vec<(SocketAddr, String)>> {
+///
+/// **The protocol has to be said and cannot be inferred.** The server looks a
+/// name up under a protocol, so a `--map` that guessed wrong would be refused
+/// with the same byte as a name that does not exist — a correct catalogue entry
+/// reported as "the peer does not offer it". The prefix is optional only because
+/// TCP is the common case; it is never ambiguous, since `udp` and `tcp` are not
+/// port numbers.
+fn maps(
+    maps: &[String],
+    bind: std::net::IpAddr,
+) -> anyhow::Result<Vec<(Protocol, SocketAddr, String)>> {
     maps.iter()
         .map(|m| {
-            let (port, service) = m
-                .split_once(':')
-                .with_context(|| format!("--map wants `port:service`, got `{m}`"))?;
+            let (protocol, rest) = match m.split_once(':') {
+                Some(("tcp", rest)) => (Protocol::Tcp, rest),
+                Some(("udp", rest)) => (Protocol::Udp, rest),
+                _ => (Protocol::Tcp, m.as_str()),
+            };
+            let (port, service) = rest.split_once(':').with_context(|| {
+                format!("--map wants `port:service` or `udp:port:service`, got `{m}`")
+            })?;
             let port: u16 = port
                 .parse()
-                .with_context(|| format!("`{port}` is not a port"))?;
-            Ok((SocketAddr::new(bind, port), service.to_owned()))
+                .with_context(|| format!("`{port}` is not a port, in --map `{m}`"))?;
+            Ok((protocol, SocketAddr::new(bind, port), service.to_owned()))
         })
         .collect()
 }
