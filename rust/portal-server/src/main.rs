@@ -44,7 +44,9 @@ use tokio_util::sync::CancellationToken;
 #[argh(
     example = "\
 portal-server --auth0-token $TOKEN --key ./portal-server.pem --register \\
-              --config ./portal-server.toml --allow ep:1a2b3c… --capability-ttl 300",
+              --config ./portal-server.toml --pair
+
+portal-server --auth0-token $TOKEN --grants",
     note = "\
 The catalogue (--config), which is the whole of what may be reached:
 
@@ -64,17 +66,18 @@ UDP payloads over about 1200 bytes are dropped rather than split, and counted.
 The case to know is a large DNS response; docs/portal.md has the arithmetic.
 ",
     note = "\
-Getting a peer connected takes one exchange, because the proxy will not let two
-Endpoints talk until a Grant says so:
+The proxy will not let two Endpoints talk until this side has authorised them,
+and there are two ways to do it. They are not alternatives of equal standing.
 
-  1. the peer runs `portal-client --whoami` and tells you its Endpoint ID;
-  2. you pass that to --allow, and this prints a capability;
-  3. you give the peer that capability and the listener id printed here.
+--pair shows a code. Whoever redeems it gets a GRANT, which is reusable, has no
+expiry unless one is set, and -- because a Grant's key does not name a listener
+(spec 8.8) -- keeps working when this server restarts onto a new listener id.
+That is what an installation should run on. Use --grants to see who is in and
+--revoke to take it away.
 
-Both are printed on stdout at startup. **A capability is one-shot and lasts
-300 seconds at most**, so start this with the peer already standing by --
-and a peer that reconnects needs another one, which today means restarting
-(issue #166)."
+--allow issues a CAPABILITY for one Endpoint. It is one-shot and lasts 300
+seconds at most, so it is for letting a guest in once. A peer that reconnects
+on one needs another."
 )]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -125,8 +128,23 @@ struct Args {
     /// print a starter catalogue on stdout and exit
     #[argh(switch)]
     example_config: bool,
-    /// an Endpoint ID to issue a capability for at startup, printed on stdout.
-    /// Repeatable
+    /// show a pairing code and let whoever redeems it in for good. This is
+    /// the one to use: a redeemed code is a Grant, which is reusable and
+    /// survives this server restarting
+    #[argh(switch)]
+    pair: bool,
+    /// how long the pairing code lasts, in seconds. Clamped to 60..=300
+    #[argh(option)]
+    pairing_ttl: Option<u64>,
+    /// print who may reach this Endpoint, and exit
+    #[argh(switch)]
+    grants: bool,
+    /// take a grant away, by the id --grants prints
+    #[argh(option)]
+    revoke: Option<String>,
+    /// an Endpoint ID to issue a one-shot capability for at startup, printed
+    /// on stdout. For letting a guest in once; --pair is what standing access
+    /// wants. Repeatable
     #[argh(option)]
     allow: Vec<String>,
     /// how long an issued capability lasts, in seconds. The proxy clamps this
@@ -219,16 +237,68 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("stand the portal server up")?;
 
-    println!("listener id : {}", server.info.listener_id);
     println!("endpoint id : {}", server.info.endpoint_id);
+    // **The listener id is printed for diagnostics, not for carrying.** A
+    // client on a grant looks the current one up for itself; only the
+    // capability path needs it by hand, and only until the connect it is for.
+    println!("listener id : {}", server.info.listener_id);
+
+    if let Some(grant_id) = &args.revoke {
+        server
+            .revoke_grant(grant_id)
+            .await
+            .with_context(|| format!("revoke {grant_id}"))?;
+        println!("revoked     : {grant_id}");
+    }
+
+    if args.grants {
+        let grants = server.grants().await.context("list grants")?;
+        if grants.is_empty() {
+            println!("\nNobody is paired with this Endpoint.");
+        } else {
+            println!();
+            for grant in &grants {
+                println!(
+                    "grant       : {}  {}  ({}{})",
+                    grant.grant_id,
+                    grant.allowed_endpoint,
+                    grant.origin,
+                    grant
+                        .label
+                        .as_deref()
+                        .map(|l| format!(", {l}"))
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        server.close().await;
+        return Ok(());
+    }
+
+    if args.pair {
+        let code = server
+            .show_pairing_code(args.pairing_ttl)
+            .await
+            .context("mint a pairing code")?;
+        println!("\npairing code: {}", code.code);
+        println!(
+            "  or the URI: {}",
+            isekai_p2p::agent::pairing_uri(&code.code)
+        );
+        println!("  expires at: {}", code.expires_at);
+        println!("\nThe peer runs: portal-client --pair {}", code.code);
+        println!("Once redeemed they can reconnect without asking again, and this");
+        println!("server can restart without breaking it.");
+    }
+
     for endpoint in &args.allow {
         let capability = server
             .issue_capability(endpoint, args.capability_ttl)
             .await
             .with_context(|| format!("issue a capability for {endpoint}"))?;
-        println!("capability  : {capability}   (for {endpoint})");
+        println!("\ncapability  : {capability}   (for {endpoint})");
+        println!("One-shot, and it expires -- give the client this and the listener id now.");
     }
-    println!("\nGive the client the listener id and its capability.");
 
     let mut events = server.signaling.subscribe();
     loop {

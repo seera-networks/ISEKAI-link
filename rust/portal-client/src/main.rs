@@ -30,11 +30,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(FromArgs)]
 #[argh(
     example = "\
-portal-client --key ./portal-client.pem --whoami
+portal-client --auth0-token $TOKEN --pair ABCD-1234
 
-portal-client --auth0-token $TOKEN --key ./portal-client.pem \\
-              --listener pl_1a2b3c… --capability cap_4d5e6f… \\
-              --map 5432:db --map udp:5353:dns",
+portal-client --auth0-token $TOKEN --map 5432:db --map udp:5353:dns",
     note = "\
 --map takes `port:service`, or `udp:port:service` for a UDP one. TCP without
 the prefix. Repeatable, and the port is yours to choose:
@@ -52,17 +50,19 @@ forward reachable from your network is a second door onto the server's
 services.
 ",
     note = "\
-The server's operator has to let you in first, because the proxy will not let
-two Endpoints talk until a Grant says so:
+The server's operator has to let you in first, and there are two ways in.
 
-  1. run --whoami and send them the Endpoint ID it prints;
-  2. they run portal-server --allow <that id>, which prints a capability;
-  3. pass that capability and their listener id to --capability and --listener.
+PAIRING, which is the one to use: they run `portal-server --pair` and read you
+the code; you run `--pair <code>` once. That makes a standing grant, and after
+it every connect needs only --map -- the current listener is looked up for you,
+so the server can restart without breaking anything.
 
---whoami needs nothing but --key, and makes no network call.
+A CAPABILITY, for being let in once: run --whoami, send them the Endpoint ID,
+and they issue one with --allow. Pass it with --capability and --listener. It
+is one-shot and expires in 300 seconds at most, so have the command ready
+before they issue it.
 
-**A capability is one-shot and lasts 300 seconds at most**, so have this
-command ready before they run step 2. Reconnecting needs a fresh one."
+--whoami needs nothing but --key and makes no network call."
 )]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -103,10 +103,25 @@ struct Args {
     /// print this Endpoint's ID and exit -- what the server needs for --allow
     #[argh(switch)]
     whoami: bool,
-    /// the server's listener id, which its operator prints at startup
+    /// redeem a pairing code the server's operator showed, and exit. What it
+    /// makes is a standing grant: after this, connecting needs neither
+    /// --listener nor --capability, and survives the server restarting
+    #[argh(option)]
+    pair: Option<String>,
+    /// a name for this device, recorded with the grant so the operator can see
+    /// what they let in
+    #[argh(option)]
+    label: Option<String>,
+    /// which paired server to connect to, by its Endpoint ID. Only needed when
+    /// paired with more than one
+    #[argh(option)]
+    peer: Option<String>,
+    /// the server's listener id. Only for the one-shot --capability path; a
+    /// grant finds the current listener itself
     #[argh(option)]
     listener: Option<String>,
-    /// the capability the server issued for this Endpoint -- see --whoami
+    /// a one-shot capability the server issued for this Endpoint. --pair is
+    /// what standing access wants
     #[argh(option)]
     capability: Option<String>,
     /// a local port to map onto a service, as `port:name` or
@@ -161,34 +176,49 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Some(code) = &args.pair {
+        let cfg = config(&args, key)?;
+        let code = isekai_p2p::agent::pairing_code_from_input(code);
+        let directory = isekai_p2p::PeerDirectory::open(&cfg)
+            .await
+            .context("open the proxy control plane")?;
+        let grant = directory
+            .pair(&code, args.label.as_deref())
+            .await
+            .context("redeem the pairing code")?;
+        println!("paired with : {}", grant.owner_endpoint);
+        println!("grant       : {}", grant.grant_id);
+        println!("\nConnect with --map alone; the listener is found for you.");
+        return Ok(());
+    }
+
     let maps = maps(&args.map, args.bind)?;
     if maps.is_empty() {
         anyhow::bail!("nothing to forward; pass at least one --map port:service");
     }
-    let listener = args
-        .listener
-        .clone()
-        .context("--listener is required (the server prints it)")?;
-    let capability = args
-        .capability
-        .clone()
-        .context("--capability is required (the server issues it for this Endpoint)")?;
-
-    let cfg = P2pConfig {
-        identity_url: args.identity_url,
-        identity_http3: args.identity_http3,
-        proxy_url: args.proxy_url,
-        auth0_token: args.auth0_token.context("--auth0-token is required")?,
-        auth0: None,
-        protocol: args.protocol,
-        register: args.register,
-        device_name: args.device_name,
-        token_ttl: None,
-        key,
+    // **A grant unless a capability was handed over.** The two are not
+    // alternatives of equal standing: a grant is what an installation should be
+    // running on, and the capability path is for the guest who was let in once.
+    let reach = match (&args.capability, &args.listener) {
+        (Some(capability), Some(listener_id)) => portal_core::session::Reach::Capability {
+            capability,
+            listener_id,
+        },
+        (Some(_), None) => {
+            anyhow::bail!("--capability needs --listener, which names the one it is for")
+        }
+        (None, Some(_)) => anyhow::bail!(
+            "--listener is only for the --capability path. On a grant the current listener \
+             is found for you -- drop it, or add --capability"
+        ),
+        (None, None) => portal_core::session::Reach::Grant {
+            peer: args.peer.as_deref(),
+        },
     };
 
+    let cfg = config(&args, key)?;
     let shutdown = CancellationToken::new();
-    let connected = portal_core::session::connect(&cfg, &capability, &listener, &shutdown)
+    let connected = portal_core::session::connect(&cfg, reach, &shutdown)
         .await
         .context("connect to the portal server")?;
     println!("connection id: {}", connected.session.connection_id());
@@ -250,6 +280,28 @@ async fn main() -> anyhow::Result<()> {
     }
     connected.close().await;
     Ok(())
+}
+
+/// The P2P configuration these arguments describe.
+///
+/// Built in one place because three paths need it — pairing, a grant connect
+/// and a capability connect — and only the last of those used to exist.
+fn config(args: &Args, key: isekai_p2p::agent::EndpointKey) -> anyhow::Result<P2pConfig> {
+    Ok(P2pConfig {
+        identity_url: args.identity_url.clone(),
+        identity_http3: args.identity_http3,
+        proxy_url: args.proxy_url.clone(),
+        auth0_token: args
+            .auth0_token
+            .clone()
+            .context("--auth0-token is required")?,
+        auth0: None,
+        protocol: args.protocol.clone(),
+        register: args.register,
+        device_name: args.device_name.clone(),
+        token_ttl: None,
+        key,
+    })
 }
 
 /// Parse `port:name` or `udp:port:name` into what to bind and what to ask for.

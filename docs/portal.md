@@ -96,71 +96,59 @@ in charge of where forwarded traffic goes.
 The file is read before anything touches the network, so a typo costs you a
 message naming the service rather than a half-started server.
 
-## 2. Get the peer's Endpoint ID
+## 2. Start the server and show a pairing code
 
-**Before starting the server**, because who may connect is decided at startup.
+```sh
+portal-server --auth0-token "$TOKEN" --register --pair
+```
+
+```
+endpoint id : ep:9z8y7x…
+listener id : pl_1a2b3c…
+
+pairing code: K7QM-3XPD
+  or the URI: isekai://pair?code=K7QM-3XPD
+  expires at: 2026-08-22T07:31:04Z
+
+The peer runs: portal-client --pair K7QM-3XPD
+```
+
+Read the code to whoever should be let in. It lasts five minutes and can be
+redeemed once; asking again replaces it, so an unused code is not something you
+have to clean up.
+
+`--register` is only needed the first time, when the key is new. Keep
+`portal-server.pem`: a new key is a new Endpoint ID, and every grant made
+against the old one stops applying.
+
+## 3. Redeem it, once
+
 On the client machine:
 
 ```sh
-portal-client --whoami
-ep:4d5e6f…
-```
-
-That generates `portal-client.pem` if it does not exist and prints the Endpoint
-ID it holds. It makes no network call. Send the ID to the server's operator.
-
-Keep that key: a new one is a new Endpoint ID, and the capability you are about
-to be issued stops meaning anything.
-
-## 3. Start the server, letting that peer in
-
-**Have the peer ready to run step 4 before you start this**, for a reason worth
-reading first: a capability is **one-shot and lasts five minutes at most** — the
-proxy clamps `--capability-ttl` to 30..=300 seconds and defaults to 30. It is
-not a credential you hand over at leisure.
-
-```sh
-portal-server --auth0-token "$TOKEN" --register \
-              --allow ep:4d5e6f… --capability-ttl 300
+portal-client --auth0-token "$TOKEN" --register --pair K7QM-3XPD
 ```
 
 ```
-listener id : pl_1a2b3c…
-endpoint id : ep:9z8y7x…
-capability  : cap_7g8h9i…   (for ep:4d5e6f…)
+paired with : ep:9z8y7x…
+grant       : g_5f6a7b…
 
-Give the client the listener id and its capability.
+Connect with --map alone; the listener is found for you.
 ```
 
-The proxy will not let two Endpoints talk until a **Grant** says so, and only
-this side can ask for one — that is what `--allow` does. Send the peer the
-capability **and** the listener id, now.
+**That is the last time either side has to carry anything.** What pairing makes
+is a *Grant*, and a Grant's key is `(server Endpoint, your Endpoint, protocol)`
+with no listener in it — so it is reusable, it has no expiry unless one is set,
+and it keeps working when the server restarts onto a new listener id. The client
+asks the proxy which listener that Endpoint has now, every time it connects.
 
-`--register` is only needed the first time, when the key is new. Keep
-`portal-server.pem` for the same reason as above.
-
-**This is the roughest edge portal has**, and it is worth knowing before you
-plan around it:
-
-- a capability is spent by the connection that uses it, so a client that
-  reconnects needs a **new** one;
-- `--allow` is a startup flag, so a new capability means **restarting the
-  server**;
-- restarting creates a new Peer Listener, so the **listener id changes** and
-  every peer has to be told the new one.
-
-The Endpoint ID survives a restart; the listener id does not, which is why it
-is the one that has to be re-sent. Issuing a capability to a running server is [#166](https://github.com/seera-networks/ISEKAI-link/issues/166),
-and it is the thing to fix first.
+`--register` on the first run only: the key was generated here and the Identity
+API has not seen it yet.
 
 ## 4. Forward a port
 
 ```sh
-portal-client --auth0-token "$TOKEN" --register \
-              --listener pl_1a2b3c… \
-              --capability cap_7g8h9i… \
-              --map 5432:db \
-              --map udp:5353:dns
+portal-client --auth0-token "$TOKEN" --map 5432:db --map udp:5353:dns
 ```
 
 ```
@@ -169,9 +157,9 @@ tcp 127.0.0.1:5432 -> db
 udp 127.0.0.1:5353 -> dns
 ```
 
-`--register` on the first run only: `--whoami` generated the key but did not
-register the Endpoint, and a token cannot be issued for one the Identity API has
-never seen. Leave it off afterwards.
+No listener id, no capability, and the same command works tomorrow and after the
+server has been restarted. Paired with more than one server, add
+`--peer ep:9z8y7x…`; the client says so, and lists them, if it needs telling.
 
 And then, from anything on that machine:
 
@@ -196,8 +184,8 @@ which is a second door onto the server's services — do it deliberately.
 ## What this does not do
 
 **It does not authenticate the service.** The forward carries whatever the
-service speaks. If that is a database with no password, then anyone you issue a
-capability to has a database with no password — a tunnel makes the *transport*
+service speaks. If that is a database with no password, then anyone you pair
+with has a database with no password — a tunnel makes the *transport*
 private, and says nothing about what is at the end of it. Put the same
 authentication on a forwarded service that you would put on an exposed one.
 
@@ -213,7 +201,44 @@ over TCP. Ordinary queries are well under it. A resolver configured for a
 smaller buffer is fine.
 
 **One peer at a time per client.** The session model supports more; the
-command line does not, yet.
+command line does not, yet. `--peer` chooses which of several paired servers to
+connect to, not how many at once.
+
+---
+
+## Letting somebody in just once
+
+Pairing is standing access. For a guest — someone who should reach a service
+today and not next week — there is a capability instead:
+
+```sh
+portal-client --whoami                     # they send you this Endpoint ID
+portal-server --auth0-token "$TOKEN" --allow ep:4d5e6f… --capability-ttl 300
+portal-client --auth0-token "$TOKEN" \
+              --listener pl_1a2b3c… --capability cap_7g8h9i… --map 5432:db
+```
+
+**It is one-shot and lasts 300 seconds at most**, so the peer has to be at the
+keyboard. That is the point of it rather than a limitation: what you are handing
+over is one connection, not a way back in.
+
+## Taking access away
+
+```sh
+portal-server --auth0-token "$TOKEN" --grants
+```
+
+```
+grant       : g_5f6a7b…  ep:4d5e6f…  (pairing, masa's laptop)
+```
+
+```sh
+portal-server --auth0-token "$TOKEN" --revoke g_5f6a7b…
+```
+
+A grant stands until revoked, so this is the counterpart of pairing and not an
+afterthought. Grants belong to the Endpoint rather than to a listener, so they
+survive restarts — which means nothing expires them by accident either.
 
 ---
 
@@ -234,9 +259,9 @@ connection counters and which path they are about.
 | `capability-endpoint-mismatch` | the capability was issued for a different Endpoint. Usually a second key: `--key` defaults to `portal-client.pem` in the working directory, so running from another directory makes a new Endpoint. The client says `generating a new Endpoint key` when it does |
 | nothing below `error` in the log | you are on a build before this was fixed — `RUST_LOG=info` |
 
-**A capability is one-shot and short-lived.** `cap_…`, 30 seconds by default and
-300 at most. If the client is not run within that window, or is run a second
-time, the server has to issue another — see step 3.
+**`capability-endpoint-mismatch` on the capability path**: it was issued for a
+different Endpoint, or it has already been used. A capability is one-shot and
+lasts 300 seconds at most. On the pairing path this cannot happen.
 
 ---
 

@@ -4,7 +4,9 @@
 //! as of phase 3b ([`udp`]).
 //!
 //! [`session`] opens the P2P session both ways as of phase 1c-iii-c-ii, so
-//! `portal-server` and `portal-client` reach each other over a proxy.
+//! `portal-server` and `portal-client` reach each other over a proxy — on a
+//! Grant from pairing since phase 6 ([`session::Reach`]), which is what lets a
+//! client reconnect, and outlive the server restarting, without the operator.
 //!
 //! ```text
 //!   client                                   server
