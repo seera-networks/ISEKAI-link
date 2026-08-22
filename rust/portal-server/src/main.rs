@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 #[argh(
     example = "\
 portal-server --auth0-token $TOKEN --key ./portal-server.pem --register \\
-              --config ./portal-server.toml --allow ep_1a2b3c...",
+              --config ./portal-server.toml --allow ep:1a2b3c… --capability-ttl 300",
     note = "\
 The catalogue (--config), which is the whole of what may be reached:
 
@@ -71,7 +71,10 @@ Endpoints talk until a Grant says so:
   2. you pass that to --allow, and this prints a capability;
   3. you give the peer that capability and the listener id printed here.
 
-Both are printed on stdout at startup."
+Both are printed on stdout at startup. **A capability is one-shot and lasts
+300 seconds at most**, so start this with the peer already standing by --
+and a peer that reconnects needs another one, which today means restarting
+(issue #166)."
 )]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -126,23 +129,34 @@ struct Args {
     /// Repeatable
     #[argh(option)]
     allow: Vec<String>,
-    /// how long an issued capability lasts, in seconds
+    /// how long an issued capability lasts, in seconds. The proxy clamps this
+    /// to 30..=300 and defaults to 30, which is not long enough to send one to
+    /// a person -- pass 300 unless the peer is already waiting
     #[argh(option)]
     capability_ttl: Option<u64>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // **`info` when `RUST_LOG` says nothing**, which is not a default so much as
-    // a fix: `from_default_env()` on an unset variable builds a filter that
-    // passes nothing, so every `warn!` in the forwarding — a service refused, a
-    // target that will not answer, a datagram too large — went nowhere unless
-    // the operator already knew to ask. A tool whose failures are silent until
-    // you set an environment variable is not one somebody else can use.
+    // **stderr, and `info` unless `RUST_LOG` says otherwise.**
+    //
+    // Two fixes in one. `fmt()` writes to *stdout* by default, which puts log
+    // lines in among the ids this program prints for the operator to copy —
+    // every other binary in this workspace sets stderr and this one did not.
+    //
+    // And `from_default_env()` defaults to `ERROR`, so `warn!` and below were
+    // dropped: a service refused, a target that would not answer, a datagram
+    // too large to send. `from_env_lossy` rather than `try_from_default_env`
+    // keeps the old leniency — one bad directive in `RUST_LOG` skips that
+    // directive rather than throwing the whole variable away, which matters
+    // because reaching for `RUST_LOG` is what somebody does when confused
+    // already.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                .from_env_lossy(),
         )
         .init();
     let args: Args = argh::from_env();
@@ -168,6 +182,15 @@ async fn main() -> anyhow::Result<()> {
         path.set_file_name(format!("{stem}-portal-cert.pem"));
         path
     });
+
+    // **Said out loud, because a generated key looks exactly like a loaded one
+    // until it fails.** `--key` has a default, so running from a different
+    // directory than last time silently makes a *second* Endpoint — and the
+    // failure is `capability-endpoint-mismatch` from the proxy, several steps
+    // later, naming nothing that points back here.
+    if !args.key.exists() {
+        tracing::info!(path = %args.key.display(), "generating a new Endpoint key");
+    }
 
     let cfg = P2pConfig {
         identity_url: args.identity_url,

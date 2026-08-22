@@ -57,11 +57,18 @@ use crate::server::{Catalogue, Protocol};
 
 /// A catalogue to start from, which `portal-server --example-config` prints.
 ///
-/// **A file that would be refused if it were used unchanged**, deliberately:
-/// both targets are addresses nothing is listening on, so somebody who runs it
-/// as-is gets `Unreachable` and a log line naming the service rather than a
-/// forward that appears to work. The commentary is the half of the format that
-/// a schema cannot carry — what may be reached is decided here and only here.
+/// **The targets are RFC 5737 documentation addresses**, and that is the
+/// security-relevant part of this constant rather than a stylistic one. This is
+/// a file people copy and edit, and an example left in among their own entries
+/// is an entry they did not mean to offer. `10.0.0.1:53` reads as a plausible
+/// placeholder and is the commonest LAN gateway there is — on exactly the
+/// networks portal is pointed at — so leaving it in would quietly publish the
+/// operator's own resolver, and it would *work*, which is what makes it worse
+/// than a typo. `192.0.2.0/24` is routed nowhere by definition, so the same
+/// mistake costs an `Unreachable` and a log line naming the service.
+///
+/// The commentary is the half of the format that a schema cannot carry — what
+/// may be reached is decided here and only here.
 pub const EXAMPLE: &str = r#"# What this portal server offers, and nothing else.
 #
 # A peer asks for a service by NAME. The target below never crosses the wire, so
@@ -76,15 +83,19 @@ pub const EXAMPLE: &str = r#"# What this portal server offers, and nothing else.
 # plaintext to the peer that reached it -- a tunnel does not authenticate the
 # service at the far end of it.
 
+# The addresses below are RFC 5737 documentation addresses, routed nowhere.
+# Replace them: an example left in among your own entries is a service you did
+# not mean to offer.
+
 [service.db]
 protocol = "tcp"
-target   = "10.0.0.5:5432"
+target   = "192.0.2.10:5432"
 
 # UDP is forwarded up to about 1200 bytes per datagram; anything larger is
 # dropped and counted rather than split. A large DNS response can exceed it.
 [service.dns]
 protocol = "udp"
-target   = "10.0.0.1:53"
+target   = "192.0.2.1:53"
 "#;
 
 /// Read the catalogue from `path`.
@@ -201,11 +212,12 @@ mod tests {
         let catalogue = parse(EXAMPLE).expect("--example-config must produce a file that loads");
         assert_eq!(
             catalogue.look_up("db", Protocol::Tcp),
-            Lookup::Found("10.0.0.5:5432".parse().unwrap()),
+            Lookup::Found("192.0.2.10:5432".parse().unwrap()),
         );
         assert_eq!(
             catalogue.look_up("dns", Protocol::Udp),
-            Lookup::Found("10.0.0.1:53".parse().unwrap()),
+            Lookup::Found("192.0.2.1:53".parse().unwrap()),
+            "and the targets stay inside RFC 5737, for the reason `EXAMPLE` gives",
         );
     }
 

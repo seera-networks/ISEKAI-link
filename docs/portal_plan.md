@@ -378,7 +378,7 @@ having before anyone asks.
 | | **The advertisement moved to `isekai_p2p::direct_path`** — both halves of it, since neither is any use alone. What portal does *with* a path is `portal-core::path`, and it differs from the camera's: no button to wait for, so it prefers as soon as `PathAdded` names one, and `PathRemoved` rather than a byte watchdog is what sends it back (the camera's counts frames; a connection-level counter cannot see a dead preferred path under multipath) | **done** — the switch happens on hardware over a real proxy, correctly, ~276µs after validation. The row's own criterion is **not** met and is #165: see below |
 | | **"A transfer survives the switch" turns out to be the wrong shape for portal**, which is why it is an issue rather than a checkbox. The switch lands within a millisecond of connect, before a forward can be started, so an ordinary forward runs entirely on the direct path and never crosses one. What is left untested is the *other* direction — a live transfer when the direct path dies (`PathRemoved`) or the peer declares it backup — and neither can be provoked to order | #165 |
 | **5** | Packaging: a CLI that is pleasant (`portal-client --map 5432:db`), logging, `--help` that explains the catalogue | somebody else can use it from the README alone |
-| | **done** — `docs/portal.md`, linked from the top-level README. `--help` carries the catalogue format and the exchange that gets a peer connected; `--example-config` writes a starter file that `config`'s own tests parse. Both binaries default `--key`, `--config` and the log filter, the last of which was the real defect: `EnvFilter::from_default_env()` with `RUST_LOG` unset passes **nothing**, so every warning in the forwarding went nowhere | writing the page found two things the page could not paper over: #166 and #167 |
+| | **done** — `docs/portal.md`, linked from the top-level README. `--help` carries the catalogue format and the exchange that gets a peer connected; `--example-config` writes a starter file that `config`'s own tests parse. Both binaries default `--key`, `--config` and the log filter, the last of which was the real defect: `from_default_env()` defaults to `ERROR`, so every `warn!` in the forwarding went nowhere — and `fmt()` writes to stdout, in among the ids the operator is meant to copy | writing the page found two things the page could not paper over: #166 and #167 |
 
 Mobile (FFI) is deliberately last and not scheduled: the desktop shape has to
 settle first, and a phone is a strange place to terminate a database connection.
@@ -467,7 +467,7 @@ portal-server --auth0-token … --key server.pem --register \
               --allow ep:40d25d…
 listener id : pl_…
 endpoint id : ep:…
-capability  : eyJ…   (for ep:40d25d…)
+capability  : cap_…   (for ep:40d25d…)
 ```
 
 **The client connects and maps local ports.** `--map` is `port:service`, and
@@ -475,7 +475,7 @@ nothing about it reaches the server:
 
 ```
 portal-client --auth0-token … --key client.pem --register \
-              --listener pl_… --capability eyJ… --map 5432:db
+              --listener pl_… --capability cap_… --map 5432:db
 connection id: …
 127.0.0.1:5432 -> db
 ```

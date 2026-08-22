@@ -114,35 +114,51 @@ to be issued stops meaning anything.
 
 ## 3. Start the server, letting that peer in
 
+**Have the peer ready to run step 4 before you start this**, for a reason worth
+reading first: a capability is **one-shot and lasts five minutes at most** — the
+proxy clamps `--capability-ttl` to 30..=300 seconds and defaults to 30. It is
+not a credential you hand over at leisure.
+
 ```sh
-portal-server --auth0-token "$TOKEN" --register --allow ep:4d5e6f…
+portal-server --auth0-token "$TOKEN" --register \
+              --allow ep:4d5e6f… --capability-ttl 300
 ```
 
 ```
 listener id : pl_1a2b3c…
 endpoint id : ep:9z8y7x…
-capability  : eyJhbGciOi…   (for ep:4d5e6f…)
+capability  : cap_7g8h9i…   (for ep:4d5e6f…)
 
 Give the client the listener id and its capability.
 ```
 
 The proxy will not let two Endpoints talk until a **Grant** says so, and only
 this side can ask for one — that is what `--allow` does. Send the peer the
-capability **and** the listener id.
+capability **and** the listener id, now.
 
 `--register` is only needed the first time, when the key is new. Keep
 `portal-server.pem` for the same reason as above.
 
-**Letting another peer in means restarting with a second `--allow`**, and the
-listener id changes when you do, so everyone already connected has to be told
-the new one. Issuing a capability to a running server is #166.
+**This is the roughest edge portal has**, and it is worth knowing before you
+plan around it:
+
+- a capability is spent by the connection that uses it, so a client that
+  reconnects needs a **new** one;
+- `--allow` is a startup flag, so a new capability means **restarting the
+  server**;
+- restarting creates a new Peer Listener, so the **listener id changes** and
+  every peer has to be told the new one.
+
+The Endpoint ID survives a restart; the listener id does not, which is why it
+is the one that has to be re-sent. Issuing a capability to a running server is [#166](https://github.com/seera-networks/ISEKAI-link/issues/166),
+and it is the thing to fix first.
 
 ## 4. Forward a port
 
 ```sh
 portal-client --auth0-token "$TOKEN" --register \
               --listener pl_1a2b3c… \
-              --capability eyJhbGciOi… \
+              --capability cap_7g8h9i… \
               --map 5432:db \
               --map udp:5353:dns
 ```
@@ -203,8 +219,9 @@ command line does not, yet.
 
 ## When it does not work
 
-Both programs log to stderr at `info`. `RUST_LOG=debug` gets the rest, including
-the per-second connection counters and which path they are about.
+Both programs log to **stderr** at `info`, so the ids they print on stdout stay
+copy-pasteable. `RUST_LOG=debug` gets the rest, including the per-second
+connection counters and which path they are about.
 
 | what you see | what it means |
 | --- | --- |
@@ -214,10 +231,12 @@ the per-second connection counters and which path they are about.
 | `no relay leg claims this connection` | a connection arrived that no leg accounts for. It works, over the relay only |
 | forwarding works but stays slow | check for `forwarding moved onto the direct path`. Without it you are on the relay, which is a round trip through someone else's machine |
 | a DNS query times out and small ones work | the response is over the size limit above |
-| nothing at all in the log | you are on a build before this was fixed — `RUST_LOG=info` |
+| `capability-endpoint-mismatch` | the capability was issued for a different Endpoint. Usually a second key: `--key` defaults to `portal-client.pem` in the working directory, so running from another directory makes a new Endpoint. The client says `generating a new Endpoint key` when it does |
+| nothing below `error` in the log | you are on a build before this was fixed — `RUST_LOG=info` |
 
-**A capability expires.** `--capability-ttl` sets how long; when it lapses the
-client cannot connect and the server must issue another.
+**A capability is one-shot and short-lived.** `cap_…`, 30 seconds by default and
+300 at most. If the client is not run within that window, or is run a second
+time, the server has to issue another — see step 3.
 
 ---
 

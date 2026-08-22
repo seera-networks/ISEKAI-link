@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 portal-client --key ./portal-client.pem --whoami
 
 portal-client --auth0-token $TOKEN --key ./portal-client.pem \\
-              --listener pl_1a2b3c... --capability cap_4d5e6f... \\
+              --listener pl_1a2b3c… --capability cap_4d5e6f… \\
               --map 5432:db --map udp:5353:dns",
     note = "\
 --map takes `port:service`, or `udp:port:service` for a UDP one. TCP without
@@ -59,7 +59,10 @@ two Endpoints talk until a Grant says so:
   2. they run portal-server --allow <that id>, which prints a capability;
   3. pass that capability and their listener id to --capability and --listener.
 
---whoami needs nothing but --key, and makes no network call."
+--whoami needs nothing but --key, and makes no network call.
+
+**A capability is one-shot and lasts 300 seconds at most**, so have this
+command ready before they run step 2. Reconnecting needs a fresh one."
 )]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -119,20 +122,37 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // **`info` when `RUST_LOG` says nothing**, which is not a default so much as
-    // a fix: `from_default_env()` on an unset variable builds a filter that
-    // passes nothing, so every `warn!` in the forwarding — a service refused, a
-    // target that will not answer, a datagram too large — went nowhere unless
-    // the operator already knew to ask. A tool whose failures are silent until
-    // you set an environment variable is not one somebody else can use.
+    // **stderr, and `info` unless `RUST_LOG` says otherwise.**
+    //
+    // Two fixes in one. `fmt()` writes to *stdout* by default, which puts log
+    // lines in among the ids this program prints for the operator to copy —
+    // every other binary in this workspace sets stderr and this one did not.
+    //
+    // And `from_default_env()` defaults to `ERROR`, so `warn!` and below were
+    // dropped: a service refused, a target that would not answer, a datagram
+    // too large to send. `from_env_lossy` rather than `try_from_default_env`
+    // keeps the old leniency — one bad directive in `RUST_LOG` skips that
+    // directive rather than throwing the whole variable away, which matters
+    // because reaching for `RUST_LOG` is what somebody does when confused
+    // already.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                .from_env_lossy(),
         )
         .init();
     let args: Args = argh::from_env();
 
+    // **Said out loud, because a generated key looks exactly like a loaded one
+    // until it fails.** `--key` has a default, so running from a different
+    // directory than last time silently makes a *second* Endpoint — and the
+    // failure is `capability-endpoint-mismatch` from the proxy, several steps
+    // later, naming nothing that points back here.
+    if !args.key.exists() {
+        tracing::info!(path = %args.key.display(), "generating a new Endpoint key");
+    }
     let key = load_or_generate_key(&args.key)?;
     if args.whoami {
         // Before any network call: this is what the operator needs in order to
