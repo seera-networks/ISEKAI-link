@@ -30,9 +30,19 @@ use tokio_util::sync::CancellationToken;
 #[derive(FromArgs)]
 #[argh(
     example = "\
-portal-client --auth0-token $TOKEN --pair ABCD-1234
+portal-client --login
 
-portal-client --auth0-token $TOKEN --map 5432:db --map udp:5353:dns",
+portal-client --pair ABCD-1234
+
+portal-client --map 5432:db --map udp:5353:dns",
+    note = "\
+Sign in once with --login. It runs the Auth0 device flow -- a code and a URL to
+open -- and saves tokens beside the Endpoint key that refresh from then on, so
+nothing else here needs a token.
+
+--auth0-token still works and cannot be refreshed: when it expires the session
+ends a few minutes later, mid-forward.
+",
     note = "\
 --map takes `port:service`, or `udp:port:service` for a UDP one. TCP without
 the prefix. Repeatable, and the port is yours to choose:
@@ -81,10 +91,20 @@ struct Args {
         default = "String::from(\"https://tokyo.link.isekai.tools:8443\")"
     )]
     proxy_url: String,
-    /// auth0 access token, used only to obtain the Endpoint Token. Not needed
-    /// with --whoami
+    /// auth0 access token, used only to obtain the Endpoint Token. Cannot be
+    /// refreshed -- `--login` is the way to stay signed in. Not needed with
+    /// --whoami
     #[argh(option)]
     auth0_token: Option<String>,
+    /// sign in to Auth0 once, saving tokens that refresh from then on, and
+    /// exit. This is what lets a server be left running: an --auth0-token
+    /// expires and takes the session with it
+    #[argh(switch)]
+    login: bool,
+    /// where the saved sign-in lives. Defaults to the Endpoint key's name with
+    /// `-auth0.json` in place of its extension
+    #[argh(option)]
+    auth0_tokens: Option<PathBuf>,
     /// P2P protocol string
     #[argh(option, default = "String::from(\"isekai-portal-v1\")")]
     protocol: String,
@@ -194,8 +214,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let tokens = args
+        .auth0_tokens
+        .clone()
+        .unwrap_or_else(|| portal_core::login::tokens_beside(&args.key));
+    if args.login {
+        return portal_core::login::sign_in(&tokens).await;
+    }
+
     if let Some(code) = &args.pair {
-        return redeem(&args, key, code).await;
+        return redeem(&args, &tokens, key, code).await;
     }
 
     let maps = maps(&args.map, args.bind)?;
@@ -222,7 +250,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         },
     };
 
-    let cfg = config(&args, key)?;
+    let cfg = config(&args, &tokens, key).await?;
     let shutdown = CancellationToken::new();
     let connected = portal_core::session::connect(&cfg, reach, &shutdown)
         .await
@@ -291,10 +319,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
 /// Redeem a pairing code, and say what it paired with.
 async fn redeem(
     args: &Args,
+    tokens: &std::path::Path,
     key: isekai_p2p::agent::EndpointKey,
     code: &str,
 ) -> anyhow::Result<()> {
-    let cfg = config(args, key)?;
+    let cfg = config(args, tokens, key).await?;
     // Whatever was scanned, pasted or typed: a URI from a QR, or the eight
     // characters with or without their dash.
     let code = isekai_p2p::agent::pairing_code_from_input(code);
@@ -315,16 +344,21 @@ async fn redeem(
 ///
 /// Built in one place because three paths need it — pairing, a grant connect
 /// and a capability connect — and only the last of those used to exist.
-fn config(args: &Args, key: isekai_p2p::agent::EndpointKey) -> anyhow::Result<P2pConfig> {
+async fn config(
+    args: &Args,
+    tokens: &std::path::Path,
+    key: isekai_p2p::agent::EndpointKey,
+) -> anyhow::Result<P2pConfig> {
+    let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
     Ok(P2pConfig {
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
-        auth0_token: args
-            .auth0_token
-            .clone()
-            .context("--auth0-token is required")?,
-        auth0: None,
+        auth0_token: auth.token,
+        // **The whole point.** The Endpoint Token renewal runs every few
+        // minutes for the life of the session and needs a current Auth0 token
+        // each time; without this it reuses one that expires.
+        auth0: auth.source,
         protocol: args.protocol.clone(),
         register: args.register,
         device_name: args.device_name.clone(),

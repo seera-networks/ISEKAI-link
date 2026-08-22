@@ -43,10 +43,21 @@ use tokio_util::sync::CancellationToken;
 #[derive(FromArgs)]
 #[argh(
     example = "\
-portal-server --auth0-token $TOKEN --key ./portal-server.pem --register \\
+portal-server --login
+
+portal-server --key ./portal-server.pem --register \\
               --config ./portal-server.toml --pair
 
-portal-server --auth0-token $TOKEN --grants",
+portal-server --grants",
+    note = "\
+Sign in once with --login. It runs the Auth0 device flow -- a code and a URL to
+open -- and saves tokens beside the Endpoint key that refresh from then on, so
+nothing else here needs a token.
+
+--auth0-token still works and cannot be refreshed: when it expires the Endpoint
+Token renewal stops being authorised and the session ends a few minutes later.
+For a server meant to be left running that is the thing --login exists to fix.
+",
     note = "\
 The catalogue (--config), which is the whole of what may be reached:
 
@@ -96,10 +107,20 @@ struct Args {
         default = "String::from(\"https://tokyo.link.isekai.tools:8443\")"
     )]
     proxy_url: String,
-    /// auth0 access token, used only to obtain the Endpoint Token. Not needed
-    /// with --example-config
+    /// auth0 access token, used only to obtain the Endpoint Token. Cannot be
+    /// refreshed -- `--login` is what keeps a long-running server working.
+    /// Not needed with --example-config
     #[argh(option)]
     auth0_token: Option<String>,
+    /// sign in to Auth0 once, saving tokens that refresh from then on, and
+    /// exit. This is what lets a server be left running: an --auth0-token
+    /// expires and takes the session with it
+    #[argh(switch)]
+    login: bool,
+    /// where the saved sign-in lives. Defaults to the Endpoint key's name with
+    /// `-auth0.json` in place of its extension
+    #[argh(option)]
+    auth0_tokens: Option<PathBuf>,
     /// P2P protocol string
     #[argh(option, default = "String::from(\"isekai-portal-v1\")")]
     protocol: String,
@@ -160,23 +181,34 @@ struct Args {
 /// Endpoint, and the answer lives on the proxy — a Peer Listener is what a peer
 /// connects *through*, and standing one up to ask would put a second row under
 /// this Endpoint for every client that then looks one up.
-async fn administer_grants(args: &Args) -> anyhow::Result<()> {
-    let cfg = P2pConfig {
+async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Result<()> {
+    let cfg = config(args, tokens, load_or_generate_key(&args.key)?).await?;
+    grant_admin(args, &cfg).await
+}
+
+/// The P2P configuration these arguments describe, authenticated however this
+/// installation is.
+async fn config(
+    args: &Args,
+    tokens: &std::path::Path,
+    key: isekai_p2p::agent::EndpointKey,
+) -> anyhow::Result<P2pConfig> {
+    let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
+    Ok(P2pConfig {
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
-        auth0_token: args
-            .auth0_token
-            .clone()
-            .context("--auth0-token is required")?,
-        auth0: None,
+        auth0_token: auth.token,
+        // **The whole point.** With this the Endpoint Token renewal, which runs
+        // every few minutes for the life of the session, asks for a current
+        // Auth0 token instead of reusing one that has expired.
+        auth0: auth.source,
         protocol: args.protocol.clone(),
         register: args.register,
         device_name: args.device_name.clone(),
         token_ttl: None,
-        key: load_or_generate_key(&args.key)?,
-    };
-    grant_admin(args, &cfg).await
+        key,
+    })
 }
 
 async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
@@ -271,8 +303,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // listener on this Endpoint and protocol is exactly what a client on a
     // grant then has to choose between, so an operator asking "who is in?"
     // would be making the connections they are asking about ambiguous.
+    let tokens = args
+        .auth0_tokens
+        .clone()
+        .unwrap_or_else(|| portal_core::login::tokens_beside(&args.key));
+    if args.login {
+        // Before the key, the catalogue and the network: this is what somebody
+        // runs when they have none of them.
+        return portal_core::login::sign_in(&tokens).await;
+    }
+
     if args.grants || args.revoke.is_some() {
-        return administer_grants(&args).await;
+        return administer_grants(&args, &tokens).await;
     }
 
     // Read before anything else touches the network: a typo in the catalogue
@@ -299,18 +341,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tracing::info!(path = %args.key.display(), "generating a new Endpoint key");
     }
 
-    let cfg = P2pConfig {
-        identity_url: args.identity_url,
-        identity_http3: args.identity_http3,
-        proxy_url: args.proxy_url,
-        auth0_token: args.auth0_token.context("--auth0-token is required")?,
-        auth0: None,
-        protocol: args.protocol,
-        register: args.register,
-        device_name: args.device_name,
-        token_ttl: None,
-        key: load_or_generate_key(&args.key)?,
-    };
+    let cfg = config(&args, &tokens, load_or_generate_key(&args.key)?).await?;
 
     let shutdown = CancellationToken::new();
     // `AutoNotify` rather than `Manual`: there is no operator watching a window

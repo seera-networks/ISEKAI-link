@@ -25,8 +25,9 @@ Two programs:
 
 ## Before you start
 
-You need an **Auth0 access token** for the ISEKAI deployment, on both machines.
-Everything else — Endpoint keys, certificates — is generated on first use.
+You need an **ISEKAI account**, and a browser once, on each machine. Everything
+else — Endpoint keys, certificates, tokens — is generated or fetched on first
+use.
 
 ### Download a release
 
@@ -80,6 +81,47 @@ somewhere else.
 
 ---
 
+## 0. Sign in, once per machine
+
+```sh
+portal-server --login          # or portal-client --login
+```
+
+```
+To sign in, open:
+
+    https://seera-networks.jp.auth0.com/activate?user_code=CVNR-SWDW
+
+and confirm the code:  CVNR-SWDW
+
+Waiting…
+```
+
+Open it, confirm the code, and that machine is signed in for good: the tokens
+land beside the Endpoint key (`portal-server-auth0.json`) and **refresh
+themselves from then on**. No command after this needs a token.
+
+**This is what lets a server be left running.** An Endpoint Token lasts minutes
+and is reissued for the life of the session, and each reissue needs a current
+Auth0 token — so a session started with a token that later expires stops being
+able to renew, and ends. `--auth0-token` still works for scripts that already
+have one, and it says so in the log; it cannot be refreshed.
+
+The saved file is a credential in its own right — a refresh token mints access
+tokens until it is revoked — so it is written owner-readable, like the key
+beside it. `--auth0-tokens` puts it somewhere else.
+
+If the sign-in is ever revoked, the next start says so and names the fix rather
+than failing several minutes in:
+
+```
+Error: refresh the Auth0 access token
+Caused by:
+    the Auth0 session has ended, sign in again: Unknown or invalid refresh token.
+```
+
+---
+
 ## 1. Say what may be reached
 
 On the machine with the services:
@@ -115,7 +157,7 @@ message naming the service rather than a half-started server.
 ## 2. Start the server and show a pairing code
 
 ```sh
-portal-server --auth0-token "$TOKEN" --register --pair
+portal-server --register --pair
 ```
 
 ```
@@ -142,7 +184,7 @@ against the old one stops applying.
 On the client machine:
 
 ```sh
-portal-client --auth0-token "$TOKEN" --register --pair K7QM-3XPD
+portal-client --register --pair K7QM-3XPD
 ```
 
 ```
@@ -164,7 +206,7 @@ API has not seen it yet.
 ## 4. Forward a port
 
 ```sh
-portal-client --auth0-token "$TOKEN" --map 5432:db --map udp:5353:dns
+portal-client --map 5432:db --map udp:5353:dns
 ```
 
 ```
@@ -229,8 +271,8 @@ today and not next week — there is a capability instead:
 
 ```sh
 portal-client --whoami                     # they send you this Endpoint ID
-portal-server --auth0-token "$TOKEN" --allow ep:4d5e6f… --capability-ttl 300
-portal-client --auth0-token "$TOKEN" \
+portal-server --allow ep:4d5e6f… --capability-ttl 300
+portal-client \
               --listener pl_1a2b3c… --capability cap_7g8h9i… --map 5432:db
 ```
 
@@ -241,7 +283,7 @@ over is one connection, not a way back in.
 ## Taking access away
 
 ```sh
-portal-server --auth0-token "$TOKEN" --grants
+portal-server --grants
 ```
 
 ```
@@ -249,7 +291,7 @@ grant       : gr_5f6a7b…  ep:4d5e6f…  (pairing, masa's laptop)
 ```
 
 ```sh
-portal-server --auth0-token "$TOKEN" --revoke gr_5f6a7b…
+portal-server --revoke gr_5f6a7b…
 ```
 
 Both answer and exit without serving anything. That is not just tidiness: a
@@ -270,6 +312,7 @@ connection counters and which path they are about.
 
 | what you see | what it means |
 | --- | --- |
+| `the Auth0 session has ended, sign in again` | the saved sign-in was revoked or expired past refreshing. `--login` again |
 | ``the peer does not offer `db` `` | not in the catalogue, or offered under the other protocol. The two are deliberately the same answer on the wire — the server's log says which |
 | ``the peer could not reach `db` `` | it is in the catalogue and the target did not answer. The service is down, or `target` is wrong |
 | the local connect succeeds and then closes at once | the same refusal, seen by an application that does not print the reason |

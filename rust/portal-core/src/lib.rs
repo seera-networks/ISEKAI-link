@@ -30,6 +30,7 @@ pub mod client;
 pub mod config;
 pub mod datagram;
 pub mod frame;
+pub mod login;
 pub mod path;
 pub mod server;
 pub mod session;
