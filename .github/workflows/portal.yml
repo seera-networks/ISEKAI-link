@@ -101,10 +101,9 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
       - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
@@ -131,10 +130,9 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
       - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
@@ -173,14 +171,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
       # **Not Windows-only**, however much it looks it: on Linux this installs
       # `liblttng-ust-dev` and `libnuma-dev`, which the ubuntu image does not
       # carry and msquic's CMake stops without. The `test` job above runs it
       # unconditionally for the same reason.
       - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable

@@ -73,13 +73,12 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
 
       # Same bootstrap the iOS workflow uses; seera-msquic needs its build
       # dependencies present before cargo drives its CMake build.
       - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
 

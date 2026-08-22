@@ -75,10 +75,9 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
       - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
@@ -114,10 +113,9 @@ jobs:
       ENDPOINT_KEY_PEM: ${{ secrets.ISEKAI_TEST_ENDPOINT_KEY_PEM }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
       - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
@@ -235,10 +233,9 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
       - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable

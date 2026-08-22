@@ -1,0 +1,42 @@
+name: Fetch the submodules this build needs
+description: >
+  msquic-async-rs and tonic-h3, plus msquic and seera-msquic inside the first,
+  and nothing deeper. What MsQuic itself needs is prepare-machine.ps1's job.
+
+runs:
+  using: composite
+  steps:
+    # **Not `submodules: recursive` on the checkout**, which is what this
+    # replaces. Recursion descends into MsQuic's `quictls`, and from there into
+    # `krb5`, `tlsfuzzer`, `wycheproof`, `oqs-provider`, `pyca-cryptography`,
+    # `python-ecdsa`, `tlslite-ng` and `gost-engine` — test corpora and engines
+    # that nothing in this workspace compiles, cloned on every job on every
+    # runner. Each clone is a chance to fail, and one of them did:
+    #
+    #   fatal: unable to access 'https://github.com/krb5/krb5/':
+    #   Recv failure: Connection reset by peer
+    #
+    # taking a whole build down over a Kerberos implementation no part of this
+    # repository has ever called.
+    #
+    # `docs/Build.md` §2 has never asked for recursion. It names these four and
+    # then runs `prepare-machine.ps1`, which initialises exactly the MsQuic
+    # submodules the chosen TLS provider needs — `quictls` or `openssl`, plus
+    # `clog` and `googletest` — with a plain, non-recursive `git submodule
+    # update`. So the deep tree was never wanted; it was inherited from a
+    # checkout option that means "everything".
+    #
+    # **And narrowing it found that `-Tls openssl` was the wrong provider.**
+    # Every workflow passed it; the build wants `quictls`, and said so the
+    # moment it was the only thing not fetched:
+    #
+    #   /bin/sh: 1: …/seera-msquic/submodules/quictls/config: not found
+    #
+    # Recursion had been supplying both, so the flag was never load-bearing and
+    # never checked. `docs/Build.md` has said `quictls` on Linux and `schannel`
+    # on Windows all along.
+    - shell: bash
+      run: |
+        set -euo pipefail
+        git submodule update --init submodules/msquic-async-rs submodules/tonic-h3
+        git -C submodules/msquic-async-rs submodule update --init msquic seera-msquic

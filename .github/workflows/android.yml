@@ -72,10 +72,9 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
       - name: Prepare machine for seera-msquic
-        run: scripts/prepare-machine.ps1 -Tls openssl -ForBuild
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
@@ -101,8 +100,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: ./.github/actions/submodules
+      # **New here, and it was being got for free.** This job cross-compiles
+      # the core, which configures quictls (see the NDK note below) — and the
+      # sources for that used to arrive because the checkout was recursive.
+      # With the fetch narrowed to what `docs/Build.md` names, the MsQuic
+      # submodules are this script's job, exactly as in `bindings` above.
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
