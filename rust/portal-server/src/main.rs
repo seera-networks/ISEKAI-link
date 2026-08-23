@@ -414,11 +414,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // landing in the gap between one iteration ending and the next future
     // being built was simply not seen. Pinned so the same future is polled
     // across iterations rather than restarted.
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
+    let signalled = tokio::signal::ctrl_c();
+    tokio::pin!(signalled);
+    // Only an interrupt arms the hatch: the loop also ends when the signaling
+    // stream breaks, and turning a user's *first* press into a hard exit there
+    // would skip withdrawing the Peer Listener — the one thing the comment
+    // below says must not be skipped.
+    let mut interrupted = false;
     loop {
         tokio::select! {
-            _ = &mut interrupted => break,
+            _ = &mut signalled => { interrupted = true; break }
             event = events.recv() => match event {
                 Ok(event) => tracing::info!("signaling: {event:?}"),
                 // Lagged only loses log lines; the session is unaffected.
@@ -429,7 +434,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             },
         }
     }
-    portal_core::shutdown::hard_exit_on_second_interrupt();
+    if interrupted {
+        portal_core::shutdown::hard_exit_on_second_interrupt();
+    }
     // Not just `shutdown.cancel()`: returning from `main` drops the runtime, and
     // the session withdraws the Peer Listener on its way out. Cancel-and-return
     // leaves it listed for its whole lease, pointing at a process that is gone.

@@ -54,17 +54,33 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// press is a hard exit. It does not replace understanding a hang; it stops one
 /// from trapping whoever meets it.
 pub fn hard_exit_on_second_interrupt() {
-    tokio::spawn(async {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("interrupted again; leaving without waiting");
-            use std::io::Write as _;
-            let _ = std::io::stdout().flush();
-            let _ = std::io::stderr().flush();
-            // 128 + SIGINT, which is what a shell reports for an interrupted
-            // program.
-            unsafe { libc_exit(130) }
-        }
-    });
+    // SAFETY: `handler` is the address of an `extern "C"` function with the
+    // signature `signal(2)` requires, and `SIGINT` is a valid signal number.
+    unsafe {
+        signal(SIGINT, hard_exit as extern "C" fn(i32) as usize);
+    }
+}
+
+/// SIGINT's number on every platform this builds for.
+const SIGINT: i32 = 2;
+
+/// **A raw handler, not a spawned task**, and the difference is the case this
+/// exists for. A task needs a free worker to run on; the thing it is meant to
+/// rescue somebody from is a close that has blocked a worker, and on a
+/// single-core host `#[tokio::main]` gives exactly one. The hatch would then be
+/// starved by precisely the hang it is there for.
+///
+/// A signal handler runs on whatever thread takes the signal, with no runtime
+/// involved. `_exit` is async-signal-safe, which is the whole of what a handler
+/// is allowed to do — no allocation, no locks, and no message, because printing
+/// one is not.
+extern "C" fn hard_exit(_signal: i32) {
+    // 128 + SIGINT, which is what a shell reports for an interrupted program.
+    unsafe { libc_exit(130) }
+}
+
+unsafe extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
 }
 
 /// Wind msquic down and leave with `code`. **Never returns.**

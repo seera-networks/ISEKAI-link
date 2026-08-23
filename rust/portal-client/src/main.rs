@@ -267,6 +267,89 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .context("connect to the portal server")?;
     println!("connection id: {}", connected.session.connection_id());
 
+    // **Closed on the way out of a failure, not dropped.** A `?` here — and
+    // `--map 5432:db` with 5432 already bound is enough — would leave the
+    // forwards uncancelled, the connection never reported closed (so the relay
+    // leg stays reserved until the proxy expires it), and the registration
+    // dropped during the unwind, which is the `RegistrationClose` this whole
+    // change is about.
+    if let Err(e) = start_forwards(&connected, maps, &shutdown).await {
+        connected.close().await;
+        return Err(e);
+    }
+
+    // **Both ways this can end without us**, and watching only one of them is
+    // the worse failure: the forwarded ports stay bound over a connection that
+    // is gone, so anything connecting to them is accepted and then goes quiet
+    // rather than being refused.
+    //
+    // `ended` is the proxy withdrawing the session -- a revoked Grant, a lease
+    // that could not be renewed. The connection ending is the server exiting.
+    //
+    // `ended()` is bound rather than awaited inline because it hands back an
+    // owned token, and a temporary inside the `select!` is dropped before it is
+    // polled.
+    let ended = connected.session.ended();
+    let peer = connected.peer.connection().clone();
+    // **Armed only when the stop was an interrupt**, because the hatch turns the
+    // *next* Ctrl+C into an immediate exit. On the other two arms nobody has
+    // pressed anything yet, and arming there would make a user's first press
+    // skip reporting the connection closed — which leaves the relay leg
+    // reserved until the proxy expires it.
+    let mut interrupted = false;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => { interrupted = true; }
+        _ = ended.cancelled() => {
+            tracing::warn!("the session ended; the forwards are going with it");
+        }
+        // **Both jobs, one task.** This moves the forwards onto a direct path
+        // when one turns up, and returns when the connection is no longer
+        // usable — which is what this arm is here for. They cannot be two
+        // tasks: a connection's events are a single queue, so a second poller
+        // would take events belonging to the first.
+        _ = portal_core::path::keep_on_the_best_path(peer, shutdown.clone()) => {
+            tracing::warn!("the peer connection closed; the forwards are going with it");
+        }
+    }
+    if interrupted {
+        portal_core::shutdown::hard_exit_on_second_interrupt();
+    }
+    connected.close().await;
+    Ok(())
+}
+
+/// Redeem a pairing code, and say what it paired with.
+async fn redeem(
+    args: &Args,
+    tokens: &std::path::Path,
+    key: isekai_p2p::agent::EndpointKey,
+    code: &str,
+) -> anyhow::Result<()> {
+    let cfg = config(args, tokens, key).await?;
+    // Whatever was scanned, pasted or typed: a URI from a QR, or the eight
+    // characters with or without their dash.
+    let code = isekai_p2p::agent::pairing_code_from_input(code);
+    let directory = isekai_p2p::PeerDirectory::open(&cfg)
+        .await
+        .context("open the proxy control plane")?;
+    let grant = directory
+        .pair(&code, args.label.as_deref())
+        .await
+        .context("redeem the pairing code")?;
+    println!("paired with : {}", grant.owner_endpoint);
+    println!("grant       : {}", grant.grant_id);
+    println!("\nConnect with --map alone; the listener is found for you.");
+    Ok(())
+}
+
+/// Bind each mapped port and start forwarding it.
+///
+/// Separate so the caller can close the session when one fails; see there.
+async fn start_forwards(
+    connected: &portal_core::session::Connected,
+    maps: Vec<(Protocol, SocketAddr, String)>,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
     for (protocol, local, service) in maps {
         let forwarding = match protocol {
             Protocol::Tcp => {
@@ -294,60 +377,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .with_context(|| format!("forward {protocol} {local} to `{service}`"))?;
         println!("{protocol} {forwarding} -> {service}");
     }
-
-    // **Both ways this can end without us**, and watching only one of them is
-    // the worse failure: the forwarded ports stay bound over a connection that
-    // is gone, so anything connecting to them is accepted and then goes quiet
-    // rather than being refused.
-    //
-    // `ended` is the proxy withdrawing the session -- a revoked Grant, a lease
-    // that could not be renewed. The connection ending is the server exiting.
-    //
-    // `ended()` is bound rather than awaited inline because it hands back an
-    // owned token, and a temporary inside the `select!` is dropped before it is
-    // polled.
-    let ended = connected.session.ended();
-    let peer = connected.peer.connection().clone();
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = ended.cancelled() => {
-            tracing::warn!("the session ended; the forwards are going with it");
-        }
-        // **Both jobs, one task.** This moves the forwards onto a direct path
-        // when one turns up, and returns when the connection is no longer
-        // usable — which is what this arm is here for. They cannot be two
-        // tasks: a connection's events are a single queue, so a second poller
-        // would take events belonging to the first.
-        _ = portal_core::path::keep_on_the_best_path(peer, shutdown.clone()) => {
-            tracing::warn!("the peer connection closed; the forwards are going with it");
-        }
-    }
-    portal_core::shutdown::hard_exit_on_second_interrupt();
-    connected.close().await;
-    Ok(())
-}
-
-/// Redeem a pairing code, and say what it paired with.
-async fn redeem(
-    args: &Args,
-    tokens: &std::path::Path,
-    key: isekai_p2p::agent::EndpointKey,
-    code: &str,
-) -> anyhow::Result<()> {
-    let cfg = config(args, tokens, key).await?;
-    // Whatever was scanned, pasted or typed: a URI from a QR, or the eight
-    // characters with or without their dash.
-    let code = isekai_p2p::agent::pairing_code_from_input(code);
-    let directory = isekai_p2p::PeerDirectory::open(&cfg)
-        .await
-        .context("open the proxy control plane")?;
-    let grant = directory
-        .pair(&code, args.label.as_deref())
-        .await
-        .context("redeem the pairing code")?;
-    println!("paired with : {}", grant.owner_endpoint);
-    println!("grant       : {}", grant.grant_id);
-    println!("\nConnect with --map alone; the listener is found for you.");
     Ok(())
 }
 

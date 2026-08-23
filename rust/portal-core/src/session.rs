@@ -164,6 +164,23 @@ impl ServerHandle {
         if !isekai_p2p::peer::drain_registration(&reg, DRAIN_TIMEOUT).await {
             tracing::warn!("msquic still had live handles after {DRAIN_TIMEOUT:?}");
         }
+        // **This is where Ctrl+C hung, and the fix is not to close it.**
+        //
+        // `reg` would drop at the end of this scope, and dropping the last
+        // `Arc<Registration>` runs `RegistrationClose` — a synchronous,
+        // uninterruptible wait that no timeout is over. The drain above does
+        // not prevent it: `wait_idle` deliberately does **not** track
+        // `Configuration`s (`Registration::open_configuration` says so), so it
+        // reports idle, `active` is zero, the drop prints no warning, and the
+        // close then blocks on the listener configuration's rundown reference
+        // anyway. Hardware showed `closing: closed` and then nothing.
+        //
+        // The configuration belongs to the `Listener` and the connections
+        // accepted from it, so this side cannot "drop it first" as that
+        // documentation asks. What it can do is not close a registration in a
+        // process that is stopping — which is what `drain_msquic` and
+        // `PeerSession::drain` already do, for this reason.
+        std::mem::forget(reg);
         tracing::debug!("closed");
     }
 }

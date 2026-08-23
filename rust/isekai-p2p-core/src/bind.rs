@@ -168,12 +168,18 @@ const WIND_DOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// Wait for a cancelled leg's task, but not forever.
 ///
-/// **`task.await` on its own was unbounded**, and it is on the path out of
-/// every application here: `InitiatorSession::close` and `listener::run` both
-/// end by closing their leg, and both are what a Ctrl+C reaches. A task that
+/// **`task.await` on its own was unbounded**, and for [`ConnectRelay::close`]
+/// that is on the path out of every initiator here: `InitiatorSession::close`
+/// ends by closing its relay, and that is what a Ctrl+C reaches. A task that
 /// does not observe the cancel — parked in an H3 send to a relay that has gone,
 /// say — held the process open with nothing said and no way out, because the
 /// first Ctrl+C had already replaced SIGINT's default disposition.
+///
+/// [`BindSession::close`] has no caller in this workspace today; the listener
+/// side tears its legs down inside `ListenerSession::close`, which aborts
+/// before awaiting and is itself bounded by whatever waits on `listener::run`.
+/// Bounding this one too is for the caller that turns up later, not for a bug
+/// it has now.
 ///
 /// The leg is being torn down either way; the timeout only decides whether this
 /// waits to see it happen. Aborting after it is what makes the difference
