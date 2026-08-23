@@ -155,8 +155,37 @@ impl BindSession {
     pub async fn close(mut self) {
         self.shutdown.cancel();
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            wind_down("bind", task).await;
         }
+    }
+}
+
+/// How long a relay leg's task may take to notice it has been cancelled.
+///
+/// Generous next to the one thing it has to do — stop — and short enough that
+/// somebody who pressed Ctrl+C does not conclude the program is stuck.
+const WIND_DOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait for a cancelled leg's task, but not forever.
+///
+/// **`task.await` on its own was unbounded**, and it is on the path out of
+/// every application here: `InitiatorSession::close` and `listener::run` both
+/// end by closing their leg, and both are what a Ctrl+C reaches. A task that
+/// does not observe the cancel — parked in an H3 send to a relay that has gone,
+/// say — held the process open with nothing said and no way out, because the
+/// first Ctrl+C had already replaced SIGINT's default disposition.
+///
+/// The leg is being torn down either way; the timeout only decides whether this
+/// waits to see it happen. Aborting after it is what makes the difference
+/// between a tidy exit and a hung one.
+async fn wind_down(what: &str, task: tokio::task::JoinHandle<()>) {
+    let aborter = task.abort_handle();
+    if tokio::time::timeout(WIND_DOWN_TIMEOUT, task).await.is_err() {
+        tracing::warn!(
+            ?WIND_DOWN_TIMEOUT,
+            "the {what} leg did not stop in time; abandoning it",
+        );
+        aborter.abort();
     }
 }
 
@@ -310,7 +339,7 @@ impl ConnectRelay {
     pub async fn close(mut self) {
         self.shutdown.cancel();
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            wind_down("connect relay", task).await;
         }
     }
 }

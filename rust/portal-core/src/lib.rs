@@ -34,6 +34,7 @@ pub mod login;
 pub mod path;
 pub mod server;
 pub mod session;
+pub mod shutdown;
 pub mod transport;
 pub mod udp;
 

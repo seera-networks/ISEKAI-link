@@ -151,13 +151,20 @@ impl ServerHandle {
             reg,
             ..
         } = self;
+        // Traced step by step for the reason `Connected::close` gives: this is
+        // the path Ctrl+C takes, and the last line printed names the step that
+        // did not finish.
+        tracing::debug!("closing: cancelling the session and the accept loop");
         shutdown.cancel();
+        tracing::debug!("closing: waiting for the Peer Listener to be withdrawn");
         if tokio::time::timeout(CLOSE_TIMEOUT, running).await.is_err() {
             tracing::warn!("the listener session did not finish within {CLOSE_TIMEOUT:?}");
         }
+        tracing::debug!("closing: waiting for msquic to release its handles");
         if !isekai_p2p::peer::drain_registration(&reg, DRAIN_TIMEOUT).await {
             tracing::warn!("msquic still had live handles after {DRAIN_TIMEOUT:?}");
         }
+        tracing::debug!("closed");
     }
 }
 
@@ -325,6 +332,12 @@ impl Connected {
             sessions,
             shutdown,
         } = self;
+        // **Each step says it is starting**, because this is the path a Ctrl+C
+        // takes and the last line printed is what names a step that does not
+        // finish. Every wait below is bounded, and each of those bounds was put
+        // there after something was not — so the next one that is not should
+        // cost a bug report rather than a bisect.
+        tracing::debug!("closing: cancelling the forwards");
         shutdown.cancel();
         // **Dropped before the wait, not after it.** `Sessions` holds a
         // `Connection` clone of its own, and the drain below is a wait for
@@ -332,10 +345,13 @@ impl Connected {
         // scope is one that will never be released, and the wait would time out
         // pointing at msquic rather than at this line.
         drop(sessions);
+        tracing::debug!("closing: waiting for msquic to release the peer connection");
         if !peer.drain(DRAIN_TIMEOUT).await {
             tracing::warn!("msquic still had live handles after {DRAIN_TIMEOUT:?}");
         }
+        tracing::debug!("closing: reporting the connection closed and taking the leg down");
         session.close().await;
+        tracing::debug!("closed");
     }
 }
 

@@ -187,15 +187,22 @@ async fn main() -> anyhow::Result<()> {
     // found it twice — once after a successful pairing, once on a connect that
     // was correctly refused — and both times the exit code contradicted what
     // had been printed a line earlier.
-    let outcome = run(args).await;
-    if !isekai_p2p::agent::shutdown_msquic(SHUTDOWN_TIMEOUT).await {
-        tracing::debug!("msquic still had live handles on the way out");
-    }
-    outcome
+    // **Never returns**, and that is the fix for Ctrl+C not stopping these
+    // programs once traffic had started: returning from `main` drops the
+    // runtime and then the registrations, and `RegistrationClose` blocks
+    // uninterruptibly on a configuration's rundown reference that no timeout
+    // covers. `portal_core::shutdown` has the whole of it.
+    let code = match run(args).await {
+        Ok(()) => 0,
+        Err(e) => {
+            // Printed here because `_exit` skips the reporting `main` would
+            // have done by returning the error.
+            eprintln!("Error: {e:#}");
+            1
+        }
+    };
+    portal_core::shutdown::leave(code).await
 }
-
-/// How long to wait for msquic before leaving it to the operating system.
-const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let tokens = args
@@ -315,6 +322,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             tracing::warn!("the peer connection closed; the forwards are going with it");
         }
     }
+    portal_core::shutdown::hard_exit_on_second_interrupt();
     connected.close().await;
     Ok(())
 }

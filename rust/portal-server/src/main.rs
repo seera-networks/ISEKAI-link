@@ -278,15 +278,22 @@ async fn main() -> anyhow::Result<()> {
     // found it twice — once after a successful pairing, once on a connect that
     // was correctly refused — and both times the exit code contradicted what
     // had been printed a line earlier.
-    let outcome = run(args).await;
-    if !isekai_p2p::agent::shutdown_msquic(SHUTDOWN_TIMEOUT).await {
-        tracing::debug!("msquic still had live handles on the way out");
-    }
-    outcome
+    // **Never returns**, and that is the fix for Ctrl+C not stopping these
+    // programs once traffic had started: returning from `main` drops the
+    // runtime and then the registrations, and `RegistrationClose` blocks
+    // uninterruptibly on a configuration's rundown reference that no timeout
+    // covers. `portal_core::shutdown` has the whole of it.
+    let code = match run(args).await {
+        Ok(()) => 0,
+        Err(e) => {
+            // Printed here because `_exit` skips the reporting `main` would
+            // have done by returning the error.
+            eprintln!("Error: {e:#}");
+            1
+        }
+    };
+    portal_core::shutdown::leave(code).await
 }
-
-/// How long to wait for msquic before leaving it to the operating system.
-const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn run(args: Args) -> anyhow::Result<()> {
     if args.example_config {
@@ -401,9 +408,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let mut events = server.signaling.subscribe();
+    // **Made once, outside the loop.** `ctrl_c()` builds a future over signals
+    // that arrive *after* it is created, so calling it inside the select meant
+    // a fresh one every time a signaling event woke this loop — and a Ctrl+C
+    // landing in the gap between one iteration ending and the next future
+    // being built was simply not seen. Pinned so the same future is polled
+    // across iterations rather than restarted.
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut interrupted => break,
             event = events.recv() => match event {
                 Ok(event) => tracing::info!("signaling: {event:?}"),
                 // Lagged only loses log lines; the session is unaffected.
@@ -414,6 +429,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             },
         }
     }
+    portal_core::shutdown::hard_exit_on_second_interrupt();
     // Not just `shutdown.cancel()`: returning from `main` drops the runtime, and
     // the session withdraws the Peer Listener on its way out. Cancel-and-return
     // leaves it listed for its whole lease, pointing at a process that is gone.
