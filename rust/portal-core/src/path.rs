@@ -82,7 +82,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use msquic_async::{Connection, ConnectionEvent};
+use msquic_async::{msquic, Connection, ConnectionEvent};
 use tokio_util::sync::CancellationToken;
 
 use isekai_p2p::direct_path::{prefer_path, RELAY_PATH_ID};
@@ -114,6 +114,18 @@ const MULTIPATH_GRACE: Duration = Duration::from_secs(1);
 /// signal — a smoothed RTT only moves when an acknowledgement arrives — so it
 /// waits longer before calling a path dead.
 const STALLED_GRACE: Duration = Duration::from_secs(10);
+
+/// The largest thing this end ever hands to `send_datagram`.
+///
+/// **Not `MAX_PAYLOAD`**, which is the *payload* bound: `datagram::encode`
+/// prepends the session id, so a full-size payload reaches the connection four
+/// bytes longer. Comparing the connection's limit against the payload figure
+/// would leave 1180..=1183 reported as fine while every maximum-size datagram
+/// came back `TooBig` and was counted as a loss.
+const LARGEST_DATAGRAM: usize = crate::datagram::HEADER + crate::datagram::MAX_PAYLOAD;
+
+/// How many reporting ticks between reads of the connection-wide counters.
+const CONNECTION_STATS_EVERY: u32 = 5;
 
 /// Whether the path being preferred is delivering anything.
 ///
@@ -210,6 +222,7 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
     // Whether the path being preferred is delivering. Reset whenever the
     // preference moves, so a new path starts with a clean grace period.
     let mut stalled = Stalled::default();
+    let mut ticks: u32 = 0;
 
     // The reporting the camera apps have, with the one thing they cannot say
     // added: which path the numbers are about. `get_stats` is sampled here
@@ -224,28 +237,47 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
         let event = tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = reporting.tick() => {
-                // The connection's own counters, which describe the *first*
-                // path however many there are — worth having for loss and
-                // congestion, and labelled so nobody reads them as the
-                // preferred path's.
-                match conn.get_stats() {
-                    Ok(stats) => log_connection_stats(&conn, &stats, "connection"),
-                    Err(e) => tracing::debug!("could not read connection stats: {e}"),
+                // **Not every tick.** `get_stats` and `get_path_statistics`
+                // are each served by queueing an operation to msquic's
+                // connection worker and *blocking the calling thread* until it
+                // runs — which is what #155 cost a day to find. The per-path
+                // call has to happen every tick because the watchdog reads it;
+                // the connection-wide one carries loss and congestion totals
+                // that nothing here decides on, so it is sampled a fifth as
+                // often rather than doubling the stall this loop imposes.
+                //
+                // Labelled `connection` because it describes the *first* path
+                // however many there are — printing it as `direct` was this
+                // loop's own bug.
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(CONNECTION_STATS_EVERY) {
+                    match conn.get_stats() {
+                        Ok(stats) => log_connection_stats(&conn, &stats, "connection"),
+                        Err(e) => tracing::debug!("could not read connection stats: {e}"),
+                    }
                 }
-                if report_paths(&conn, preferred, &mut stalled) {
+                if report_paths(&conn, preferred, &direct, &mut stalled) {
                     // **Preferring the relay again, not tearing anything down.**
                     // Under multipath the relay was never left, only declared
                     // backup, so this is withdrawing a preference — nothing in
                     // flight is lost by asking.
-                    let stale = preferred.take();
-                    stalled.reset();
+                    let stale = preferred;
                     tracing::warn!(
                         local = %stale.map(|p| p.0.to_string()).unwrap_or_default(),
                         remote = %stale.map(|p| p.1.to_string()).unwrap_or_default(),
                         "the direct path has held data for {STALLED_GRACE:?} without a single \
                          acknowledgement; forwarding goes back to the relay",
                     );
-                    prefer_path(&conn, relay, relay, &direct);
+                    // **Only forget the preference if the move happened.**
+                    // `prefer_path` answers `false` when nothing changed, and
+                    // clearing `preferred` anyway would leave traffic on the
+                    // stalled path with the watchdog switched off — it only
+                    // judges a path it believes is preferred, so there would be
+                    // no second attempt.
+                    if prefer_path(&conn, relay, relay, &direct) {
+                        preferred = None;
+                        stalled.reset();
+                    }
                 }
                 continue;
             }
@@ -261,6 +293,7 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                 );
                 if prefer_path(&conn, pair, relay, &direct) {
                     preferred = Some(pair);
+                    stalled.reset();
                 }
                 continue;
             }
@@ -294,6 +327,10 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                 }
                 if prefer_path(&conn, pair, relay, &direct) {
                     preferred = Some(pair);
+                    // A new path starts with a clean grace: carrying the last
+                    // one's `(rtt, since)` over would let this one inherit a
+                    // window that is already most of the way run.
+                    stalled.reset();
                     tracing::info!(
                         path_id, local = %local_address, remote = %peer_address,
                         "forwarding moved onto the direct path; the relay stays as backup",
@@ -368,20 +405,20 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                         "the peer will not receive QUIC datagrams, so UDP forwarding over \
                          this connection cannot work; TCP forwards are unaffected",
                     );
-                } else if usize::from(max_send_length) < crate::datagram::MAX_PAYLOAD {
+                } else if usize::from(max_send_length) < LARGEST_DATAGRAM {
                     // The one direction the constant cannot absorb: under the
                     // limit means payloads this end accepts are refused by the
                     // connection, and counted as `unsent` rather than carried.
                     tracing::warn!(
                         max_send_length,
-                        limit = crate::datagram::MAX_PAYLOAD,
-                        "the connection takes smaller datagrams than portal's limit; \
-                         payloads between the two will be dropped",
+                        largest = LARGEST_DATAGRAM,
+                        "the connection takes smaller datagrams than portal will send; \
+                         payloads near the limit will be refused and counted as unsent",
                     );
                 } else {
                     tracing::debug!(
                         max_send_length,
-                        limit = crate::datagram::MAX_PAYLOAD,
+                        largest = LARGEST_DATAGRAM,
                         "the peer receives datagrams",
                     );
                 }
@@ -411,6 +448,7 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
                          forwarding is on the relay again",
                     );
                     preferred = None;
+                    stalled.reset();
                 } else {
                     tracing::debug!(
                         path_id, local = %local_address, remote = %peer_address, is_active,
@@ -437,6 +475,7 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
 fn report_paths(
     conn: &Connection,
     preferred: Option<(SocketAddr, SocketAddr)>,
+    direct: &BTreeMap<(SocketAddr, SocketAddr), u32>,
     stalled: &mut Stalled,
 ) -> bool {
     let paths = match conn.get_path_statistics() {
@@ -458,18 +497,15 @@ fn report_paths(
             "path",
         );
     }
-    let Some(_) = preferred else {
+    let Some(pair) = preferred else {
         stalled.reset();
         return false;
     };
-    // **The last entry, not the one whose `PathId` matches.** msquic's own
-    // documentation is explicit that `PathId` does not identify an entry — a
-    // path added without multipath negotiated takes the first path's id
-    // outright, and a rebinding path inherits the id of the one it replaces
-    // without it being cleared. A caller keying on it "will lose paths". The
-    // preferred path is the most recently added one, which is the last entry;
-    // with one path there is nothing to choose and this is that path.
-    let Some(path) = paths.last() else {
+    let Some(path) = preferred_entry(&paths, pair, direct) else {
+        // Not knowable this tick. Saying nothing is right: the alternative is
+        // judging the wrong path, and the wrong path here is a healthy one.
+        tracing::debug!("cannot tell which entry is the preferred path; not judging it");
+        stalled.reset();
         return false;
     };
     stalled.sample(
@@ -477,6 +513,45 @@ fn report_paths(
         path.NetworkStatistics.BytesInFlight,
         tokio::time::Instant::now(),
     )
+}
+
+/// Which statistics entry belongs to the path being preferred.
+///
+/// **The entries carry no addresses**, only a `PathId` that msquic says does not
+/// identify one — so this is positional, and the position depends on which of
+/// the two operations `prefer_path` performed.
+///
+/// **Without multipath the preferred path is the first entry.**
+/// `QuicPathSetActive` *swaps* it into `Paths[0]` (`seera-msquic`'s
+/// `src/core/path.c`): the activated path is copied to index 0 and the one it
+/// replaced takes its old slot. So after the `activate_path` fallback the last
+/// entry is the **demoted relay** — which reports a frozen `Rtt`, because no
+/// acknowledgement lands there any more, beside the *shared* `BytesInFlight`
+/// that every path carries when they share a `PathId`. Reading that pair as a
+/// stall would declare a perfectly healthy direct path dead within ten seconds
+/// of ordinary traffic, and this function existed to get that exactly backwards
+/// until review read the core.
+///
+/// **With multipath the id is known and is used.** `PathAdded` carried it, so
+/// `direct` has it; entries with any other id are certainly not this path. If
+/// more than one shares it — which happens when a rebinding path inherits the
+/// id of the one it replaces — there is no way to choose, and `None` says so.
+fn preferred_entry<'a>(
+    paths: &'a [msquic::ffi::QUIC_PATH_STATISTICS],
+    preferred: (SocketAddr, SocketAddr),
+    direct: &BTreeMap<(SocketAddr, SocketAddr), u32>,
+) -> Option<&'a msquic::ffi::QUIC_PATH_STATISTICS> {
+    let Some(&path_id) = direct.get(&preferred) else {
+        // No id for it means `prefer_path` took the `Switch` branch, which is
+        // the swap described above.
+        return paths.first();
+    };
+    let mut matching = paths.iter().filter(|p| p.PathId == path_id);
+    let first = matching.next()?;
+    match matching.next() {
+        None => Some(first),
+        Some(_) => None,
+    }
 }
 
 /// Wait until `deadline`, or forever if there is none.
@@ -538,6 +613,75 @@ mod tests {
 
     fn at(base: tokio::time::Instant, secs: u64) -> tokio::time::Instant {
         base + Duration::from_secs(secs)
+    }
+
+    fn entry(path_id: u32, rtt: u64) -> msquic::ffi::QUIC_PATH_STATISTICS {
+        let mut stats: msquic::ffi::QUIC_PATH_STATISTICS = unsafe { std::mem::zeroed() };
+        stats.PathId = path_id;
+        stats.Rtt = rtt;
+        stats
+    }
+
+    fn pair(port: u16) -> (SocketAddr, SocketAddr) {
+        (
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            format!("127.0.0.1:{}", port + 1).parse().unwrap(),
+        )
+    }
+
+    /// **Without multipath the preferred path is the first entry, not the
+    /// last.** `QuicPathSetActive` swaps the activated path into `Paths[0]` and
+    /// puts the one it replaced in its old slot, so the last entry is the
+    /// *demoted* relay — which reports a frozen RTT beside the shared bytes in
+    /// flight, and would be read as a stall on a healthy connection.
+    ///
+    /// This is the one the first version had backwards.
+    #[test]
+    fn without_multipath_the_active_path_is_the_first_entry() {
+        let paths = [entry(0, 1111), entry(0, 9999)];
+        let empty = BTreeMap::new();
+        let chosen = preferred_entry(&paths, pair(4000), &empty).expect("the active path");
+        assert_eq!(
+            chosen.Rtt, 1111,
+            "the swap puts the activated path at index 0",
+        );
+    }
+
+    /// With multipath the id came from `PathAdded`, so it is used.
+    #[test]
+    fn with_multipath_the_path_id_selects_the_entry() {
+        let paths = [entry(0, 1111), entry(7, 2222)];
+        let direct = BTreeMap::from([(pair(4000), 7)]);
+        let chosen = preferred_entry(&paths, pair(4000), &direct).expect("the preferred path");
+        assert_eq!(chosen.Rtt, 2222);
+    }
+
+    /// **And an id two entries share is not a choice.** A rebinding path
+    /// inherits the id of the one it replaces, so guessing between them risks
+    /// judging a path that is not the one carrying traffic — and the cost of
+    /// being wrong is sending a working forward back to the relay.
+    #[test]
+    fn a_shared_path_id_is_refused_rather_than_guessed() {
+        let paths = [entry(7, 1111), entry(7, 2222)];
+        let direct = BTreeMap::from([(pair(4000), 7)]);
+        assert!(preferred_entry(&paths, pair(4000), &direct).is_none());
+    }
+
+    /// The event that carries the limit describes the whole datagram, and what
+    /// portal hands over is the payload plus the session id.
+    #[test]
+    fn the_limit_is_compared_against_what_is_actually_sent() {
+        assert_eq!(
+            LARGEST_DATAGRAM,
+            crate::datagram::MAX_PAYLOAD + crate::datagram::HEADER,
+        );
+        assert!(
+            crate::datagram::encode(1, &vec![0; crate::datagram::MAX_PAYLOAD])
+                .expect("a payload at the limit")
+                .len()
+                == LARGEST_DATAGRAM,
+            "and that is the length that reaches send_datagram",
+        );
     }
 
     /// **A busy path is not a stalled one.** Data outstanding is what sending
