@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import uniffi.portal_client_ffi.PortalConfig
 import uniffi.portal_client_ffi.PortalSession
@@ -216,6 +217,12 @@ fun PortalScreen(keyFile: File) {
                 onClick = {
                     val port = localPort ?: return@Button
                     val userPrompt = prompt
+                    // Captured before this turn's placeholder entries go in --
+                    // this is what makes Ollama remember earlier turns at all
+                    // (see askOllamaChatStream: it's resent as /api/chat's
+                    // `messages` array every time, since Ollama itself keeps
+                    // no state between requests).
+                    val history = chatLog
                     // A placeholder "ollama" entry that gets filled in as tokens
                     // stream back, instead of one entry appended only once the
                     // whole response is done -- this is also what avoids the
@@ -227,7 +234,7 @@ fun PortalScreen(keyFile: File) {
                     busy = true
                     scope.launch {
                         try {
-                            askOllamaStream(port, userPrompt, systemPrompt).collect { delta ->
+                            askOllamaChatStream(port, history, userPrompt, systemPrompt).collect { delta ->
                                 val last = chatLog.last()
                                 chatLog = chatLog.dropLast(1) + (last.first to last.second + delta)
                             }
@@ -378,20 +385,33 @@ private fun LabeledField(
 }
 
 /**
- * Streams Ollama's own `/api/generate` (`stream: true`, the default) through
- * the local port the portal tunnel bound, emitting each response fragment as
- * it arrives rather than blocking for the whole reply. Ollama's streaming
- * wire format is newline-delimited JSON objects, one per fragment, the last
- * one carrying `"done": true`.
+ * Streams Ollama's `/api/chat` (`stream: true`, the default) through the
+ * local port the portal tunnel bound, emitting each response fragment as it
+ * arrives rather than blocking for the whole reply. Ollama's streaming wire
+ * format is newline-delimited JSON objects, one per fragment, the last one
+ * carrying `"done": true`.
  *
- * This replaces the earlier one-shot `stream: false` call, which held the
- * connection completely silent for the full generation time (a minute-plus
- * at this model's speed) -- long enough that the phone's own network stack
- * would give up and tear the connection down before Ollama ever got to send
- * anything back. Streaming keeps real bytes moving the whole time instead.
+ * `/api/chat` rather than `/api/generate`: Ollama itself keeps no state
+ * between requests either way, so multi-turn memory only exists if the
+ * client resends the conversation -- `history` (everything in `chatLog`
+ * before this turn) is what makes that happen, translated into `/api/chat`'s
+ * `messages` array (`"you"` -> `role: "user"`, `"ollama"` -> `role:
+ * "assistant"`; `"error"` entries are skipped, they're not real conversation
+ * content). Before this, every request sent only the current turn's text --
+ * qwen had nothing to remember because nothing prior was ever sent to it.
+ *
+ * Streaming itself (vs. the one-shot `stream: false` this replaced first)
+ * is what avoids the long-silent-wait issue that killed non-streamed
+ * replies: real bytes keep crossing the tunnel the whole time generation
+ * runs, rather than sitting quiet for a minute-plus.
  */
-private fun askOllamaStream(port: Int, prompt: String, systemPrompt: String): Flow<String> = flow {
-    val url = URL("http://127.0.0.1:$port/api/generate")
+private fun askOllamaChatStream(
+    port: Int,
+    history: List<Pair<String, String>>,
+    prompt: String,
+    systemPrompt: String,
+): Flow<String> = flow {
+    val url = URL("http://127.0.0.1:$port/api/chat")
     val conn = url.openConnection() as HttpURLConnection
     conn.requestMethod = "POST"
     conn.doOutput = true
@@ -408,10 +428,21 @@ private fun askOllamaStream(port: Int, prompt: String, systemPrompt: String): Fl
     // not partial.
     conn.readTimeout = 90_000
 
+    val messages = JSONArray()
+        .put(JSONObject().put("role", "system").put("content", systemPrompt))
+    for ((who, text) in history) {
+        val role = when (who) {
+            "you" -> "user"
+            "ollama" -> "assistant"
+            else -> continue // "error" entries: not real conversation content
+        }
+        messages.put(JSONObject().put("role", role).put("content", text))
+    }
+    messages.put(JSONObject().put("role", "user").put("content", prompt))
+
     val body = JSONObject()
         .put("model", MODEL)
-        .put("prompt", prompt)
-        .put("system", systemPrompt)
+        .put("messages", messages)
         .put("stream", true)
         .put("think", false)
         .put("options", JSONObject().put("num_predict", 500))
@@ -428,7 +459,7 @@ private fun askOllamaStream(port: Int, prompt: String, systemPrompt: String): Fl
         for (line in lines) {
             if (line.isBlank()) continue
             val obj = JSONObject(line)
-            val fragment = obj.optString("response", "")
+            val fragment = obj.optJSONObject("message")?.optString("content", "") ?: ""
             if (fragment.isNotEmpty()) emit(fragment)
             if (obj.optBoolean("done", false)) break
         }
