@@ -155,9 +155,20 @@ pub fn pair_with_code(
 
 /// How long [`PortalSession::disconnect`]/`Drop` wait for the session to
 /// actually report itself closed before giving up and shutting the runtime
-/// down anyway. Same order of magnitude as `portal_core::session::Connected
-/// ::close`'s own `DRAIN_TIMEOUT`, which this waits on indirectly.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// down anyway.
+///
+/// **Not the same 5s as `Connected::close`'s own `DRAIN_TIMEOUT`, deliberately
+/// larger.** `close()` is `peer.drain(DRAIN_TIMEOUT)` *then*
+/// `session.close().await` (the actual proxy report) — in the worst case the
+/// drain alone can spend the full `DRAIN_TIMEOUT` before the report even
+/// starts. An outer bound equal to `DRAIN_TIMEOUT` can therefore time out
+/// before the report ever runs, silently reproducing the exact failure this
+/// wait exists to prevent (the relay leg not reported closed) just with a
+/// bounded rather than unbounded wait. Confirmed live: with this at 5s, the
+/// server's connection listing never showed the leg go `Unbound` after a
+/// disconnect, even minutes later. Sized here as `DRAIN_TIMEOUT` plus real
+/// headroom for the report call itself, not just nudged past it.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A live portal tunnel: a local TCP port forwarding to `config.service` on
 /// the paired peer, over the real P2P relay + direct-path multipath
