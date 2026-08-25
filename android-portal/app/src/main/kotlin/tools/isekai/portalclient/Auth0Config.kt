@@ -19,6 +19,16 @@ package tools.isekai.portalclient
  * redirect the first time (or to need re-selecting if the phone's default
  * changes) -- reasonable to route around only if this happens in practice
  * (a click-to-continue or "on this device" default preference does it).
+ *
+ * **This is a UX question, not a security one, because the flow is
+ * Authorization Code + PKCE** (`Auth0Client.kt`): the code this redirect
+ * carries is worthless without the verifier, which never leaves this app's
+ * memory. A second app that claims `isekaiviewer://callback` -- by the
+ * chooser prompt above, or by intercepting before the user picks -- gets a
+ * code it cannot redeem, not a stolen session. Worth keeping in mind before
+ * "fixing" the chooser prompt by giving this app its own scheme back: that
+ * would undo the dashboard-change tradeoff above for a problem PKCE already
+ * closed.
  */
 object Auth0Config {
     const val DOMAIN = "seera-networks.jp.auth0.com"
