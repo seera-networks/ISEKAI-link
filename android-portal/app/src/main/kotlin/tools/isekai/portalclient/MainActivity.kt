@@ -323,10 +323,21 @@ fun PortalScreen(keyFile: File) {
                     scope.launch {
                         try {
                             val token = currentAuth0Token()
+                            // Read fresh off the store, not the composable's
+                            // `authTokens` snapshot -- currentAuth0Token() may
+                            // have just refreshed it, and the manual-token
+                            // fallback path has no entry here at all, which is
+                            // exactly the `null` that keeps portal-core's
+                            // renewal off for that path (see connect()'s doc
+                            // comment on the Rust side).
+                            val stored = authStore.tokens.value
                             val s = withContext(Dispatchers.IO) {
                                 portalConnect(
                                     config = config.copy(auth0Token = token),
                                     endpointKeyPem = endpointKeyPem,
+                                    refreshToken = stored?.refreshToken,
+                                    // Rust wants Unix seconds; Auth0Tokens.expiresAt is epoch millis.
+                                    accessTokenExpiresAtUnix = ((stored?.expiresAt ?: 0L) / 1000).toULong(),
                                 )
                             }
                             session = s
@@ -346,13 +357,25 @@ fun PortalScreen(keyFile: File) {
 
             Button(
                 onClick = {
-                    session?.disconnect()
-                    session = null
-                    localPort = null
-                    statusIsError = false
-                    status = "Disconnected"
+                    val s = session ?: return@Button
+                    status = ""
+                    busy = true
+                    scope.launch {
+                        // disconnect() now waits (bounded, up to a few
+                        // seconds) for the tunnel to actually report itself
+                        // torn down, not just for the cancel signal to be
+                        // sent -- run it off the main thread like every other
+                        // FFI call here, or this would freeze the UI for that
+                        // whole wait.
+                        withContext(Dispatchers.IO) { s.disconnect() }
+                        session = null
+                        localPort = null
+                        statusIsError = false
+                        status = "Disconnected"
+                        busy = false
+                    }
                 },
-                enabled = session != null,
+                enabled = session != null && !busy,
             ) { Text("Disconnect") }
         }
 
