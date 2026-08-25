@@ -170,6 +170,29 @@ pub fn pair_with_code(
 /// headroom for the report call itself, not just nudged past it.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long [`connect`] waits for the peer handshake to complete before
+/// giving up.
+///
+/// **Deliberately much shorter than `isekai_p2p::peer::CONNECT_DEADLINE`
+/// (900s).** That duration is sized for a different caller: an operator
+/// manually carrying a connection id across to bind the peer's leg by hand,
+/// where waiting costs nothing and — per `dial`'s own doc comment — "the
+/// caller can stop it at any time by cancelling `shutdown`, which is what
+/// the disconnect button does." Neither half of that applies here. This app
+/// connects to an already-paired, already-running `portal-server`, with
+/// nobody manually bridging anything on the far end; and unlike that other
+/// caller, there is no cancel button reachable during the wait at all —
+/// `connect` is one synchronous FFI call, and nothing gets back to Kotlin,
+/// including the `CancellationToken` this session will eventually hold,
+/// until it returns. The full 900s would mean up to fifteen minutes of
+/// `busy = true` with no way out but force-closing the app.
+///
+/// Raced against the dial with `tokio::time::timeout` instead: ordinary
+/// reconnects complete in a few seconds, and a minute past that on an
+/// already-paired peer means something is actually wrong — the resulting
+/// error at least lets the user retry rather than just keep waiting.
+const APP_CONNECT_DEADLINE: Duration = Duration::from_secs(60);
+
 /// A live portal tunnel: a local TCP port forwarding to `config.service` on
 /// the paired peer, over the real P2P relay + direct-path multipath
 /// connection.
@@ -271,9 +294,24 @@ impl Drop for PortalSession {
 /// Connect on the standing Grant from a prior [`pair_with_code`] (or `None`
 /// peer if `config.expected_endpoint` is empty — fine as long as this key is
 /// paired with only one server), and forward a local TCP port to
-/// `config.service`. Returns once the port is bound; the forward and the
-/// automatic best-path switch keep running in the background for the life of
-/// the returned `PortalSession`.
+/// `config.service`. Returns once the port is bound, or after
+/// [`APP_CONNECT_DEADLINE`] if the peer never answers — not the fifteen
+/// minutes `isekai_p2p::peer::dial` itself would otherwise wait, see that
+/// constant for why. The forward and the automatic best-path switch keep
+/// running in the background for the life of the returned `PortalSession`.
+///
+/// Never attempts to register the Endpoint — `register` is always `false`
+/// here, unconditionally, unlike [`pair_with_code`] which does it once,
+/// explicitly, before anything else. So a key that was generated but never
+/// registered (the app killed between key generation and a `pair_with_code`
+/// call that would have registered it) cannot become registered by calling
+/// this instead — same failure mode PR #151's review point 3 named for
+/// `camera-server`. Recovering from that stuck state, if it is ever worth
+/// building, belongs in `pair_with_code`/the Kotlin layer's own
+/// register-intent tracking, not here: this function has no way to tell "a
+/// fresh key nobody registered yet" apart from "a key already registered
+/// last time," and guessing wrong risks the 409 `pair_with_code` already
+/// avoids by registering at most once.
 ///
 /// `refresh_token`/`access_token_expires_at_unix`: when present, wired into a
 /// `RefreshingAuth0Token` so the session's periodic Endpoint Token renewals
@@ -315,6 +353,8 @@ pub fn connect(
     });
 
     let shutdown = CancellationToken::new();
+    // `register: false`, always -- see this function's own doc comment for
+    // the stuck-key gap that leaves open.
     let cfg = build_p2p_config(&config, key, false, auth0);
     let service = config.service.clone();
     let peer = (!config.expected_endpoint.is_empty()).then_some(config.expected_endpoint.clone());
@@ -324,9 +364,17 @@ pub fn connect(
     let local_port = runtime.block_on({
         let shutdown = shutdown.clone();
         async move {
-            let connected = session_connect(&cfg, Reach::Grant { peer: peer.as_deref() }, &shutdown)
-                .await
-                .map_err(|e| PortalError::Connect(format!("{e:#}")))?;
+            let connected = tokio::time::timeout(
+                APP_CONNECT_DEADLINE,
+                session_connect(&cfg, Reach::Grant { peer: peer.as_deref() }, &shutdown),
+            )
+            .await
+            .map_err(|_| {
+                PortalError::Connect(format!(
+                    "no response from the peer within {APP_CONNECT_DEADLINE:?}"
+                ))
+            })?
+            .map_err(|e| PortalError::Connect(format!("{e:#}")))?;
 
             let conn = connected.peer.connection().clone();
             let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
