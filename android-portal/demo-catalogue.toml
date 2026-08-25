@@ -1,3 +1,19 @@
+# The service catalogue this Android app's own demo pairs against: a local
+# Ollama, forwarded so the app's chat screen can reach it over the P2P portal.
+#
+# **Deliberately not named or placed where portal-server picks a catalogue up
+# by default.** `--config` defaults to `portal-server.toml` relative to the
+# working directory, and docs/portal.md has every command run from wherever
+# the operator's own key/catalogue live -- for this repo's checkout that is
+# usually `rust/`. A file at the default name and path there would be picked
+# up silently by anyone who forgot `--config`, offering this device's real
+# Ollama (no auth of its own) to any paired peer. Pass this file explicitly:
+#
+#   cd rust && portal-server --config ../android-portal/demo-catalogue.toml …
+#
+# See portal-server --example-config, or docs/portal.md §1, for a starter
+# catalogue to build a real one from instead of editing this demo in place.
+
 [service.ollama]
 protocol = "tcp"
 target = "127.0.0.1:11434"
