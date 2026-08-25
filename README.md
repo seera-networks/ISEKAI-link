@@ -62,7 +62,7 @@ is a local one, which is the gap those first samples show closing.
 ### 📷 ISEKAI camera
 
 Two desktop apps: one publishes a camera, the other watches it. There is an iOS
-viewer and an Android client as well.
+viewer and an Android client as well. **[Read the guide →](docs/camera.md)**
 
 Download the archive for your platform from
 [Releases](https://github.com/seera-networks/ISEKAI-link/releases/latest),
@@ -184,6 +184,7 @@ It delivers a complete real-time control experience.
 Stop dealing with networking. Start building real-time applications.
 
 - **Run something** — [Releases](https://github.com/seera-networks/ISEKAI-link/releases/latest)
+- **Stream a camera** — [the ISEKAI camera guide](docs/camera.md)
 - **Forward a port** — [the ISEKAI portal guide](docs/portal.md)
 - **Build from source** — [`docs/Build.md`](docs/Build.md)
 - **Questions, or want this behind your own product?** Open an issue, or reach out.
