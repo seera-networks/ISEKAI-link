@@ -43,17 +43,20 @@ ISEKAI Link handles the networking for you:
 
 ---
 
-## 📉 Watch it go direct
+## 🔀 Watch it go direct
 
 A session starts on the relay and moves to a direct path as soon as one
 validates — **mid-stream, without reconnecting**.
 
-<img src="./docs/camera-client.png" width="100%" alt="The camera client showing the relayed path, the direct path, and the round-trip time falling as it switches"/>
+<img src="./docs/isekai-camera-client.png" width="100%" alt="The camera client holding both the relayed path and a direct path, with the direct one marked as in use, above a graph of round-trip time"/>
 
-The client names both paths it is holding, and the graph is the round-trip time
-across the switch. **One measurement on one pair of devices**, not a benchmark:
-here the relayed leg runs out to the Tokyo proxy and back while the direct path
-is a local one, which is the gap those first samples show closing.
+The viewer holds **both paths at once** and marks the one it is using with `▶`.
+Here it has moved onto the direct path — out to the other machine's public
+address, with nothing relaying it — and the button now offers the way back.
+Neither switch costs a reconnect, which is why the stream does not notice one.
+
+The graph is the round-trip time on that direct path, sampled every second. One
+run on one pair of machines, not a benchmark.
 
 ---
 
@@ -79,7 +82,7 @@ Sign in, then the server shows a pairing code as text and as a QR code. Scan it
 or type it into the viewer once, and the two stay paired — **including after the
 camera app restarts.**
 
-<img src="./docs/camera-server.png" width="100%" alt="The camera server showing its endpoint id, listener id, and a pairing code as text and QR"/>
+<img src="./docs/isekai-camera-server.png" width="100%" alt="The camera server showing its endpoint id, listener id, and a pairing code as text and QR"/>
 
 The mobile clients live in [`ios/`](ios/README.md) and [`android/`](android/).
 
