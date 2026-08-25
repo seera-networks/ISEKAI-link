@@ -359,13 +359,39 @@ jobs:
           mkdir -p release
           for dir in artifacts/*/; do
             name="$(basename "$dir")"
-            # `find`, not `[ -d bin ] && chmod`: under `set -e` that list
-            # fails the job on a Windows bundle, which has no `bin/`.
-            find "$dir" -maxdepth 1 -type f -name 'camera-*' -exec chmod 0755 {} +
-            find "$dir/bin" -type f -exec chmod 0755 {} + 2>/dev/null || true
+            # **Not `-maxdepth 1`, and not `$dir/bin`.** `upload-artifact` is
+            # given `dist/`, whose only entry is the bundle directory, so the
+            # download lands at `artifacts/<name>/<name>/…` — one level below
+            # where the first version of this looked. It matched nothing,
+            # changed nothing, and reported success either way: v0.2.0's
+            # archives shipped `644` with this step green, which is how the
+            # repair added for #170 came to be a no-op on the job it was added
+            # to. Matching by name at any depth does not care how the artifact
+            # is nested, and the check below no longer lets it be silent.
+            find "$dir" -type f \( -name 'camera-server' -o -name 'camera-client' \) \
+              -exec chmod 0755 {} +
             (cd "$dir" && zip -r "$GITHUB_WORKSPACE/release/$name.zip" .)
           done
           ls -l release
+
+      # **Because the repair above was silent for two releases.** The modes are
+      # read back out of the finished archive, which is the only place that
+      # answers the question whoever downloads it will ask. Windows has no
+      # launcher of this shape and carries no bit worth checking.
+      - name: Check the archives are runnable
+        run: |
+          set -euo pipefail
+          for zip in release/camera-apps-ubuntu-latest.zip release/camera-apps-macos-14.zip; do
+            bad=$(unzip -ZT "$zip" \
+              | awk '$NF ~ /\/(bin\/)?camera-(server|client)$/ && $1 !~ /^-rwx/ {print $NF}')
+            if [ -n "$bad" ]; then
+              echo "not executable inside $zip:" >&2
+              echo "$bad" >&2
+              echo "the download would fail with Permission denied" >&2
+              exit 1
+            fi
+            echo "$(basename "$zip"): launchers and binaries are executable"
+          done
 
       # Attach to the release if there is one, create it if there is not.
       #
