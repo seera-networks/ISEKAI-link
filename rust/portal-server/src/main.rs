@@ -78,13 +78,20 @@ The case to know is a large DNS response; docs/portal.md has the arithmetic.
 ",
     note = "\
 The proxy will not let two Endpoints talk until this side has authorised them,
-and there are two ways to do it. They are not alternatives of equal standing.
+and there are three ways to do it. They are not alternatives of equal standing.
 
 --pair shows a code. Whoever redeems it gets a GRANT, which is reusable, has no
 expiry unless one is set, and -- because a Grant's key does not name a listener
 (spec 8.8) -- keeps working when this server restarts onto a new listener id.
 That is what an installation should run on. Use --grants to see who is in and
 --revoke to take it away.
+
+--ticket also ends in a grant, but one that EXPIRES ON ITS OWN, and you can
+have several outstanding at once -- a pairing code is one per protocol because
+a person is reading it off a screen. So this is the one for work that ends: a
+CI job, an agent sandbox, anywhere there is no screen and nobody to read a code
+aloud. It prints one string to send; --tickets shows who spent which, which is
+the only record of where a ticket went. --revoke-ticket tears up an unused one.
 
 --allow issues a CAPABILITY for one Endpoint. It is one-shot and lasts 300
 seconds at most, so it is for letting a guest in once. A peer that reconnects
@@ -173,6 +180,32 @@ struct Args {
     /// a person -- pass 300 unless the peer is already waiting
     #[argh(option)]
     capability_ttl: Option<u64>,
+    /// issue a TICKET and print the one string to hand over, then exit.
+    /// Unlike --pair, several can be outstanding at once -- run this again for
+    /// each -- and what redeeming one makes expires on its own
+    #[argh(switch)]
+    ticket: bool,
+    /// how long a --ticket stays redeemable, in seconds. Clamped to
+    /// 60..=86400, default 900. This is the life of the paper, not of the
+    /// access it grants
+    #[argh(option)]
+    ticket_ttl: Option<u64>,
+    /// how long the grant made by redeeming a --ticket lasts, in seconds.
+    /// Clamped to 60..=86400, default 3600. Cannot be unlimited
+    #[argh(option)]
+    grant_ttl: Option<u64>,
+    /// what a --ticket is for. Shown only to you, in --tickets, and carried
+    /// onto the grant whoever redeems it gets. 128 bytes at most
+    #[argh(option)]
+    ticket_label: Option<String>,
+    /// print the tickets this Endpoint has issued and who redeemed them, and
+    /// exit
+    #[argh(switch)]
+    tickets: bool,
+    /// tear up a ticket, by the id --tickets prints. A grant already made
+    /// from it stays -- use --revoke for that
+    #[argh(option)]
+    revoke_ticket: Option<String>,
 }
 
 /// Answer `--grants` and `--revoke`, which need no listener.
@@ -243,7 +276,82 @@ async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
             );
         }
     }
+
+    if let Some(ticket_id) = &args.revoke_ticket {
+        proxy
+            .revoke_ticket(ticket_id)
+            .await
+            .with_context(|| format!("revoke ticket {ticket_id}"))?;
+        // The proxy answers 204 for an id it has never seen, so this says what
+        // is true either way rather than claiming something was there.
+        println!("ticket gone : {ticket_id}");
+        println!("A grant already made from it is untouched; --grants lists those.");
+    }
+
+    if args.ticket {
+        let ticket = proxy
+            .create_ticket(
+                &cfg.protocol,
+                args.ticket_ttl,
+                args.grant_ttl,
+                args.ticket_label.as_deref(),
+            )
+            .await
+            .context("issue a ticket")?;
+        println!("\nticket id   : {}", ticket.ticket_id);
+        println!("expires at  : {}", ticket.expires_at);
+        println!("grant ttl   : {}s", ticket.grant_ttl);
+        println!("\nHand over this one string:\n");
+        println!(
+            "  {}",
+            isekai_p2p::agent::ticket_transfer(&proxy_host(&args.proxy_url), &ticket.ticket)
+        );
+        println!("\nThe peer runs: portal-client --redeem <that string>");
+        println!("\nIt works once, it is not shown again, and it is a secret until");
+        println!("it is spent -- send it the way you would send a password.");
+    }
+
+    if args.tickets {
+        let tickets = proxy.list_tickets().await.context("list tickets")?;
+        if tickets.is_empty() {
+            println!("No tickets outstanding.");
+        }
+        for ticket in &tickets {
+            let label = ticket
+                .label
+                .as_deref()
+                .map(|l| format!(", {l}"))
+                .unwrap_or_default();
+            match &ticket.redemption {
+                Some(r) => println!(
+                    "ticket      : {}  redeemed by {} as {} at {}{}",
+                    ticket.ticket_id, r.endpoint_id, r.grant_id, r.redeemed_at, label,
+                ),
+                None => println!(
+                    "ticket      : {}  unredeemed, expires {}{}",
+                    ticket.ticket_id, ticket.expires_at, label,
+                ),
+            }
+        }
+    }
     Ok(())
+}
+
+/// The host a `--proxy-url` names, for the hand-over string (spec §8.12.8).
+///
+/// Whoever redeems has to know **which proxy** to present the ticket to, and a
+/// ticket carries nothing about that. Falls back to the whole value rather than
+/// erroring: an unparseable proxy URL is a problem the connect will report far
+/// better than a string-splitting helper can.
+fn proxy_host(proxy_url: &str) -> String {
+    proxy_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(proxy_url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(proxy_url)
+        .to_owned()
 }
 
 #[tokio::main]
@@ -322,7 +430,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return portal_core::login::sign_in(&tokens).await;
     }
 
-    if args.grants || args.revoke.is_some() {
+    // Everything here is an Endpoint-token call that names no listener
+    // (§8.8, §8.12), so none of it needs a server standing up first.
+    if args.grants
+        || args.revoke.is_some()
+        || args.ticket
+        || args.tickets
+        || args.revoke_ticket.is_some()
+    {
         return administer_grants(&args, &tokens).await;
     }
 

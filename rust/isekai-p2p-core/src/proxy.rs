@@ -11,6 +11,7 @@
 //! keeping it behind a trait lets the logic be unit-tested without the msquic
 //! stack.
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -314,6 +315,98 @@ pub struct PairingCode {
     pub expires_at: String,
 }
 
+/// A Ticket, as returned by issuing one (spec §8.12.2).
+///
+/// Where a pairing code names the owner and waits for a person to read it off a
+/// screen, a Ticket is a 256-bit secret handed over out of band, and **several
+/// can be live for the same protocol at once** — which is the half of §8.12
+/// that pairing cannot do. Whoever redeems it binds themselves to it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ticket {
+    pub ticket_id: String,
+    /// The secret itself, `tkt1_`-prefixed. **Returned by this call only and
+    /// never re-fetchable** — the proxy keeps a SHA-256 of it and nothing more.
+    pub ticket: String,
+    pub owner_endpoint: String,
+    pub protocol: String,
+    /// How long the Grant made by redeeming this will last. Never unlimited.
+    pub grant_ttl: u64,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub created_at: String,
+    /// When the Ticket itself stops being redeemable. Unrelated to `grant_ttl`.
+    pub expires_at: String,
+}
+
+/// One row of `GET /v1/peer/tickets` (spec §8.12.5) — the issue response
+/// without the secret, plus who used it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TicketRecord {
+    pub ticket_id: String,
+    pub protocol: String,
+    pub grant_ttl: u64,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    /// **Absent until redeemed** — the key is missing rather than null.
+    #[serde(default)]
+    pub redemption: Option<TicketRedemption>,
+}
+
+/// Who redeemed a Ticket, and what it made (spec §8.12.5).
+///
+/// This is the owner's audit face. Without it, a Ticket handed out is a key cut
+/// for nobody in particular.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TicketRedemption {
+    pub endpoint_id: String,
+    pub grant_id: String,
+    pub redeemed_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TicketList {
+    tickets: Vec<TicketRecord>,
+}
+
+/// What redeeming a Ticket returns (spec §8.12.3).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RedeemedTicket {
+    /// Indistinguishable from any other Grant except that `origin` is
+    /// `ticket` — and §8.12.3 is explicit that `connect` must not tell them
+    /// apart.
+    pub grant: Grant,
+    /// §8.10's answer, delivered with the grant so redeeming does not have to
+    /// be followed by a listing. **Empty is not a failure**: the authorization
+    /// exists, the far side just has nothing listening yet.
+    #[serde(default)]
+    pub listeners: Vec<TicketListener>,
+}
+
+/// A listener named in a redemption response.
+///
+/// **Deliberately laxer than [`ReachableListener`], and the reason is what a
+/// strict one would cost here.** §8.12.3 says this array is §8.10's, but the
+/// example beside it shows only `listener_id`, `protocol` and `metadata` —
+/// no `owner_endpoint`, no `expires_at`, both of which §8.10 does carry. If the
+/// proxy sends the shorter shape, a struct requiring those fields turns a
+/// redemption that *succeeded* into an error: the ticket is single-use and has
+/// already been spent, the grant already exists, and the caller is told the
+/// call failed with no way to retry. Whatever is missing here can be had from
+/// [`RedeemedTicket::grant`] or a later listing; a lost ticket cannot.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TicketListener {
+    pub listener_id: String,
+    pub protocol: String,
+    #[serde(default)]
+    pub owner_endpoint: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
 /// The URI scheme a pairing QR carries.
 ///
 /// A QR holding the bare code scans to eight characters and nothing happens —
@@ -359,6 +452,119 @@ pub fn pairing_code_from_input(input: &str) -> String {
         Some(code) => code.to_owned(),
         None => input.trim().to_owned(),
     }
+}
+
+/// The fixed prefix on a Ticket secret (spec §8.12.2).
+///
+/// **Not a secret and not decoration.** It is there so that secret scanners and
+/// `grep` can both find one that has escaped into a log or a commit.
+pub const TICKET_PREFIX: &str = "tkt1_";
+
+/// The fixed prefix on the one-string form below (spec §8.12.8).
+pub const TICKET_TRANSFER_PREFIX: &str = "iskt1_";
+
+/// A Ticket together with where to redeem it (spec §8.12.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketTransfer {
+    /// Where to redeem it: an authority, not a URL —
+    /// `tokyo.link.isekai.tools:8443`.
+    ///
+    /// **The port is included where the proxy URL has one**, which §8.12.8's
+    /// example does not show. It calls this field the host, and a bare host
+    /// would not round-trip: this project's proxies are not on 443, so the
+    /// redeeming side would have to be told the port separately — which is the
+    /// out-of-band step the one-string form exists to remove. Anything reading
+    /// it should treat it as an authority and default the scheme to `https`.
+    pub proxy: String,
+    /// The `tkt1_` secret.
+    pub ticket: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TicketTransferBody {
+    p: String,
+    t: String,
+}
+
+/// Pack a Ticket and its proxy into the one string to hand over.
+///
+/// **A Ticket on its own does not say where to spend it.** The redeeming side
+/// needs a proxy to talk to, and asking whoever received it to also be told a
+/// hostname is how half of them end up at the wrong one. §8.12.8 settles the
+/// shape; this is that shape, in one place, so the two portal binaries cannot
+/// disagree about it.
+pub fn ticket_transfer(proxy: &str, ticket: &str) -> String {
+    let body = TicketTransferBody {
+        p: proxy.to_owned(),
+        t: ticket.to_owned(),
+    };
+    // Unwrap: the value is two owned `String`s in a struct with no map keys
+    // that can collide, so this cannot fail.
+    let json = serde_json::to_vec(&body).expect("ticket transfer body is serialisable");
+    format!(
+        "{TICKET_TRANSFER_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    )
+}
+
+/// Unpack what [`ticket_transfer`] made, or `None` if it is not one.
+///
+/// Also accepts a bare `tkt1_` secret, which arrives when someone was told the
+/// proxy separately — the proxy is then empty and the caller uses its own. What
+/// is *not* accepted is anything else, so a mistyped paste costs a message here
+/// rather than a request and a `403`.
+pub fn ticket_from_transfer(input: &str) -> Option<TicketTransfer> {
+    let input = input.trim();
+    // A link may carry it in the fragment, which §8.12.8 recommends over a path
+    // or a query precisely so it stays out of Referer and access logs. Taking
+    // the part after `#` costs nothing and means a copied link works.
+    let input = input.rsplit('#').next().unwrap_or(input).trim();
+    if let Some(encoded) = input.strip_prefix(TICKET_TRANSFER_PREFIX) {
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .ok()?;
+        let body: TicketTransferBody = serde_json::from_slice(&raw).ok()?;
+        if !body.t.starts_with(TICKET_PREFIX) {
+            return None;
+        }
+        return Some(TicketTransfer {
+            proxy: body.p,
+            ticket: body.t,
+        });
+    }
+    input.starts_with(TICKET_PREFIX).then(|| TicketTransfer {
+        proxy: String::new(),
+        ticket: input.to_owned(),
+    })
+}
+
+/// Replace the body of anything that looks like a Ticket with `…`.
+///
+/// §8.12.8 asks clients to keep these out of their own logs, and the reason the
+/// prefixes are fixed is so that this is a substring search rather than a
+/// judgement. Applied to text that is about to be printed or logged, not to
+/// values in flight.
+pub fn redact_tickets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    // Longest first: `iskt1_` must not be matched as `…` after an `i`.
+    while let Some((at, prefix)) = [TICKET_TRANSFER_PREFIX, TICKET_PREFIX]
+        .iter()
+        .filter_map(|p| rest.find(p).map(|at| (at, *p)))
+        .min_by_key(|(at, p)| (*at, std::cmp::Reverse(p.len())))
+    {
+        out.push_str(&rest[..at]);
+        out.push_str(prefix);
+        out.push('…');
+        let after = &rest[at + prefix.len()..];
+        // The secret runs to the first character base64url cannot contain.
+        let end = after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A connection state to filter a listing by (spec §8.5.2).
@@ -725,6 +931,91 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     ) -> Result<PairingCode, ProxyError> {
         let body = serde_json::json!({ "protocol": protocol, "ttl": ttl });
         self.request_json("POST", "/v1/peer/pairing-codes", to_vec(&body))
+            .await
+    }
+
+    /// `POST /v1/peer/tickets` (spec §8.12.2).
+    ///
+    /// **Several of these can be live for the same protocol**, which is what a
+    /// pairing code cannot do — there is one of those per (Endpoint, protocol)
+    /// because a person is reading it off a screen. A Ticket is handed over out
+    /// of band instead, so three CI jobs can each have their own.
+    ///
+    /// No listener is named: what redeeming makes is a Grant, and a Grant's key
+    /// has no listener in it (§8.8). So this works on a node that is about to
+    /// be switched off, and the Ticket still does when it comes back.
+    ///
+    /// `ttl` is how long the paper is good for and `grant_ttl` is how long
+    /// whoever presents it may stay. **They are different quantities and the
+    /// second is not capped by the first** — a 15-minute Ticket making a
+    /// 1-hour Grant is the intended case. Both clamp to 60..=86,400, and
+    /// `grant_ttl` cannot be unlimited: a Ticket is for one-off work, and work
+    /// that ends should not leave authorization behind.
+    pub async fn create_ticket(
+        &self,
+        protocol: &str,
+        ttl: Option<u64>,
+        grant_ttl: Option<u64>,
+        label: Option<&str>,
+    ) -> Result<Ticket, ProxyError> {
+        let body = serde_json::json!({
+            "protocol": protocol,
+            "ttl": ttl,
+            "grant_ttl": grant_ttl,
+            "label": label,
+        });
+        self.request_json("POST", "/v1/peer/tickets", to_vec(&body))
+            .await
+    }
+
+    /// `GET /v1/peer/tickets` (spec §8.12.5) — this Endpoint's Tickets, newest
+    /// first, each with who redeemed it if anyone has.
+    ///
+    /// Redeemed Tickets stay here until the sweep removes them, which is the
+    /// point: a record that vanished the moment it was used would not be one.
+    pub async fn list_tickets(&self) -> Result<Vec<TicketRecord>, ProxyError> {
+        let list: TicketList = self
+            .request_json("GET", "/v1/peer/tickets", Vec::new())
+            .await?;
+        Ok(list.tickets)
+    }
+
+    /// `DELETE /v1/peer/tickets/{ticket_id}` (spec §8.12.6).
+    ///
+    /// **A Grant already made from it is not withdrawn.** Tearing up the paper
+    /// does not remove whoever already walked in; use
+    /// [`revoke_grant`](Self::revoke_grant) for that. An unknown id also
+    /// answers `204`, since the state the caller wanted is the state there is.
+    pub async fn revoke_ticket(&self, ticket_id: &str) -> Result<(), ProxyError> {
+        self.request_empty(
+            "DELETE",
+            &format!("/v1/peer/tickets/{ticket_id}"),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// `POST /v1/peer/tickets/redeem` (spec §8.12.3) — **the caller becomes the
+    /// `allowed_endpoint`.**
+    ///
+    /// Every way this can be refused for authorization reasons answers the same
+    /// `403 ticket-invalid`: unknown, expired, already spent, malformed, or an
+    /// owner whose Endpoint has been revoked. Do not try to tell them apart —
+    /// the uniformity is deliberate (§8.12.4), and the three exceptions
+    /// (`400`, `403 protocol-not-allowed`, `429 grant-quota-exceeded`) are the
+    /// cases where the request does not stand up at all, and **leave the Ticket
+    /// unspent**.
+    ///
+    /// Redeeming twice is not a way to refresh anything: an existing live Grant
+    /// comes back `200` with its dates untouched, and the Ticket is spent all
+    /// the same.
+    pub async fn redeem_ticket(
+        &self,
+        ticket: &str,
+        label: Option<&str>,
+    ) -> Result<RedeemedTicket, ProxyError> {
+        let body = serde_json::json!({ "ticket": ticket, "label": label });
+        self.request_json("POST", "/v1/peer/tickets/redeem", to_vec(&body))
             .await
     }
 
@@ -1186,6 +1477,141 @@ mod tests {
         assert!(sent["listener_id"].is_null(), "a code is not a listener id");
     }
 
+    /// A ticket names no listener either, and carries the two lifetimes
+    /// separately — sending one where the other belongs would silently change
+    /// how long access lasts.
+    #[tokio::test]
+    async fn issuing_a_ticket_sends_both_lifetimes_and_no_listener() {
+        let body = r#"{"ticket_id":"tkt_1","ticket":"tkt1_secret","owner_endpoint":"ep:B",
+            "protocol":"mjpeg","grant_ttl":3600,"label":"ci",
+            "created_at":"2026-08-28T08:30:00Z","expires_at":"2026-08-28T08:45:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let ticket = client
+            .create_ticket("mjpeg", Some(900), Some(3600), Some("ci"))
+            .await
+            .unwrap();
+        assert_eq!(ticket.ticket, "tkt1_secret");
+        assert_eq!(ticket.grant_ttl, 3600);
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, body) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/peer/tickets")
+        );
+        let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(sent["protocol"], "mjpeg");
+        assert_eq!(sent["ttl"], 900, "the ticket's own life");
+        assert_eq!(sent["grant_ttl"], 3600, "the life of what redeeming makes");
+        assert!(
+            sent["listener_id"].is_null(),
+            "a ticket lands on a grant, which names no listener"
+        );
+    }
+
+    /// Redeeming returns a grant that must be indistinguishable from any other
+    /// (spec §8.12.3), and the listeners alongside it so the caller does not
+    /// have to go and ask.
+    #[tokio::test]
+    async fn redeeming_a_ticket_returns_a_grant_and_the_listeners() {
+        let body = r#"{"grant":{"grant_id":"gr_1","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"ticket",
+            "created_at":"2026-08-28T08:32:00Z","expires_at":"2026-08-28T09:32:00Z"},
+            "listeners":[{"listener_id":"pl_1","owner_endpoint":"ep:B",
+                          "protocol":"mjpeg","expires_at":"2026-08-28T09:30:00Z"}]}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let redeemed = client.redeem_ticket("tkt1_secret", None).await.unwrap();
+        assert_eq!(redeemed.grant.origin, "ticket");
+        assert_eq!(
+            redeemed.grant.expires_at.as_deref(),
+            Some("2026-08-28T09:32:00Z"),
+            "a ticket's grant always ends"
+        );
+        assert_eq!(redeemed.listeners.len(), 1);
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, body) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/peer/tickets/redeem")
+        );
+        let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(sent["ticket"], "tkt1_secret");
+        assert!(sent["label"].is_null());
+    }
+
+    /// The listener shape §8.12.3 prints beside the response is shorter than
+    /// §8.10's, which the same paragraph says it is. Whichever the proxy
+    /// actually sends, a redemption that worked must not come back as an error
+    /// — the ticket is spent either way.
+    #[tokio::test]
+    async fn redeeming_accepts_the_shorter_listener_shape() {
+        let body = r#"{"grant":{"grant_id":"gr_1","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"ticket",
+            "created_at":"2026-08-28T08:32:00Z","expires_at":"2026-08-28T09:32:00Z"},
+            "listeners":[{"listener_id":"pl_1","protocol":"mjpeg",
+                          "metadata":{"name":"validator-01"}}]}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let redeemed = client.redeem_ticket("tkt1_secret", None).await.unwrap();
+        assert_eq!(redeemed.listeners[0].listener_id, "pl_1");
+        assert_eq!(redeemed.listeners[0].owner_endpoint, None);
+    }
+
+    /// An authorised peer whose far side has not started yet is not a failure,
+    /// and the absence of `listeners` must not be read as one.
+    #[tokio::test]
+    async fn redeeming_with_nothing_listening_yet_is_not_an_error() {
+        let body = r#"{"grant":{"grant_id":"gr_1","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"ticket",
+            "created_at":"2026-08-28T08:32:00Z","expires_at":"2026-08-28T09:32:00Z"}}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let redeemed = client.redeem_ticket("tkt1_secret", None).await.unwrap();
+        assert!(redeemed.listeners.is_empty());
+    }
+
+    /// `redemption` is absent until somebody spends it — the key is missing,
+    /// not null, so a required field here would fail to parse every unredeemed
+    /// row.
+    #[tokio::test]
+    async fn an_unredeemed_ticket_parses_without_a_redemption() {
+        let body = r#"{"tickets":[
+            {"ticket_id":"tkt_1","protocol":"mjpeg","grant_ttl":3600,
+             "created_at":"2026-08-28T08:30:00Z","expires_at":"2026-08-28T08:45:00Z"},
+            {"ticket_id":"tkt_2","protocol":"mjpeg","grant_ttl":3600,
+             "created_at":"2026-08-28T08:00:00Z","expires_at":"2026-08-28T08:15:00Z",
+             "redemption":{"endpoint_id":"ep:A","grant_id":"gr_9",
+                           "redeemed_at":"2026-08-28T08:02:00Z"}}]}"#;
+        let (client, _key) = client(MockTransport::with_response(200, body));
+        let tickets = client.list_tickets().await.unwrap();
+        assert!(tickets[0].redemption.is_none());
+        assert_eq!(
+            tickets[1].redemption.as_ref().unwrap().endpoint_id,
+            "ep:A",
+            "who spent it is the whole point of the listing"
+        );
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, ..) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("GET", "/v1/peer/tickets")
+        );
+    }
+
+    /// Revoking is by id on the ticket route, not the grant one — the two are
+    /// different objects and §8.12.6 turns on that.
+    #[tokio::test]
+    async fn revoking_a_ticket_uses_the_ticket_route() {
+        let (client, _key) = client(MockTransport::with_response(204, ""));
+        client.revoke_ticket("tkt_1").await.unwrap();
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, ..) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("DELETE", "/v1/peer/tickets/tkt_1")
+        );
+    }
+
     /// The other pairing shape, and that an absent label is sent as null rather
     /// than as the string "null" or omitted.
     #[tokio::test]
@@ -1526,6 +1952,95 @@ mod tests {
         assert_eq!(
             pairing_code_from_input("https://example.test/pair?code=K7M2-QX4P"),
             "https://example.test/pair?code=K7M2-QX4P"
+        );
+    }
+
+    #[test]
+    fn a_ticket_transfer_round_trips() {
+        let packed = ticket_transfer("tokyo.link.isekai.tools:8443", "tkt1_QA81kTj0cA4Q8gL9");
+        assert!(packed.starts_with(TICKET_TRANSFER_PREFIX));
+        // The secret must not be readable in the packed form without decoding
+        // it, or a shoulder-glance at a chat window is enough.
+        assert!(!packed.contains("QA81kTj0cA4Q8gL9"));
+        assert_eq!(
+            ticket_from_transfer(&packed),
+            Some(TicketTransfer {
+                proxy: "tokyo.link.isekai.tools:8443".to_owned(),
+                ticket: "tkt1_QA81kTj0cA4Q8gL9".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_bare_ticket_is_accepted_and_names_no_proxy() {
+        assert_eq!(
+            ticket_from_transfer("  tkt1_QA81kTj0cA4Q8gL9  "),
+            Some(TicketTransfer {
+                proxy: String::new(),
+                ticket: "tkt1_QA81kTj0cA4Q8gL9".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_ticket_is_taken_from_a_link_fragment() {
+        // §8.12.8 asks for the fragment rather than the path or query, so that
+        // it stays out of Referer and access logs. A person copying the whole
+        // link should still be able to paste it.
+        let packed = ticket_transfer("proxy.test", "tkt1_abc");
+        let link = format!("https://example.test/join#{packed}");
+        assert_eq!(
+            ticket_from_transfer(&link).map(|t| t.ticket),
+            Some("tkt1_abc".to_owned())
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_a_ticket_is_refused_before_the_network() {
+        for input in [
+            "nonsense",
+            "K7M2-QX4P",
+            "",
+            // Right prefix, but the payload is not base64url.
+            "iskt1_!!!!",
+            // Decodes, but the inner value is not a ticket — so redeeming it
+            // would spend a request to be told nothing useful.
+            &format!(
+                "iskt1_{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(br#"{"p":"proxy.test","t":"not-a-ticket"}"#)
+            ),
+        ] {
+            assert_eq!(ticket_from_transfer(input), None, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn redaction_keeps_the_prefix_and_drops_the_secret() {
+        let line = "redeeming tkt1_QA81kTj0cA4Q8gL9 now";
+        assert_eq!(redact_tickets(line), "redeeming tkt1_… now");
+        // The longer prefix must win. Matching `tkt1_` first would leave the
+        // `is` behind and redact from inside the word: `is` + `kt1_…`.
+        let packed = ticket_transfer("proxy.test", "tkt1_abc");
+        assert_eq!(
+            redact_tickets(&format!("hand over {packed}")),
+            "hand over iskt1_…"
+        );
+        // Both kinds on one line, each cut at its own end.
+        assert_eq!(
+            redact_tickets("iskt1_AAaa-_09 then tkt1_BBbb, done"),
+            "iskt1_… then tkt1_…, done"
+        );
+    }
+
+    #[test]
+    fn redaction_leaves_everything_else_alone() {
+        assert_eq!(redact_tickets("nothing to see"), "nothing to see");
+        assert_eq!(
+            redact_tickets("grant gr_AbC12345 from ticket tkt_AbC12345"),
+            // `tkt_` is the id, not the secret, and is meant to be readable —
+            // only `tkt1_` is the thing worth hiding.
+            "grant gr_AbC12345 from ticket tkt_AbC12345"
         );
     }
 

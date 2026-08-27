@@ -60,12 +60,18 @@ forward reachable from your network is a second door onto the server's
 services.
 ",
     note = "\
-The server's operator has to let you in first, and there are two ways in.
+The server's operator has to let you in first, and there are three ways in.
 
 PAIRING, which is the one to use: they run `portal-server --pair` and read you
 the code; you run `--pair <code>` once. That makes a standing grant, and after
 it every connect needs only --map -- the current listener is looked up for you,
 so the server can restart without breaking anything.
+
+A TICKET, when nobody is reading a code aloud: they run `portal-server
+--ticket` and send you the one string it prints; you run `--redeem <string>`
+once. Same standing grant afterwards, except it expires on its own -- which is
+the point, for work that ends. The string says which proxy to redeem at, so
+--proxy-url does not have to be right for this.
 
 A CAPABILITY, for being let in once: run --whoami, send them the Endpoint ID,
 and they issue one with --allow. Pass it with --capability and --listener. It
@@ -128,6 +134,11 @@ struct Args {
     /// --listener nor --capability, and survives the server restarting
     #[argh(option)]
     pair: Option<String>,
+    /// redeem a TICKET the server's operator sent you, and exit. Takes the
+    /// one string --ticket printed, which says which proxy to redeem at. What
+    /// it makes is a grant that expires on its own
+    #[argh(option)]
+    redeem: Option<String>,
     /// a name for this device, recorded with the grant so the operator can see
     /// what they let in
     #[argh(option)]
@@ -236,6 +247,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return redeem(&args, &tokens, key, code).await;
     }
 
+    if let Some(ticket) = &args.redeem {
+        return redeem_ticket(&args, &tokens, key, ticket).await;
+    }
+
     let maps = maps(&args.map, args.bind)?;
     if maps.is_empty() {
         anyhow::bail!("nothing to forward; pass at least one --map port:service");
@@ -339,6 +354,66 @@ async fn redeem(
     println!("paired with : {}", grant.owner_endpoint);
     println!("grant       : {}", grant.grant_id);
     println!("\nConnect with --map alone; the listener is found for you.");
+    Ok(())
+}
+
+/// Redeem a ticket, and say what it let us into.
+///
+/// **The ticket says which proxy to present it at**, and that wins over
+/// `--proxy-url` — a ticket redeemed anywhere else is simply not a ticket that
+/// proxy has ever heard of, and the answer would be `403 ticket-invalid` with
+/// nothing to suggest the address was the problem. A bare `tkt1_` secret
+/// carries no proxy, and then the configured one is used.
+async fn redeem_ticket(
+    args: &Args,
+    tokens: &std::path::Path,
+    key: isekai_p2p::agent::EndpointKey,
+    ticket: &str,
+) -> anyhow::Result<()> {
+    let Some(transfer) = isekai_p2p::agent::ticket_from_transfer(ticket) else {
+        // Deliberately does not echo the value back: it is a secret until it is
+        // spent, and a failed paste is exactly the moment somebody copies the
+        // whole line into a bug report.
+        anyhow::bail!(
+            "that is not a ticket -- expected the `iskt1_` string the operator sent, \
+             or a bare `tkt1_` secret"
+        );
+    };
+    let mut cfg = config(args, tokens, key).await?;
+    if !transfer.proxy.is_empty() {
+        let proxy_url = if transfer.proxy.contains("://") {
+            transfer.proxy.clone()
+        } else {
+            format!("https://{}", transfer.proxy)
+        };
+        if proxy_url != cfg.proxy_url {
+            println!("redeeming at: {proxy_url}  (the ticket says so)");
+        }
+        cfg.proxy_url = proxy_url;
+    }
+    let directory = isekai_p2p::PeerDirectory::open(&cfg)
+        .await
+        .context("open the proxy control plane")?;
+    let redeemed = directory
+        .redeem_ticket(&transfer.ticket, args.label.as_deref())
+        .await
+        .context("redeem the ticket")?;
+    let grant = &redeemed.grant;
+    println!("let in by   : {}", grant.owner_endpoint);
+    println!("grant       : {}", grant.grant_id);
+    match &grant.expires_at {
+        Some(at) => println!("expires at  : {at}"),
+        // The proxy is required to put a finite life on a ticket's grant, so
+        // this should not happen; say so rather than printing nothing, because
+        // "access that never lapses" is the one thing tickets exist to avoid.
+        None => println!("expires at  : never -- unexpected for a ticket"),
+    }
+    if redeemed.listeners.is_empty() {
+        println!("\nNothing is listening on that Endpoint yet. That is not a failure:");
+        println!("you are authorised, and --map will find it once the server is up.");
+    } else {
+        println!("\nConnect with --map alone; the listener is found for you.");
+    }
     Ok(())
 }
 

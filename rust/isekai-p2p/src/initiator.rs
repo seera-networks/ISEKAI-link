@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay, RelayOptions};
 use isekai_p2p_core::observed::ObservedAddressWatch;
 use isekai_p2p_core::proxy::{
-    Candidate, Grant, PeerConnection, ProxyClient, ProxyError, ReachableListener,
+    Candidate, Grant, PeerConnection, ProxyClient, ProxyError, ReachableListener, RedeemedTicket,
 };
 use isekai_p2p_core::transport::MasqueH3Transport;
 use time::format_description::well_known::Rfc3339;
@@ -337,6 +337,21 @@ impl PeerDirectory {
     /// Enrol on a listener of this Endpoint's own account (spec §8.9.3).
     pub async fn enrol(&self, listener_id: &str, label: Option<&str>) -> anyhow::Result<Grant> {
         Ok(self.proxy.pair_with_listener(listener_id, label).await?)
+    }
+
+    /// Redeem a Ticket, binding this Endpoint to it (spec §8.12.3).
+    ///
+    /// Unlike a pairing code this is a 256-bit secret that was handed over out
+    /// of band, so it is not read off a screen and several can be outstanding
+    /// at once. What comes back is a Grant with a finite life, and the
+    /// listeners reachable through it — the latter so that redeeming does not
+    /// have to be followed by a listing. An empty list is not a failure.
+    pub async fn redeem_ticket(
+        &self,
+        ticket: &str,
+        label: Option<&str>,
+    ) -> anyhow::Result<RedeemedTicket> {
+        Ok(self.proxy.redeem_ticket(ticket, label).await?)
     }
 
     /// Connect to one of these listeners on a grant, over the control-plane

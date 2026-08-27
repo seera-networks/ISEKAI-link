@@ -48,9 +48,11 @@ pub mod agent {
     pub use isekai_p2p_core::identity::EndpointToken;
     pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::proxy::{
-        pairing_code_from_input, pairing_code_in_uri, pairing_uri, Candidate, CandidateType,
-        Capability, CertBundle, ConnectionStateFilter, Grant, ListenerConnections, ListenerEvent,
-        PairingCode, PeerConnection, ReachableListener,
+        pairing_code_from_input, pairing_code_in_uri, pairing_uri, redact_tickets,
+        ticket_from_transfer, ticket_transfer, Candidate, CandidateType, Capability, CertBundle,
+        ConnectionStateFilter, Grant, ListenerConnections, ListenerEvent, PairingCode,
+        PeerConnection, ReachableListener, RedeemedTicket, Ticket, TicketListener, TicketRecord,
+        TicketRedemption, TicketTransfer, TICKET_PREFIX, TICKET_TRANSFER_PREFIX,
     };
     pub use isekai_p2p_core::proxy::{
         CachedCertificate, CertificateParameters, IssuedCertificate, ProxyClient, ProxyError,
