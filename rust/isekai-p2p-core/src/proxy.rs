@@ -323,19 +323,31 @@ pub struct PairingCode {
 /// that pairing cannot do. Whoever redeems it binds themselves to it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ticket {
-    pub ticket_id: String,
     /// The secret itself, `tkt1_`-prefixed. **Returned by this call only and
     /// never re-fetchable** — the proxy keeps a SHA-256 of it and nothing more.
+    ///
+    /// The one required field, and everything else here is optional **because
+    /// of** that sentence. A response this cannot parse is a ticket the proxy
+    /// has already minted and will never show again: the operator would get an
+    /// error, no secret to hand over, and no `ticket_id` to revoke the thing
+    /// with. A missing `created_at` is not worth that.
     pub ticket: String,
-    pub owner_endpoint: String,
-    pub protocol: String,
+    #[serde(default)]
+    pub ticket_id: Option<String>,
+    #[serde(default)]
+    pub owner_endpoint: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
     /// How long the Grant made by redeeming this will last. Never unlimited.
-    pub grant_ttl: u64,
+    #[serde(default)]
+    pub grant_ttl: Option<u64>,
     #[serde(default)]
     pub label: Option<String>,
-    pub created_at: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
     /// When the Ticket itself stops being redeemable. Unrelated to `grant_ttl`.
-    pub expires_at: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 /// One row of `GET /v1/peer/tickets` (spec §8.12.5) — the issue response
@@ -463,6 +475,20 @@ pub const TICKET_PREFIX: &str = "tkt1_";
 /// The fixed prefix on the one-string form below (spec §8.12.8).
 pub const TICKET_TRANSFER_PREFIX: &str = "iskt1_";
 
+/// The authority a proxy base URL names — `tokyo.link.isekai.tools:8443`.
+///
+/// Shared so that the side writing a hand-over string and the side checking one
+/// agree on what counts as "the same proxy". Falls back to the whole input
+/// rather than erroring: a proxy URL that does not parse is a problem the
+/// connect reports far better than this can.
+pub fn proxy_authority(proxy_url: &str) -> &str {
+    let rest = proxy_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(proxy_url);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
 /// A Ticket together with where to redeem it (spec §8.12.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketTransfer {
@@ -520,8 +546,16 @@ pub fn ticket_from_transfer(input: &str) -> Option<TicketTransfer> {
     // the part after `#` costs nothing and means a copied link works.
     let input = input.rsplit('#').next().unwrap_or(input).trim();
     if let Some(encoded) = input.strip_prefix(TICKET_TRANSFER_PREFIX) {
+        // **Both padding modes.** This encodes without, as §8.12.8's example
+        // does, but `URL_SAFE_NO_PAD` *rejects* padding rather than tolerating
+        // it — and padded urlsafe base64 is what the common encoders produce by
+        // default (Python's `urlsafe_b64encode` among them). Two payload
+        // lengths in three end up padded, so a proxy UI or a second
+        // implementation emitting the same format would have every other
+        // ticket refused here as "not a ticket". Strict out, liberal in.
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(encoded))
             .ok()?;
         let body: TicketTransferBody = serde_json::from_slice(&raw).ok()?;
         if !body.t.starts_with(TICKET_PREFIX) {
@@ -1491,7 +1525,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ticket.ticket, "tkt1_secret");
-        assert_eq!(ticket.grant_ttl, 3600);
+        assert_eq!(ticket.grant_ttl, Some(3600));
 
         let calls = client.transport.calls.lock().unwrap();
         let (method, path, _, body) = calls.last().unwrap();
@@ -2013,6 +2047,43 @@ mod tests {
         ] {
             assert_eq!(ticket_from_transfer(input), None, "{input:?}");
         }
+    }
+
+    #[test]
+    fn a_padded_transfer_is_accepted_too() {
+        // Not what this encodes, but what another implementation is likely to:
+        // padded urlsafe base64 is the default of most encoders, and
+        // `URL_SAFE_NO_PAD` refuses rather than ignores it.
+        let padded = base64::engine::general_purpose::URL_SAFE
+            .encode(br#"{"p":"proxy.testx","t":"tkt1_abc"}"#);
+        assert!(padded.contains('='), "this fixture is meant to be padded");
+        assert_eq!(
+            ticket_from_transfer(&format!("iskt1_{padded}")),
+            Some(TicketTransfer {
+                proxy: "proxy.testx".to_owned(),
+                ticket: "tkt1_abc".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_authority_is_what_two_sides_compare() {
+        assert_eq!(
+            proxy_authority("https://tokyo.link.isekai.tools:8443"),
+            "tokyo.link.isekai.tools:8443"
+        );
+        assert_eq!(proxy_authority("https://a.test/base?x=1#y"), "a.test");
+        assert_eq!(proxy_authority("a.test:8443"), "a.test:8443");
+    }
+
+    /// The whole point of loosening this: a response that lost a field must
+    /// still hand back the secret, because there is no second chance at it.
+    #[test]
+    fn a_ticket_response_missing_everything_but_the_secret_still_parses() {
+        let ticket: Ticket = serde_json::from_str(r#"{"ticket":"tkt1_secret"}"#).unwrap();
+        assert_eq!(ticket.ticket, "tkt1_secret");
+        assert_eq!(ticket.ticket_id, None);
+        assert_eq!(ticket.grant_ttl, None);
     }
 
     #[test]

@@ -298,14 +298,28 @@ async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
             )
             .await
             .context("issue a ticket")?;
-        println!("\nticket id   : {}", ticket.ticket_id);
-        println!("expires at  : {}", ticket.expires_at);
-        println!("grant ttl   : {}s", ticket.grant_ttl);
+        // **The secret first.** Everything else here is optional, and the
+        // reason is that it is shown once: a response missing `created_at`
+        // must not cost the operator the one string they came for.
         println!("\nHand over this one string:\n");
         println!(
             "  {}",
-            isekai_p2p::agent::ticket_transfer(&proxy_host(&args.proxy_url), &ticket.ticket)
+            isekai_p2p::agent::ticket_transfer(
+                isekai_p2p::agent::proxy_authority(&args.proxy_url),
+                &ticket.ticket,
+            )
         );
+        println!();
+        match &ticket.ticket_id {
+            Some(id) => println!("ticket id   : {id}  (--revoke-ticket takes this)"),
+            None => println!("ticket id   : not reported -- --tickets will list it"),
+        }
+        if let Some(at) = &ticket.expires_at {
+            println!("expires at  : {at}");
+        }
+        if let Some(ttl) = ticket.grant_ttl {
+            println!("grant ttl   : {ttl}s");
+        }
         println!("\nThe peer runs: portal-client --redeem <that string>");
         println!("\nIt works once, it is not shown again, and it is a secret until");
         println!("it is spent -- send it the way you would send a password.");
@@ -335,23 +349,6 @@ async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// The host a `--proxy-url` names, for the hand-over string (spec §8.12.8).
-///
-/// Whoever redeems has to know **which proxy** to present the ticket to, and a
-/// ticket carries nothing about that. Falls back to the whole value rather than
-/// erroring: an unparseable proxy URL is a problem the connect will report far
-/// better than a string-splitting helper can.
-fn proxy_host(proxy_url: &str) -> String {
-    proxy_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(proxy_url)
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(proxy_url)
-        .to_owned()
 }
 
 #[tokio::main]

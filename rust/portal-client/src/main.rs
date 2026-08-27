@@ -244,6 +244,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     if let Some(code) = &args.pair {
+        // **A ticket put in the wrong flag must not be sent as a code.** The
+        // proxy would refuse it, but only after the secret had travelled in a
+        // `code` field and landed in whatever that failure is logged to. The
+        // two are easy to mix up: both are "the thing they sent me".
+        if isekai_p2p::agent::ticket_from_transfer(code).is_some() {
+            anyhow::bail!(
+                "that is a ticket, not a pairing code -- redeem it with --redeem.\n\
+                 Nothing was sent. ({})",
+                isekai_p2p::agent::redact_tickets(code),
+            );
+        }
         return redeem(&args, &tokens, key, code).await;
     }
 
@@ -379,18 +390,29 @@ async fn redeem_ticket(
              or a bare `tkt1_` secret"
         );
     };
-    let mut cfg = config(args, tokens, key).await?;
-    if !transfer.proxy.is_empty() {
-        let proxy_url = if transfer.proxy.contains("://") {
-            transfer.proxy.clone()
-        } else {
-            format!("https://{}", transfer.proxy)
-        };
-        if proxy_url != cfg.proxy_url {
-            println!("redeeming at: {proxy_url}  (the ticket says so)");
-        }
-        cfg.proxy_url = proxy_url;
+    // **The string says which proxy, and that is not the same as choosing it.**
+    // Redeeming sends this Endpoint's token, and PoP signs the method, path and
+    // body but not the authority — so nothing binds those credentials to the
+    // proxy they were meant for. Taking the address out of a pasted string
+    // would mean whoever composed the string picks where the token goes.
+    //
+    // So a mismatch stops here and names the flag to pass. It also keeps the
+    // advice at the end of this function true: every later `--map` builds its
+    // config from `--proxy-url` again, and a grant made at some other proxy
+    // would be looked up at this one and not found.
+    let configured = isekai_p2p::agent::proxy_authority(&args.proxy_url);
+    if !transfer.proxy.is_empty() && transfer.proxy != configured {
+        anyhow::bail!(
+            "this ticket is for {}, but --proxy-url is {configured}.\n\
+             Redeeming sends this Endpoint's token to whichever proxy is used, so \
+             the address is not taken from the ticket on its own.\n\
+             If you trust it: --proxy-url https://{} --redeem …\n\
+             Pass it to every later command too -- that is where the grant lives.",
+            transfer.proxy,
+            transfer.proxy,
+        );
     }
+    let cfg = config(args, tokens, key).await?;
     let directory = isekai_p2p::PeerDirectory::open(&cfg)
         .await
         .context("open the proxy control plane")?;

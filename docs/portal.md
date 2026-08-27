@@ -287,16 +287,23 @@ portal-server --ticket --ticket-label ci-run-4821 --grant-ttl 3600
 ```
 
 ```
-ticket id   : tkt_AbC12345
-expires at  : 2026-08-28T08:45:00Z
-grant ttl   : 3600s
-
 Hand over this one string:
 
   iskt1_eyJwIjoidG9reW8ubGluay5pc2VrYWkudG9vbHM6ODQ0MyIsInQiOiJ0a3QxX1FBODF…
 
+ticket id   : tkt_AbC12345  (--revoke-ticket takes this)
+expires at  : 2026-08-28T08:45:00Z
+grant ttl   : 3600s
+
 The peer runs: portal-client --redeem <that string>
+
+It works once, it is not shown again, and it is a secret until
+it is spent -- send it the way you would send a password.
 ```
+
+The secret is printed **first, and before anything that could be missing from
+the proxy's answer**: it is shown once and never again, so nothing optional gets
+to come between you and it.
 
 ```sh
 portal-client --redeem iskt1_eyJwIjoi…
@@ -325,21 +332,35 @@ and 3,600.
 **A ticket cannot make unlimited access.** That is the one thing pairing does
 that this deliberately does not.
 
-### The string carries the proxy
+### The string carries the proxy, but does not choose it
 
 `--redeem` takes the whole `iskt1_` string rather than the bare secret, because
-a ticket by itself does not say **where** to spend it. Presenting it to the
+a ticket by itself does not say **where** to spend it: presenting one to the
 wrong proxy is refused as an unknown ticket, with nothing in the answer to
-suggest the address was the problem — so the address travels with it, and
-`--proxy-url` does not have to be right on the redeeming side.
+suggest the address was the problem.
+
+What it does **not** do is send you there. Redeeming presents this Endpoint's
+token, and the proof-of-possession covers the method, path and body but not the
+host — so a string composed by somebody else would otherwise decide where your
+credentials go. If the ticket names a proxy other than `--proxy-url`, portal
+stops and tells you what to pass:
+
+```
+Error: this ticket is for osaka.link.isekai.tools:8443, but --proxy-url is
+tokyo.link.isekai.tools:8443.
+```
+
+Pass that `--proxy-url` to the later commands too — **the grant lives at the
+proxy you redeemed at**, and `--map` looks it up wherever `--proxy-url` points.
 
 Put it in a link's **fragment** if you send one (`https://…/join#iskt1_…`): a
 path or a query ends up in `Referer` headers and access logs. `--redeem` takes
 that form too.
 
 Treat it as a password until it is spent. Both `iskt1_` and `tkt1_` are fixed
-prefixes so that secret scanners and `grep` can find one that got away, and
-portal masks them in its own output.
+prefixes so that secret scanners and `grep` can find one that got away. Handing
+a ticket to `--pair` by mistake is refused before anything is sent, rather than
+travelling to the proxy in a field meant for an eight-character code.
 
 ### Seeing where they went
 
