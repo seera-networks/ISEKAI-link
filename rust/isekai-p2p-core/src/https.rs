@@ -59,11 +59,28 @@ impl ControlPlaneTransport for HttpsTransport {
         }
         let resp = req.send().await.context("HTTPS request failed")?;
         let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                // Non-UTF-8 header values are dropped rather than lossily
+                // decoded: nothing here reads a header it did not expect, and
+                // a mangled one would be a worse answer than none.
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_owned(), v.to_owned()))
+            })
+            .collect();
         let body = resp
             .bytes()
             .await
             .context("failed to read the response body")?
             .to_vec();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            headers,
+        })
     }
 }

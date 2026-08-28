@@ -110,6 +110,16 @@ impl ControlPlaneTransport for MasqueH3Transport {
             .map_err(|e| anyhow::anyhow!("H3 request failed: {e}"))?;
 
         let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_owned(), v.to_owned()))
+            })
+            .collect();
         let body = response
             .into_body()
             .collect()
@@ -117,7 +127,11 @@ impl ControlPlaneTransport for MasqueH3Transport {
             .map_err(|e| anyhow::anyhow!("failed to read response body: {e:?}"))?
             .to_bytes()
             .to_vec();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            headers,
+        })
     }
 }
 

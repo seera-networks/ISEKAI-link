@@ -21,10 +21,43 @@ use crate::endpoint::EndpointKey;
 use crate::pop;
 
 /// A raw HTTP response from the control plane.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// Response headers, lowercased names.
+    ///
+    /// **Carried because `Retry-After` lives here and nowhere else.** Both
+    /// servers put the wait for `429 …-slots-exhausted` and `503
+    /// …-unavailable` in the header and not in the problem body, and both
+    /// specs ask the client to back off by what it says — §8.8.6 goes as far
+    /// as adding the sweep interval to it, precisely so a client that obeys
+    /// does not come back to a second `429`. Dropping the headers here meant
+    /// no caller could obey.
+    pub headers: Vec<(String, String)>,
+}
+
+impl HttpResponse {
+    /// The first value of `name`, which is matched case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// `Retry-After` as a duration, when it is the delta-seconds form.
+    ///
+    /// The HTTP-date form is not parsed: neither server sends it, and a
+    /// half-understood date is worse than no answer — the caller's own backoff
+    /// is a sound fallback, a date read as zero is not.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        self.header("retry-after")?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+    }
 }
 
 /// Opens a long-lived response and hands its body back in pieces.
@@ -1113,7 +1146,11 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
                     _ => break,
                 }
             }
-            return Err(problem_error(&HttpResponse { status, body }));
+            return Err(problem_error(&HttpResponse {
+                status,
+                body,
+                headers: Vec::new(),
+            }));
         }
 
         let (events, receiver) = mpsc::channel(32);
@@ -1418,6 +1455,7 @@ mod tests {
             m.responses.lock().unwrap().push(HttpResponse {
                 status,
                 body: body.as_bytes().to_vec(),
+                ..HttpResponse::default()
             });
             m
         }
@@ -1444,7 +1482,7 @@ mod tests {
                 .pop()
                 .unwrap_or(HttpResponse {
                     status: 500,
-                    body: Vec::new(),
+                    ..HttpResponse::default()
                 }))
         }
     }

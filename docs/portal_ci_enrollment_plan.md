@@ -236,7 +236,22 @@ ID トークンの寿命（5〜15 分）と同じ桁かそれより長い。asse
    - **`reason` は渡せない。** Identity が `enrollment_released` を付ける。有人経路の
      `reason` は引き続き必須なので、`Auth0` と `Enrollment` で必須項が入れ替わる —
      型で分けずに `Option` 1 つで通すと、有人経路の `reason` 忘れが `400` になって初めて
-     分かる。**呼び分けは引数ではなく `IdentityAuth` の側で決まる**ことをテストで固定する。
+     分かる。
+
+   **この経路だけ `RevokeAuth` を別に持つ**（実装で決めた。改訂 2 は
+   「`IdentityAuth::Auth0` へ入れる」と書いていたが、`IdentityAuth` は登録・発行・更新が
+   共有する型なので、そこへ `reason` を積むと関係の無い経路まで持たされる）。
+
+   ```rust
+   pub enum RevokeAuth<'a> {
+       Auth0 { token: &'a str, reason: RevokeReason },
+       Enrollment { key: &'a str },
+   }
+   ```
+
+   `RevokeReason` も列挙型にする。語彙は閉じており、しかも**半分は呼び出し元のもので
+   はない** — `enrollment_idle` / `enrollment_key_revoked` は Identity が書く理由で、
+   要求に書くと弾かれる。応答と一覧には載るが要求には載らないので、この型には無い。
 
    できるのは**自分を止めることだけ**である（PoP がその Endpoint の秘密鍵を要求する）。
    漏れた鍵だけでは、同じ鍵で生やした別の Endpoint も、有人登録の Endpoint も止められない。
@@ -722,7 +737,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 
 **受け入れ条件**: 上の 6 つが書き取られ、値が `docs/portal.md` の運用節に載っている。
 
-### フェーズ 1 — Identity クライアント
+### フェーズ 1 — Identity クライアント — **完了**
 
 §2.1。§8.2.2 / §8.2.3 / §8.8.2 / §8.8.4 / §8.8.5 / §8.8.9 と `IdentityAuth`。
 
@@ -1075,3 +1090,61 @@ Proxy 仕様 §8.13.2 が「既存の Endpoint Token に自動で付いてはな
 
 **1 は無認証の要求 1 本で判別できる**（経路が無ければ `404`、あれば `401`）が、
 本番配備への問い合わせなので運用者の了解を取ってから行う。
+
+---
+
+## 10. フェーズ 1 の結果
+
+`isekai-p2p-core` に実装した。`cargo test -p isekai-p2p-core` は 75 本が通り、
+`fmt` / `clippy -D warnings` はクリーン。`isekai-p2p` / `portal-core` / `portal-client` /
+`portal-server` も通る。
+
+### 10.1 入ったもの
+
+| 仕様 | API |
+| --- | --- |
+| §8.2.2 / §8.2.3 | `refresh_challenge` / `refresh_token` |
+| §8.8.4 / §8.8.5 | `enroll_challenge` / `enroll` |
+| §8.8.2 / §8.8.9 | `create_enrollment_key` / `list_enrollment_keys` / `enrollment_key_enrollments` / `revoke_enrollment_key` |
+| §8.7 | `revoke_endpoint`（有人・自己失効の両方） |
+
+型は `IdentityAuth` / `RevokeAuth` / `RevokeReason` / `Enrolled` / `Binding` /
+`NewEnrollmentKey` / `IssuedEnrollmentKey` / `EnrollmentKeyRecord` /
+`EnrollmentRecord` / `Revoked` / `RevokedEnrollmentKey`。
+
+### 10.2 計画に無かった変更: `HttpResponse` がヘッダを持つ
+
+**`Retry-After` はヘッダにしか無い。** 計画の §2.1-7 は「`IdentityError` に
+`retry_after` を載せる」と書いていたが、`HttpResponse` が `status` と `body` しか
+運んでいなかったので、**そもそも読めなかった**。Identity 側は
+`AppError::into_response` で `RETRY_AFTER` ヘッダを立てるだけで、Problem のボディには
+入れない。
+
+`HttpResponse` に `headers: Vec<(String, String)>` を足し、`https.rs` と
+`transport.rs` の両方で詰めるようにした。`retry_after()` は delta-seconds 形式だけを
+読む — HTTP-date 形式はどちらのサーバも送らず、**半端に解釈した日付は「答えが無い」より
+悪い**（呼び出し元自身の後退は健全な代替だが、0 と読んだ日付はそうではない）。
+
+### 10.3 サーバ実装と突き合わせて分かったこと
+
+仕様だけでは決まらず、`../ISEKAI-identity-0-a` を読んで確定させた点。
+
+- **自己失効に `Authorization` を付けてはならない。** ハンドラは
+  「**Auth0 認証が失敗したときにだけ**ボディの鍵を見る」構造になっている
+  （`revoke.rs` の `match Auth0Auth::from_parts`）。両方を送ると人として判定される
+  経路へ入る。`IdentityAuth::Enrollment` がヘッダを出さないのは、そのための
+  仕様であって作法ではない。
+- **`refresh/challenge` のボディは `{endpoint_id, enrollment_key}` だけ。**
+  `RefreshChallengeRequest` に `assertion` の項が無い。ISEKAI-identity#32 の回答どおり。
+- **`enroll` の応答は `EnrollResponse` の全項を必ず返す。** それでも `Enrolled` は
+  `endpoint_id` と `endpoint_token` 以外を省略可のままにした。サーバが返さない想定では
+  なく、**パースに失敗した登録応答の代償が取り返せない**（枠・Challenge・鍵ペアを
+  同時に失う）ためである。
+
+### 10.4 次
+
+フェーズ 2（`Credential` / `AssertionSource` / 発行と更新の分岐）へ進める。
+**フェーズ 4 と、フェーズ 5 の Provisioning Key 引き換えは §9.2 のブロッカー待ち**
+（ISEKAI-identity#33）。フェーズ 3（Proxy クライアント）は、鍵を発行できないので
+実地の確認ができないが、**実装とテストは進められる** — モックに対する検証が
+受け入れ条件であり、そこはブロッカーと独立している。
