@@ -408,11 +408,15 @@ impl NewEnrollmentKey {
 pub struct IssuedEnrollmentKey {
     /// The secret, `enr1_`-prefixed. Store it now or lose it.
     ///
-    /// **The wire name is `key_plaintext`,** which is what the server and its
-    /// OpenAPI both say; §8.8.2's example says `key`, and the two disagree.
-    /// Accepting either is the right leniency in exactly this place — the key
-    /// is minted, counted against the quota and never shown again, so a name
-    /// this cannot match costs the caller a key rather than a retry.
+    /// **The wire name is `key_plaintext`.** §8.8.2's example used to say
+    /// `key` and has been corrected (ISEKAI-identity#36) to match the server
+    /// and its OpenAPI, which always said `key_plaintext`.
+    ///
+    /// `key` is still accepted, because the cost of not accepting it is
+    /// asymmetric: the key is minted, counted against the quota and never
+    /// shown again, so a name this cannot match costs the caller a key rather
+    /// than a retry. That is worth one `alias` against a deployment running
+    /// something older.
     #[serde(rename = "key_plaintext", alias = "key")]
     pub key: String,
     #[serde(default)]

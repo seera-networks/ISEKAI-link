@@ -468,9 +468,10 @@ async fn issuing_a_key_states_a_binding_and_carries_no_pop() {
             post(
                 |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
                     record(&s, "/v1/enrollment-keys", h, b).await;
-                    // **The server's names, not the spec's example.** §8.8.2
-                    // prints `key`; `enrollment.rs` and `openapi.yaml` both
-                    // say `key_plaintext`, and the server answers the call.
+                    // **The server's names.** §8.8.2's example printed `key`
+                    // until ISEKAI-identity#36 corrected it; `enrollment.rs`
+                    // and `openapi.yaml` always said `key_plaintext`, and the
+                    // server is what answers the call.
                     Json(json!({
                         "key_id": "enk_1",
                         "key_plaintext": "enr1_SECRET",

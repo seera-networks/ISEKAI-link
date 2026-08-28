@@ -1211,11 +1211,23 @@ enroll / refresh / revoke の 3 経路についてで、**鍵の管理 API（§8
 `#[serde(default)]` を外した** — 一覧は冪等で再実行が安く、読めない形は黙らずに
 言うべきである。
 
-平文のほうは **`key_plaintext` を正とし、`key` も alias で受ける**。ここは
-**仕様と実装が食い違っている**（§8.8.2 の例は `key`、`openapi.yaml` と
-`enrollment.rs` は `key_plaintext`）ので、寛容にするのが正しい唯一の場所である —
-名前が合わないことの代償が、再試行ではなく鍵 1 本だからである。
-上流へ [ISEKAI-identity#35](https://github.com/seera-networks/ISEKAI-identity/issues/35) として報告した。
+平文のほうは **`key_plaintext` を正とし、`key` も alias で受ける**。報告した時点では
+**仕様と実装が食い違っていた**（§8.8.2 の例は `key`、`openapi.yaml` と `enrollment.rs` は
+`key_plaintext`）ので、寛容にするのが正しい唯一の場所だった — 名前が合わないことの代償が、
+再試行ではなく鍵 1 本だからである。
+
+> **解決した。** [ISEKAI-identity#35](https://github.com/seera-networks/ISEKAI-identity/issues/35)
+> は [#36](https://github.com/seera-networks/ISEKAI-identity/pull/36) で閉じ、§8.8.2 の例が
+> `key_plaintext` に直った。**alias は残す** — 代償の非対称は変わらないので、古い版を
+> 動かしている配備に対する 1 行の保険として置いておく。
+>
+> **同じ形のずれが他に 3 件見つかっている**（§8.8.2 の `status` / `revoked_at`、
+> §8.8.5 の `policy_distribution`、§8.8.9 の `proxy_notification`）。どれも
+> **こちらの型は影響を受けない** — serde が知らない項目を無視するためで、
+> `proxy_notification` に至っては §10.4 で既に足してある。
+> 上流は仕様の例と実際の応答を項目の経路で突き合わせるテストを入れた。
+>
+> 一覧の包みが `items` であることも、18 項目すべてを書いた例として仕様に載った。
 
 **加えて 3 件、設計の誤り。**
 
