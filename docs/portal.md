@@ -403,7 +403,14 @@ ticket      : tkt_Dd77e210  unredeemed, expires 2026-08-28T09:15:00Z, nightly-ba
 
 **This is the only record of where a ticket went.** Whoever redeems binds
 themselves to it, and if the wrong party got there first this is where you see
-it — and the intended one finds out because their redemption is refused.
+it — and the intended one finds out because their redemption is refused. The
+grant it made does not say where it came from, so nothing else records this.
+
+**It is the only record until it ages out**, which it does: a redeemed ticket
+stays for a retention window — a day, on the default deployment — and the proxy
+keeps a bounded number of them per Endpoint, dropping the oldest first. That is
+sized for "who was let in recently", not for a permanent log. If a redemption
+matters beyond that, read it while it is here.
 
 ```sh
 portal-server --revoke-ticket tkt_Dd77e210
