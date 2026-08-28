@@ -525,6 +525,28 @@ impl ProvisioningBinding {
     }
 }
 
+/// A binding as the proxy reports it (spec §8.13.3).
+///
+/// **`kind` is a `String` rather than an enum**, unlike [`ProvisioningBinding`]
+/// which the caller constructs. A type this does not recognise must not stop a
+/// listing from parsing — the request side has to name something the server
+/// knows, but the response side only has to be readable, and §8.13.9 has adding
+/// types as an open question.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BindingView {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// **The value a caller cannot guess and cannot set.** The proxy takes it
+    /// from its own configuration, so echoing it here is how whoever configures
+    /// the far side learns what to mint for.
+    #[serde(default)]
+    pub audience: Option<String>,
+}
+
 /// A Provisioning Key as issued (spec §8.13.3).
 ///
 /// **`key` is the only required field**, for the reason [`Ticket`] gives: it is
@@ -568,7 +590,7 @@ pub struct ProvisioningKey {
     /// has to mint for. **Not settable by the caller** — a key naming another
     /// service's audience would accept the tokens that service holds.
     #[serde(default)]
-    pub binding: Option<serde_json::Value>,
+    pub binding: Option<BindingView>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -601,7 +623,7 @@ pub struct ProvisioningKeyRecord {
     #[serde(default)]
     pub redemption_count: Option<i64>,
     #[serde(default)]
-    pub binding: Option<serde_json::Value>,
+    pub binding: Option<BindingView>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]

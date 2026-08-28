@@ -149,7 +149,9 @@ async fn issuing_a_key_sends_the_binding_and_reads_back_the_secret() {
     assert_eq!(issued.key, "pvk1_9dQ2mR7xK0");
     assert_eq!(issued.key_id.as_deref(), Some("pvk_AbC12345"));
     // The audience the operator configured, echoed so CI knows what to mint.
-    assert_eq!(issued.binding.as_ref().unwrap()["audience"], "isekai-proxy");
+    let binding = issued.binding.as_ref().unwrap();
+    assert_eq!(binding.kind, "oidc");
+    assert_eq!(binding.audience.as_deref(), Some("isekai-proxy"));
 
     let (method, path, body) = &mock.calls()[0];
     assert_eq!(
@@ -209,6 +211,25 @@ async fn listing_keys_reads_the_wrapper_the_proxy_sends() {
 ///
 /// An empty one reads as "this Endpoint has no keys", which is what somebody
 /// sees just before issuing past the quota of four.
+/// A binding type this build does not know must not stop a listing parsing.
+///
+/// §8.13.9 has adding types as an open question, and a client that refused the
+/// whole listing over one unfamiliar word would make that change breaking for
+/// no reason — the request side has to name something the server knows, the
+/// response side only has to be readable.
+#[tokio::test]
+async fn an_unfamiliar_binding_type_still_parses() {
+    let mock = MockProxy::answering(
+        200,
+        json!({ "keys": [{ "key_id": "pvk_1", "binding": { "type": "spiffe" } }] }),
+    );
+    let keys = client(mock)
+        .list_provisioning_keys()
+        .await
+        .expect("listing");
+    assert_eq!(keys[0].binding.as_ref().unwrap().kind, "spiffe");
+}
+
 #[tokio::test]
 async fn an_unreadable_key_listing_is_refused() {
     let mock = MockProxy::answering(200, json!({ "items": [{ "key_id": "pvk_1" }] }));

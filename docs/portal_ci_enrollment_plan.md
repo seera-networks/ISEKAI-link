@@ -779,7 +779,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
   読まない（既存テストの拡張）。
 - `403 provisioning-binding-invalid` が `provisioning-key-invalid` と別の型として届く。
 
-### フェーズ 4 — `portal-server` の発行系
+### フェーズ 4 — `portal-server` の発行系 — **完了**
 
 §2.6。既存の `grant_admin` に 4 フラグ。
 
@@ -1435,3 +1435,64 @@ Identity の §8.8.2 は「なぜ Proxy に揃えないか」を明記してい�
 フェーズ 4（`portal-server` の発行系 CLI）。§9.5 のとおり、配備が
 `DEFAULT_PERMISSIONS` に `peer-provisioning:create` を入れていなければ
 `--provisioning-key` は `403` になる。
+
+---
+
+## 13. フェーズ 4 の結果
+
+`portal-server` に 4 つのフラグと、それを支える 2 つの補助関数。テスト 3 本
+（`portal-server` に初めてテストが入った）、ワークスペースはビルドでき、
+触ったクレートの `fmt` / `clippy -D warnings` はクリーン。
+
+### 13.1 入ったもの
+
+| フラグ | 対応 |
+| --- | --- |
+| `--provisioning-key` | §8.13.3。`--provisioning-ttl` / `--grant-ttl` / `--max-live-grants` / `--binding-oidc` / `--binding-subject` / `--provisioning-label` |
+| `--provisioning-keys` | §8.13.7 一覧。**枠は `live/max` の両方**を出す |
+| `--provisioning-redemptions <id>` | §8.13.7 引き換え記録 |
+| `--revoke-provisioning-key <id>` | §8.13.7 失効 |
+
+`--grant-ttl` は `--ticket` と**共用する**。同じ意味の値であり、フラグを分けると
+「どちらがどちらに効くのか」を help で説明する羽目になる。
+
+### 13.2 出力で決めたこと
+
+**`--revoke-provisioning-key` は `--revoke-ticket` と逆のことを言う。**
+Ticket の失効は「破いた紙で入った人は出ていかない」だが、こちらは派生 Grant を消す。
+出力にそう書いた — 走行中のジョブが認可を失うこと、確立済みの接続は切れないこと、
+記録は残ること。**2 つの出力を読み比べて矛盾しない**ことが受け入れ条件だった。
+
+**`--provisioning-key` は audience を出す。** これは運用者が推測できず設定もできない値で
+（Proxy が自分の設定から取る）、**CI を設定する人がその値を知る唯一の経路が
+この出力**である。載っていなければ「Proxy の運用者に訊け」と言う。
+
+**`--provisioning-keys` は `live/max` を両方出す。** 天井だけでは「この鍵がジョブを
+断っているか」が分からない。`provisioning-slots-exhausted` を踏んだ運用者が見るのは
+この行である。
+
+**引き換え記録は「回数」を出す。** 行は Endpoint、`redeem_count` は訪問回数であり、
+長寿命ランナーが 1 日に何十回更新しても行は 1 つ。行だけ出すと誰も訊いていない質問に
+答えることになる。
+
+### 13.3 実装して分かったこと
+
+**binding の検証は認証より前に置く。** 最初は `grant_admin` の中に書いていたが、
+そこは sign-in と Identity への 1 往復のあとである。**引数だけで分かる誤りに、
+ネットワークを 1 往復させてから答える理由が無い** — `portal-client` が
+`check_ticket` について同じことをしている。`administer_grants` の先頭へ移した。
+
+**応答の `binding` を `serde_json::Value` にしていたのを型にした。**
+`portal-server` に `serde_json` を足すか、型を作るかの二択で、後者を選んだ。
+`BindingView` の `kind` は **`String` のまま**にしてある — 要求側は Proxy が知る型を
+名乗る必要があるが、応答側は読めれば足り、知らない型 1 つで一覧全体のパースが
+止まるのは §8.13.9（型の追加は未解決）に対して不必要に壊れやすい。
+
+**`portal-server` にテストが 1 本も無かった。** binding の組み立ては純粋関数なので、
+msquic を要さずに固定できる。この環境ではバイナリを起動できない（`libmsquic.so.2`）
+ので、**引数の検査はテストでしか確かめられない**という事情もある。
+
+### 13.4 次
+
+フェーズ 5（`portal-client` の CI 経路と `keep_the_grant`）。§9.5 のとおり
+`--issue-enrollment-key` は `--permissions` を既定で `peer-connect:initiate` に絞る。

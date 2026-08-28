@@ -32,6 +32,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use argh::FromArgs;
+use isekai_p2p::agent::{BindingView, ProvisioningBinding};
 use isekai_p2p::{load_or_generate_key, AcceptPolicy, P2pConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -102,7 +103,29 @@ the only record of where a ticket went. --revoke-ticket stops an unused one.
 
 --allow issues a CAPABILITY for one Endpoint. It is one-shot and lasts 300
 seconds at most, so it is for letting a guest in once. A peer that reconnects
-on one needs another."
+on one needs another.",
+    note = "\
+A PROVISIONING KEY is the fourth way, and it is not a ticket you can use twice.
+A ticket is a piece of paper you hand over; this is an arrangement you install,
+so it lives in a secret store rather than in a chat window, and everything
+about it is shaped by that being a standing power somebody holds.
+
+  --provisioning-key       issue one, printing the secret once
+  --provisioning-keys      list them, with how full each one is
+  --provisioning-redemptions <id>   who came in on one, and how often
+  --revoke-provisioning-key <id>    stop it
+
+Use it where the same automation connects over and over and nobody is there to
+hand out a ticket per run -- CI being the case it exists for. Bind it with
+--binding-oidc and --binding-subject so the key alone is not enough to get in;
+without a binding it is a bearer secret, which is fine on a build machine you
+own and wrong for a public repository.
+
+Two things differ from --ticket and both matter. Redeeming again EXTENDS the
+grant rather than being refused, which is how a job longer than --grant-ttl
+keeps working. And revoking DELETES the grants it made, so running jobs stop --
+the opposite of --revoke-ticket, and deliberately: you cannot see who came in
+on a key without asking, so stopping one has to close the door it opened."
 )]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -215,6 +238,49 @@ struct Args {
     /// either way -- use --revoke for that
     #[argh(option)]
     revoke_ticket: Option<String>,
+    /// issue a PROVISIONING KEY and print the secret once, then exit. For
+    /// automation that connects again and again -- redeeming it repeatedly
+    /// extends the grant rather than being refused. Bind it with
+    /// --binding-oidc unless the machine holding it is yours
+    #[argh(switch)]
+    provisioning_key: bool,
+    /// how long a --provisioning-key stays redeemable, in seconds. Clamped to
+    /// 60..=2592000 (30 days), default 604800. There is no unlimited: rotate
+    /// instead, which needs no downtime because four can be live at once
+    #[argh(option)]
+    provisioning_ttl: Option<u64>,
+    /// how many grants a --provisioning-key may have alive at once. Clamped to
+    /// 1..=32, default 4. Match it to how many jobs run in parallel, not to
+    /// how many run in a day: re-redeeming does not take a second slot
+    #[argh(option)]
+    max_live_grants: Option<u64>,
+    /// bind a --provisioning-key to a workload identity issuer, so the key
+    /// alone will not let anyone in. Needs --binding-subject. The issuer must
+    /// be one the proxy's operator allowed
+    #[argh(option)]
+    binding_oidc: Option<String>,
+    /// the exact `sub` the bound workload must present. No wildcards and no
+    /// prefixes -- issue another key to cover another branch or repository
+    #[argh(option)]
+    binding_subject: Option<String>,
+    /// what a --provisioning-key is for. Shown only to you, and carried onto
+    /// the grants it makes unless the peer names its own. 128 bytes at most
+    #[argh(option)]
+    provisioning_label: Option<String>,
+    /// print the provisioning keys this Endpoint has issued, with how many
+    /// grants each one is holding open, and exit
+    #[argh(switch)]
+    provisioning_keys: bool,
+    /// print who came in on a provisioning key and how often, by the id
+    /// --provisioning-keys prints, and exit. This is the only record of where
+    /// a key went
+    #[argh(option)]
+    provisioning_redemptions: Option<String>,
+    /// stop a provisioning key, by the id --provisioning-keys prints. **This
+    /// also deletes the grants it made**, so anything connected on one stops
+    /// being authorised -- unlike --revoke-ticket, which leaves them
+    #[argh(option)]
+    revoke_provisioning_key: Option<String>,
 }
 
 /// Answer `--grants` and `--revoke`, which need no listener.
@@ -224,8 +290,13 @@ struct Args {
 /// connects *through*, and standing one up to ask would put a second row under
 /// this Endpoint for every client that then looks one up.
 async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Result<()> {
+    // **Settled on the arguments, before anything authenticates.** A half-given
+    // binding is a typo, and finding it out after a sign-in and an Identity
+    // round trip tells the operator nothing extra. `portal-client` checks a
+    // ticket's authority the same way and for the same reason.
+    let binding = provisioning_binding(args)?;
     let cfg = config(args, tokens).await?;
-    grant_admin(args, &cfg).await
+    grant_admin(args, &cfg, binding.as_ref()).await
 }
 
 /// The P2P configuration these arguments describe, authenticated however this
@@ -253,7 +324,73 @@ async fn config(args: &Args, tokens: &std::path::Path) -> anyhow::Result<P2pConf
     })
 }
 
-async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
+/// The binding these arguments describe, refused before anything authenticates.
+///
+/// **Both halves or neither.** `--binding-oidc` alone would be a key bound to
+/// an issuer and no subject, which the proxy refuses — and a run that got that
+/// far has already signed in and asked Identity for a token to learn what the
+/// arguments said on their own. A `sub` with no issuer is the same mistake from
+/// the other side.
+///
+/// `None` means an unbound key, which the proxy accepts. It is the right shape
+/// for a build machine whose secret store is yours, and the wrong one for a
+/// public repository's CI: the key alone is then enough to reach this Endpoint.
+fn provisioning_binding(args: &Args) -> anyhow::Result<Option<ProvisioningBinding>> {
+    match (&args.binding_oidc, &args.binding_subject) {
+        (Some(issuer), Some(subject)) => Ok(Some(ProvisioningBinding::Oidc {
+            issuer: issuer.clone(),
+            subject: subject.clone(),
+        })),
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!(
+            "--binding-oidc needs --binding-subject: an issuer without a subject would let \
+             any workload that issuer knows about in"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "--binding-subject needs --binding-oidc, which says who vouches for that subject"
+        ),
+    }
+}
+
+/// Show a key's binding, including the audience the peer has to mint for.
+///
+/// **The audience is the half an operator cannot guess.** It is not settable
+/// here — the proxy takes it from its own configuration, because a key naming
+/// another service's audience would accept the tokens that service is holding —
+/// so echoing it is the only way the person configuring CI learns the value.
+fn print_binding(binding: Option<&BindingView>) {
+    let Some(binding) = binding else {
+        return;
+    };
+    match binding.kind.as_str() {
+        "oidc" => {
+            println!(
+                "bound to    : {} / {}",
+                binding.issuer.as_deref().unwrap_or("?"),
+                binding.subject.as_deref().unwrap_or("?"),
+            );
+            match binding.audience.as_deref() {
+                Some(audience) => {
+                    println!("audience    : {audience}  (the peer mints its token for this)")
+                }
+                // Worth saying rather than printing nothing: without it the
+                // peer cannot know what to ask its issuer for.
+                None => println!("audience    : not reported -- ask the proxy's operator"),
+            }
+        }
+        "none" => {
+            println!("bound to    : nothing -- the key alone is enough to get in.");
+            println!("              Use --binding-oidc for a public repository's CI.");
+        }
+        other => println!("bound to    : {other}"),
+    }
+}
+
+async fn grant_admin(
+    args: &Args,
+    cfg: &P2pConfig,
+    binding: Option<&ProvisioningBinding>,
+) -> anyhow::Result<()> {
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
     let proxy = isekai_p2p::proxy_client(cfg, &token)?;
 
@@ -362,6 +499,122 @@ async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
         println!("\nThe peer runs: portal-client --redeem <that string>");
         println!("\nIt works once, it is not shown again, and it is a secret until");
         println!("it is spent -- send it the way you would send a password.");
+    }
+
+    // **Revocation before issuance**, as with tickets: a run that rotates a key
+    // does both, and the old one should stop before the new one is printed.
+    if let Some(key_id) = &args.revoke_provisioning_key {
+        proxy
+            .revoke_provisioning_key(key_id)
+            .await
+            .with_context(|| format!("revoke provisioning key {key_id}"))?;
+        // **This says the opposite of `--revoke-ticket`, and has to.** Tearing
+        // up a ticket leaves whoever already walked in; revoking one of these
+        // deletes the grants it made. The asymmetry is deliberate on the
+        // proxy's side (§8.13.7): an owner cannot see who came in on a key
+        // without asking, so "stop this key" that left the door open would
+        // leave them watching a door they cannot shut.
+        println!("revoked     : {key_id}");
+        println!("The grants it made are gone with it, so anything running on one has");
+        println!("stopped being authorised. Established connections are not cut, but");
+        println!("nothing new is let in. The record of who came in stays -- ask for it");
+        println!("with --provisioning-redemptions {key_id}.");
+    }
+
+    if args.provisioning_key {
+        let key = proxy
+            .create_provisioning_key(
+                &cfg.protocol,
+                args.provisioning_ttl,
+                args.grant_ttl,
+                args.max_live_grants,
+                binding,
+                args.provisioning_label.as_deref(),
+            )
+            .await
+            .context("issue a provisioning key")?;
+        // **The secret first**, for the same reason `--ticket` prints it
+        // first: everything else is optional in the response, and a missing
+        // `created_at` must not cost the operator the one string they came for.
+        println!("\nPut this in the automation's secret store:\n");
+        println!("  {}", key.key);
+        println!();
+        match &key.key_id {
+            Some(id) => println!("key id      : {id}  (--revoke-provisioning-key takes this)"),
+            None => println!("key id      : not reported -- --provisioning-keys will list it"),
+        }
+        if let Some(at) = &key.expires_at {
+            println!("expires at  : {at}");
+        }
+        if let Some(ttl) = key.grant_ttl {
+            println!("grant ttl   : {ttl}s  (redeeming again extends it)");
+        }
+        if let Some(slots) = key.max_live_grants {
+            println!("slots       : {slots} grants alive at once");
+        }
+        print_binding(key.binding.as_ref());
+        println!("\nThe peer redeems it with its own Endpoint Token; it does not need");
+        println!("--pair or a ticket as well.");
+        println!("\nIt is shown once and it is a standing power: whoever holds it can");
+        println!("reach this Endpoint until the key expires or is revoked.");
+    }
+
+    if args.provisioning_keys {
+        let keys = proxy
+            .list_provisioning_keys()
+            .await
+            .context("list provisioning keys")?;
+        if keys.is_empty() {
+            println!("No provisioning keys issued.");
+        }
+        for key in &keys {
+            let label = key
+                .label
+                .as_deref()
+                .map(|l| format!(", {l}"))
+                .unwrap_or_default();
+            // **Both halves of the slot count.** The ceiling alone does not say
+            // whether a key is turning jobs away, which is the question an
+            // operator has when a run fails with `provisioning-slots-exhausted`.
+            let slots = match (key.live_grants, key.max_live_grants) {
+                (Some(live), Some(max)) => format!("{live}/{max} slots"),
+                (Some(live), None) => format!("{live} grants"),
+                _ => "slots unknown".to_owned(),
+            };
+            println!(
+                "key         : {}  {slots}, {} redemptions, expires {}{label}",
+                key.key_id,
+                key.redemption_count.unwrap_or(0),
+                key.expires_at.as_deref().unwrap_or("?"),
+            );
+        }
+    }
+
+    if let Some(key_id) = &args.provisioning_redemptions {
+        let rows = proxy
+            .provisioning_redemptions(key_id)
+            .await
+            .with_context(|| format!("list redemptions of {key_id}"))?;
+        if rows.is_empty() {
+            println!("Nobody has come in on {key_id}.");
+        }
+        for row in &rows {
+            // **`redeem_count` is visits, and the row is an Endpoint.** One
+            // long-lived runner re-redeeming all day is one row and many
+            // visits, so printing only the row would answer a question nobody
+            // asked.
+            let subject = row
+                .binding_subject
+                .as_deref()
+                .map(|s| format!("  as {s}"))
+                .unwrap_or_default();
+            println!(
+                "redeemed by : {}  {} time(s), last {}{subject}",
+                row.endpoint_id,
+                row.redeem_count.unwrap_or(1),
+                row.redeemed_at.as_deref().unwrap_or("?"),
+            );
+        }
     }
 
     if args.tickets {
@@ -473,7 +726,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         || args.pair
         || args.ticket
         || args.tickets
-        || args.revoke_ticket.is_some();
+        || args.revoke_ticket.is_some()
+        || args.provisioning_key
+        || args.provisioning_keys
+        || args.provisioning_redemptions.is_some()
+        || args.revoke_provisioning_key.is_some();
     // **`--allow` is the one that does need a listener**, and these paths exit
     // before there is one. Dropping it quietly is the worst of the three
     // options: the code or the listing would print, the run would look like it
@@ -583,4 +840,52 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // leaves it listed for its whole lease, pointing at a process that is gone.
     server.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_with(oidc: Option<&str>, subject: Option<&str>) -> Args {
+        let mut args: Args = argh::FromArgs::from_args(&["portal-server"], &[]).expect("defaults");
+        args.binding_oidc = oidc.map(str::to_owned);
+        args.binding_subject = subject.map(str::to_owned);
+        args
+    }
+
+    /// An issuer with no subject would admit every workload that issuer knows
+    /// about — which is most of GitHub. The proxy refuses it; this refuses it
+    /// before a sign-in.
+    #[test]
+    fn half_a_binding_is_refused() {
+        let err = provisioning_binding(&args_with(Some("https://issuer.test"), None)).unwrap_err();
+        assert!(format!("{err:#}").contains("--binding-subject"));
+
+        let err = provisioning_binding(&args_with(None, Some("repo:o/r"))).unwrap_err();
+        assert!(format!("{err:#}").contains("--binding-oidc"));
+    }
+
+    /// Neither is a valid choice, not an oversight: it is the right shape for a
+    /// build machine whose secret store is yours.
+    #[test]
+    fn no_binding_at_all_is_allowed() {
+        assert!(provisioning_binding(&args_with(None, None))
+            .expect("unbound is a choice")
+            .is_none());
+    }
+
+    #[test]
+    fn both_halves_make_an_oidc_binding() {
+        let binding =
+            provisioning_binding(&args_with(Some("https://issuer.test"), Some("repo:o/r")))
+                .expect("valid")
+                .expect("some");
+        assert_eq!(
+            binding,
+            ProvisioningBinding::Oidc {
+                issuer: "https://issuer.test".to_owned(),
+                subject: "repo:o/r".to_owned(),
+            },
+        );
+    }
 }
