@@ -512,9 +512,9 @@ Listener を鍵に含まないという Proxy 仕様 §8.8 の設計の帰結**�
 **前提**: 発行には新しい permission `peer-provisioning:create` が要る
 （Proxy 仕様 §8.13.2）。`peer-connect:accept` では発行できない。
 
-> **これは現在ブロックされている。** Identity は `peer-provisioning:create` を
-> **発行できない** — 仕様 §7 の権限表にも、実装の `Permission` 列挙型にも無い。
-> §9.2 を読むこと。**このフェーズは上流が対応するまで着手できない。**
+> **ISEKAI-identity#34 で発行できるようになった。** ただし**既定では付かない** —
+> 配備が `DEFAULT_PERMISSIONS` に明示する必要があり、その粒度は配備全体である。
+> §9.2 / §9.5 を読むこと。**このフェーズのブロックは解けている。**
 
 ### 2.7 CI ワークフロー
 
@@ -825,6 +825,7 @@ $ portal-client --login                      # CI の Endpoint を所有する U
 $ portal-client --issue-enrollment-key \
     --binding-oidc token.actions.githubusercontent.com \
     --binding-subject 'repo:<org>/<repo>:ref:refs/heads/main' \
+    --permissions peer-connect:initiate \
     --protocols isekai-portal-v1 \
     --max-live-endpoints 8 --endpoint-idle-ttl 1800 \
     --enrollment-label gha-main
@@ -846,7 +847,7 @@ $ portal-server --provisioning-key \
 | 項目 | Enrollment Key | Provisioning Key |
 | --- | --- | --- |
 | protocol | `protocols` に `isekai-portal-v1` | `protocol` = `isekai-portal-v1` |
-| permission | `permissions` に `peer-connect:initiate` | （引き換え側に追加の権限は不要） |
+| permission | `permissions` に `peer-connect:initiate` **だけ**を明示（§9.5） | （引き換え側に追加の権限は不要） |
 | `binding.issuer` | 一致 | 一致 |
 | `binding.subject` | **完全一致**。ワイルドカード不可 | 同じ値 |
 | `binding.audience` | `isekai-identity`（運用者設定） | `isekai-proxy`（運用者設定） |
@@ -996,7 +997,7 @@ Proxy は `../ISEKAI-link-server-0-a`（`main`、`a5ccb0f`）を読んだ。
 | 2 | `ENROLLMENT_OIDC_ISSUERS` に GitHub | ⚠ 既定 **空**。**足す必要がある** |
 | 3 | 2 つの audience の実値 | ✅ 既定のまま分かれている |
 | 4 | Proxy の `--p2p-provisioning-oidc-issuer` | ⚠ 既定 **空**。**足す必要がある** |
-| 5 | 運用者の天井に `peer-provisioning:create` | ❌ **発行できない。§9.2** |
+| 5 | 運用者の天井に `peer-provisioning:create` | ⚠ **解決済み**（上流）。ただし配備で明示が要る。§9.2 |
 | 6 | 発行者の天井（`peer-connect:initiate` / `isekai-portal-v1`） | ⚠ 権限は既定で足りる。**protocol は既定に無い** |
 
 **1.** `state.rs` の `env_flag("ENROLLMENT_KEYS_ENABLED")`。偽なら §8.8 の経路を router へ
@@ -1021,7 +1022,23 @@ per-user の値で、**サーバ既定は組織テナントが `["isekai-validat
 portal が今日動いている配備では既に入っているはずだが、**それは配備の事実であって
 既定ではない**（§9.4）。
 
-### 9.2 ブロッカー: Identity は `peer-provisioning:create` を発行できない
+### 9.2 ~~ブロッカー~~: `peer-provisioning:create`（解決済み）
+
+> **解決した。** [ISEKAI-identity#34](https://github.com/seera-networks/ISEKAI-identity/pull/34)
+> が `Permission::PeerProvisioningCreate` を足し、仕様 §7 の権限表にも入れた
+> （`28d659e`）。**フェーズ 4 のブロックは解けている。**
+>
+> **ただし既定では付かない。** 提案どおり `DEFAULT_PERMISSIONS` の既定には入っておらず、
+> 要る配備が明示する。**そして粒度は配備全体である** — permission を主体ごとに配る器が
+> 無いので、有効にすると**以後その配備で登録される全 Endpoint に付く**。上流も
+> 「発行できないよりは配備全体で有効にできるほうがよい」という順序で閉じ、粒度は
+> 仕様 §8.8.12-6 に残している。
+>
+> **こちらに 2 つ効く。** §9.5 に書いた。
+>
+> 以下は当時の分析で、記録として残す。
+
+#### 当時の分析: Identity は `peer-provisioning:create` を発行できない
 
 **Proxy は要求する。**
 
@@ -1065,6 +1082,39 @@ Proxy 仕様 §8.13.2 が「既存の Endpoint Token に自動で付いてはな
 まさにこの点であり、既定に入れると全 Endpoint に付いてしまう。運用者が
 `DEFAULT_PERMISSIONS` で明示するか、エンタイトルメントで配る形が筋である。
 
+*（→ #34 はこのとおりに閉じた。既定には入れず、`DEFAULT_PERMISSIONS` の綴り違いと
+空指定で起動を止めるようにもなっている — 黙って落とす形が「回避策を試して何も起きない」
+の正体だった。）*
+
+### 9.5 #34 がこちらに効く 2 点
+
+**1. フェーズ 0 の確認項目が 1 つ増える。**
+
+`DEFAULT_PERMISSIONS` に `peer-provisioning:create` が入っているか。既定では付かず、
+入っていなければ `portal-server --provisioning-key` は従来どおり
+`403 insufficient-permission` である。§9.4 の一覧に足す。
+
+**2. Enrollment Key は `permissions` を明示しなければならない。**
+
+**これが本題である。** `EnrollmentGrant::clamp` は `requested_permissions` が `None` の
+とき**天井をそのまま焼き付ける**。天井は `DEFAULT_PERMISSIONS` なので、上の 1 を
+有効にした配備で `permissions` を省いて鍵を作ると、**CI の Endpoint に
+`peer-provisioning:create` が付く。**
+
+```text
+DEFAULT_PERMISSIONS に peer-provisioning:create を足す（portal-server が要る）
+  → Enrollment Key の permissions を省略
+    → CI の Endpoint が Provisioning Key を発行できる
+      → CI から、portal-server への恒久的な到達を配れる
+```
+
+CI ランナーに要るのは `peer-connect:initiate` **だけ**である。§6.1 の発行例に
+`--permissions peer-connect:initiate` を足した。**省略が最小権限にならない配備が
+ありうる**、というのが #34 の粒度の話がこちらへ届く形である。
+
+（Proxy 仕様 §8.13.2 が「引き換え側に必要な permission は `peer-connect:initiate` のみ」と
+書いているとおりで、鍵を配る側と使う側は非対称である。）
+
 ### 9.3 ついでに分かったこと
 
 - **Proxy の §8.13 は常時マウントされている**（gate が無い）のに、Identity の §8.8 は
@@ -1087,6 +1137,9 @@ Proxy 仕様 §8.13.2 が「既存の Endpoint Token に自動で付いてはな
 2. その `ENROLLMENT_OIDC_ISSUERS` に GitHub の issuer が入っているか
 3. `tokyo.link.isekai.tools:8443` に `--p2p-provisioning-oidc-issuer` が渡されているか
 4. CI の Endpoint を持つ User の protocol 天井に `isekai-portal-v1` が入っているか
+5. **`DEFAULT_PERMISSIONS` に `peer-provisioning:create` が入っているか**（§9.5）。
+   入っていなければ `--provisioning-key` は `403`。入れる場合は、その配備で以後
+   登録される**全 Endpoint に付く**ことを承知のうえで入れる
 
 **1 は無認証の要求 1 本で判別できる**（経路が無ければ `404`、あれば `401`）が、
 本番配備への問い合わせなので運用者の了解を取ってから行う。
@@ -1187,8 +1240,11 @@ enroll / refresh / revoke の 3 経路についてで、**鍵の管理 API（§8
 
 ### 10.5 次
 
-フェーズ 2（`Credential` / `AssertionSource` / 発行と更新の分岐）へ進める。
-**フェーズ 4 と、フェーズ 5 の Provisioning Key 引き換えは §9.2 のブロッカー待ち**
-（ISEKAI-identity#33）。フェーズ 3（Proxy クライアント）は、鍵を発行できないので
-実地の確認ができないが、**実装とテストは進められる** — モックに対する検証が
-受け入れ条件であり、そこはブロッカーと独立している。
+**ブロッカーは無くなった。** ISEKAI-identity#34 が `peer-provisioning:create` を
+発行できるようにしたので（§9.2）、フェーズ 2〜6 はどれも順に進められる。
+
+残る条件は運用側の 1 行 — `DEFAULT_PERMISSIONS` に `peer-provisioning:create` を
+足すこと — と、**それに伴って Enrollment Key の `permissions` を明示すること**
+（§9.5）。後者は実装の話でもあり、フェーズ 5 の `portal-client --issue-enrollment-key`
+は `--permissions` を**既定で `peer-connect:initiate` に絞る**。省略が最小権限に
+ならない配備がありうる以上、省略の側を安全に倒しておく。
