@@ -32,8 +32,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use isekai_p2p::agent::ReachableListener;
 use isekai_p2p::agent::RelayOptions;
-use isekai_p2p::agent::{PairingCode, ReachableListener};
 use isekai_p2p::direct_path::{self, RelayLegs};
 use isekai_p2p::endpoint_cert;
 use isekai_p2p::listener::{run, ListenerCommand};
@@ -83,6 +83,15 @@ impl ServerHandle {
     ///
     /// The one thing the client cannot get for itself: a Grant is what the
     /// proxy checks, and only this Endpoint can ask for one on its listener.
+    ///
+    /// **The only authorisation call that belongs on a running server.**
+    /// Pairing codes, tickets and grants all name a protocol and no listener
+    /// (spec §8.8, §8.9.1, §8.12.2), so they are Endpoint-token calls on
+    /// [`isekai_p2p::proxy_client`] — and routing them through here would mean
+    /// standing a listener up to ask, which adds a row under this Endpoint for
+    /// every client that then looks one up. `portal-server` takes that path for
+    /// all of them. A capability is scoped to the listener it is for, which is
+    /// why this one stays.
     pub async fn issue_capability(
         &self,
         allowed_endpoint: &str,
@@ -95,37 +104,6 @@ impl ServerHandle {
                 ttl,
                 reply,
             })
-            .await
-            .map_err(|_| anyhow::anyhow!("the listener session has stopped"))?;
-        answer
-            .await
-            .map_err(|_| anyhow::anyhow!("the listener session dropped the request"))?
-    }
-
-    /// Mint a pairing code to show whoever should be let in.
-    ///
-    /// **This is the one to reach for**, and [`issue_capability`] is the
-    /// exception. What a redeemed code makes is a Grant, which is reusable and
-    /// whose key has no listener in it (spec §8.8) — so the peer reconnects
-    /// without asking again, and keeps working when this server restarts onto a
-    /// new listener id. A capability does neither.
-    ///
-    /// The code lasts 60..=300 seconds and replaces whatever this listener had:
-    /// there is at most one live code per (Endpoint, protocol), so asking again
-    /// is how you replace one nobody used rather than how you accumulate them.
-    ///
-    /// **Listing and revoking grants are deliberately not here.** They are
-    /// Endpoint-token calls on [`isekai_p2p::proxy_client`] and need no
-    /// listener — and putting them on a running server would mean standing one
-    /// up to ask, which adds a second listener under this Endpoint for every
-    /// client that then looks one up. `portal-server --grants` and `--revoke`
-    /// take that path instead.
-    ///
-    /// [`issue_capability`]: Self::issue_capability
-    pub async fn show_pairing_code(&self, ttl: Option<u64>) -> anyhow::Result<PairingCode> {
-        let (reply, answer) = oneshot::channel();
-        self.commands
-            .send(ListenerCommand::ShowPairingCode { ttl, reply })
             .await
             .map_err(|_| anyhow::anyhow!("the listener session has stopped"))?;
         answer

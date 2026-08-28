@@ -161,16 +161,32 @@ in charge of where forwarded traffic goes.
 The file is read before anything touches the network, so a typo costs you a
 message naming the service rather than a half-started server.
 
-## 2. Start the server and show a pairing code
+## 2. Start the server
 
 ```sh
-portal-server --register --pair
+portal-server --register --config portal-server.toml
 ```
 
 ```
 endpoint id : ep:9z8y7x…
 listener id : pl_1a2b3c…
+```
 
+Leave it running. The listener id is printed for diagnostics: a client on a
+grant looks the current one up for itself, and only the one-shot capability
+path below needs it by hand.
+
+`--register` is only needed the first time, when the key is new. Keep
+`portal-server.pem`: a new key is a new Endpoint ID, and every grant made
+against the old one stops applying.
+
+## 3. Show a pairing code
+
+```sh
+portal-server --pair
+```
+
+```
 pairing code: K7QM-3XPD
   or the URI: isekai://pair?code=K7QM-3XPD
   expires at: 2026-08-22T07:31:04Z
@@ -182,11 +198,15 @@ Read the code to whoever should be let in. It lasts five minutes and can be
 redeemed once; asking again replaces it, so an unused code is not something you
 have to clean up.
 
-`--register` is only needed the first time, when the key is new. Keep
-`portal-server.pem`: a new key is a new Endpoint ID, and every grant made
-against the old one stops applying.
+**This does not start the server**, and does not need one running either. A
+pairing code names a protocol and nothing else — what redeeming it makes is a
+grant, and a grant's key has no listener in it — so it can be issued while a
+server is already up, which is the usual case once something is installed.
 
-## 3. Redeem it, once
+So this is a second terminal, not a second server — which is what it had to be
+before, and the reason for the change.
+
+## 4. Redeem it, once
 
 On the client machine:
 
@@ -210,7 +230,7 @@ asks the proxy which listener that Endpoint has now, every time it connects.
 `--register` on the first run only: the key was generated here and the Identity
 API has not seen it yet.
 
-## 4. Forward a port
+## 5. Forward a port
 
 ```sh
 portal-client --map 5432:db --map udp:5353:dns
