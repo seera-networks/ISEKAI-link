@@ -1141,7 +1141,51 @@ Proxy 仕様 §8.13.2 が「既存の Endpoint Token に自動で付いてはな
   なく、**パースに失敗した登録応答の代償が取り返せない**（枠・Challenge・鍵ペアを
   同時に失う）ためである。
 
-### 10.4 次
+### 10.4 `/code-review high` の指摘（改訂 3）
+
+**2 件、サーバの wire format と食い違っていた。** どちらも「仕様の文面から書き、サーバで
+確かめなかった」型の誤りである — §10.3 で「サーバを読んで確定させた」と書いたのは
+enroll / refresh / revoke の 3 経路についてで、**鍵の管理 API（§8.8.2 / §8.8.9）は
+確かめていなかった。**
+
+| 誤り | 正 | 症状 |
+| --- | --- | --- |
+| 発行応答の平文が `key` | **`key_plaintext`** | パースに失敗し、**鍵を 1 本失う**（クォータは減り、二度と表示されない） |
+| 一覧の包みが `keys` | **`items`** | `serde(default)` のせいで**エラーにならず空を返す** |
+
+2 つ目のほうが悪い。「この owner に鍵は無い」と読めてしまい、それを見た運用者が
+5 本目を発行して `429 enrollment-key-quota-exceeded` を踏む。**`items` は
+`#[serde(default)]` を外した** — 一覧は冪等で再実行が安く、読めない形は黙らずに
+言うべきである。
+
+平文のほうは **`key_plaintext` を正とし、`key` も alias で受ける**。ここは
+**仕様と実装が食い違っている**（§8.8.2 の例は `key`、`openapi.yaml` と
+`enrollment.rs` は `key_plaintext`）ので、寛容にするのが正しい唯一の場所である —
+名前が合わないことの代償が、再試行ではなく鍵 1 本だからである。
+上流へ [ISEKAI-identity#34](https://github.com/seera-networks/ISEKAI-identity/issues/34) として報告した。
+
+**加えて 3 件、設計の誤り。**
+
+- **`revoke_endpoint` が `EndpointKey` しか受け取っていなかった。** 有人経路
+  （`device_lost` / `admin_revoke` / `security_incident`）は**その端末の秘密鍵を
+  持たない人**が呼ぶものなので、鍵から `endpoint_id` を導くと「自分が秘密鍵を持つ
+  Endpoint しか失効させられない」API になっていた。`RevokeAuth::Auth0` が
+  `endpoint_id` を、`Enrollment` が `endpoint: &EndpointKey` を取る形に分けた。
+  **型が経路の違いを言う**ようになった。
+- **`binding.type` が `sub` / `tenant` の鍵を引き換えられなかった。** §8.8.3 は
+  Auth0 AT を**併せて**要求するが、`IdentityAuth::Enrollment` にその口が無く、
+  `enroll_challenge` は `bearer` を `None` に固定していた。`create_enrollment_key` は
+  `Binding::Sub` / `Binding::Tenant` を発行できるので、**引き換えられない鍵を作れる**
+  状態だった。`auth0: Option<&str>` を足し、`IdentityAuth::enrollment(key)` /
+  `.with_assertion()` / `.with_auth0()` を用意した。
+- **`RevokedEnrollmentKey` が `proxy_notification` を落としていた。** `Revoked` には
+  「`200` は止まったことを意味しない」と書いておきながら、カスケードの側で同じ危険を
+  見えなくしていた。鍵を止めるのは漏洩の場面である。
+
+テストは 15 本になった（+5）。**モックはサーバの名前で書く** — 仕様の例で書いたことが
+1 つ目の誤りをテストごと隠していた。
+
+### 10.5 次
 
 フェーズ 2（`Credential` / `AssertionSource` / 発行と更新の分岐）へ進める。
 **フェーズ 4 と、フェーズ 5 の Provisioning Key 引き換えは §9.2 のブロッカー待ち**

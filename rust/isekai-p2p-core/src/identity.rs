@@ -99,14 +99,59 @@ pub enum IdentityAuth<'a> {
     /// 5–15 minutes against a renewal interval that is longer than that.
     Enrollment {
         key: &'a str,
+        /// Present when the key was issued with `binding.type: "oidc"`.
         assertion: Option<&'a str>,
+        /// **Present when the binding is `sub` or `tenant`** (§8.8.3), where
+        /// the comparison is against an Auth0 principal that has to be there
+        /// to compare with. Those two types are the attended case — rolling
+        /// out fifty devices without walking each one through a challenge —
+        /// and the server answers `400 assertion-required` without this.
+        ///
+        /// A key route carrying an Auth0 token is not a contradiction: the
+        /// key still says which key, and the header says which person.
+        auth0: Option<&'a str>,
     },
+}
+
+impl<'a> IdentityAuth<'a> {
+    /// An enrolment key on its own — the `binding: none` case.
+    pub const fn enrollment(key: &'a str) -> Self {
+        IdentityAuth::Enrollment {
+            key,
+            assertion: None,
+            auth0: None,
+        }
+    }
+
+    /// Add the workload identity token an `oidc` binding wants.
+    pub const fn with_assertion(self, assertion: &'a str) -> Self {
+        match self {
+            IdentityAuth::Enrollment { key, auth0, .. } => IdentityAuth::Enrollment {
+                key,
+                assertion: Some(assertion),
+                auth0,
+            },
+            other => other,
+        }
+    }
+
+    /// Add the Auth0 token a `sub` or `tenant` binding wants.
+    pub const fn with_auth0(self, token: &'a str) -> Self {
+        match self {
+            IdentityAuth::Enrollment { key, assertion, .. } => IdentityAuth::Enrollment {
+                key,
+                assertion,
+                auth0: Some(token),
+            },
+            other => other,
+        }
+    }
 }
 
 impl IdentityAuth<'_> {
     /// Add whatever this credential contributes to a JSON request body.
     fn apply_to_body(&self, body: &mut Value) {
-        if let IdentityAuth::Enrollment { key, assertion } = self {
+        if let IdentityAuth::Enrollment { key, assertion, .. } = self {
             body["enrollment_key"] = json!(key);
             if let Some(assertion) = assertion {
                 body["assertion"] = json!(assertion);
@@ -118,7 +163,11 @@ impl IdentityAuth<'_> {
     fn bearer(&self) -> Option<&str> {
         match self {
             IdentityAuth::Auth0(token) => Some(token),
-            IdentityAuth::Enrollment { .. } => None,
+            // **`None` unless a `sub`/`tenant` binding put one here**, and that
+            // is load bearing on the self-revoke route: the server only reads
+            // the body's key once Auth0 authentication has failed, so a token
+            // sent needlessly takes the other branch.
+            IdentityAuth::Enrollment { auth0, .. } => *auth0,
         }
     }
 }
@@ -162,14 +211,26 @@ impl RevokeReason {
 /// `binding` answers "who may *get* something with this key", and revocation
 /// gets nothing; the job that died badly enough to be unable to mint an OIDC
 /// token is exactly the job whose slot should come back.
+///
+/// **The two arms name their target differently, and have to.** An owner
+/// revoking a lost device does not hold that device's private key — that is
+/// what `device_lost` means — so the Auth0 arm takes an id. The key arm takes
+/// the key itself, because it signs a PoP with it, and that is precisely what
+/// confines self-revocation to the one Endpoint whose private key is in hand.
 #[derive(Debug, Clone, Copy)]
 pub enum RevokeAuth<'a> {
     Auth0 {
         token: &'a str,
+        /// Any Endpoint this caller owns, or any at all for an admin.
+        endpoint_id: &'a str,
         reason: RevokeReason,
     },
     Enrollment {
         key: &'a str,
+        /// **This Endpoint and no other.** The PoP signed with it is the
+        /// proof, so a leaked enrolment key alone stops nothing — not the
+        /// other Endpoints it grew, and not an attended one.
+        endpoint: &'a EndpointKey,
     },
 }
 
@@ -346,6 +407,13 @@ impl NewEnrollmentKey {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssuedEnrollmentKey {
     /// The secret, `enr1_`-prefixed. Store it now or lose it.
+    ///
+    /// **The wire name is `key_plaintext`,** which is what the server and its
+    /// OpenAPI both say; §8.8.2's example says `key`, and the two disagree.
+    /// Accepting either is the right leniency in exactly this place — the key
+    /// is minted, counted against the quota and never shown again, so a name
+    /// this cannot match costs the caller a key rather than a retry.
+    #[serde(rename = "key_plaintext", alias = "key")]
     pub key: String,
     #[serde(default)]
     pub key_id: Option<String>,
@@ -411,8 +479,12 @@ pub struct EnrollmentKeyRecord {
 
 #[derive(Debug, Clone, Deserialize)]
 struct EnrollmentKeyList {
-    #[serde(default)]
-    keys: Vec<EnrollmentKeyRecord>,
+    /// **Not defaulted, unlike most fields here.** A listing is idempotent and
+    /// costs nothing to repeat, so a shape this cannot read should say so: a
+    /// silent empty list reads as "this owner has no keys", and an operator
+    /// acting on that issues past the quota of 4 until the `429`.
+    #[serde(alias = "keys")]
+    items: Vec<EnrollmentKeyRecord>,
 }
 
 /// One Endpoint an Enrollment Key registered (§8.8.9).
@@ -484,6 +556,15 @@ pub struct RevokedEnrollmentKey {
     pub status: Option<String>,
     #[serde(default)]
     pub revoked_at: Option<String>,
+    /// Whether the cascade reached the proxy: `delivered` | `partial` |
+    /// `failed` | `disabled`, and absent when there was nothing to revoke.
+    ///
+    /// **Carried for the same reason [`Revoked`] carries it.** A `200` here
+    /// does not mean the Endpoints this key grew have stopped — one
+    /// undelivered notification leaves their grants standing at the proxy,
+    /// and revoking a key is what somebody does about a leak.
+    #[serde(default)]
+    pub proxy_notification: Option<String>,
     #[serde(default)]
     pub effects: Option<RevokeKeyEffects>,
 }
@@ -675,20 +756,25 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     /// different key cannot be spent here.
     pub async fn enroll_challenge(
         &self,
-        enrollment_key: &str,
+        auth: IdentityAuth<'_>,
         key: &EndpointKey,
     ) -> Result<Challenge, IdentityError> {
-        let body = json!({
-            "enrollment_key": enrollment_key,
+        let mut body = json!({
             "endpoint_id": key.endpoint_id(),
             "public_key": key.public_jwk(),
         });
-        // Deliberately not `IdentityAuth::Enrollment`: the credential is
-        // already spelled out in the body above, and passing it again would
-        // write `enrollment_key` twice.
+        // The key, but not the assertion: `binding` is checked at §8.8.5 and
+        // not here, so asking for the evidence twice only widens the window in
+        // which a short-lived OIDC token can expire between the two calls.
+        if let IdentityAuth::Enrollment { key, .. } = auth {
+            body["enrollment_key"] = json!(key);
+        }
+        // `auth.bearer()` rather than nothing: a `sub`/`tenant` key needs the
+        // Auth0 token here too, and §8.8.4's ordering puts the existing-
+        // registration check behind it.
         self.post_bytes(
             "/v1/endpoints/enroll/challenge",
-            None,
+            auth.bearer(),
             None,
             serde_json::to_vec(&body).expect("json body serializes"),
         )
@@ -747,31 +833,31 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     pub async fn revoke_endpoint(
         &self,
         auth: RevokeAuth<'_>,
-        key: &EndpointKey,
         note: Option<&str>,
     ) -> Result<Revoked, IdentityError> {
-        let endpoint_id = key.endpoint_id();
-        let path = format!("/v1/endpoints/{endpoint_id}/revoke");
         let mut body = json!({});
         if let Some(note) = note {
             body["note"] = json!(note);
         }
         match auth {
-            RevokeAuth::Auth0 { token, reason } => {
+            RevokeAuth::Auth0 {
+                token,
+                endpoint_id,
+                reason,
+            } => {
                 body["reason"] = json!(reason.as_str());
+                let path = format!("/v1/endpoints/{endpoint_id}/revoke");
                 self.post(&path, IdentityAuth::Auth0(token), None, body)
                     .await
             }
-            RevokeAuth::Enrollment { key: enrollment } => {
-                // No assertion — see `RevokeAuth`. And no `Authorization`: the
-                // server only looks for a key in the body once Auth0 auth has
-                // failed, so sending both would take the other branch.
-                let auth = IdentityAuth::Enrollment {
-                    key: enrollment,
-                    assertion: None,
-                };
+            RevokeAuth::Enrollment { key, endpoint } => {
+                let path = format!("/v1/endpoints/{}/revoke", endpoint.endpoint_id());
+                // No assertion, and no `Authorization`: the server only looks
+                // for a key in the body once Auth0 auth has failed, so sending
+                // a token here would take the other branch.
+                let auth = IdentityAuth::enrollment(key);
                 auth.apply_to_body(&mut body);
-                self.post_signed(&path, auth, key, body).await
+                self.post_signed(&path, auth, endpoint, body).await
             }
         }
     }
@@ -840,7 +926,7 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
                 Vec::new(),
             )
             .await?;
-        Ok(list.keys)
+        Ok(list.items)
     }
 
     /// §8.8.9 — which Endpoints a key registered, and how each of them ended.

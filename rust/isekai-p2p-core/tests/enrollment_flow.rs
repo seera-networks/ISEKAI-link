@@ -30,6 +30,11 @@ use isekai_p2p_core::https::HttpsTransport;
 use isekai_p2p_core::identity::{
     Binding, IdentityAuth, IdentityClient, NewEnrollmentKey, RevokeAuth, RevokeReason,
 };
+
+/// The enrolment credential these tests use, with no binding evidence.
+fn enrolment(key: &str) -> IdentityAuth<'_> {
+    IdentityAuth::enrollment(key)
+}
 use p256::ecdsa::Signature;
 use serde_json::{Value, json};
 
@@ -128,15 +133,12 @@ async fn enrolling_carries_the_key_in_the_body_and_no_authorization() {
     let client = serve(app).await;
     let key = EndpointKey::generate();
     let challenge = client
-        .enroll_challenge("enr1_SECRET", &key)
+        .enroll_challenge(enrolment("enr1_SECRET"), &key)
         .await
         .expect("challenge");
     let enrolled = client
         .enroll(
-            IdentityAuth::Enrollment {
-                key: "enr1_SECRET",
-                assertion: Some("OIDC.JWT"),
-            },
+            enrolment("enr1_SECRET").with_assertion("OIDC.JWT"),
             &key,
             &challenge,
             Some("gha-4821"),
@@ -197,7 +199,10 @@ async fn enrolling_sends_the_public_key_only() {
 
     let client = serve(app).await;
     let key = EndpointKey::generate();
-    client.enroll_challenge("enr1_SECRET", &key).await.unwrap();
+    client
+        .enroll_challenge(enrolment("enr1_SECRET"), &key)
+        .await
+        .unwrap();
 
     let reqs = captured.take();
     let jwk = &reqs[0].2["public_key"];
@@ -233,18 +238,12 @@ async fn a_minimal_enrolment_response_is_enough() {
 
     let client = serve(app).await;
     let key = EndpointKey::generate();
-    let challenge = client.enroll_challenge("enr1_S", &key).await.unwrap();
+    let challenge = client
+        .enroll_challenge(enrolment("enr1_S"), &key)
+        .await
+        .unwrap();
     let enrolled = client
-        .enroll(
-            IdentityAuth::Enrollment {
-                key: "enr1_S",
-                assertion: None,
-            },
-            &key,
-            &challenge,
-            None,
-            None,
-        )
+        .enroll(enrolment("enr1_S"), &key, &challenge, None, None)
         .await
         .expect("a minimal response is not a failure");
 
@@ -290,10 +289,7 @@ async fn renewing_mints_one_assertion_and_signs_a_pop() {
 
     let client = serve(app).await;
     let key = EndpointKey::generate();
-    let auth = IdentityAuth::Enrollment {
-        key: "enr1_SECRET",
-        assertion: Some("OIDC.JWT"),
-    };
+    let auth = enrolment("enr1_SECRET").with_assertion("OIDC.JWT");
     let challenge = client
         .refresh_challenge(auth, &key.endpoint_id())
         .await
@@ -393,8 +389,10 @@ async fn self_revocation_sends_no_assertion_and_no_reason() {
     let key = EndpointKey::generate();
     let revoked = client
         .revoke_endpoint(
-            RevokeAuth::Enrollment { key: "enr1_SECRET" },
-            &key,
+            RevokeAuth::Enrollment {
+                key: "enr1_SECRET",
+                endpoint: &key,
+            },
             Some("job 4821 finished"),
         )
         .await
@@ -438,14 +436,15 @@ async fn an_owner_revocation_states_a_reason() {
         .with_state(captured.clone());
 
     let client = serve(app).await;
-    let key = EndpointKey::generate();
     client
         .revoke_endpoint(
             RevokeAuth::Auth0 {
                 token: "AUTH0_AT",
+                // **An id, not a key.** Revoking a lost device is exactly the
+                // case where the caller does not hold its private key.
+                endpoint_id: "ep:someone-elses",
                 reason: RevokeReason::DeviceLost,
             },
-            &key,
             None,
         )
         .await
@@ -469,9 +468,12 @@ async fn issuing_a_key_states_a_binding_and_carries_no_pop() {
             post(
                 |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
                     record(&s, "/v1/enrollment-keys", h, b).await;
+                    // **The server's names, not the spec's example.** §8.8.2
+                    // prints `key`; `enrollment.rs` and `openapi.yaml` both
+                    // say `key_plaintext`, and the server answers the call.
                     Json(json!({
                         "key_id": "enk_1",
-                        "key": "enr1_SECRET",
+                        "key_plaintext": "enr1_SECRET",
                         "permissions": ["peer-connect:initiate"],
                         "protocols": ["isekai-portal-v1"],
                         "warnings": ["binding.type is none"],
@@ -540,7 +542,7 @@ async fn a_full_key_hands_back_the_wait_it_was_given() {
     let client = serve(app).await;
     let key = EndpointKey::generate();
     let err = client
-        .enroll_challenge("enr1_S", &key)
+        .enroll_challenge(enrolment("enr1_S"), &key)
         .await
         .expect_err("a full key is refused");
 
@@ -563,7 +565,158 @@ async fn a_refusal_without_a_wait_reports_none() {
 
     let client = serve(app).await;
     let key = EndpointKey::generate();
-    let err = client.enroll_challenge("enr1_S", &key).await.unwrap_err();
+    let err = client
+        .enroll_challenge(enrolment("enr1_S"), &key)
+        .await
+        .unwrap_err();
     assert_eq!(err.status(), Some(403));
     assert_eq!(err.retry_after(), None);
+}
+
+/// The listing route's wrapper is `items`, not `keys`.
+///
+/// **A shape mismatch here has to be an error, not an empty list.** The field
+/// is not defaulted for that reason: a listing that quietly answers "no keys"
+/// for an owner who has four is what an operator reads right before issuing a
+/// fifth and taking a `429 enrollment-key-quota-exceeded`.
+#[tokio::test]
+async fn listing_keys_reads_the_wrapper_the_server_sends() {
+    let app = Router::new().route(
+        "/v1/enrollment-keys",
+        axum::routing::get(|| async {
+            Json(json!({
+                "tenant_id": "org_a",
+                "items": [
+                    { "key_id": "enk_1", "status": "active", "live_endpoints": 2 },
+                    { "key_id": "enk_2", "status": "revoked" },
+                ],
+            }))
+        }),
+    );
+
+    let client = serve(app).await;
+    let keys = client
+        .list_enrollment_keys("AUTH0_AT")
+        .await
+        .expect("listing parses");
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].key_id, "enk_1");
+    assert_eq!(keys[0].live_endpoints, Some(2));
+}
+
+/// And a wrapper it does not recognise is refused rather than emptied.
+#[tokio::test]
+async fn an_unreadable_listing_is_an_error_not_an_empty_one() {
+    let app = Router::new().route(
+        "/v1/enrollment-keys",
+        axum::routing::get(|| async { Json(json!({ "rows": [{ "key_id": "enk_1" }] })) }),
+    );
+
+    let client = serve(app).await;
+    let err = client.list_enrollment_keys("AUTH0_AT").await.unwrap_err();
+    assert!(
+        err.to_string().contains("invalid response JSON"),
+        "an empty list would read as \"this owner has no keys\": {err}",
+    );
+}
+
+/// A `sub` or `tenant` binding needs the Auth0 token as well as the key
+/// (§8.8.3), on **both** legs of the enrolment.
+///
+/// Those two types are the attended case — fifty devices deployed at once,
+/// without walking each one through a challenge — and the server answers
+/// `400 assertion-required` when the header is missing. A client that could
+/// only ever send one of the two could issue keys it can never redeem.
+#[tokio::test]
+async fn a_sub_bound_key_carries_the_auth0_token_too() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/endpoints/enroll/challenge",
+            post(
+                |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
+                    record(&s, "/v1/endpoints/enroll/challenge", h, b).await;
+                    Json(challenge_body())
+                },
+            ),
+        )
+        .route(
+            "/v1/endpoints/enroll",
+            post(
+                |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
+                    record(&s, "/v1/endpoints/enroll", h, b).await;
+                    Json(json!({ "endpoint_id": "ep:abc", "endpoint_token": "T" }))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+
+    let client = serve(app).await;
+    let key = EndpointKey::generate();
+    let auth = enrolment("enr1_SECRET").with_auth0("AUTH0_AT");
+    let challenge = client.enroll_challenge(auth, &key).await.unwrap();
+    client
+        .enroll(auth, &key, &challenge, None, None)
+        .await
+        .unwrap();
+
+    for (path, headers, body) in captured.take() {
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer AUTH0_AT",
+            "{path} must carry the principal the binding compares against",
+        );
+        assert_eq!(body["enrollment_key"], "enr1_SECRET", "{path}");
+    }
+}
+
+/// Revoking a key says whether the cascade reached the proxy.
+///
+/// A key is revoked because of a leak, and the Endpoints it grew keep their
+/// grants at the proxy until it hears. A `200` that does not say so would let
+/// the operator believe the door is shut.
+#[tokio::test]
+async fn revoking_a_key_reports_whether_the_proxy_heard() {
+    let app = Router::new().route(
+        "/v1/enrollment-keys/{key_id}/revoke",
+        post(|| async {
+            Json(json!({
+                "key_id": "enk_1",
+                "status": "revoked",
+                "revoked_at": "2026-08-28T11:00:00Z",
+                "proxy_notification": "failed",
+                "effects": {
+                    "revoked_endpoints": ["ep:a"],
+                    "remaining_endpoints": [],
+                    "newly_revoked": true,
+                },
+            }))
+        }),
+    );
+
+    let client = serve(app).await;
+    let revoked = client
+        .revoke_enrollment_key("AUTH0_AT", "enk_1", Some(true), None)
+        .await
+        .expect("revoke");
+    assert_eq!(revoked.proxy_notification.as_deref(), Some("failed"));
+    let effects = revoked.effects.expect("effects");
+    assert_eq!(effects.revoked_endpoints, vec!["ep:a"]);
+}
+
+/// The spec's `key` spelling still parses, so a server that follows §8.8.2's
+/// example rather than its own OpenAPI does not cost anyone a key.
+#[tokio::test]
+async fn either_spelling_of_the_minted_secret_is_accepted() {
+    let app = Router::new().route(
+        "/v1/enrollment-keys",
+        post(|| async { Json(json!({ "key_id": "enk_1", "key": "enr1_SECRET" })) }),
+    );
+
+    let client = serve(app).await;
+    let issued = client
+        .create_enrollment_key("AUTH0_AT", &NewEnrollmentKey::new(Binding::None))
+        .await
+        .expect("a key is never worth failing over a field name");
+    assert_eq!(issued.key, "enr1_SECRET");
 }
