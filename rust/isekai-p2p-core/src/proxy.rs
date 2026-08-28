@@ -505,15 +505,13 @@ pub fn proxy_authority(proxy_url: &str) -> &str {
 /// A Ticket together with where to redeem it (spec §8.12.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketTransfer {
-    /// Where to redeem it: an authority, not a URL —
-    /// `tokyo.link.isekai.tools:8443`.
+    /// Where to redeem it: an **authority**, not a URL and not a bare host —
+    /// `tokyo.link.isekai.tools:8443`. The scheme is always `https`.
     ///
-    /// **The port is included where the proxy URL has one**, which §8.12.8's
-    /// example does not show. It calls this field the host, and a bare host
-    /// would not round-trip: this project's proxies are not on 443, so the
-    /// redeeming side would have to be told the port separately — which is the
-    /// out-of-band step the one-string form exists to remove. Anything reading
-    /// it should treat it as an authority and default the scheme to `https`.
+    /// The port is what makes this round-trip. A bare host would send the
+    /// redeeming side to 443, and this project's proxies are not there — so it
+    /// would have to be told the port separately, which is the out-of-band step
+    /// the one-string form exists to remove.
     pub proxy: String,
     /// The `tkt1_` secret.
     pub ticket: String,
