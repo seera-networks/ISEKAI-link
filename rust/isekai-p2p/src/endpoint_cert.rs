@@ -217,18 +217,29 @@ pub async fn issue(
 /// gap between them.
 const ATTESTATION_LIFETIME: time::Duration = time::Duration::days(90);
 
-/// How long to wait between attempts when the proxy says to come back.
+/// How long to wait between attempts when the proxy has nothing to say about it.
 ///
-/// The proxy advertises `Retry-After: 30`, and this does not read it: the
-/// control-plane transport hands back a status and a body, not headers. These
-/// are chosen to cover an ACME order that is merely slow without turning a
-/// broken proxy into a minute of silence at startup. Reading the header is the
-/// better answer if this ever needs to be more than approximately right.
+/// **The proxy's `Retry-After` wins when there is one**, which there is on
+/// `certificate-unavailable`. These cover the case where there is not: an ACME
+/// order that is merely slow, without turning a broken proxy into a minute of
+/// silence at startup.
+///
+/// This used to say the transport could not see headers. It can, since the
+/// enrolment work needed the same thing for `429 …-slots-exhausted`, so the
+/// "better answer" that comment pointed at is now one line.
 const ISSUANCE_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(5),
     Duration::from_secs(10),
     Duration::from_secs(20),
 ];
+
+/// The longest single wait to honour from a `Retry-After`.
+///
+/// The proxy advertises 30, so honouring the header cannot make startup worse
+/// than the header being honest. A cap is still wanted: the value arrives from
+/// outside, and three unbounded waits is a camera that never reports why it has
+/// not started.
+const MAX_HONOURED_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Issue, retrying the answers that say retrying is the point.
 ///
@@ -256,11 +267,17 @@ async fn issue_with_retries(
             ProxyError::Problem { problem, .. }
                 if problem.as_ref().map(|p| p.kind()) == Some("certificate-unavailable")
         );
-        let Some(delay) = delays.next().filter(|_| retryable) else {
+        let Some(fallback) = delays.next().filter(|_| retryable) else {
             return Err(error);
         };
+        // **What the proxy said, when it said anything.** It knows how long its
+        // own ACME order has been running; this side is guessing.
+        let delay = error
+            .retry_after()
+            .map(|asked| asked.min(MAX_HONOURED_RETRY_AFTER))
+            .unwrap_or(*fallback);
         tracing::info!(?delay, "the proxy is not ready to issue yet: {error}");
-        tokio::time::sleep(*delay).await;
+        tokio::time::sleep(delay).await;
     }
 }
 

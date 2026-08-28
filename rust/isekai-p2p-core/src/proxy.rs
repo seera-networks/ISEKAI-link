@@ -538,6 +538,14 @@ impl ProvisioningBinding {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvisioningKey {
     /// The secret, `pvk1_`-prefixed. **Store it now or lose it.**
+    ///
+    /// `key_plaintext` is accepted as well. Not because anything sends it —
+    /// the proxy says `key` and §8.13.3 agrees — but because the cost of a
+    /// name this cannot match is asymmetric: the key is already minted and
+    /// counted against a quota of four, so the caller loses a slot rather than
+    /// a round trip. The same argument put an alias on Identity's side, and it
+    /// holds here whether or not the two ever drift.
+    #[serde(alias = "key_plaintext")]
     pub key: String,
     #[serde(default)]
     pub key_id: Option<String>,
@@ -852,6 +860,25 @@ pub fn ticket_from_transfer(input: &str) -> Option<TicketTransfer> {
         proxy: String::new(),
         ticket: input.to_owned(),
     })
+}
+
+/// Which kind of secret this text begins with, if any.
+///
+/// **The companion to [`redact_secrets`], and they belong together.** Redacting
+/// keeps a secret out of a log after somebody has mistyped; this is what stops
+/// the mistyping from sending it anywhere. A guard that knew only about Tickets
+/// while the redaction knew about four kinds would keep the quieter half of the
+/// promise.
+///
+/// Matches the prefix only, so it says "this looks like a Provisioning Key",
+/// never "this is a valid one" — the point is to refuse before anything is
+/// sent, not to judge the value.
+pub fn secret_prefix(input: &str) -> Option<&'static str> {
+    // Longest first, so `iskt1_` is not reported as `tkt1_` after an `i`.
+    SECRET_PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| input.starts_with(prefix))
 }
 
 /// Replace the body of anything that looks like a secret with `…`.
@@ -2523,6 +2550,39 @@ mod tests {
         assert_eq!(ticket.ticket, "tkt1_secret");
         assert_eq!(ticket.ticket_id, None);
         assert_eq!(ticket.grant_ttl, None);
+    }
+
+    /// Detection and redaction have to know the same four things.
+    ///
+    /// The guard that refuses a secret in the wrong flag is what stops it being
+    /// sent; redaction only keeps it out of the log afterwards. Knowing fewer
+    /// kinds here than there would keep the quieter half of the promise.
+    #[test]
+    fn every_redacted_prefix_is_also_detectable() {
+        for prefix in SECRET_PREFIXES {
+            let value = format!("{prefix}AbCd1234");
+            assert_eq!(secret_prefix(&value), Some(prefix), "{prefix}");
+            assert_eq!(redact_secrets(&value), format!("{prefix}…"), "{prefix}");
+        }
+    }
+
+    /// Longest-first here too: an `iskt1_` transfer is not "a ticket after an
+    /// `i`", and telling somebody the wrong one is telling them the wrong flag.
+    #[test]
+    fn a_transfer_is_detected_as_a_transfer() {
+        assert_eq!(
+            secret_prefix("iskt1_AAaa-_09"),
+            Some(TICKET_TRANSFER_PREFIX),
+        );
+    }
+
+    /// A pairing code and an identifier are not secrets, and refusing them
+    /// would refuse the flag's own argument.
+    #[test]
+    fn what_is_not_a_secret_is_not_detected() {
+        assert_eq!(secret_prefix("ABCD-1234"), None);
+        assert_eq!(secret_prefix("pvk_AbC12345"), None);
+        assert_eq!(secret_prefix("enk_AbC12345"), None);
     }
 
     /// The two keys are redacted for the same reason a Ticket is, and more:

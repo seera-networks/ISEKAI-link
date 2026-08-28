@@ -259,14 +259,26 @@ async fn run(args: Args) -> anyhow::Result<()> {
         anyhow::bail!("--peer is not needed here: being let in is what names the peer");
     }
     if let Some(code) = &args.pair {
-        // **A ticket put in the wrong flag must not be sent as a code.** The
+        // **A secret put in the wrong flag must not be sent as a code.** The
         // proxy would refuse it, but only after the secret had travelled in a
-        // `code` field and landed in whatever that failure is logged to. The
-        // two are easy to mix up: both are "the thing they sent me".
-        if isekai_p2p::agent::ticket_from_transfer(code).is_some() {
+        // `code` field and landed in whatever that failure is logged to. They
+        // are easy to mix up: all of them are "the thing they sent me".
+        //
+        // **All four prefixes, not just a ticket's.** A pairing code is eight
+        // characters somebody reads aloud; everything with one of these
+        // prefixes is a secret, and two of them are standing arrangements
+        // rather than a single use, so putting one here is the more expensive
+        // mistake of the two.
+        if let Some(prefix) = isekai_p2p::agent::secret_prefix(code) {
             anyhow::bail!(
-                "that is a ticket, not a pairing code -- redeem it with --redeem.\n\
+                "that is {}, not a pairing code{}\n\
                  Nothing was sent. ({})",
+                what_it_is(prefix),
+                match prefix {
+                    isekai_p2p::agent::TICKET_PREFIX
+                    | isekai_p2p::agent::TICKET_TRANSFER_PREFIX => " -- redeem it with --redeem.",
+                    _ => ".",
+                },
                 isekai_p2p::agent::redact_secrets(code),
             );
         }
@@ -379,6 +391,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
     connected.close().await;
     Ok(())
+}
+
+/// What a secret prefix means, in words a person can act on.
+fn what_it_is(prefix: &str) -> &'static str {
+    match prefix {
+        isekai_p2p::agent::TICKET_PREFIX | isekai_p2p::agent::TICKET_TRANSFER_PREFIX => "a ticket",
+        isekai_p2p::agent::PROVISIONING_KEY_PREFIX => "a Provisioning Key",
+        isekai_p2p::agent::ENROLLMENT_KEY_PREFIX => "an Enrollment Key",
+        _ => "a secret",
+    }
 }
 
 /// Redeem a pairing code, and say what it paired with.
