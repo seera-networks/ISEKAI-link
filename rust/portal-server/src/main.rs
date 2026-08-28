@@ -98,7 +98,7 @@ have several outstanding at once -- a pairing code is one per protocol because
 a person is reading it off a screen. So this is the one for work that ends: a
 CI job, an agent sandbox, anywhere there is no screen and nobody to read a code
 aloud. It prints one string to send; --tickets shows who spent which, which is
-the only record of where a ticket went. --revoke-ticket tears up an unused one.
+the only record of where a ticket went. --revoke-ticket stops an unused one.
 
 --allow issues a CAPABILITY for one Endpoint. It is one-shot and lasts 300
 seconds at most, so it is for letting a guest in once. A peer that reconnects
@@ -210,8 +210,9 @@ struct Args {
     /// exit
     #[argh(switch)]
     tickets: bool,
-    /// tear up a ticket, by the id --tickets prints. A grant already made
-    /// from it stays -- use --revoke for that
+    /// stop a ticket being redeemable, by the id --tickets prints. One already
+    /// redeemed is left as it is, record and all; the grant it made stays
+    /// either way -- use --revoke for that
     #[argh(option)]
     revoke_ticket: Option<String>,
 }
@@ -290,10 +291,15 @@ async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
             .revoke_ticket(ticket_id)
             .await
             .with_context(|| format!("revoke ticket {ticket_id}"))?;
-        // The proxy answers 204 for an id it has never seen, so this says what
-        // is true either way rather than claiming something was there.
-        println!("ticket gone : {ticket_id}");
-        println!("A grant already made from it is untouched; --grants lists those.");
+        // **`204` says almost nothing**, and deliberately: the id may never have
+        // existed, or may name a ticket already spent -- which §8.12.6 leaves
+        // alone, because revoking one would stop nothing and erase the only
+        // record of who came in on it. So this reports the one thing true in
+        // every case rather than announcing a deletion that may not have
+        // happened.
+        println!("not redeemable now: {ticket_id}");
+        println!("If it had already been redeemed, the record of that stays in --tickets,");
+        println!("and the grant it made is untouched -- --revoke is what takes those away.");
     }
 
     if args.pair {

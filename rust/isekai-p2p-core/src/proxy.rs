@@ -295,6 +295,9 @@ pub struct Grant {
     /// same way. An id and the Endpoint it lets you reach are what any of this
     /// needs; a missing `created_at` is not worth that, and the fields below
     /// are shown rather than acted on.
+    ///
+    /// The spec requires all of them, and this is not a claim that it will not.
+    /// It is that the cost of being wrong is paid once and cannot be undone.
     #[serde(default)]
     pub allowed_endpoint: Option<String>,
     #[serde(default)]
@@ -411,15 +414,18 @@ pub struct RedeemedTicket {
 
 /// A listener named in a redemption response.
 ///
-/// **Deliberately laxer than [`ReachableListener`], and the reason is what a
-/// strict one would cost here.** §8.12.3 says this array is §8.10's, but the
-/// example beside it shows only `listener_id`, `protocol` and `metadata` —
-/// no `owner_endpoint`, no `expires_at`, both of which §8.10 does carry. If the
-/// proxy sends the shorter shape, a struct requiring those fields turns a
-/// redemption that *succeeded* into an error: the ticket is single-use and has
-/// already been spent, the grant already exists, and the caller is told the
-/// call failed with no way to retry. Whatever is missing here can be had from
-/// [`RedeemedTicket::grant`] or a later listing; a lost ticket cannot.
+/// **Laxer than [`ReachableListener`], and kept that way after the question was
+/// settled.** §8.12.3 used to say this array was §8.10's while printing an
+/// example without `owner_endpoint` or `expires_at`; the spec now says those
+/// are present and that "same content" never meant "optional". So the shorter
+/// shape should not arrive.
+///
+/// This still does not require them, because of what requiring them costs when
+/// one does go missing: a redemption that *succeeded* is reported as an error,
+/// with the ticket single-use and already spent, the grant already created, and
+/// nothing to retry — the spec makes the same point in that paragraph. Anything
+/// absent here can be had from [`RedeemedTicket::grant`] or a later listing; a
+/// spent ticket cannot.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TicketListener {
     pub listener_id: String,
@@ -505,13 +511,18 @@ pub fn proxy_authority(proxy_url: &str) -> &str {
 /// A Ticket together with where to redeem it (spec §8.12.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketTransfer {
-    /// Where to redeem it: an **authority**, not a URL and not a bare host —
+    /// Where to redeem it: an **authority**, not a URL —
     /// `tokyo.link.isekai.tools:8443`. The scheme is always `https`.
     ///
-    /// The port is what makes this round-trip. A bare host would send the
-    /// redeeming side to 443, and this project's proxies are not there — so it
-    /// would have to be told the port separately, which is the out-of-band step
-    /// the one-string form exists to remove.
+    /// **[`ticket_transfer`] always writes the port**, which §8.12.8 asks for:
+    /// a bare host means 443, and this project's proxies are not there, so
+    /// omitting it would leave the port to be told separately — the out-of-band
+    /// step the one-string form exists to remove.
+    ///
+    /// A bare host can still *arrive*, since the spec permits one, and it is
+    /// carried through as written rather than filled in. Whoever compares this
+    /// against their own proxy is then comparing 443 against 443, which is what
+    /// the shorter form meant.
     pub proxy: String,
     /// The `tkt1_` secret.
     pub ticket: String,

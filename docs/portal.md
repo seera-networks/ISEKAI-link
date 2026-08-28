@@ -414,6 +414,12 @@ anybody already let in by it** — that is a grant now, and `--revoke` is what
 takes a grant away. Tearing up the paper does not evict the person who already
 walked in.
 
+**A ticket that has already been redeemed is left alone**, and the command still
+answers the same way. There is nothing left to stop, and deleting the row would
+take the record of who came in on it with it — the grant does not say where it
+came from, so that listing is the only place it is written down. It ages out
+with the rest.
+
 ## Letting somebody in just once
 
 Pairing is standing access. For a guest — someone who should reach a service
