@@ -472,7 +472,12 @@ fn check_ticket(args: &Args, ticket: &str) -> anyhow::Result<isekai_p2p::agent::
         );
     };
     let configured = isekai_p2p::agent::proxy_authority(&args.proxy_url);
-    if !transfer.proxy.is_empty() && transfer.proxy != configured {
+    // Case-insensitively, because host names are: a ticket issued against
+    // `Tokyo.link.…` would otherwise be refused by a client on the default
+    // lowercase URL, with an error naming two addresses that read the same.
+    // The security property is unchanged -- this still has to be the host the
+    // operator passed.
+    if !transfer.proxy.is_empty() && !transfer.proxy.eq_ignore_ascii_case(configured) {
         anyhow::bail!(
             "this ticket is for {}, but --proxy-url is {configured}.\n\
              Redeeming sends this Endpoint's token to whichever proxy is used, so \

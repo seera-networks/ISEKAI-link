@@ -332,7 +332,7 @@ portal-client --redeem iskt1_eyJwIjoi… --map 5432:db
 ```
 let in by   : ep:9z8y7x…
 grant       : gr_AbC12345
-expires at  : 2026-09-28T09:32:00Z
+expires at  : 2026-08-28T09:32:00Z
 connection id: b7f0c1…
 tcp 127.0.0.1:5432 -> db
 ```

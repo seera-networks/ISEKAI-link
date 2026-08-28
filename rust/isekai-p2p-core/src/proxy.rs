@@ -287,13 +287,26 @@ pub struct Grant {
     pub grant_id: String,
     /// The Endpoint being reached. Not a listener — see [`ProxyClient::create_grant`].
     pub owner_endpoint: String,
-    pub allowed_endpoint: String,
-    pub protocol: String,
-    /// `manual`, `pairing` or `owner_match` — how this grant came to exist.
-    pub origin: String,
+    /// **Only the two fields above are required, and the rest are optional for
+    /// the same reason [`TicketListener`] is lax.** A grant arrives from
+    /// `POST /v1/peer/tickets/redeem` (§8.12.3), where failing to parse it
+    /// means a single-use ticket already spent, a grant already created, and a
+    /// caller told the call failed — deterministically, so retrying fails the
+    /// same way. An id and the Endpoint it lets you reach are what any of this
+    /// needs; a missing `created_at` is not worth that, and the fields below
+    /// are shown rather than acted on.
+    #[serde(default)]
+    pub allowed_endpoint: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// `manual`, `pairing`, `owner_match` or `ticket` — how this grant came to
+    /// exist.
+    #[serde(default)]
+    pub origin: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
-    pub created_at: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
     /// Absent means it stands until revoked.
     #[serde(default)]
     pub expires_at: Option<String>,
@@ -1492,7 +1505,7 @@ mod tests {
             .pair_with_code("K7M2-QX4P", Some("laptop"))
             .await
             .unwrap();
-        assert_eq!(grant.origin, "pairing");
+        assert_eq!(grant.origin.as_deref(), Some("pairing"));
         assert_eq!(
             grant.owner_endpoint, "ep:B",
             "the grant names the Endpoint let in to, not a listener"
@@ -1555,7 +1568,7 @@ mod tests {
                           "protocol":"mjpeg","expires_at":"2026-08-28T09:30:00Z"}]}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
         let redeemed = client.redeem_ticket("tkt1_secret", None).await.unwrap();
-        assert_eq!(redeemed.grant.origin, "ticket");
+        assert_eq!(redeemed.grant.origin.as_deref(), Some("ticket"));
         assert_eq!(
             redeemed.grant.expires_at.as_deref(),
             Some("2026-08-28T09:32:00Z"),
@@ -1589,6 +1602,21 @@ mod tests {
         let redeemed = client.redeem_ticket("tkt1_secret", None).await.unwrap();
         assert_eq!(redeemed.listeners[0].listener_id, "pl_1");
         assert_eq!(redeemed.listeners[0].owner_endpoint, None);
+    }
+
+    /// The grant is what the ticket was spent on, so losing the response to a
+    /// field nobody acts on would be the same bad trade as with the listeners.
+    #[tokio::test]
+    async fn redeeming_survives_a_grant_missing_its_descriptive_fields() {
+        let body = r#"{"grant":{"grant_id":"gr_1","owner_endpoint":"ep:B"}}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let redeemed = client.redeem_ticket("tkt1_secret", None).await.unwrap();
+        assert_eq!(redeemed.grant.grant_id, "gr_1");
+        assert_eq!(
+            redeemed.grant.owner_endpoint, "ep:B",
+            "the peer to connect to is the one field this cannot do without"
+        );
+        assert_eq!(redeemed.grant.origin, None);
     }
 
     /// An authorised peer whose far side has not started yet is not a failure,

@@ -96,7 +96,8 @@ On the machine with the services, say what may be reached and show a code:
 ```sh
 portal-server --login
 portal-server --example-config > portal-server.toml   # name the services
-portal-server --register --pair                       # prints a pairing code
+portal-server --register --config portal-server.toml  # leave this running
+portal-server --pair                                  # prints a pairing code
 ```
 
 ```toml

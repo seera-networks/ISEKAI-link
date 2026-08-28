@@ -1160,12 +1160,17 @@ impl MyApp {
         let mut revoke = None;
         for grant in grants {
             ui.horizontal(|ui| {
-                let name = grant.label.as_deref().unwrap_or(&grant.allowed_endpoint);
+                let name = grant
+                    .label
+                    .as_deref()
+                    .or(grant.allowed_endpoint.as_deref())
+                    .unwrap_or(&grant.grant_id);
                 ui.label(name);
                 ui.label(
-                    egui::RichText::new(match grant.origin.as_str() {
-                        "pairing" => "paired",
-                        "owner_match" => "same account",
+                    egui::RichText::new(match grant.origin.as_deref() {
+                        Some("pairing") => "paired",
+                        Some("owner_match") => "same account",
+                        Some("ticket") => "by ticket",
                         _ => "added by hand",
                     })
                     .small()

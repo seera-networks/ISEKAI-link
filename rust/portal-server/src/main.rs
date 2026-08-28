@@ -274,8 +274,8 @@ async fn grant_admin(args: &Args, cfg: &P2pConfig) -> anyhow::Result<()> {
             println!(
                 "grant       : {}  {}  ({}{})",
                 grant.grant_id,
-                grant.allowed_endpoint,
-                grant.origin,
+                grant.allowed_endpoint.as_deref().unwrap_or("?"),
+                grant.origin.as_deref().unwrap_or("origin unknown"),
                 grant
                     .label
                     .as_deref()
@@ -464,13 +464,25 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     // Everything here is an Endpoint-token call that names no listener
     // (§8.8, §8.12), so none of it needs a server standing up first.
-    if args.grants
+    let administering = args.grants
         || args.revoke.is_some()
         || args.pair
         || args.ticket
         || args.tickets
-        || args.revoke_ticket.is_some()
-    {
+        || args.revoke_ticket.is_some();
+    // **`--allow` is the one that does need a listener**, and these paths exit
+    // before there is one. Dropping it quietly is the worst of the three
+    // options: the code or the listing would print, the run would look like it
+    // worked, and the capability nobody was issued would be discovered by the
+    // peer failing to connect.
+    if administering && !args.allow.is_empty() {
+        anyhow::bail!(
+            "--allow issues a capability against a running listener, and this run exits \
+             before there is one. Issue it from the run that serves, or use --pair \
+             or --ticket, which need no server"
+        );
+    }
+    if administering {
         return administer_grants(&args, &tokens).await;
     }
 
