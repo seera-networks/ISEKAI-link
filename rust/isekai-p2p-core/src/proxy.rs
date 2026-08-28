@@ -166,7 +166,39 @@ pub enum ProxyError {
     Problem {
         status: u16,
         problem: Option<Problem>,
+        /// What `Retry-After` said, when it said anything.
+        ///
+        /// **The server's number beats one the caller computes.** A
+        /// `429 provisioning-slots-exhausted` carries the wait until the
+        /// earliest slot frees, and `503 provisioning-unavailable` the wait for
+        /// an issuer's JWKS to come back — neither is derivable from anything
+        /// the caller holds.
+        retry_after: Option<std::time::Duration>,
     },
+}
+
+impl ProxyError {
+    /// How long the proxy asked the caller to wait, if it did.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            ProxyError::Problem { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// The problem's kind, for the few decisions that turn on it.
+    ///
+    /// Most do not: §8.13.6 collapses unknown, expired, revoked and malformed
+    /// keys into one `provisioning-key-invalid` on purpose, and a caller that
+    /// tries to tell those apart has rebuilt the oracle that uniformity denies.
+    /// The ones that do are the exceptions §8.13.6 lists, which say the request
+    /// did not stand up rather than that it was refused.
+    pub fn kind(&self) -> Option<&str> {
+        match self {
+            ProxyError::Problem { problem, .. } => problem.as_ref().map(Problem::kind),
+            _ => None,
+        }
+    }
 }
 
 // ---- Candidates & DTOs (mirror the proxy handlers) ----------------------
@@ -335,10 +367,19 @@ pub struct Grant {
     pub allowed_endpoint: Option<String>,
     #[serde(default)]
     pub protocol: Option<String>,
-    /// `manual`, `pairing`, `owner_match` or `ticket` — how this grant came to
-    /// exist.
+    /// `manual`, `pairing`, `owner_match`, `ticket` or `provisioning` — how
+    /// this grant came to exist.
     #[serde(default)]
     pub origin: Option<String>,
+    /// Which Provisioning Key opened this door. **Only when `origin` is
+    /// `provisioning`.**
+    ///
+    /// Present because revoking a key has to find what it made (§8.13.7), and
+    /// because it is how an owner reading a grant list answers "which key let
+    /// this in". A Ticket-made grant carries no such id — the reasons differ,
+    /// and §8.12.10 leaves that one open.
+    #[serde(default)]
+    pub provisioning_key_id: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -445,6 +486,170 @@ pub struct RedeemedTicket {
     pub listeners: Vec<TicketListener>,
 }
 
+/// What binds a Provisioning Key to something other than its own possession
+/// (spec §8.13.4).
+///
+/// **`audience` is absent on purpose.** The proxy takes it from operator
+/// configuration and refuses to let a caller name one: a workload mints tokens
+/// for whatever audience it asks for, so a key naming another service's
+/// audience would accept the tokens that service is holding. The issue response
+/// echoes the configured value so CI knows what to mint for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisioningBinding {
+    /// Possession alone. **Never for a public repository's CI.**
+    None,
+    /// A workload identity token from `issuer` whose `sub` matches exactly.
+    /// No wildcards and no prefixes — cross a branch or a repository by
+    /// issuing another key.
+    Oidc { issuer: String, subject: String },
+    /// The redeeming Endpoint Token's `sub` must equal the key owner's.
+    Sub,
+    /// Its `tenant_id` must equal the key owner's. Refused when either side
+    /// has none: "unset matches unset" would let any caller without a tenant
+    /// through.
+    Tenant,
+}
+
+impl ProvisioningBinding {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            ProvisioningBinding::None => serde_json::json!({ "type": "none" }),
+            ProvisioningBinding::Sub => serde_json::json!({ "type": "sub" }),
+            ProvisioningBinding::Tenant => serde_json::json!({ "type": "tenant" }),
+            ProvisioningBinding::Oidc { issuer, subject } => serde_json::json!({
+                "type": "oidc",
+                "issuer": issuer,
+                "subject": subject,
+            }),
+        }
+    }
+}
+
+/// A Provisioning Key as issued (spec §8.13.3).
+///
+/// **`key` is the only required field**, for the reason [`Ticket`] gives: it is
+/// returned by this call and never again, so a response this cannot parse is a
+/// key the proxy has minted, counted against a quota of four, and will never
+/// show. The rest is shown rather than acted on.
+///
+/// The plaintext field is `key` here and `key_plaintext` on the Identity side.
+/// The two servers genuinely differ, and Identity's §8.8.2 says why it does not
+/// follow this one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvisioningKey {
+    /// The secret, `pvk1_`-prefixed. **Store it now or lose it.**
+    pub key: String,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub owner_endpoint: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// How long a Grant made by redeeming this lasts. Never unlimited, and
+    /// narrower than a Ticket's — §8.13.5's re-redemption is what that
+    /// narrowness assumes.
+    #[serde(default)]
+    pub grant_ttl: Option<i64>,
+    #[serde(default)]
+    pub max_live_grants: Option<i64>,
+    #[serde(default)]
+    pub live_grants: Option<i64>,
+    #[serde(default)]
+    pub redemption_count: Option<i64>,
+    /// Includes the `audience` the operator configured, which is the value CI
+    /// has to mint for. **Not settable by the caller** — a key naming another
+    /// service's audience would accept the tokens that service holds.
+    #[serde(default)]
+    pub binding: Option<serde_json::Value>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// When the key stops being redeemable. Unrelated to `grant_ttl`.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// One row of `GET /v1/peer/provisioning-keys` (spec §8.13.7) — the issue
+/// response without the secret, plus how full the key is.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvisioningKeyRecord {
+    pub key_id: String,
+    #[serde(default)]
+    pub owner_endpoint: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub grant_ttl: Option<i64>,
+    #[serde(default)]
+    pub max_live_grants: Option<i64>,
+    /// Slots in use right now. **Not a running total** — a Grant that expires
+    /// or is revoked frees its slot.
+    #[serde(default)]
+    pub live_grants: Option<i64>,
+    /// Redemptions within the retention window, counting repeats: a long-lived
+    /// runner that re-redeems all day is many here and one row in
+    /// [`ProvisioningRedemption`].
+    #[serde(default)]
+    pub redemption_count: Option<i64>,
+    #[serde(default)]
+    pub binding: Option<serde_json::Value>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProvisioningKeyList {
+    /// **`keys`, which is not what Identity calls the same idea.** Not
+    /// defaulted: a listing is idempotent and cheap to repeat, so a shape this
+    /// cannot read should say so rather than read as "this Endpoint has no
+    /// keys" — which is what somebody sees just before issuing past the quota.
+    keys: Vec<ProvisioningKeyRecord>,
+}
+
+/// Who came in on a Provisioning Key, and how often (spec §8.13.7).
+///
+/// **This is the compensation, not a convenience.** §8.13.1 admits the key is a
+/// bearer credential; being able to answer "which job came in on it" is part of
+/// what makes that acceptable to run.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvisioningRedemption {
+    pub endpoint_id: String,
+    #[serde(default)]
+    pub grant_id: Option<String>,
+    /// The workload's `sub`, when the binding is `oidc`. The assertion itself
+    /// is verified and discarded; this is what it proved.
+    #[serde(default)]
+    pub binding_subject: Option<String>,
+    #[serde(default)]
+    pub first_redeemed_at: Option<String>,
+    /// The most recent redemption.
+    #[serde(default)]
+    pub redeemed_at: Option<String>,
+    /// **Counted rather than inferred from the row count.** The record is
+    /// unique per `(key, endpoint)` and re-redemption updates it, so rows count
+    /// Endpoints and this counts visits.
+    #[serde(default)]
+    pub redeem_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProvisioningRedemptionList {
+    redemptions: Vec<ProvisioningRedemption>,
+}
+
+/// What redeeming a Provisioning Key returns (spec §8.13.5).
+///
+/// **The same shape a Ticket redemption answers in**, deliberately, so that a
+/// client which already redeems tickets needs no second parser — the proxy's
+/// own handler says as much. The difference is in the grant: `origin` is
+/// `provisioning` and `provisioning_key_id` names the key.
+pub type RedeemedProvisioningKey = RedeemedTicket;
+
 /// A listener named in a redemption response.
 ///
 /// **Laxer than [`ReachableListener`], and kept that way after the question was
@@ -526,6 +731,28 @@ pub const TICKET_PREFIX: &str = "tkt1_";
 
 /// The fixed prefix on the one-string form below (spec §8.12.8).
 pub const TICKET_TRANSFER_PREFIX: &str = "iskt1_";
+
+/// A Provisioning Key's prefix (spec §8.13.3).
+///
+/// Fixed and not secret, so that a secret scanner can find one — and
+/// **different from Identity's `enr1_` on purpose**: whoever picks a leaked one
+/// up can tell at a glance which server to revoke it at.
+pub const PROVISIONING_KEY_PREFIX: &str = "pvk1_";
+
+/// An Enrollment Key's prefix (Identity §8.8.2).
+pub const ENROLLMENT_KEY_PREFIX: &str = "enr1_";
+
+/// Every secret prefix worth keeping out of a log, longest first.
+///
+/// **Longest first matters**: `iskt1_` must not be matched as an `i` followed
+/// by `tkt1_`, which would leave the `iskt1_` visible and redact from the wrong
+/// offset.
+const SECRET_PREFIXES: [&str; 4] = [
+    TICKET_TRANSFER_PREFIX,
+    TICKET_PREFIX,
+    PROVISIONING_KEY_PREFIX,
+    ENROLLMENT_KEY_PREFIX,
+];
 
 /// The authority a proxy base URL names — `tokyo.link.isekai.tools:8443`.
 ///
@@ -627,17 +854,22 @@ pub fn ticket_from_transfer(input: &str) -> Option<TicketTransfer> {
     })
 }
 
-/// Replace the body of anything that looks like a Ticket with `…`.
+/// Replace the body of anything that looks like a secret with `…`.
 ///
-/// §8.12.8 asks clients to keep these out of their own logs, and the reason the
-/// prefixes are fixed is so that this is a substring search rather than a
-/// judgement. Applied to text that is about to be printed or logged, not to
-/// values in flight.
-pub fn redact_tickets(text: &str) -> String {
+/// Covers all four: Tickets and their transfer envelopes (§8.12.8),
+/// Provisioning Keys (§8.13.3) and Enrollment Keys (Identity §8.8.2). Both
+/// specs ask clients to keep these out of their own logs, and the reason every
+/// prefix is fixed is so that this is a substring search rather than a
+/// judgement. Applied to text about to be printed or logged, not to values in
+/// flight.
+///
+/// **The two keys belong here as much as a Ticket does**, and more: a Ticket is
+/// single-use, while a key is a standing arrangement that a scanner would find
+/// weeks later in a CI log.
+pub fn redact_secrets(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    // Longest first: `iskt1_` must not be matched as `…` after an `i`.
-    while let Some((at, prefix)) = [TICKET_TRANSFER_PREFIX, TICKET_PREFIX]
+    while let Some((at, prefix)) = SECRET_PREFIXES
         .iter()
         .filter_map(|p| rest.find(p).map(|at| (at, *p)))
         .min_by_key(|(at, p)| (*at, std::cmp::Reverse(p.len())))
@@ -1108,6 +1340,135 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             .await
     }
 
+    /// `POST /v1/peer/provisioning-keys` (spec §8.13.3) — put a standing
+    /// arrangement in place.
+    ///
+    /// **Needs `peer-provisioning:create`, which `peer-connect:accept` does not
+    /// imply.** A Ticket is the extension of handing somebody a piece of paper;
+    /// this says "let whoever holds this in, from now on", and §8.13.2 keeps
+    /// the two apart so the second cannot arrive on a token by accident.
+    ///
+    /// No listener is named: what redeeming makes is a Grant, whose key has no
+    /// listener in it, so the key outlives any particular listener.
+    ///
+    /// `binding` is optional here — unlike Identity's Enrollment Key, where it
+    /// cannot be omitted. §8.8.2 explains the asymmetry: what this creates is
+    /// authorization, bounded by a slot count and a `grant_ttl` and revocable
+    /// down to its derived Grants, whereas an Enrollment Key creates *subjects*
+    /// that stand on their own keys afterwards. **`none` is still the wrong
+    /// choice for a public repository's CI.**
+    pub async fn create_provisioning_key(
+        &self,
+        protocol: &str,
+        ttl: Option<u64>,
+        grant_ttl: Option<u64>,
+        max_live_grants: Option<u64>,
+        binding: Option<&ProvisioningBinding>,
+        label: Option<&str>,
+    ) -> Result<ProvisioningKey, ProxyError> {
+        let mut body = serde_json::json!({ "protocol": protocol });
+        if let Some(v) = ttl {
+            body["ttl"] = serde_json::json!(v);
+        }
+        if let Some(v) = grant_ttl {
+            body["grant_ttl"] = serde_json::json!(v);
+        }
+        if let Some(v) = max_live_grants {
+            body["max_live_grants"] = serde_json::json!(v);
+        }
+        if let Some(binding) = binding {
+            body["binding"] = binding.to_json();
+        }
+        if let Some(label) = label {
+            body["label"] = serde_json::json!(label);
+        }
+        self.request_json("POST", "/v1/peer/provisioning-keys", to_vec(&body))
+            .await
+    }
+
+    /// `GET /v1/peer/provisioning-keys` (spec §8.13.7) — this Endpoint's keys,
+    /// each with how full it is.
+    ///
+    /// `live_grants` against `max_live_grants` is the number that says whether
+    /// a key is turning jobs away; the ceiling alone does not.
+    pub async fn list_provisioning_keys(&self) -> Result<Vec<ProvisioningKeyRecord>, ProxyError> {
+        let list: ProvisioningKeyList = self
+            .request_json("GET", "/v1/peer/provisioning-keys", Vec::new())
+            .await?;
+        Ok(list.keys)
+    }
+
+    /// `GET /v1/peer/provisioning-keys/{key_id}/redemptions` (spec §8.13.7).
+    ///
+    /// **Outlives the key.** Revoking or expiring one does not erase this:
+    /// a key is stopped because of a leak, a compromise or somebody leaving,
+    /// and that is the moment "who came in on it" matters most.
+    pub async fn provisioning_redemptions(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<ProvisioningRedemption>, ProxyError> {
+        let list: ProvisioningRedemptionList = self
+            .request_json(
+                "GET",
+                &format!("/v1/peer/provisioning-keys/{key_id}/redemptions"),
+                Vec::new(),
+            )
+            .await?;
+        Ok(list.redemptions)
+    }
+
+    /// `DELETE /v1/peer/provisioning-keys/{key_id}` (spec §8.13.7).
+    ///
+    /// **This deletes the Grants the key made, which is the opposite of what
+    /// revoking a Ticket does.** Tearing up a piece of paper does not remove
+    /// whoever already walked in, and §8.12.6 leaves those Grants alone
+    /// deliberately. Here the owner does not know who is inside without asking,
+    /// so "stop this key" has to mean the door it opened closes — otherwise the
+    /// operator watches a door they cannot shut for up to `grant_ttl`.
+    ///
+    /// **Running jobs are cut off.** Established connections are not torn down,
+    /// but nothing new is authorized.
+    pub async fn revoke_provisioning_key(&self, key_id: &str) -> Result<(), ProxyError> {
+        self.request_empty(
+            "DELETE",
+            &format!("/v1/peer/provisioning-keys/{key_id}"),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// `POST /v1/peer/provisioning-keys/redeem` (spec §8.13.5) — **the caller
+    /// becomes the `allowed_endpoint`.**
+    ///
+    /// **Redeeming again is how a long job keeps its authorization**, which is
+    /// the reverse of a Ticket. `grant_ttl` is capped at an hour precisely
+    /// because this extends it: the answer is `200` with `expires_at` moved to
+    /// `max(existing, now + grant_ttl)`, never backwards, so a new job cannot
+    /// shorten a running one's grant.
+    ///
+    /// Most refusals answer the same `403 provisioning-key-invalid` — unknown,
+    /// expired, revoked, malformed, or an owner whose Endpoint has been
+    /// revoked — and telling them apart is not the caller's business.
+    /// **`403 provisioning-binding-invalid` is deliberately not one of them**:
+    /// presenting a 256-bit secret is not guesswork, so that answer says the
+    /// key is real and the CI is misconfigured (wrong branch, wrong repository,
+    /// missing audience). Folding it in would leave an operator unable to tell
+    /// a leak from a typo.
+    pub async fn redeem_provisioning_key(
+        &self,
+        key: &str,
+        assertion: Option<&str>,
+        label: Option<&str>,
+    ) -> Result<RedeemedProvisioningKey, ProxyError> {
+        let body = serde_json::json!({
+            "key": key,
+            "assertion": assertion,
+            "label": label,
+        });
+        self.request_json("POST", "/v1/peer/provisioning-keys/redeem", to_vec(&body))
+            .await
+    }
+
     /// `GET /v1/peer-listeners/{id}/events` (spec §8.11) — what happened, as it
     /// happens.
     ///
@@ -1432,6 +1793,7 @@ fn problem_error(resp: &HttpResponse) -> ProxyError {
     ProxyError::Problem {
         status: resp.status,
         problem: serde_json::from_slice(&resp.body).ok(),
+        retry_after: resp.retry_after(),
     }
 }
 
@@ -1991,7 +2353,9 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            ProxyError::Problem { status, problem } => {
+            ProxyError::Problem {
+                status, problem, ..
+            } => {
                 assert_eq!(status, 403);
                 assert_eq!(problem.unwrap().kind(), "capability-invalid");
             }
@@ -2161,29 +2525,59 @@ mod tests {
         assert_eq!(ticket.grant_ttl, None);
     }
 
+    /// The two keys are redacted for the same reason a Ticket is, and more:
+    /// a Ticket is single-use, while a key is a standing arrangement that a
+    /// scanner would find in a CI log weeks later.
+    #[test]
+    fn both_kinds_of_key_are_redacted_too() {
+        assert_eq!(
+            redact_secrets("issued pvk1_9dQ2mR7xK0 and enr1_AbCd-_09 today"),
+            "issued pvk1_… and enr1_… today",
+        );
+    }
+
+    /// Longest-first matching, which is the one way this can go quietly wrong:
+    /// read as `i` + `tkt1_`, an `iskt1_` transfer keeps its `is` and the
+    /// redaction starts one prefix too late.
+    #[test]
+    fn a_transfer_is_not_read_as_a_ticket_after_an_i() {
+        let redacted = redact_secrets("take iskt1_AAaa-_09 please");
+        assert_eq!(redacted, "take iskt1_… please");
+        assert!(!redacted.contains("itkt1_"));
+    }
+
+    /// A `pvk_` id is not a `pvk1_` secret, and neither is an `enk_` one.
+    #[test]
+    fn identifiers_that_merely_look_similar_are_left_alone() {
+        assert_eq!(
+            redact_secrets("key pvk_AbC12345 made grant gr_AbC12345 for enk_AbC12345"),
+            "key pvk_AbC12345 made grant gr_AbC12345 for enk_AbC12345",
+        );
+    }
+
     #[test]
     fn redaction_keeps_the_prefix_and_drops_the_secret() {
         let line = "redeeming tkt1_QA81kTj0cA4Q8gL9 now";
-        assert_eq!(redact_tickets(line), "redeeming tkt1_… now");
+        assert_eq!(redact_secrets(line), "redeeming tkt1_… now");
         // The longer prefix must win. Matching `tkt1_` first would leave the
         // `is` behind and redact from inside the word: `is` + `kt1_…`.
         let packed = ticket_transfer("proxy.test", "tkt1_abc");
         assert_eq!(
-            redact_tickets(&format!("hand over {packed}")),
+            redact_secrets(&format!("hand over {packed}")),
             "hand over iskt1_…"
         );
         // Both kinds on one line, each cut at its own end.
         assert_eq!(
-            redact_tickets("iskt1_AAaa-_09 then tkt1_BBbb, done"),
+            redact_secrets("iskt1_AAaa-_09 then tkt1_BBbb, done"),
             "iskt1_… then tkt1_…, done"
         );
     }
 
     #[test]
     fn redaction_leaves_everything_else_alone() {
-        assert_eq!(redact_tickets("nothing to see"), "nothing to see");
+        assert_eq!(redact_secrets("nothing to see"), "nothing to see");
         assert_eq!(
-            redact_tickets("grant gr_AbC12345 from ticket tkt_AbC12345"),
+            redact_secrets("grant gr_AbC12345 from ticket tkt_AbC12345"),
             // `tkt_` is the id, not the secret, and is meant to be readable —
             // only `tkt1_` is the thing worth hiding.
             "grant gr_AbC12345 from ticket tkt_AbC12345"

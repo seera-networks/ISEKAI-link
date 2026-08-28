@@ -769,7 +769,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 - `GithubActionsOidc` が audience ごとにキャッシュし、`exp` の手前で捨てる。
   環境変数が無ければ、何を設定すべきか（`permissions: id-token: write`）を名指しで言う。
 
-### フェーズ 3 — Proxy クライアント
+### フェーズ 3 — Proxy クライアント — **完了**
 
 §2.2。§8.13 の 5 メソッドと型、`redact_secrets`。
 
@@ -1347,3 +1347,62 @@ Credential` を足した。
 
 フェーズ 3（Proxy クライアント、§8.13）。§9.5 のとおり、フェーズ 5 の
 `--issue-enrollment-key` は `--permissions` を既定で `peer-connect:initiate` に絞る。
+
+---
+
+## 12. フェーズ 3 の結果
+
+`isekai-p2p-core::proxy` に §8.13 を実装した。テストは 11 本、ワークスペースは
+ビルドでき、触ったクレートの `fmt` / `clippy -D warnings` はクリーン。
+
+### 12.1 入ったもの
+
+`create_provisioning_key` / `list_provisioning_keys` / `provisioning_redemptions` /
+`revoke_provisioning_key` / `redeem_provisioning_key` と、
+`ProvisioningBinding` / `ProvisioningKey` / `ProvisioningKeyRecord` /
+`ProvisioningRedemption`。`RedeemedProvisioningKey` は `RedeemedTicket` の別名で、
+**同じ型をそのまま使う** — Proxy のハンドラ自身が「Ticket を引き換えられる
+クライアントが 2 つ目のパーサを要らないように」と書いている。
+
+`Grant` に `provisioning_key_id` を足し、`origin` の doc に `provisioning` を加えた。
+`redact_tickets` は `redact_secrets` になり、4 つの前置すべてを伏せる。
+`ProxyError::Problem` は `retry_after` を運び、`kind()` が生えた。
+
+### 12.2 サーバを読んで避けた取り違え
+
+**フェーズ 1 と同じ罠が、逆向きに置いてあった。**
+
+| | Identity（§8.8） | Proxy（§8.13） |
+| --- | --- | --- |
+| 平文の鍵 | `key_plaintext` | **`key`** |
+| 一覧の包み | `items` | **`keys`** |
+
+フェーズ 1 で `key_plaintext` / `items` に直したばかりなので、**対称だろうと考えて
+そちらに揃えていたら、今度は逆向きに間違えていた。** 2 つは別のサーバで別の仕様であり、
+Identity の §8.8.2 は「なぜ Proxy に揃えないか」を明記している。
+今回は最初にハンドラを読んだので踏まずに済んだ。テストのモックもサーバの名前で書いてある。
+
+**もう 1 つ、モックのほうが間違っていた。** `Problem` の `status` は必須で、Proxy の
+`ProblemBody` も実際に送っている。省いたフィクスチャを書いたせいで `kind()` が
+`None` になり、テストが 2 本落ちた — **コードではなくテストの側の誤り**だったが、
+「サーバが本当に送っているか」を確かめる手順を踏んでいなければ、`Problem` を緩めて
+しまうところだった。
+
+### 12.3 決めたこと
+
+- **一覧の包みは `#[serde(default)]` にしない。** フェーズ 1 の `items` と同じ理由で、
+  読めない形は黙って空を返すより言うべきである。「この Endpoint に鍵は無い」と
+  読めるのが、クォータ 4 を超えて発行する直前に人が見る画面である。
+- **`ProxyError::kind()` を足したが、使ってよい場面は限られる。** §8.13.6 が
+  未知・期限切れ・失効・不正形式を 1 つの `provisioning-key-invalid` に畳んでいるのは
+  意図であり、それを解こうとする呼び出し側は一様性が否定している oracle を作り直す
+  ことになる。**例外は `provisioning-binding-invalid`** で、こちらは「鍵は本物、CI の
+  設定が違う」と言っている — 畳み込むと運用者が漏洩と打ち間違いを区別できない。
+- **`ProvisioningBinding` は `binding` を省略可のままにする**（Identity 側とは逆）。
+  §8.8.2 が非対称の理由を書いている: 鍵が作るのは認可であって主体ではない。
+
+### 12.4 次
+
+フェーズ 4（`portal-server` の発行系 CLI）。§9.5 のとおり、配備が
+`DEFAULT_PERMISSIONS` に `peer-provisioning:create` を入れていなければ
+`--provisioning-key` は `403` になる。

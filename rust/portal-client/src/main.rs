@@ -267,7 +267,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             anyhow::bail!(
                 "that is a ticket, not a pairing code -- redeem it with --redeem.\n\
                  Nothing was sent. ({})",
-                isekai_p2p::agent::redact_tickets(code),
+                isekai_p2p::agent::redact_secrets(code),
             );
         }
     }
