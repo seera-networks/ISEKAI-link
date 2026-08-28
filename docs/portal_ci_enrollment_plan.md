@@ -494,9 +494,12 @@ Listener を鍵に含まないという Proxy 仕様 §8.8 の設計の帰結**�
 「入った人は出ていかない」だが、Provisioning Key の失効は派生 Grant を消す
 （Proxy 仕様 §8.13.7 が意図的に反転させている）。走行中のジョブが落ちる、と出力に書く。
 
-**前提**: 発行には新しい permission `peer-provisioning:create` が要る（§8.13.2）。
-`peer-connect:accept` では発行できない。運用者の Endpoint の天井にこれが無ければ
-`403 insufficient-permission` で止まる — §5 のフェーズ 0 で確認する。
+**前提**: 発行には新しい permission `peer-provisioning:create` が要る
+（Proxy 仕様 §8.13.2）。`peer-connect:accept` では発行できない。
+
+> **これは現在ブロックされている。** Identity は `peer-provisioning:create` を
+> **発行できない** — 仕様 §7 の権限表にも、実装の `Permission` 列挙型にも無い。
+> §9.2 を読むこと。**このフェーズは上流が対応するまで着手できない。**
 
 ### 2.7 CI ワークフロー
 
@@ -704,7 +707,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 
 ## 5. フェーズ
 
-### フェーズ 0 — サーバ側の前提を確認する（実装なし）
+### フェーズ 0 — サーバ側の前提を確認する（実装なし）— **実施済み。§9 に結果**
 
 これが無いと以降のすべてが `404` か `403` になり、しかもクライアントのログは
 その理由を言わない。
@@ -960,3 +963,115 @@ $ portal-server --grants                               # いま入っている�
   Proxy 仕様 §8.13.3 が明示しており、**どちらも交換の窓のために 1 ではなく 4 にした**と
   書いてある。ただし出典が無いと確かめようが無いので、§6.4 に引用を足し、
   `max_live_endpoints` の既定 4 と**別の数**であることを言い足した。
+
+---
+
+## 9. フェーズ 0 の結果
+
+Identity は `../ISEKAI-identity-0-a`（`main`、`aa8ae54` = #32 が入ったもの）、
+Proxy は `../ISEKAI-link-server-0-a`（`main`、`a5ccb0f`）を読んだ。
+**ソースが答えられるのは「何が設定できるか」までで、「稼働中の配備に何が設定されているか」は
+§9.4 のとおり未確認である。**
+
+### 9.1 6 項目の確認結果
+
+| # | 項目 | 結果 |
+| --- | --- | :---: |
+| 1 | `ENROLLMENT_KEYS_ENABLED` | ⚠ 既定 `0`。**立てる必要がある** |
+| 2 | `ENROLLMENT_OIDC_ISSUERS` に GitHub | ⚠ 既定 **空**。**足す必要がある** |
+| 3 | 2 つの audience の実値 | ✅ 既定のまま分かれている |
+| 4 | Proxy の `--p2p-provisioning-oidc-issuer` | ⚠ 既定 **空**。**足す必要がある** |
+| 5 | 運用者の天井に `peer-provisioning:create` | ❌ **発行できない。§9.2** |
+| 6 | 発行者の天井（`peer-connect:initiate` / `isekai-portal-v1`） | ⚠ 権限は既定で足りる。**protocol は既定に無い** |
+
+**1.** `state.rs` の `env_flag("ENROLLMENT_KEYS_ENABLED")`。偽なら §8.8 の経路を router へ
+マウントしない（`403` ではなく `404`）。
+
+**2.** 空のまま起動すると「`binding.type` は `none` しか作れない」と警告が出る。
+`https` 以外を書くと**起動しない**（SSRF の入口なので、起動を止めて運用者に見せる設計）。
+
+**3.** Identity は `ENROLLMENT_OIDC_AUDIENCE` の既定が `isekai-identity`、Proxy は
+`--p2p-provisioning-oidc-audience` の既定が `isekai-proxy`。どちらもコードのコメントが
+「利用者は指定できない」と明記している。**§4.3 の前提はそのまま成り立つ。**
+
+**4.** `--p2p-provisioning-oidc-issuer` は繰り返し指定で、既定は空 =「何も許さない」。
+起動時に「https で host を持つ URL」を検証して、違えば起動を止める。
+
+**6.** permission の天井は `DEFAULT_PERMISSIONS`（既定は §7 の全 5 権限で、
+`peer-connect:initiate` を含む）。protocol の天井は `resolve_ceiling` を通る
+per-user の値で、**サーバ既定は組織テナントが `["isekai-validator-v1"]`、
+個人テナント（`org_id` を持たない利用者）は空 = 1 つも許さない**。
+したがって `isekai-portal-v1` は、`DEFAULT_PROTOCOLS` / `INDIVIDUAL_PROTOCOLS`、
+またはそのユーザーの `protocol_ceilings` の行として**明示的に入れる必要がある**。
+portal が今日動いている配備では既に入っているはずだが、**それは配備の事実であって
+既定ではない**（§9.4）。
+
+### 9.2 ブロッカー: Identity は `peer-provisioning:create` を発行できない
+
+**Proxy は要求する。**
+
+```rust
+// isekai-link-server/src/p2p/handlers.rs — create_provisioning_key
+require_permission(&claim, permission::PEER_PROVISIONING_CREATE)?;
+```
+
+**Identity は発行できない。** 権限は完全一致でパースされ、未知の文字列は `None` になる。
+
+```rust
+// ISEKAI-identity/src/domain/permission.rs
+pub enum Permission {
+    UdpListenPublicCreate, UdpListenPublicDelete,
+    PeerListenerPrivateCreate, PeerConnectInitiate, PeerConnectAccept,
+}
+```
+
+**そして、これは実装の抜けではなく仕様の食い違いである。** Identity 仕様 §7 の権限表は
+この 5 つで閉じており、`peer-provisioning:create` はどこにも無い — 唯一の言及は
+§8.8.12-5（未解決）で、Proxy 仕様が新設したことに触れているだけである。
+一方 Proxy 仕様 §8.13.2 は「**§5.4 の permission 表に 1 行加える**」と書いている。
+**§5.4 は Proxy 仕様の表であり、その値を実際に鋳造するのは Identity である。**
+片方の仕様が、もう片方が発行する語彙を、もう片方に断らずに増やしている。
+
+**影響。** `portal-server --provisioning-key`（フェーズ 4）が必ず
+`403 insufficient-permission` になる。Provisioning Key を作れないので **P2 が塞がらず、
+CI から接続できない**（§0 の「片方だけでは用を成さない」がそのまま起きる）。
+
+**回避策は無い。**
+
+| 案 | 判定 |
+| --- | --- |
+| Identity に権限を足す（上流） | **これしかない。** 語彙は Identity が持っている |
+| `DEFAULT_PERMISSIONS` に文字列で足す | 不可。`Permission::parse` が `None` を返し、環境変数は `filter_map` で黙って落とす |
+| Proxy 側の `require_permission` を外す | 不可。Proxy 仕様 §8.13.1 が「補償の 1 つ目」に数えており、外すなら Provisioning Key を出荷してはならない |
+
+**上流へ上げる。** 要るのは Identity 仕様 §7 に 1 行と、`Permission` に 1 列挙子である。
+`DEFAULT_PERMISSIONS` の既定に入れるかどうかは別の判断で、**入れないほうがよい** —
+Proxy 仕様 §8.13.2 が「既存の Endpoint Token に自動で付いてはならない」と書いているのは
+まさにこの点であり、既定に入れると全 Endpoint に付いてしまう。運用者が
+`DEFAULT_PERMISSIONS` で明示するか、エンタイトルメントで配る形が筋である。
+
+### 9.3 ついでに分かったこと
+
+- **Proxy の §8.13 は常時マウントされている**（gate が無い）のに、Identity の §8.8 は
+  既定で無効である。**片側だけ準備しても気づけない** — Provisioning Key は作れるのに
+  Enrollment Key の経路が `404` を返す、という状態が普通に起こりうる。
+  フェーズ 0 を「実装なし」で残したのはこのためである。
+- **Enrollment Key の permission 天井は、発行者が実際に持っている権限ではなく
+  サーバ既定 `DEFAULT_PERMISSIONS` である。** protocol だけが per-user の天井を通る。
+  仕様 §8.8.2 の「発行者が自分で登録したときに得られたもの」と読み合わせれば一貫している。
+- **個人テナントの protocol 既定が空**なのは、CI 用の Enrollment Key を個人アカウントで
+  発行しようとしたときに `403 protocol-not-allowed` として現れる。エラーは
+  「その protocol は許されていない」としか言わないので、**テナントの種類を先に確かめる。**
+
+### 9.4 稼働中の配備について未確認のもの
+
+ソースからは決まらない。運用者に訊くか、配備へ問い合わせるかが要る。
+
+1. `identity.isekai.tools:9443` で `ENROLLMENT_KEYS_ENABLED` が立っているか
+   （立っていなければ §8.8 の全経路が `404`）
+2. その `ENROLLMENT_OIDC_ISSUERS` に GitHub の issuer が入っているか
+3. `tokyo.link.isekai.tools:8443` に `--p2p-provisioning-oidc-issuer` が渡されているか
+4. CI の Endpoint を持つ User の protocol 天井に `isekai-portal-v1` が入っているか
+
+**1 は無認証の要求 1 本で判別できる**（経路が無ければ `404`、あれば `401`）が、
+本番配備への問い合わせなので運用者の了解を取ってから行う。
