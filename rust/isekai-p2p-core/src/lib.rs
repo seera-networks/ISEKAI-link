@@ -26,6 +26,7 @@ pub mod hostname;
 /// HTTPS (HTTP/1.1 + HTTP/2) transport for the Identity API.
 pub mod https;
 pub mod identity;
+pub mod mtu;
 pub mod pop;
 pub mod proxy;
 

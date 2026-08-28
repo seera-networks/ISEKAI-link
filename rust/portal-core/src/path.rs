@@ -120,8 +120,8 @@ const STALLED_GRACE: Duration = Duration::from_secs(10);
 /// **Not `MAX_PAYLOAD`**, which is the *payload* bound: `datagram::encode`
 /// prepends the session id, so a full-size payload reaches the connection four
 /// bytes longer. Comparing the connection's limit against the payload figure
-/// would leave 1180..=1183 reported as fine while every maximum-size datagram
-/// came back `TooBig` and was counted as a loss.
+/// would leave a connection reporting 1163..=1166 as fine while every
+/// maximum-size datagram came back `TooBig` and was counted as a loss.
 const LARGEST_DATAGRAM: usize = crate::datagram::HEADER + crate::datagram::MAX_PAYLOAD;
 
 /// How many reporting ticks between reads of the connection-wide counters.

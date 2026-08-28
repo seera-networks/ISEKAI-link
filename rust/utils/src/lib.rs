@@ -140,12 +140,12 @@ pub fn make_msquic_async_listener_with(
     let alpn = [msquic::BufferRef::from(alpn)];
     let settings = msquic::Settings::new()
         .set_IdleTimeoutMs(30_000)
-        // 1248 is msquic's floor (QUIC_DPLPMTUD_MIN_MTU); a smaller
-        // request is silently clamped up to it. Stated explicitly so
-        // the cap the listener applies is the one it appears to apply.
-        // Matches the video client (see `camera_core::video`), so the
-        // relay tunnel carries the same packet size in both directions.
-        .set_MaximumMtu(1248)
+        // **The same constant the dialling half uses**, and it has to be: this
+        // is the listener end of the same connection, and `portal-core` sizes
+        // its datagrams from it for *both* directions. Written as 1248 here
+        // until P1 of `docs/portal_mtu_plan.md` — raising one end alone would
+        // have left this one refusing every datagram at the new limit.
+        .set_MaximumMtu(isekai_p2p_core::mtu::PEER_MTU)
         // Keeps the *connection* from going idle. It does not keep a path warm:
         // it is re-armed by any activity anywhere on the connection, so on a
         // connection that is carrying traffic it never fires at all. Keeping an

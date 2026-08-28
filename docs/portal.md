@@ -296,8 +296,11 @@ but a forward that used those bytes would start losing large datagrams the
 moment it moved onto an IPv6 direct path, which is worse than being 20 bytes
 short everywhere.
 
-> This said "about 1200" until the arithmetic was measured, which was 37 too
-> generous. Payloads in the gap were accepted and then lost.
+> This page said "about 1200" and the code enforced 1180, until the arithmetic
+> was measured. 1180 was 17 too generous — payloads in that gap would have been
+> accepted here and refused by the connection. None were, because every relayed
+> path is IPv4, where 20 more bytes fit; the gap was only ever reachable on an
+> IPv6 direct path.
 
 The case to know is DNS: EDNS0 commonly advertises a 1232-byte buffer, so a
 large response can exceed this — and it is dropped with no truncation bit and no
