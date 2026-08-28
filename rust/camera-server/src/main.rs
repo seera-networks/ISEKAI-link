@@ -579,12 +579,10 @@ impl MyApp {
                 identity_url,
                 identity_http3: false,
                 proxy_url,
-                auth0_token,
+                credential: camera_core::Credential::auth0(auth0_token, auth0, register),
                 protocol,
-                register,
                 device_name: Some("camera-server".to_string()),
                 token_ttl: None,
-                auth0,
                 key,
             };
             // Automatic, since the proxy has already checked that a grant

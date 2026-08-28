@@ -15,6 +15,7 @@ use anyhow::{bail, Context};
 use argh::FromArgs;
 use isekai_p2p::config::{issue_endpoint_token, P2pConfig};
 use isekai_p2p::initiator::InitiatorSession;
+use isekai_p2p::Credential;
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::proxy::{Candidate, CandidateType, ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::{shutdown_msquic, MasqueH3Transport};
@@ -342,12 +343,10 @@ async fn token(a: Token) -> anyhow::Result<()> {
         identity_http3: a.identity_http3,
         // Unused by token issuance, but the config is shared with the sessions.
         proxy_url: String::new(),
-        auth0_token: a.auth0_token,
+        credential: Credential::auth0(a.auth0_token, None, a.register),
         protocol: String::new(),
-        register: a.register,
         device_name: a.device_name,
         token_ttl: a.ttl,
-        auth0: None,
         key: load_key(&a.key)?,
     };
     let token = issue_endpoint_token(&cfg).await?;
@@ -383,13 +382,11 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
         identity_url: String::new(),
         identity_http3: false,
         proxy_url: a.proxy_url,
-        auth0_token: String::new(),
-        protocol: a.protocol,
         // The token/key came straight from the caller; no Identity round-trip.
-        register: false,
+        credential: Credential::auth0(String::new(), None, false),
+        protocol: a.protocol,
         device_name: None,
         token_ttl: None,
-        auth0: None,
         key: load_key(&a.key)?,
     };
     let candidates = parse_candidates(&a.candidate)?;

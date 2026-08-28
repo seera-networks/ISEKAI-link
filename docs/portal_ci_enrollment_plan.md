@@ -754,7 +754,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 - `Enrolled` が `endpoint_id` と `endpoint_token` だけの応答をパースできる。
 - `429` の `Retry-After` が `IdentityError` に載る。
 
-### フェーズ 2 — 資格情報の継ぎ目
+### フェーズ 2 — 資格情報の継ぎ目 — **完了**
 
 §2.3。`Credential` / `Enrollment` / `AssertionSource` と `issue_endpoint_token` の分岐。
 13 か所の構築サイトの移行を含む。
@@ -1248,3 +1248,49 @@ enroll / refresh / revoke の 3 経路についてで、**鍵の管理 API（§8
 （§9.5）。後者は実装の話でもあり、フェーズ 5 の `portal-client --issue-enrollment-key`
 は `--permissions` を**既定で `peer-connect:initiate` に絞る**。省略が最小権限に
 ならない配備がありうる以上、省略の側を安全に倒しておく。
+
+---
+
+## 11. フェーズ 2 の結果
+
+`isekai-p2p` に実装した。**ワークスペース全体がビルドでき**、触ったクレートの
+テストは全て通る。`fmt` はクリーン、`clippy -D warnings` も触ったクレートについては
+クリーンである（`webrtc-app` と `channel-masque` には既存の指摘が 4 件・16 件あるが、
+`main` でも同じように出る）。
+
+### 11.1 入ったもの
+
+- **`Credential`**（`auth.rs`）。`P2pConfig` の `auth0_token` / `auth0` / `register` が
+  1 つになった。`register` は `Credential::Auth0` の**中**で、無人経路では書きようが無い。
+- **`AssertionSource`**（`auth.rs`）。`Auth0TokenSource` の隣、同じ形。
+  **`audience` を引数に取る。**
+- **`oidc` モジュール** — `GithubActionsOidc`（`ACTIONS_ID_TOKEN_REQUEST_*` から鋳造）と
+  `TokenFiles`（audience → パス、呼ばれるたびに読み直す）。
+- **`issue_endpoint_token` の分岐** — 未登録なら §8.8.4 → §8.8.5、登録済みなら
+  §8.2.2 → §8.2.3。判定は `Arc<tokio::sync::OnceCell<String>>`。
+
+移行した構築サイトは 13 か所。`Credential::auth0(token, source, register)` を置いたので、
+差分は各所 1〜数行に収まった。
+
+### 11.2 実装して分かったこと
+
+**`OnceCell` の「負けた側」を落としてはならない。** `get_or_try_init` は勝者の値を
+全員に返すが、**トークンは値ではなく副産物**である（§8.8.5 は登録と最初のトークンを
+1 往復で返す）。勝者はそのトークンを持ち、敗者は持たない。敗者を勝者のトークンで
+帰すと、1 時間前に発行された 15 分のトークンを返しうる。**勝者だけが自分の鋳造した
+トークンを返し、それ以外は更新へ落ちる**形にした（`unattended`）。
+並行 8 本のテストが、enroll が 1 回で `TOKEN.FROM.ENROL` を持つ呼び出しも 1 つだけ
+であることを固定している。
+
+**FFI の `cfg.auth0_token = …` が書けなくなった。** 構築後に代入していた箇所が 2 つあり、
+`directory_config` の引数に移した。**これは enum を入れた目的そのもの**である —
+「一瞬だけ誤った資格を名乗っている config」という状態が表現できなくなった。
+
+**`GithubActionsOidc` に `Debug` は付けない。** ランナーの bearer を持っているので、
+derive した `Debug` は「issue に貼られたログ行に秘密が載る」経路になる。テストは
+`unwrap_err()` ではなく `let Err(err) = … else` で書いた。
+
+### 11.3 次
+
+フェーズ 3（Proxy クライアント、§8.13）。§9.5 のとおり、フェーズ 5 の
+`--issue-enrollment-key` は `--permissions` を既定で `peer-connect:initiate` に絞る。

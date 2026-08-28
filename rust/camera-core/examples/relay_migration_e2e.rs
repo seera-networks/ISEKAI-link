@@ -31,7 +31,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use camera_core::{
-    load_or_generate_key, InitiatorSession, P2pConfig, PathEvent, ServerCommand, VideoRecvOptions,
+    load_or_generate_key, Credential, InitiatorSession, P2pConfig, PathEvent, ServerCommand,
+    VideoRecvOptions,
 };
 use isekai_p2p::agent::RelayOptions;
 use msquic_async::{msquic, Registration};
@@ -73,12 +74,10 @@ fn config(auth0: &str, identity: &str, proxy: &str, protocol: &str, key_path: &s
         identity_url: identity.to_owned(),
         identity_http3: false,
         proxy_url: proxy.to_owned(),
-        auth0_token: auth0.to_owned(),
+        credential: Credential::auth0(auth0.to_owned(), None, register),
         protocol: protocol.to_owned(),
-        register,
         device_name: Some("relay-migration-e2e".to_owned()),
         token_ttl: None,
-        auth0: None,
         key: load_or_generate_key(key_path).expect("load/generate key"),
     }
 }
@@ -128,9 +127,15 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
     // --- Target side ---
     let server_cfg = config(auth0, identity, proxy, protocol, "e2e-server.pem");
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
-    let server =
-        camera_core::spawn_p2p_server(Some(reg.clone()), server_cfg, &video_key_path(), frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone())
-            .await?;
+    let server = camera_core::spawn_p2p_server(
+        Some(reg.clone()),
+        server_cfg,
+        &video_key_path(),
+        frame_rx,
+        camera_core::AcceptPolicy::Manual,
+        shutdown.clone(),
+    )
+    .await?;
     println!(
         "server ready: listener={} endpoint={} video={}",
         server.info.listener_id, server.info.endpoint_id, server.info.video_addr

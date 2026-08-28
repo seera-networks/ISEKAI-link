@@ -39,7 +39,7 @@ pub use video::{
 pub use isekai_p2p::agent::{CertBundle, EndpointToken, ObservedAddressWatch, RelayOptions};
 /// Signing in to Auth0 and staying signed in — what keeps a camera's Endpoint
 /// Token renewable for longer than one access token's lifetime.
-pub use isekai_p2p::{auth0, Auth0TokenSource, StaticAuth0Token};
+pub use isekai_p2p::{auth0, AssertionSource, Auth0TokenSource, Credential, StaticAuth0Token};
 pub use isekai_p2p::{issue_endpoint_token, load_or_generate_key, InitiatorSession, P2pConfig};
 
 /// Open the msquic registration an application should run everything on.

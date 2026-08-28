@@ -242,13 +242,11 @@ async fn config(args: &Args, tokens: &std::path::Path) -> anyhow::Result<P2pConf
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
-        auth0_token: auth.token,
-        // **The whole point.** With this the Endpoint Token renewal, which runs
-        // every few minutes for the life of the session, asks for a current
-        // Auth0 token instead of reusing one that has expired.
-        auth0: auth.source,
+        // **The whole point of the source.** With it the Endpoint Token
+        // renewal, which runs every few minutes for the life of the session,
+        // asks for a current Auth0 token instead of reusing one that expired.
+        credential: isekai_p2p::Credential::auth0(auth.token, auth.source, args.register),
         protocol: args.protocol.clone(),
-        register: args.register,
         device_name: args.device_name.clone(),
         token_ttl: None,
         key,

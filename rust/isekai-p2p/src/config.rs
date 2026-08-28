@@ -7,17 +7,16 @@
 //! data path.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::https::HttpsTransport;
-use isekai_p2p_core::identity::{EndpointToken, IdentityClient};
+use isekai_p2p_core::identity::{EndpointToken, IdentityAuth, IdentityClient};
 use isekai_p2p_core::proxy::{ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
-use crate::auth::Auth0TokenSource;
+use crate::auth::{Credential, Enrollment};
 
 /// Everything a P2P session needs to reach the services and identify itself.
 ///
@@ -32,23 +31,14 @@ pub struct P2pConfig {
     pub identity_http3: bool,
     /// Proxy base URL, e.g. `https://tokyo.link.isekai.tools:8443`.
     pub proxy_url: String,
-    /// Auth0 access token — used **only** to obtain the Endpoint Token from the
-    /// Identity API. It is never sent to the proxy.
+    /// How this session proves who it is to the Identity API — a person's Auth0
+    /// sign-in, or an Enrollment Key for a job with nobody at the keyboard.
     ///
-    /// The starting token. An Endpoint Token lasts minutes and is reissued for
-    /// the life of the session, so once this one expires renewal needs a fresh
-    /// one from [`P2pConfig::auth0`].
-    pub auth0_token: String,
-    /// Where to get a *current* Auth0 token when the Endpoint Token is renewed.
-    ///
-    /// `None` keeps using [`P2pConfig::auth0_token`], which works until that
-    /// token expires and then stops — see [`crate::auth`].
-    pub auth0: Option<Arc<dyn Auth0TokenSource>>,
+    /// **Never sent to the proxy**, whichever it is: the proxy sees only the
+    /// Endpoint Token this obtains, and a PoP over each request.
+    pub credential: Credential,
     /// P2P protocol string, e.g. `isekai-validator-v1`.
     pub protocol: String,
-    /// Register the Endpoint before issuing a token (needed on first use of a
-    /// freshly generated key).
-    pub register: bool,
     /// Device display name recorded at registration.
     pub device_name: Option<String>,
     /// Requested Endpoint Token TTL, in seconds (`None` = server default).
@@ -81,8 +71,8 @@ pub fn load_or_generate_key(path: &Path) -> anyhow::Result<EndpointKey> {
     Ok(key)
 }
 
-/// Register (when [`P2pConfig::register`] is set) and issue an Endpoint Token,
-/// over whichever Identity API transport the config selects.
+/// Obtain an Endpoint Token over whichever Identity API transport the config
+/// selects, registering or enrolling first when that is what is needed.
 pub async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<EndpointToken> {
     // The Identity API serves h1/h2 on TCP+TLS and h3 on QUIC at the same port;
     // pick one. The two branches build different concrete transports, so the
@@ -116,26 +106,164 @@ async fn issue<T: ControlPlaneTransport>(
     client: &IdentityClient<T>,
     cfg: &P2pConfig,
 ) -> anyhow::Result<EndpointToken> {
-    // The source when there is one, and only then the starting token: this runs
-    // again every few minutes for the life of the session, so by the second call
-    // the captured token may already be the stale one.
-    let auth0 = match &cfg.auth0 {
-        Some(source) => source
-            .auth0_token()
-            .await
-            .context("could not obtain a current Auth0 token")?,
-        None => cfg.auth0_token.clone(),
-    };
-    let token = if cfg.register {
-        client
-            .register_and_issue(&auth0, &cfg.key, cfg.device_name.as_deref(), cfg.token_ttl)
-            .await?
-    } else {
-        client
-            .issue_token(&auth0, &cfg.key, None, None, cfg.token_ttl)
-            .await?
-    };
-    Ok(token)
+    match &cfg.credential {
+        Credential::Auth0 {
+            token,
+            source,
+            register,
+        } => {
+            // The source when there is one, and only then the starting token:
+            // this runs again every few minutes for the life of the session, so
+            // by the second call the captured token may already be the stale
+            // one.
+            let auth0 = match source {
+                Some(source) => source
+                    .auth0_token()
+                    .await
+                    .context("could not obtain a current Auth0 token")?,
+                None => token.clone(),
+            };
+            let token = if *register {
+                client
+                    .register_and_issue(&auth0, &cfg.key, cfg.device_name.as_deref(), cfg.token_ttl)
+                    .await?
+            } else {
+                client
+                    .issue_token(&auth0, &cfg.key, None, None, cfg.token_ttl)
+                    .await?
+            };
+            Ok(token)
+        }
+        Credential::Enrollment(enrollment) => unattended(client, cfg, enrollment).await,
+    }
+}
+
+/// The audience Identity checks a `binding` assertion against (§8.8.3).
+///
+/// **Not the proxy's.** Both servers take this from operator configuration and
+/// refuse to let a caller name one, and the two defaults differ on purpose: a
+/// token minted for one is then refused by the other.
+const IDENTITY_AUDIENCE: &str = "isekai-identity";
+
+/// Enrol once, and renew from then on (§8.8.5 / §8.8.7).
+///
+/// **The first call registers and the rest refresh**, and which one this is has
+/// to be decided by shared state rather than by asking the server: a second
+/// enrolment presents the same keypair, takes `409 endpoint-already-registered`
+/// — one key registers exactly one Endpoint — and does not free the slot it
+/// spent. `Enrollment::cell` is an `Arc<OnceCell<_>>` so that every clone of the
+/// config, including the renewal task's, sees the same answer.
+async fn unattended<T: ControlPlaneTransport>(
+    client: &IdentityClient<T>,
+    cfg: &P2pConfig,
+    enrollment: &Enrollment,
+) -> anyhow::Result<EndpointToken> {
+    // Set by whichever caller actually enrols, and read back below. The
+    // enrolment response carries the first Endpoint Token with it (§8.8.5), so
+    // the caller that did the work already holds one and must not go on to
+    // spend a renewal round trip getting a second.
+    let mut minted: Option<EndpointToken> = None;
+    enrollment
+        .cell()
+        .get_or_try_init(|| async {
+            let enrolled = enrol(client, cfg, enrollment).await?;
+            let endpoint_id = enrolled.endpoint_id.clone();
+            minted = Some(enrolled.token());
+            Ok::<_, anyhow::Error>(endpoint_id)
+        })
+        .await?;
+    match minted {
+        Some(token) => Ok(token),
+        // Somebody else enrolled — either a previous call of ours, or a
+        // concurrent one that won. Either way this Endpoint exists now and the
+        // way to a token is a renewal.
+        None => refresh(client, cfg, enrollment).await,
+    }
+}
+
+/// §8.8.4 → §8.8.5: a challenge, then registration and the first token.
+async fn enrol<T: ControlPlaneTransport>(
+    client: &IdentityClient<T>,
+    cfg: &P2pConfig,
+    enrollment: &Enrollment,
+) -> anyhow::Result<isekai_p2p_core::identity::Enrolled> {
+    let auth0 = enrollment_auth0(enrollment).await?;
+    // **Fetched before the challenge and used only at §8.8.5.** The challenge
+    // does not verify the binding, so minting first and spending the token on
+    // the second call keeps one round trip's worth of the assertion's life for
+    // the call that actually checks it.
+    let assertion = enrollment_assertion(enrollment).await?;
+    let auth = identity_auth(enrollment, assertion.as_deref(), auth0.as_deref());
+    // The challenge takes no assertion (§8.8.4); `enroll_challenge` drops it.
+    let challenge = client
+        .enroll_challenge(auth, &cfg.key)
+        .await
+        .context("could not obtain an enrolment challenge")?;
+    client
+        .enroll(
+            auth,
+            &cfg.key,
+            &challenge,
+            cfg.device_name.as_deref(),
+            cfg.token_ttl,
+        )
+        .await
+        .context("could not enrol this Endpoint")
+}
+
+/// §8.2.2 → §8.2.3 with an Enrollment Key in place of the Auth0 token (§8.8.7).
+async fn refresh<T: ControlPlaneTransport>(
+    client: &IdentityClient<T>,
+    cfg: &P2pConfig,
+    enrollment: &Enrollment,
+) -> anyhow::Result<EndpointToken> {
+    let auth0 = enrollment_auth0(enrollment).await?;
+    // **Minted again, every renewal.** §8.8.7 verifies the binding each time,
+    // which is exactly what stops the key working after the job that owns the
+    // workload identity has ended.
+    let assertion = enrollment_assertion(enrollment).await?;
+    let auth = identity_auth(enrollment, assertion.as_deref(), auth0.as_deref());
+    let challenge = client
+        .refresh_challenge(auth, &cfg.key.endpoint_id())
+        .await
+        .context("could not obtain a renewal challenge")?;
+    client
+        .refresh_token(auth, &cfg.key, &challenge, cfg.token_ttl)
+        .await
+        .context("could not renew the endpoint token")
+}
+
+fn identity_auth<'a>(
+    enrollment: &'a Enrollment,
+    assertion: Option<&'a str>,
+    auth0: Option<&'a str>,
+) -> IdentityAuth<'a> {
+    IdentityAuth::Enrollment {
+        key: &enrollment.key,
+        assertion,
+        auth0,
+    }
+}
+
+async fn enrollment_assertion(enrollment: &Enrollment) -> anyhow::Result<Option<String>> {
+    match &enrollment.assertion {
+        Some(source) => Ok(Some(source.assertion(IDENTITY_AUDIENCE).await.context(
+            "could not mint a workload identity token for the Identity API",
+        )?)),
+        None => Ok(None),
+    }
+}
+
+async fn enrollment_auth0(enrollment: &Enrollment) -> anyhow::Result<Option<String>> {
+    match &enrollment.auth0 {
+        Some(source) => Ok(Some(
+            source
+                .auth0_token()
+                .await
+                .context("could not obtain a current Auth0 token")?,
+        )),
+        None => Ok(None),
+    }
 }
 
 /// How long before an Endpoint Token expires to replace it.

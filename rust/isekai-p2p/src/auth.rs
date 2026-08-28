@@ -15,6 +15,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::sync::OnceCell;
+
 /// A source of Auth0 access tokens that are valid *now*.
 ///
 /// Called each time an Endpoint Token is issued, which is every few minutes for
@@ -28,6 +30,142 @@ pub trait Auth0TokenSource: Send + Sync {
     /// Returning an error is therefore the right answer to "the user has to log
     /// in again" — the caller reports it and the video keeps flowing meanwhile.
     fn auth0_token(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + '_>>;
+}
+
+/// A source of workload identity assertions, one per audience.
+///
+/// The unattended counterpart of [`Auth0TokenSource`], and it takes the
+/// audience as an argument for a reason that is worth stating: **Identity and
+/// the proxy deliberately want different ones** (`isekai-identity` and
+/// `isekai-proxy`), so that a token minted for one is refused by the other.
+/// Passing the audience in is what makes reusing a single token for both
+/// inexpressible rather than merely discouraged.
+///
+/// # Called for every request that needs one
+///
+/// Not once per job. §8.8.7 verifies `binding` on **every** renewal — that is
+/// the brake that stops an `oidc` key outliving the job it was issued for — and
+/// a GitHub ID token lives 5–15 minutes against a renewal interval that is
+/// longer than that. So an implementation mints or re-reads; there is nothing
+/// worth caching, and a cache that never hits is only one more way to hold an
+/// expired token.
+pub trait AssertionSource: Send + Sync {
+    /// A workload identity token for `audience`, valid now.
+    fn assertion<'a>(
+        &'a self,
+        audience: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>>;
+}
+
+/// How a session proves who it is to the Identity API.
+///
+/// **An enum rather than a set of optional fields.** The alternative — leaving
+/// the Auth0 fields in place and adding an enrolment one beside them — makes "a
+/// config whose Auth0 token is silently ignored" representable, and that turns
+/// up as a `401` several steps later with nothing pointing back at the config
+/// that caused it.
+#[derive(Clone)]
+pub enum Credential {
+    /// Route A: a person signed in to Auth0.
+    Auth0 {
+        /// The token to start with. An Endpoint Token lasts minutes and is
+        /// reissued for the life of the session, so once this one expires
+        /// renewal needs a fresh one from `source`.
+        token: String,
+        /// Where a *current* token comes from. `None` keeps using `token`,
+        /// which works until it expires and then stops.
+        source: Option<Arc<dyn Auth0TokenSource>>,
+        /// Register the Endpoint before issuing a token (§8.1), needed on
+        /// first use of a freshly generated key.
+        ///
+        /// **Inside this arm and not beside it.** §8.1 registration requires
+        /// Auth0 authentication state, so it is not a choice the unattended
+        /// route has; leaving it at the top level would make a field that is
+        /// silently ignored there — the same defect this enum removes.
+        register: bool,
+    },
+    /// §8.8: an Enrollment Key, for a job with nobody at the keyboard.
+    Enrollment(Enrollment),
+}
+
+impl Credential {
+    /// The ordinary attended credential.
+    pub fn auth0(
+        token: impl Into<String>,
+        source: Option<Arc<dyn Auth0TokenSource>>,
+        register: bool,
+    ) -> Self {
+        Credential::Auth0 {
+            token: token.into(),
+            source,
+            register,
+        }
+    }
+
+    /// An Enrollment Key, with the assertion source its `binding` needs.
+    ///
+    /// `assertion` is required for an `oidc` binding and unused otherwise;
+    /// `auth0` is required for a `sub` or `tenant` one (§8.8.3) and unused
+    /// otherwise. Both are wrong to omit only in the case that needs them, and
+    /// the server says so plainly (`400 assertion-required`).
+    pub fn enrollment(key: impl Into<String>) -> Self {
+        Credential::Enrollment(Enrollment {
+            key: key.into(),
+            assertion: None,
+            auth0: None,
+            enrolled: Arc::new(OnceCell::new()),
+        })
+    }
+}
+
+/// An Enrollment Key and whatever its `binding` additionally requires.
+#[derive(Clone)]
+pub struct Enrollment {
+    /// The `enr1_` secret.
+    pub key: String,
+    /// Where to mint the workload identity token an `oidc` binding wants.
+    pub assertion: Option<Arc<dyn AssertionSource>>,
+    /// An Auth0 token, for the `sub` and `tenant` bindings that compare
+    /// against a principal (§8.8.3). Those two are the attended case and
+    /// cannot be used by a job on its own.
+    pub auth0: Option<Arc<dyn Auth0TokenSource>>,
+    /// Whether this key has already grown its Endpoint, and which one.
+    ///
+    /// **Shared across clones, and it has to be.** [`crate::P2pConfig`] is
+    /// `Clone` and the renewal task holds one while other callers hold others.
+    /// A second enrolment would present the same keypair and take
+    /// `409 endpoint-already-registered` — which is unrecoverable, since one
+    /// key registers exactly one Endpoint — and it would not even free the
+    /// slot it spent.
+    ///
+    /// **`tokio`'s `OnceCell` and not `std`'s.** The initializer is async, and
+    /// `std::sync::OnceLock` has no way to hold one: "check, then enrol" across
+    /// an `.await` is a race two concurrent callers both win.
+    enrolled: Arc<OnceCell<String>>,
+}
+
+impl Enrollment {
+    /// Mint assertions for the `oidc` binding from `source`.
+    pub fn with_assertions(mut self, source: Arc<dyn AssertionSource>) -> Self {
+        self.assertion = Some(source);
+        self
+    }
+
+    /// Present an Auth0 token as well, for a `sub` or `tenant` binding.
+    pub fn with_auth0(mut self, source: Arc<dyn Auth0TokenSource>) -> Self {
+        self.auth0 = Some(source);
+        self
+    }
+
+    /// The Endpoint this key grew, once it has.
+    pub fn endpoint_id(&self) -> Option<&str> {
+        self.enrolled.get().map(String::as_str)
+    }
+
+    /// The cell the enrolment writes to. See its documentation.
+    pub(crate) fn cell(&self) -> &OnceCell<String> {
+        &self.enrolled
+    }
 }
 
 /// The one token the caller had, and no way to get another.

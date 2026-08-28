@@ -543,13 +543,11 @@ async fn config(
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
-        auth0_token: auth.token,
-        // **The whole point.** The Endpoint Token renewal runs every few
-        // minutes for the life of the session and needs a current Auth0 token
-        // each time; without this it reuses one that expires.
-        auth0: auth.source,
+        // **The whole point of the source.** The Endpoint Token renewal runs
+        // every few minutes for the life of the session and needs a current
+        // Auth0 token each time; without one it reuses one that expires.
+        credential: isekai_p2p::Credential::auth0(auth.token, auth.source, args.register),
         protocol: args.protocol.clone(),
-        register: args.register,
         device_name: args.device_name.clone(),
         token_ttl: None,
         key,

@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use camera_core::{load_or_generate_key, InitiatorSession, P2pConfig, ServerCommand};
+use camera_core::{load_or_generate_key, Credential, InitiatorSession, P2pConfig, ServerCommand};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -34,7 +34,6 @@ fn video_key_path() -> std::path::PathBuf {
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
-
 
 /// Whether to register the Endpoint before asking for a token.
 ///
@@ -57,12 +56,10 @@ fn config(auth0: &str, identity: &str, proxy: &str, protocol: &str, key_path: &s
         identity_url: identity.to_owned(),
         identity_http3: false,
         proxy_url: proxy.to_owned(),
-        auth0_token: auth0.to_owned(),
+        credential: Credential::auth0(auth0.to_owned(), None, register),
         protocol: protocol.to_owned(),
-        register,
         device_name: Some("relay-gap-e2e".to_owned()),
         token_ttl: None,
-        auth0: None,
         key: load_or_generate_key(key_path).expect("load/generate key"),
     }
 }
@@ -113,8 +110,15 @@ async fn run(
 
     let server_cfg = config(auth0, identity, proxy, protocol, "gap-server.pem");
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
-    let server =
-        camera_core::spawn_p2p_server(None, server_cfg, &video_key_path(), frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
+    let server = camera_core::spawn_p2p_server(
+        None,
+        server_cfg,
+        &video_key_path(),
+        frame_rx,
+        camera_core::AcceptPolicy::Manual,
+        shutdown.clone(),
+    )
+    .await?;
     println!(
         "server ready: listener={} endpoint={} video={}",
         server.info.listener_id, server.info.endpoint_id, server.info.video_addr

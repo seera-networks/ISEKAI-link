@@ -16,6 +16,7 @@ use axum::routing::post;
 use axum::Router;
 use isekai_p2p::agent::EndpointKey;
 use isekai_p2p::config::{issue_endpoint_token, P2pConfig};
+use isekai_p2p::Credential;
 use serde_json::{json, Value};
 
 #[derive(Clone, Default)]
@@ -58,12 +59,10 @@ fn config(identity_url: String, register: bool) -> P2pConfig {
         identity_url,
         identity_http3: false,
         proxy_url: String::new(),
-        auth0_token: "AUTH0_AT".into(),
+        credential: Credential::auth0("AUTH0_AT", None, register),
         protocol: "isekai-validator-v1".into(),
-        register,
         device_name: Some("test-device".into()),
         token_ttl: Some(900),
-        auth0: None,
         key: EndpointKey::generate(),
     }
 }

@@ -561,21 +561,24 @@ fn apply_insecure_skip_verify(enabled: bool) {
 }
 
 /// The control-plane settings shared by the calls that do not stream.
+/// **The token is a parameter rather than something set afterwards.** It was
+/// assigned into the config after building it, which the credential enum no
+/// longer allows — and that is the point of the enum: a config always says
+/// which credential it carries, with no window in which it says the wrong one.
 fn directory_config(
     config: &ClientConfig,
     endpoint_key_pem: &str,
+    auth0_token: String,
 ) -> Result<P2pConfig, ClientError> {
     apply_insecure_skip_verify(config.insecure_skip_verify);
     Ok(P2pConfig {
         identity_url: config.identity_url.clone(),
         identity_http3: false,
         proxy_url: config.proxy_url.clone(),
-        auth0_token: String::new(),
+        credential: camera_core::Credential::auth0(auth0_token, None, config.register),
         protocol: config.protocol.clone(),
-        register: config.register,
         device_name: Some("ios-camera-client".to_owned()),
         token_ttl: None,
-        auth0: None,
         key: EndpointKey::from_pkcs8_pem(endpoint_key_pem)
             .map_err(|e| ClientError::InvalidKey(e.to_string()))?,
     })
@@ -607,8 +610,7 @@ pub fn list_cameras(
     endpoint_key_pem: String,
     auth0_token: String,
 ) -> Result<Vec<Camera>, ClientError> {
-    let mut cfg = directory_config(&config, &endpoint_key_pem)?;
-    cfg.auth0_token = auth0_token;
+    let cfg = directory_config(&config, &endpoint_key_pem, auth0_token)?;
     on_a_runtime(async move {
         let directory = camera_core::PeerDirectory::open(&cfg)
             .await
@@ -645,8 +647,7 @@ pub fn pair_with_code(
     code: String,
     label: String,
 ) -> Result<Paired, ClientError> {
-    let mut cfg = directory_config(&config, &endpoint_key_pem)?;
-    cfg.auth0_token = auth0_token;
+    let cfg = directory_config(&config, &endpoint_key_pem, auth0_token)?;
     let code = camera_core::pairing_code_from_input(&code);
     if code.is_empty() {
         return Err(ClientError::InvalidArgument("no pairing code".to_owned()));
@@ -782,15 +783,17 @@ pub fn connect(
         identity_url: config.identity_url,
         identity_http3: false,
         proxy_url: config.proxy_url,
-        auth0_token,
-        protocol: config.protocol,
-        register: config.register,
-        device_name: Some("ios-camera-client".to_owned()),
-        token_ttl: None,
         // What makes the session survive its own access token: every Endpoint
         // Token renewal asks the app for a current one.
-        auth0: auth0_provider
-            .map(|t| Arc::new(SwiftAuth0Tokens(t)) as Arc<dyn camera_core::Auth0TokenSource>),
+        credential: camera_core::Credential::auth0(
+            auth0_token,
+            auth0_provider
+                .map(|t| Arc::new(SwiftAuth0Tokens(t)) as Arc<dyn camera_core::Auth0TokenSource>),
+            config.register,
+        ),
+        protocol: config.protocol,
+        device_name: Some("ios-camera-client".to_owned()),
+        token_ttl: None,
         key,
     };
 

@@ -22,9 +22,11 @@ pub mod auth0;
 pub mod config;
 pub mod initiator;
 pub mod listener;
+/// Where an unattended job's workload identity assertion comes from.
+pub mod oidc;
 pub mod secret;
 
-pub use auth::{Auth0TokenSource, StaticAuth0Token};
+pub use auth::{AssertionSource, Auth0TokenSource, Credential, Enrollment, StaticAuth0Token};
 pub use config::{issue_endpoint_token, load_or_generate_key, proxy_client, P2pConfig};
 pub use initiator::{InitiatorSession, PeerDirectory};
 pub use listener::{
@@ -45,7 +47,11 @@ pub mod agent {
     pub use isekai_p2p_core::endpoint::EndpointKey;
     /// Whether a peer certificate names the host that was dialled (#134).
     pub use isekai_p2p_core::hostname::certificate_matches;
-    pub use isekai_p2p_core::identity::EndpointToken;
+    pub use isekai_p2p_core::identity::{
+        Binding, EndpointToken, Enrolled, EnrollmentKeyRecord, EnrollmentRecord, IdentityAuth,
+        IdentityError, IssuedEnrollmentKey, NewEnrollmentKey, RevokeAuth, RevokeReason, Revoked,
+        RevokedEnrollmentKey,
+    };
     pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::proxy::{
         pairing_code_from_input, pairing_code_in_uri, pairing_uri, proxy_authority, redact_tickets,

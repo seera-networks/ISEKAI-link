@@ -39,7 +39,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use camera_core::{load_or_generate_key, P2pConfig, ServerCommand};
+use camera_core::{load_or_generate_key, Credential, P2pConfig, ServerCommand};
 use jpeg_encoder::{ColorType, Encoder};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -242,7 +242,10 @@ async fn main() -> anyhow::Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--control" => {
-                control_addr = Some(args.next().unwrap_or_else(|| DEFAULT_CONTROL_ADDR.to_owned()))
+                control_addr = Some(
+                    args.next()
+                        .unwrap_or_else(|| DEFAULT_CONTROL_ADDR.to_owned()),
+                )
             }
             "-h" | "--help" => {
                 println!("usage: synthetic_server [--control [addr]]");
@@ -255,8 +258,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let auth0_token = std::env::var("AUTH0_TOKEN")
-        .map_err(|_| anyhow::anyhow!("AUTH0_TOKEN is required"))?;
+    let auth0_token =
+        std::env::var("AUTH0_TOKEN").map_err(|_| anyhow::anyhow!("AUTH0_TOKEN is required"))?;
     let identity_url = env_or("IDENTITY_URL", "https://identity.isekai.tools:9443");
     let proxy_url = env_or("PROXY_URL", "https://tokyo.link.isekai.tools:8443");
     let protocol = env_or("PROTOCOL", "isekai-validator-v1");
@@ -272,18 +275,24 @@ async fn main() -> anyhow::Result<()> {
         identity_url: identity_url.clone(),
         identity_http3: false,
         proxy_url: proxy_url.clone(),
-        auth0_token: auth0_token.clone(),
+        credential: Credential::auth0(auth0_token.clone(), None, register),
         protocol: protocol.clone(),
-        register,
         device_name: Some("synthetic-server".to_owned()),
         token_ttl: None,
-        auth0: None,
         key: load_or_generate_key(key_path)?,
     };
 
     let shutdown = CancellationToken::new();
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(4);
-    let server = camera_core::spawn_p2p_server(None, cfg, &video_key_path(), frame_rx, camera_core::AcceptPolicy::Manual, shutdown.clone()).await?;
+    let server = camera_core::spawn_p2p_server(
+        None,
+        cfg,
+        &video_key_path(),
+        frame_rx,
+        camera_core::AcceptPolicy::Manual,
+        shutdown.clone(),
+    )
+    .await?;
 
     println!(
         "listener={} endpoint={} video={}",

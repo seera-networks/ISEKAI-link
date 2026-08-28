@@ -539,19 +539,20 @@ impl MyApp {
             identity_url: self.identity_url.clone(),
             identity_http3: false,
             proxy_url: self.proxy_url.clone(),
-            auth0_token: self.auth0_token.clone(),
-            protocol: self.protocol.clone(),
-            register: self.register,
-            device_name: Some("camera-client".to_string()),
-            token_ttl: None,
             // The refreshing source when the operator has signed in. Without it
             // the pasted token is all there is, and the Endpoint Token stops
             // renewing when it expires — which on a viewer means the session
             // cannot report itself closed or open anything new.
-            auth0: self
-                .auth0_source
-                .clone()
-                .map(|s| s as Arc<dyn camera_core::Auth0TokenSource>),
+            credential: camera_core::Credential::auth0(
+                self.auth0_token.clone(),
+                self.auth0_source
+                    .clone()
+                    .map(|s| s as Arc<dyn camera_core::Auth0TokenSource>),
+                self.register,
+            ),
+            protocol: self.protocol.clone(),
+            device_name: Some("camera-client".to_string()),
+            token_ttl: None,
             key,
         })
     }
