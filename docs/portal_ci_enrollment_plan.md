@@ -1162,7 +1162,7 @@ enroll / refresh / revoke の 3 経路についてで、**鍵の管理 API（§8
 **仕様と実装が食い違っている**（§8.8.2 の例は `key`、`openapi.yaml` と
 `enrollment.rs` は `key_plaintext`）ので、寛容にするのが正しい唯一の場所である —
 名前が合わないことの代償が、再試行ではなく鍵 1 本だからである。
-上流へ [ISEKAI-identity#34](https://github.com/seera-networks/ISEKAI-identity/issues/34) として報告した。
+上流へ [ISEKAI-identity#35](https://github.com/seera-networks/ISEKAI-identity/issues/35) として報告した。
 
 **加えて 3 件、設計の誤り。**
 
