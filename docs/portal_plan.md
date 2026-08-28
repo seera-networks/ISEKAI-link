@@ -104,6 +104,12 @@ stream would add head-of-line blocking that the application does not expect.
   `isekai-p2p-core::transport`'s MTU floor (#102) is what bounds this; the
   number belongs in one constant with the arithmetic written out beside it.
 
+  > **Superseded.** The bound is **1163**, not "about 1200": that estimate
+  > never subtracted the QUIC packet and DATAGRAM frame overhead or portal's
+  > own session id. `docs/portal_mtu_plan.md` §6 has the measurement, and P1
+  > corrected the constant. The paragraph below is what phase 3 was designed
+  > against and is kept for that.
+
   **The bound this leaves is about 1200 bytes, and it is not raisable.** The
   peer connection's 1248-byte MTU is a floor msquic will not go under, so a
   larger UDP payload cannot cross a portal forward at all. The case to know is

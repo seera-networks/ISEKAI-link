@@ -203,6 +203,7 @@ impl Sessions {
         if self.drops.any() || failed_opens != 0 {
             tracing::info!(
                 oversize = self.drops.oversize.load(Ordering::Relaxed),
+                refused_too_big = self.drops.refused_too_big.load(Ordering::Relaxed),
                 overflow = self.drops.overflow.load(Ordering::Relaxed),
                 unknown_session = self.drops.unknown_session.load(Ordering::Relaxed),
                 malformed = self.drops.malformed.load(Ordering::Relaxed),
@@ -255,10 +256,13 @@ impl Sessions {
         };
         match self.conn.send_datagram(&framed) {
             Ok(()) => true,
-            // The connection's own limit rather than ours, and it is the one
-            // that is true — `MAX_PAYLOAD` is deliberately under it.
+            // **Not `oversize`, and that distinction is the point.** Reaching
+            // here means the payload was inside `MAX_PAYLOAD` and the
+            // connection still would not take it — so the path underneath is
+            // narrower than the floor that constant is derived from, which is
+            // the connection's business rather than the caller's.
             Err(DgramSendError::TooBig) => {
-                self.oversize(session, payload.len());
+                self.refused_too_big(session, payload.len());
                 false
             }
             // **Counted, not merely logged.** `Denied` here is not one lost
@@ -299,6 +303,31 @@ impl Sessions {
             );
         } else {
             tracing::debug!(session, len, "another oversize UDP payload dropped");
+        }
+    }
+
+    /// The other half of [`oversize`](Self::oversize), said once for the same
+    /// reason and worth its own line because the fix is somewhere else.
+    ///
+    /// An operator seeing this has a connection that cannot carry what
+    /// `MAX_PAYLOAD` promises. That is not something the application can size
+    /// its way out of, and it should not be reported as though it were.
+    fn refused_too_big(&self, session: u32, len: usize) {
+        if self.drops.refused_too_big.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::warn!(
+                session,
+                len,
+                limit = MAX_PAYLOAD,
+                "the connection refused a UDP payload that is within portal's limit, so \
+                 this path carries less than the guaranteed datagram; \
+                 further ones on this connection are counted, not logged",
+            );
+        } else {
+            tracing::debug!(
+                session,
+                len,
+                "another UDP payload refused by the connection"
+            );
         }
     }
 

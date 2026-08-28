@@ -52,40 +52,49 @@ use tokio::sync::Notify;
 /// Bytes of framing before the payload: the session id.
 pub const HEADER: usize = 4;
 
-/// The largest UDP payload this can carry, and why that number.
+/// The largest UDP payload this will carry, and why that number.
 ///
-/// **The arithmetic, because the failure is silent otherwise.** A portal
-/// datagram rides inside the peer QUIC connection, which
-/// `isekai_p2p::peer::client_config` caps at `MaximumMtu(1248)` — msquic clamps
-/// that up to `QUIC_DPLPMTUD_MIN_MTU` and no lower value can be asked for. A
-/// connection's maximum datagram length runs about 42 bytes under its MTU
-/// (`isekai_p2p_core::transport` does the same sum for the relay leg), so about
-/// 1206 bytes are available; [`HEADER`] takes four of them.
+/// **Derived, not chosen.** [`isekai_p2p::peer::GUARANTEED_DATAGRAM`] is what a
+/// peer connection promises to take — 1248 less IPv6 and UDP headers, less the
+/// QUIC packet and DATAGRAM frame overhead, all of it measured and written down
+/// there — and this is that, less the four bytes [`HEADER`] spends on the
+/// session id. Nothing here is a round number somebody picked.
 ///
-/// 1180 is under that with room to spare, and the spare is deliberate: the
-/// number above is msquic's arithmetic rather than ours, and a payload that is
-/// one byte too large is dropped rather than rejected at the caller. Being
-/// wrong in this direction costs a few bytes per datagram; being wrong in the
-/// other costs a silent hole in a service that looked like it worked.
+/// ```text
+///   PEER_MTU                     1248
+///   - IPv6 + UDP headers          -48    IPv4 has 20 spare; not offered
+///   - QUIC packet + DATAGRAM      -33    measured
+///   = guaranteed datagram        1167
+///   - portal's [u32 session]       -4
+///   = MAX_PAYLOAD                1163
+/// ```
 ///
-/// **It is a ceiling, not a promise.** msquic reports its own limit per
-/// connection and refuses anything over it with `DgramSendError::TooBig`; the
-/// sender checks this constant first so the refusal is counted here rather than
-/// arriving as an error from three layers down, and handles `TooBig` anyway
-/// because the runtime value is the one that is true.
+/// **This is a floor and the connection's own limit is usually higher.** msquic
+/// reports a per-connection maximum that is 20 bytes larger on an IPv4 path,
+/// and today every relay path is IPv4 — the inner connection's relay leg is the
+/// local end of the MASQUE tunnel, so it dials 127.0.0.1. Sizing to that would
+/// mean a forward that works over the relay and loses its large datagrams the
+/// moment it moves onto an IPv6 direct path, which is the failure this number
+/// exists to not have.
 ///
-/// **The runtime value is watched rather than adopted**, which is the decision
-/// worth stating. `ConnectionEvent::DatagramStateChanged` carries the real
-/// `max_send_length`, and [`crate::path`] compares it against this constant on
-/// every connection: below it is a warning, because payloads between the two
-/// would be accepted here and refused by the connection.
+/// **It was 1180 and that was 17 too much.** A payload of 1164..=1180 was
+/// accepted here and refused by the connection on any IPv6 path; it never bit
+/// because the relay leg is IPv4. `docs/portal_mtu_plan.md` §6.2 has the
+/// measurement.
 ///
-/// It is not *raised* to match, and that is deliberate. This number is a promise
-/// `docs/portal.md` makes to whoever runs a forward — "about 1200 bytes" — and
-/// msquic's limit grows as MTU discovery probes upward, differently on
-/// different networks. Following it would leave a DNS forward working from one
-/// place and silently losing responses from another, which is worse than a
-/// bound that is the same everywhere and slightly low.
+/// **The runtime value is watched rather than adopted.**
+/// `ConnectionEvent::DatagramStateChanged` carries the real `max_send_length`,
+/// and [`crate::path`] compares it against this constant on every connection:
+/// below it is a warning, because payloads between the two would be accepted
+/// here and refused by the connection.
+///
+/// It is not *raised* to match. This number is a promise `docs/portal.md` makes
+/// to whoever runs a forward, and msquic's limit moves with the path — following
+/// it would leave a DNS forward working from one place and silently losing
+/// responses from another, which is worse than a bound that is the same
+/// everywhere and slightly low. Raising the floor is what the MTU plan's
+/// contract B is for, and it raises it by making the connection keep its word
+/// rather than by trusting a number that can fall.
 ///
 /// The event's other half, `send_enabled`, is why a peer that will not receive
 /// datagrams at all is now said once at connect time rather than as one
@@ -93,19 +102,18 @@ pub const HEADER: usize = 4;
 ///
 /// # What this rules out, said plainly
 ///
-/// **A UDP payload over about 1200 bytes cannot cross a portal forward**, and
+/// **A UDP payload over 1163 bytes cannot cross a portal forward today**, and
 /// raising this constant does not change that — the true limit is the peer
-/// connection's, and its 1248-byte MTU is itself a floor msquic will not go
-/// under. Splitting is not an option either; §4.1 is explicit that a datagram
-/// service which silently splits is worse than one which silently loses.
+/// connection's. Splitting is not an option either; `portal_plan.md` §4.1 is
+/// explicit that a datagram service which silently splits is worse than one
+/// which silently loses.
 ///
 /// The case to know about is DNS: EDNS0 commonly advertises a 1232-byte buffer,
 /// so a large response can exceed this and be dropped — with no truncation bit
 /// and no ICMP, which leaves a stub resolver waiting for a timeout instead of
 /// retrying over TCP. A resolver configured for a smaller buffer, or one that
-/// falls back on timeout, is fine. This is a property of forwarding UDP inside
-/// a relayed QUIC connection rather than something phase 3 can fix.
-pub const MAX_PAYLOAD: usize = 1180;
+/// falls back on timeout, is fine.
+pub const MAX_PAYLOAD: usize = isekai_p2p::peer::GUARANTEED_DATAGRAM - HEADER;
 
 /// How many datagrams a session may hold before the oldest is dropped.
 ///
@@ -154,8 +162,22 @@ pub fn decode(datagram: &Bytes) -> Option<(u32, Bytes)> {
 /// a service that loses data silently.
 #[derive(Debug, Default)]
 pub struct Drops {
-    /// Payloads that would not fit in one datagram.
+    /// Payloads larger than [`MAX_PAYLOAD`], which is the size this promises to
+    /// carry — so these are the application's, and no path will fix them.
     pub oversize: AtomicU64,
+    /// Payloads within [`MAX_PAYLOAD`] that the connection refused as too big.
+    ///
+    /// **Separate from `oversize`, and the difference is who has to act.** That
+    /// one says the application sent something larger than portal ever offered.
+    /// This one says portal offered it and the connection would not take it,
+    /// which means the path underneath is narrower than [`MAX_PAYLOAD`]
+    /// assumes — a floor derived from `PEER_MTU` and the worst-case IP header,
+    /// so a path under it is a surprise worth being able to see.
+    ///
+    /// Counted together they were indistinguishable, and the two lead
+    /// different places: one to the caller's message size, one to the
+    /// connection.
+    pub refused_too_big: AtomicU64,
     /// Datagrams discarded because a session's queue was full.
     pub overflow: AtomicU64,
     /// Datagrams with nowhere to go: a session that was swept while the peer
@@ -203,6 +225,7 @@ impl Drops {
     pub fn total(&self) -> u64 {
         let Self {
             oversize,
+            refused_too_big,
             overflow,
             unknown_session,
             malformed,
@@ -211,6 +234,7 @@ impl Drops {
         } = self;
         [
             oversize,
+            refused_too_big,
             overflow,
             unknown_session,
             malformed,
@@ -352,6 +376,27 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The number, guarded.** Everything `docs/portal.md` promises rides on
+    /// this, and it is derived from two constants in another crate — so a
+    /// change to `PEER_MTU` or `DATAGRAM_OVERHEAD` should land here rather than
+    /// on somebody's DNS forward.
+    ///
+    /// The derivation, once more, so this test says why and not only what:
+    /// 1248 MTU, less 48 for IPv6 and UDP headers, less 33 measured for the
+    /// QUIC packet and DATAGRAM frame, less 4 for the session id.
+    #[test]
+    fn the_limit_is_what_was_measured() {
+        assert_eq!(isekai_p2p::peer::PEER_MTU, 1248);
+        assert_eq!(isekai_p2p::peer::DATAGRAM_OVERHEAD, 33);
+        assert_eq!(isekai_p2p::peer::GUARANTEED_DATAGRAM, 1167);
+        assert_eq!(MAX_PAYLOAD, 1163);
+        assert_eq!(
+            MAX_PAYLOAD + HEADER,
+            isekai_p2p::peer::GUARANTEED_DATAGRAM,
+            "a framed datagram at the limit has to fit the guarantee exactly",
+        );
+    }
 
     #[test]
     fn a_payload_at_the_limit_is_framed_and_one_over_it_is_not() {

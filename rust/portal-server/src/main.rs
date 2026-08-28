@@ -23,7 +23,7 @@
 //!
 //! # UDP services carry a size limit the file cannot raise
 //!
-//! `protocol = "udp"` is forwarded as of phase 3b, up to about 1200 bytes per
+//! `protocol = "udp"` is forwarded as of phase 3b, up to 1163 bytes per
 //! datagram; anything larger is dropped and counted rather than split.
 //! `portal_core::datagram::MAX_PAYLOAD` has the arithmetic and the case to know
 //! about, which is a large DNS response.
@@ -74,7 +74,7 @@ The catalogue (--config), which is the whole of what may be reached:
 in charge of where forwarded traffic goes. `--example-config` writes a starter
 file to stdout.
 
-UDP payloads over about 1200 bytes are dropped rather than split, and counted.
+UDP payloads over 1163 bytes are dropped rather than split, and counted.
 The case to know is a large DNS response; docs/portal.md has the arithmetic.
 ",
     note = "\

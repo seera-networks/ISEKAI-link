@@ -151,6 +151,58 @@ pub struct ClientOptions<'a> {
 /// rather than decoration: the MTU cap is sized to the CONNECT-UDP tunnel, and
 /// the two keepalives cover two different things that cost a field test to tell
 /// apart.
+/// The MTU a peer connection is capped at, at the IP level.
+///
+/// msquic clamps `MaximumMtu` up to `QUIC_DPLPMTUD_MIN_MTU`, which is this, so
+/// asking for less is silently ignored — stating it keeps the code honest about
+/// the cap it is applying rather than the one it wrote down.
+///
+/// The cap exists so an inner QUIC packet plus CONNECT-UDP encapsulation fits
+/// inside the relay tunnel's HTTP datagram. `isekai_p2p_core::transport` sizes
+/// the outer `MinimumMtu` to carry it and does that arithmetic there.
+pub const PEER_MTU: u16 = 1248;
+
+/// What a QUIC packet plus a DATAGRAM frame costs inside [`PEER_MTU`].
+///
+/// **Measured, and the source agrees term by term** (`docs/portal_mtu_plan.md`
+/// §6.1). msquic's `QuicCalculateDatagramLength` subtracts
+/// `QUIC_DATAGRAM_OVERHEAD(CidLength) + CXPLAT_ENCRYPTION_OVERHEAD`, which for
+/// this library is:
+///
+/// | | |
+/// | --- | --- |
+/// | `MIN_SHORT_HEADER_LENGTH_V1` | 5 (a 1-byte header plus 4 for the packet number) |
+/// | connection id | 9 |
+/// | `DATAGRAM_FRAME_HEADER_LENGTH` | 3 |
+/// | `CXPLAT_ENCRYPTION_OVERHEAD` | 16 |
+///
+/// The connection id is 9 because `MsQuicLib.CidTotalLength` is
+/// `CidServerIdLength + QUIC_CID_PID_LENGTH + QUIC_CID_PAYLOAD_LENGTH`, and the
+/// first of those is zero while load balancing is off (`core/library.c`).
+///
+/// **Turning load balancing on would take five bytes off every datagram**, so
+/// this is a property of how the library is configured rather than a constant
+/// of the protocol.
+pub const DATAGRAM_OVERHEAD: usize = 33;
+
+/// IP and UDP headers msquic takes off [`PEER_MTU`] before it has a QUIC packet.
+///
+/// IPv6's, because the guarantee below has to hold on both and this is the
+/// larger. An IPv4 connection has 20 bytes spare and they are not offered.
+const IPV6_AND_UDP_HEADERS: usize = 40 + 8;
+
+/// The largest QUIC datagram a peer connection is **guaranteed** to carry.
+///
+/// **A floor, not the current limit.** msquic reports its own per-connection
+/// value and it can be larger — on an IPv4 path it is, by 20 bytes — but it is
+/// derived from whichever path is `Paths[0]` and follows that path as it
+/// changes. Something that must not lose traffic when the connection migrates
+/// has to live under the worst case rather than under what it is told today.
+///
+/// `docs/portal_mtu_plan.md` is where that reasoning lives and where raising
+/// this is planned.
+pub const GUARANTEED_DATAGRAM: usize = PEER_MTU as usize - IPV6_AND_UDP_HEADERS - DATAGRAM_OVERHEAD;
+
 pub fn client_config(
     reg: Option<Arc<Registration>>,
     opts: ClientOptions<'_>,
@@ -185,21 +237,9 @@ pub fn client_config(
         // seconds with the viewer still sitting there. The listener side has
         // had this all along (`isekai_link_utils`); this side had not.
         .set_KeepAliveIntervalMs(CONNECTION_KEEPALIVE.as_millis() as u32)
-        // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
-        // (1248), so asking for less is silently ignored — 1248 is what
-        // this connection actually uses, and stating it keeps the code
-        // honest about the cap it is applying.
-        //
-        // The cap exists so a video QUIC packet plus CONNECT-UDP
-        // encapsulation fits inside the relay tunnel's HTTP datagram.
-        // Without it the default 1500 overflows the tunnel and packets
-        // are dropped as `TooLarge`. The outer connection's
-        // `MinimumMtu` (see `isekai_p2p_core::transport`, which does the
-        // arithmetic) is what is sized to carry 1248 plus that
-        // encapsulation. Deliberately not repeated here: this said 1400
-        // for a while after that floor became 1350, and a number in two
-        // places is a number that disagrees with itself.
-        .set_MaximumMtu(1248)
+        // See [`PEER_MTU`]. Without a cap the default 1500 overflows the
+        // relay tunnel and packets are dropped as `TooLarge`.
+        .set_MaximumMtu(PEER_MTU)
         .set_PeerUnidiStreamCount(100)
         .set_StreamMultiReceiveEnabled();
     // Asked for by whoever will receive them, which is why it is an option

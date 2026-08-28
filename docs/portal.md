@@ -274,10 +274,30 @@ with has a database with no password — a tunnel makes the *transport*
 private, and says nothing about what is at the end of it. Put the same
 authentication on a forwarded service that you would put on an exposed one.
 
-**UDP payloads over about 1200 bytes are dropped**, counted, and never split. A
+**UDP payloads over 1163 bytes are dropped**, counted, and never split. A
 datagram service that silently splits is worse than one that silently loses,
-because the application cannot tell the difference. The limit is the peer
-connection's MTU and cannot be raised.
+because the application cannot tell the difference.
+
+That number is not a setting. It is what a QUIC datagram has left after the
+connection's 1248-byte MTU has paid for IPv6 and UDP headers, the QUIC packet
+and DATAGRAM frame, and the four bytes portal spends naming the session:
+
+```
+  1248  the peer connection's MTU, which msquic will not go under
+  - 48  IPv6 and UDP headers
+  - 33  QUIC packet + DATAGRAM frame + encryption
+  -  4  portal's session id
+  1163
+```
+
+**It is the same on every network**, and deliberately so. The connection's own
+limit is 20 bytes larger on an IPv4 path, and today every relayed path is IPv4 —
+but a forward that used those bytes would start losing large datagrams the
+moment it moved onto an IPv6 direct path, which is worse than being 20 bytes
+short everywhere.
+
+> This said "about 1200" until the arithmetic was measured, which was 37 too
+> generous. Payloads in the gap were accepted and then lost.
 
 The case to know is DNS: EDNS0 commonly advertises a 1232-byte buffer, so a
 large response can exceed this — and it is dropped with no truncation bit and no

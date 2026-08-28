@@ -179,6 +179,12 @@ portal が UDP フォワードのサイズについてアプリに与える契�
 P1 単独で意味がある。現在の上限が大きすぎるという既存の不具合が直り、契約 B に
 進まない判断をしてもここまでは残る。
 
+**P1 は完了。** 上限は 1163 に、カウンタは `oversize` と `refused_too_big` に
+分かれ、`docs/portal.md` は算術ごと書き直した。定数は `isekai-p2p` の
+`PEER_MTU` / `DATAGRAM_OVERHEAD` / `GUARANTEED_DATAGRAM` から導かれ、portal 側に
+数字は残っていない。`refused_too_big` はループバックでは踏めない — v4 経路の実効
+上限 1187 が portal の 1167 を上回るためで、これは floor が効いている証拠である。
+
 ### P2 — 契約 B
 
 - `seera-msquic` にサイズ付きパス検証を追加（§2.1 の 1〜3）

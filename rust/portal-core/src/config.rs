@@ -91,7 +91,7 @@ pub const EXAMPLE: &str = r#"# What this portal server offers, and nothing else.
 protocol = "tcp"
 target   = "192.0.2.10:5432"
 
-# UDP is forwarded up to about 1200 bytes per datagram; anything larger is
+# UDP is forwarded up to 1163 bytes per datagram; anything larger is
 # dropped and counted rather than split. A large DNS response can exceed it.
 [service.dns]
 protocol = "udp"

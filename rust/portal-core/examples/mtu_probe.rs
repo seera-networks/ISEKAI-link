@@ -1,20 +1,18 @@
 //! What the inner peer connection will actually carry, measured rather than
-//! derived (`docs/portal_mtu_plan.md` P0).
+//! derived (`docs/portal_mtu_plan.md` §6).
 //!
-//! The plan's arithmetic starts from `MaximumMtu = 1248` and subtracts a QUIC
-//! packet plus DATAGRAM frame overhead it calls **42, provisional** — a figure
-//! taken from the *outer* connection, whose connection IDs are not the inner
-//! one's. Every number after it rides on that, so it is measured here instead.
-//!
-//! Two families, because the overhead is not the only thing that moves: msquic
-//! sizes a datagram from the path MTU less the IP and UDP headers, and IPv6's
-//! header is 20 bytes larger. The contract has to hold on both, so it is the
-//! smaller of the two.
+//! **This settled the plan's provisional 42-byte overhead at 33**, which moved
+//! contract A from 1154 to 1163. That is done; what it is for now is checking
+//! that the constants still describe the connection — run it after touching
+//! `PEER_MTU`, `DATAGRAM_OVERHEAD`, or anything in msquic that changes a
+//! connection id, and it will say whether `MAX_PAYLOAD` still agrees.
 //!
 //!   cargo run -p portal-core --example mtu_probe
 //!
-//! Nothing here is a test. It stands up a loopback connection with the same
+//! Nothing here is a test. It stands a loopback connection up with the same
 //! `peer::client_config` production uses and reports what msquic says about it.
+//! The unit test in `datagram` pins the arithmetic; this is what checks the
+//! arithmetic against a live connection.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,8 +23,9 @@ use portal_core::datagram::{HEADER, MAX_PAYLOAD};
 use portal_core::transport;
 use tokio_util::sync::CancellationToken;
 
-/// What `peer::client_config` asks for, and what msquic clamps it to.
-const MAXIMUM_MTU: usize = 1248;
+/// Taken from the crate that sets it, so this cannot drift from what is
+/// actually configured — which is the whole failure mode it exists to catch.
+const MAXIMUM_MTU: usize = isekai_p2p::peer::PEER_MTU as usize;
 
 /// IP + UDP headers msquic takes off the path MTU before it has a QUIC packet.
 const IPV4_UDP: usize = 20 + 8;
@@ -71,14 +70,21 @@ async fn main() -> anyhow::Result<std::convert::Infallible> {
     }
 
     println!("\n  contract A = {worst}, the smaller of the two");
-    println!(
-        "  MAX_PAYLOAD is {MAX_PAYLOAD}, which is {} too large",
-        MAX_PAYLOAD as i64 - worst as i64
-    );
-    println!(
-        "  a payload between {} and {MAX_PAYLOAD} is accepted here and refused by an IPv6 connection",
-        worst + 1
-    );
+    match MAX_PAYLOAD as i64 - worst as i64 {
+        0 => println!("  MAX_PAYLOAD is {MAX_PAYLOAD}, which agrees"),
+        over if over > 0 => {
+            println!("  MAX_PAYLOAD is {MAX_PAYLOAD}, which is {over} too large");
+            println!(
+                "  a payload between {} and {MAX_PAYLOAD} is accepted here and refused \
+                 by an IPv6 connection",
+                worst + 1
+            );
+        }
+        under => println!(
+            "  MAX_PAYLOAD is {MAX_PAYLOAD}, {} under the guarantee -- bytes left unused",
+            -under
+        ),
+    }
     // **Leaves rather than returns**, which is `portal_core::shutdown`'s whole
     // subject: the registration is still holding a live connection, and letting
     // the runtime drop underneath it runs `RegistrationClose` — a blocking,
