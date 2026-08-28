@@ -163,15 +163,53 @@ async fn unattended<T: ControlPlaneTransport>(
     // the caller that did the work already holds one and must not go on to
     // spend a renewal round trip getting a second.
     let mut minted: Option<EndpointToken> = None;
-    enrollment
+    let enrolled_id = enrollment
         .cell()
         .get_or_try_init(|| async {
-            let enrolled = enrol(client, cfg, enrollment).await?;
-            let endpoint_id = enrolled.endpoint_id.clone();
-            minted = Some(enrolled.token());
-            Ok::<_, anyhow::Error>(endpoint_id)
+            match enrol(client, cfg, enrollment).await {
+                Ok(enrolled) => {
+                    minted = Some(enrolled.token());
+                    // **The keypair's id, not the one the response echoed.**
+                    // What this records is which keypair this credential has
+                    // spent itself on, and that is a local fact — §8.8.4 has
+                    // already bound the id to the public key, so the echo adds
+                    // nothing and would make the guard depend on the server
+                    // agreeing about a value we derived.
+                    Ok(cfg.key.endpoint_id())
+                }
+                // **`409` means it is already there, which is a success for
+                // this cell's purpose.** The enrolment can reach the server and
+                // still fail here — the connection drops while the body is
+                // read, or the body is a shape `Enrolled` cannot parse, which
+                // is a case that type documents. `get_or_try_init` does not
+                // remember failures, so without this every later call would
+                // enrol again, take `409` again, and the renewal loop would
+                // retry that forever while a plain refresh would have worked.
+                Err(e) if already_registered(&e) => {
+                    tracing::info!(
+                        "this Endpoint is already enrolled; renewing instead of registering",
+                    );
+                    Ok(cfg.key.endpoint_id())
+                }
+                Err(e) => Err(e),
+            }
         })
         .await?;
+
+    // **The cell belongs to the credential; the registration belongs to the
+    // keypair.** One Enrollment Key may grow several Endpoints (that is what
+    // `max_live_endpoints` counts), so sharing one `Credential` between configs
+    // with different keys would otherwise let the second skip enrolment and
+    // renew an Endpoint that was never registered. Each keypair needs its own
+    // `Credential`, and saying so here beats a `403` from §8.2.3 that names
+    // nothing.
+    if enrolled_id != &cfg.key.endpoint_id() {
+        anyhow::bail!(
+            "this Enrollment Key credential already enrolled {enrolled_id}, but this config              carries {}. One key registers one Endpoint per keypair — give each keypair its              own Credential.",
+            cfg.key.endpoint_id(),
+        );
+    }
+
     match minted {
         Some(token) => Ok(token),
         // Somebody else enrolled — either a previous call of ours, or a
@@ -181,6 +219,18 @@ async fn unattended<T: ControlPlaneTransport>(
     }
 }
 
+/// Whether this failure is the Identity API saying the Endpoint is already
+/// registered (§8.8.5).
+///
+/// Looked at by status rather than by the problem's slug: `409` is the only one
+/// that route answers, and the body is not worth parsing twice.
+fn already_registered(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<isekai_p2p_core::identity::IdentityError>()
+        .and_then(|e| e.status())
+        == Some(409)
+}
+
 /// §8.8.4 → §8.8.5: a challenge, then registration and the first token.
 async fn enrol<T: ControlPlaneTransport>(
     client: &IdentityClient<T>,
@@ -188,10 +238,11 @@ async fn enrol<T: ControlPlaneTransport>(
     enrollment: &Enrollment,
 ) -> anyhow::Result<isekai_p2p_core::identity::Enrolled> {
     let auth0 = enrollment_auth0(enrollment).await?;
-    // **Fetched before the challenge and used only at §8.8.5.** The challenge
-    // does not verify the binding, so minting first and spending the token on
-    // the second call keeps one round trip's worth of the assertion's life for
-    // the call that actually checks it.
+    // **Minted before the challenge so that a failed mint costs nothing.** A
+    // challenge is one-shot and lives 120 seconds, so taking one and then
+    // discovering the runner cannot mint a token wastes it. The assertion is
+    // one round trip older by the time §8.8.5 checks it, which is nothing
+    // against the 5–15 minutes it lives.
     let assertion = enrollment_assertion(enrollment).await?;
     let auth = identity_auth(enrollment, assertion.as_deref(), auth0.as_deref());
     // The challenge takes no assertion (§8.8.4); `enroll_challenge` drops it.
@@ -218,9 +269,10 @@ async fn refresh<T: ControlPlaneTransport>(
     enrollment: &Enrollment,
 ) -> anyhow::Result<EndpointToken> {
     let auth0 = enrollment_auth0(enrollment).await?;
-    // **Minted again, every renewal.** §8.8.7 verifies the binding each time,
-    // which is exactly what stops the key working after the job that owns the
-    // workload identity has ended.
+    // **Minted again, every renewal**, and before the challenge for the same
+    // reason as in `enrol`. §8.8.7 verifies the binding each time, which is
+    // exactly what stops the key working after the job that owns the workload
+    // identity has ended.
     let assertion = enrollment_assertion(enrollment).await?;
     let auth = identity_auth(enrollment, assertion.as_deref(), auth0.as_deref());
     let challenge = client

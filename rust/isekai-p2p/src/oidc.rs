@@ -50,6 +50,13 @@ pub struct GithubActionsOidc {
     http: reqwest::Client,
 }
 
+/// How long to wait for the runner to mint a token.
+///
+/// Generous for a call to a service on the same network, and short enough that
+/// a job fails with a message instead of sitting until the workflow's own
+/// timeout.
+const MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 const URL_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const TOKEN_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
 
@@ -62,7 +69,15 @@ impl GithubActionsOidc {
             (Some(url), Some(request_token)) => Ok(Self {
                 url,
                 request_token,
-                http: reqwest::Client::new(),
+                // **Bounded, because this runs inside the enrolment's
+                // `OnceCell` initializer.** Every concurrent caller on the same
+                // credential waits behind whoever is initializing, so a runner
+                // endpoint that accepts the connection and then says nothing
+                // would hang the whole session rather than fail it.
+                http: reqwest::Client::builder()
+                    .timeout(MINT_TIMEOUT)
+                    .build()
+                    .context("could not build an HTTP client")?,
             }),
             _ => anyhow::bail!(
                 "{URL_VAR} and {TOKEN_VAR} are not set, so no workload identity token can be \

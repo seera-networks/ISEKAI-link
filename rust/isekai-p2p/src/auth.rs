@@ -102,19 +102,27 @@ impl Credential {
         }
     }
 
-    /// An Enrollment Key, with the assertion source its `binding` needs.
+    /// An Enrollment Key with no additional evidence — the `binding: none`
+    /// case.
     ///
-    /// `assertion` is required for an `oidc` binding and unused otherwise;
-    /// `auth0` is required for a `sub` or `tenant` one (§8.8.3) and unused
-    /// otherwise. Both are wrong to omit only in the case that needs them, and
-    /// the server says so plainly (`400 assertion-required`).
+    /// For an `oidc` binding, add an assertion source; for `sub` or `tenant`,
+    /// an Auth0 one (§8.8.3):
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use isekai_p2p::{AssertionSource, Credential, Enrollment};
+    /// # fn example(source: Arc<dyn AssertionSource>) -> Credential {
+    /// Enrollment::new("enr1_…").with_assertions(source).into()
+    /// # }
+    /// ```
     pub fn enrollment(key: impl Into<String>) -> Self {
-        Credential::Enrollment(Enrollment {
-            key: key.into(),
-            assertion: None,
-            auth0: None,
-            enrolled: Arc::new(OnceCell::new()),
-        })
+        Enrollment::new(key).into()
+    }
+}
+
+impl From<Enrollment> for Credential {
+    fn from(enrollment: Enrollment) -> Self {
+        Credential::Enrollment(enrollment)
     }
 }
 
@@ -129,14 +137,19 @@ pub struct Enrollment {
     /// against a principal (§8.8.3). Those two are the attended case and
     /// cannot be used by a job on its own.
     pub auth0: Option<Arc<dyn Auth0TokenSource>>,
-    /// Whether this key has already grown its Endpoint, and which one.
+    /// Which Endpoint this credential has already grown, if any.
     ///
     /// **Shared across clones, and it has to be.** [`crate::P2pConfig`] is
     /// `Clone` and the renewal task holds one while other callers hold others.
     /// A second enrolment would present the same keypair and take
-    /// `409 endpoint-already-registered` — which is unrecoverable, since one
-    /// key registers exactly one Endpoint — and it would not even free the
-    /// slot it spent.
+    /// `409 endpoint-already-registered`, which does not even free the slot it
+    /// spent.
+    ///
+    /// **One Enrollment Key can grow several Endpoints** — that is what
+    /// `max_live_endpoints` counts — so this records *which*, and the caller
+    /// checks it against the keypair in hand. A credential shared between two
+    /// configs with different keys would otherwise let the second skip
+    /// enrolment and renew an Endpoint that was never registered.
     ///
     /// **`tokio`'s `OnceCell` and not `std`'s.** The initializer is async, and
     /// `std::sync::OnceLock` has no way to hold one: "check, then enrol" across
@@ -145,6 +158,21 @@ pub struct Enrollment {
 }
 
 impl Enrollment {
+    /// An Enrollment Key on its own.
+    ///
+    /// **Public, so the builders below can be reached without destructuring.**
+    /// They live here rather than on [`Credential`] because they are only
+    /// meaningful on this arm; without a constructor a caller had to `match` an
+    /// enum on an arm that cannot occur, which is worse than either.
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            assertion: None,
+            auth0: None,
+            enrolled: Arc::new(OnceCell::new()),
+        }
+    }
+
     /// Mint assertions for the `oidc` binding from `source`.
     pub fn with_assertions(mut self, source: Arc<dyn AssertionSource>) -> Self {
         self.assertion = Some(source);

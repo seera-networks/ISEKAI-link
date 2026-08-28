@@ -19,7 +19,7 @@ use axum::routing::post;
 use axum::Router;
 use isekai_p2p::agent::EndpointKey;
 use isekai_p2p::config::{issue_endpoint_token, P2pConfig};
-use isekai_p2p::{AssertionSource, Credential};
+use isekai_p2p::{AssertionSource, Credential, Enrollment};
 use serde_json::{json, Value};
 
 /// Every request the mock Identity API saw: (path, body).
@@ -236,10 +236,9 @@ async fn every_renewal_mints_a_fresh_assertion() {
     let hits = Hits::default();
     let url = serve(hits.clone()).await;
     let assertions = Arc::new(CountingAssertions::default());
-    let credential = match Credential::enrollment("enr1_SECRET") {
-        Credential::Enrollment(e) => Credential::Enrollment(e.with_assertions(assertions.clone())),
-        other => other,
-    };
+    let credential = Enrollment::new("enr1_SECRET")
+        .with_assertions(assertions.clone())
+        .into();
     let cfg = config(url, credential);
 
     issue_endpoint_token(&cfg).await.expect("enrol");
@@ -296,4 +295,116 @@ async fn a_silent_lifetime_falls_back_to_the_floor() {
     // 300 is what §8.2.1 clamps a `ttl` to; zero would put the renewal loop on
     // its 30-second minimum for the length of the job.
     assert_eq!(token.expires_in, 300);
+}
+
+/// An enrolment that reached the server but not the caller still leaves a
+/// working session.
+///
+/// **The expensive shape.** `get_or_try_init` does not remember failures, so
+/// without this every later call re-enrols, takes `409` again, and the renewal
+/// loop retries that for the length of the job — while a plain refresh would
+/// have worked all along. The response body being unreadable is a case
+/// `Enrolled` explicitly anticipates; a dropped connection while reading it is
+/// another.
+#[tokio::test]
+async fn an_enrolment_the_server_already_did_falls_through_to_renewal() {
+    let hits = Hits::default();
+    let app = Router::new()
+        .route(
+            "/v1/endpoints/enroll/challenge",
+            post(
+                |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
+                    record(&s, "enroll/challenge", b).await;
+                    challenge_response()
+                },
+            ),
+        )
+        .route(
+            "/v1/endpoints/enroll",
+            post(
+                |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
+                    record(&s, "enroll", b).await;
+                    (
+                        axum::http::StatusCode::CONFLICT,
+                        Json(json!({ "type": "endpoint-already-registered" })),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1/tokens/endpoint/refresh/challenge",
+            post(
+                |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
+                    record(&s, "refresh/challenge", b).await;
+                    challenge_response()
+                },
+            ),
+        )
+        .route(
+            "/v1/tokens/endpoint/refresh",
+            post(
+                |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
+                    record(&s, "refresh", b).await;
+                    Json(json!({
+                        "endpoint_token": "TOKEN.FROM.REFRESH",
+                        "token_type": "Bearer",
+                        "expires_in": 900,
+                        "endpoint_id": "ep:abc",
+                    }))
+                },
+            ),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let cfg = config(
+        format!("http://{addr}"),
+        Credential::enrollment("enr1_SECRET"),
+    );
+
+    let first = issue_endpoint_token(&cfg)
+        .await
+        .expect("recovers via renewal");
+    assert_eq!(first.endpoint_token, "TOKEN.FROM.REFRESH");
+
+    // And it does not try to enrol again afterwards: the cell took the `409`
+    // as the answer it is.
+    let second = issue_endpoint_token(&cfg).await.expect("renews");
+    assert_eq!(second.endpoint_token, "TOKEN.FROM.REFRESH");
+    assert_eq!(
+        hits.paths().iter().filter(|p| *p == "enroll").count(),
+        1,
+        "one attempt, then renewals",
+    );
+}
+
+/// One Enrollment Key can grow several Endpoints, so the guard has to know
+/// *which* one it recorded.
+///
+/// Sharing a credential across keypairs would otherwise let the second config
+/// skip enrolment and renew an Endpoint that was never registered — a `403`
+/// from §8.2.3 naming nothing. This says so where the mistake is made.
+#[tokio::test]
+async fn a_credential_will_not_stand_in_for_a_second_keypair() {
+    let hits = Hits::default();
+    let url = serve(hits.clone()).await;
+    let credential = Credential::enrollment("enr1_SECRET");
+
+    let first = config(url.clone(), credential.clone());
+    issue_endpoint_token(&first).await.expect("enrol");
+
+    // Same credential, different keypair — `config` generates a fresh one.
+    let second = config(url, credential);
+    let err = issue_endpoint_token(&second)
+        .await
+        .expect_err("a keypair that never enrolled must not renew");
+    let message = format!("{err:#}");
+    assert!(message.contains("own Credential"), "{message}");
+    assert_eq!(
+        hits.paths().iter().filter(|p| *p == "refresh").count(),
+        0,
+        "and it must not have gone on to renew",
+    );
 }
