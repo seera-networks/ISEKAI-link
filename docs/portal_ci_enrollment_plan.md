@@ -7,6 +7,14 @@
 **ISEKAI Link Server 仕様 §8.13（Provisioning Key API）**。以下、前者を「Identity 仕様」、
 後者を「Proxy 仕様」と書く。
 
+> **節番号の読み方。** 番号だけのものは Identity 仕様である。**§8.7〜§8.12 は両仕様に
+> 同じ番号があるので、Proxy 仕様のほうは必ず「Proxy 仕様 §…」と明記する** — たとえば
+> Grant を定めているのは Proxy 仕様 §8.8 で、Enrollment Key を定めているのは
+> Identity 仕様 §8.8 である。§8.13 は Proxy 仕様にしかない。
+>
+> **改訂 2。** `/code-review high` の指摘を反映した。更新の間隔（§1.3 / §4.2）、
+> `OnceLock` の型（§2.3）、枠を返す位置（§2.5）が事実として誤っていた。§8 に一覧がある。
+>
 > **改訂 1（上流の回答を反映）。** 初版が §7 に挙げた未解決 2 件は
 > [ISEKAI-identity#32](https://github.com/seera-networks/ISEKAI-identity/pull/32) で解決した。
 > **ジョブは自分で枠を返せる**ようになり（§4.6）、**`refresh/challenge` に assertion は要らない**
@@ -74,9 +82,9 @@ Enrollment Key を使う。Auth0 の M2M クレデンシャルは Identity API �
 | --- | --- |
 | §8.1.1 / §8.1.2 登録 | `isekai_p2p_core::identity::{register_challenge, register}` |
 | §8.2.1 Endpoint Token 発行 | `identity::issue_token`（PoP つき） |
-| §8.9 ペアリング | `proxy::pair_with_code` / `pair_with_listener` |
-| §8.12 Ticket | `proxy::{create_ticket, list_tickets, revoke_ticket, redeem_ticket}` |
-| §8.10 到達可能な Listener | `proxy::list_reachable_listeners` |
+| Proxy 仕様 §8.9 ペアリング | `proxy::pair_with_code` / `pair_with_listener` |
+| Proxy 仕様 §8.12 Ticket | `proxy::{create_ticket, list_tickets, revoke_ticket, redeem_ticket}` |
+| Proxy 仕様 §8.10 到達可能な Listener | `proxy::list_reachable_listeners` |
 | 接続 | `portal_core::session::{Reach, connect}` |
 | トークンの更新ループ | `isekai_p2p::config::spawn_token_renewal` |
 
@@ -89,14 +97,29 @@ Enrollment Key を使う。Auth0 の M2M クレデンシャルは Identity API �
 | §8.8.4 / §8.8.5 | 無人 Challenge と無人登録 | `Authorization` を持たない第 3 の経路 |
 | §8.8.7 | Enrollment Key による更新 | §8.2.2 / §8.2.3 の変種 |
 | §8.7 | 失効。**Enrollment Key + PoP でも呼べる** | 改訂 1。有人経路とは必須項が違う |
-| §8.13.3 / §8.13.7 | Provisioning Key の発行・一覧・引き換え記録・失効 | 系統 B |
-| §8.13.5 | 引き換え | 系統 B、`assertion` つき |
+| Proxy 仕様 §8.13.3 / §8.13.7 | Provisioning Key の発行・一覧・引き換え記録・失効 | 系統 B |
+| Proxy 仕様 §8.13.5 | 引き換え | 系統 B、`assertion` つき |
 
-**ここで一番効く事実**: 現在の更新ループは §8.2.1（発行）を 4 分おきに呼び直しているが、
+**ここで一番効く事実**: 現在の更新ループは §8.2.1（**発行**）を呼び直しているが、
 **§8.2.1 は Auth0 AT を要求する**。無人 Endpoint はそこへ行けない。したがって
 **§8.2.2 / §8.2.3 の実装は「あると良い」ではなく、この計画の前提条件**である。
-Identity 仕様 §8.8.7 が「更新できなければ、無人登録は最長 15 分しか持たない」と書いている
-のはこのことである。
+§8.8.7 が「更新できなければ、無人登録は最長 15 分しか持たない」と書いているのは
+このことである。
+
+**間隔は 4 分ではない。** `renew_delay`（`rust/isekai-p2p/src/config.rs`）は
+`expires_in − 60 秒`（下限 30 秒）を返し、240 秒の `RENEW_UNKNOWN` は
+**寿命が分からないときだけ**の値である。`spawn_token_renewal` の 3 か所の呼び出しは
+いずれも初期値として `None` を渡すので、実際の刻みはこうなる。
+
+```text
+t=0        トークン取得（expires_in = 900）
+t=240s     1 回目の更新   ← 初期値が None なので RENEW_UNKNOWN
+t=240+840s 2 回目以降     ← renew_delay(Some(900)) = 840 秒 = 14 分
+```
+
+**この数字は §4.2 の結論を弱めるどころか強める。** 定常の間隔 14 分は、GitHub の
+ID トークンの寿命（5〜15 分）と同じ桁かそれより長い。assertion を使い回す余地は
+実質的に無い。
 
 ### 1.4 触らないと決めたもの
 
@@ -263,7 +286,13 @@ Identity 仕様 §8.8.7 が「更新できなければ、無人登録は最長 1
    ```rust
    pub enum Credential {
        /// 系統 A。いまある経路。
-       Auth0 { token: String, source: Option<Arc<dyn Auth0TokenSource>> },
+       Auth0 {
+           token: String,
+           source: Option<Arc<dyn Auth0TokenSource>>,
+           /// **ここへ移す。** §8.1 の登録は Auth0 認証状態を要求するので、
+           /// これは系統 A だけの選択肢である。
+           register: bool,
+       },
        /// §8.8。無人の経路。
        Enrollment(Enrollment),
    }
@@ -274,13 +303,19 @@ Identity 仕様 §8.8.7 が「更新できなければ、無人登録は最長 1
        /// `binding.type` が `oidc` のとき必須。audience ごとに鋳造する。
        pub assertion: Option<Arc<dyn AssertionSource>>,
        /// **登録は 1 プロセスに 1 回だけ。** 下記。
-       enrolled: Arc<OnceLock<String>>,
+       enrolled: Arc<tokio::sync::OnceCell<String>>,
    }
    ```
 
-   `P2pConfig` から `auth0_token` と `auth0` が消え、`credential: Credential` が入る。
-   構築箇所は 14 か所（camera 系、FFI、agent、portal 両側、テストと例）あるが、
-   `Credential::auth0(token, source)` のコンストラクタを置けば各所 1 行の機械的な差分になる。
+   `P2pConfig` から `auth0_token` / `auth0` / **`register`** が消え、
+   `credential: Credential` が入る。構築箇所は **13 か所**（camera 系、FFI、agent、
+   portal 両側、テストと例）あるが、`Credential::auth0(token, source, register)` の
+   コンストラクタを置けば各所 1 行の機械的な差分になる。
+
+   **`register` を上に残さない。** 残すと「無人経路では黙って無視されるフィールド」が
+   できる — 本節が `enrollment: Option<…>` を退けたのとまったく同じ形の欠陥である。
+   `P2pConfig` は全フィールドが公開のプレーンな構造体で、構築は 13 か所すべてが
+   構造体リテラルなので、**「構築時に弾く」場所はそもそも存在しない**。型で消す。
 
    > **`enrollment: Option<…>` を足すだけにしない。** そのほうが差分は小さいが、
    > 「Auth0 の 2 フィールドが黙って無視される設定」が表現できてしまう。それは数手先の
@@ -289,9 +324,15 @@ Identity 仕様 §8.8.7 が「更新できなければ、無人登録は最長 1
 
 2. **`enrolled` は共有状態でなければならない。** `P2pConfig` は `Clone` で、更新ループは
    クローンを持って走る。ここが値だと、クローンした側が 2 度目の登録を試み、
-   **同じ鍵ペアなので必ず `409` で落ちる**。`Arc<OnceLock<String>>` にして、
-   「まだ登録していない → §8.8.4 / §8.8.5」「登録済み → §8.2.2 / §8.2.3」を分岐する。
-   `auth0: Option<Arc<dyn Auth0TokenSource>>` が既に `Arc` を持っているのと同じ理由である。
+   **同じ鍵ペアなので必ず `409` で落ちる**。`auth0: Option<Arc<dyn Auth0TokenSource>>` が
+   既に `Arc` を持っているのと同じ理由である。
+
+   **`std::sync::OnceLock` では足りない。** 初期化子が同期のクロージャなので、
+   「未登録なら登録する」は `.await` を跨いだ check-then-act になる。`issue_endpoint_token`
+   の呼び出しは 13 か所あり、更新タスクは他の呼び出しと**並行に走る**ので、2 つが
+   空のセルを見て**両方が enroll を打つ**。負けたほうが受け取る `409` は §4.4 のとおり
+   回復不能で、しかも枠は空かない。**`tokio::sync::OnceCell::get_or_try_init` を使う**
+   （失敗を憶えないので、一時的な `503` のあと次の呼び出しが再試行できる）。
 
 3. **`AssertionSource` を足す。** `Auth0TokenSource` の隣、同じ形。
 
@@ -315,24 +356,32 @@ Identity 仕様 §8.8.7 が「更新できなければ、無人登録は最長 1
    | `GithubActionsOidc` | `ACTIONS_ID_TOKEN_REQUEST_URL` に `&audience=` を付けて GET し、`ACTIONS_ID_TOKEN_REQUEST_TOKEN` を bearer にする。ワークフローに `permissions: id-token: write` が要る |
    | `TokenFiles` | audience → パスの対応表。呼ばれるたびに読み直す（Kubernetes の projected SA トークンはその場で差し替わる） |
 
-   どちらも **audience ごとにキャッシュし、`exp` の手前 60 秒で捨てる**。更新は 4 分おきに
-   走るので、毎回鋳造すると発行者への要求が増えるだけで、`exp` まで有効なトークンを
-   捨てる理由が無い。
+   **キャッシュは置かない。** 更新の定常間隔は 14 分（§1.3）で、GitHub の ID トークンは
+   5〜15 分しか生きない。**次の更新の時点でほぼ確実に切れている**ので、キャッシュは
+   当たらず、当たらないキャッシュは「期限切れのトークンを掴む経路」を 1 本増やすだけである。
+   呼ばれるたびに鋳造する。`TokenFiles` も同じ理由で毎回読み直す。
 
 4. **`issue_endpoint_token` を分岐させる。**
 
    ```text
-   Credential::Auth0       → いまと同じ（register?→ §8.2.1）
+   Credential::Auth0       → いまと同じ（register ? §8.1 → §8.2.1）
    Credential::Enrollment  → 未登録: §8.8.4 → §8.8.5（登録と最初のトークンが 1 往復）
                              登録済: §8.2.2 → §8.2.3（毎回 assertion を鋳造し直す）
    ```
 
-   `cfg.register` は **`Enrollment` では意味を持たない**。無人経路では登録は
-   選択肢ではなく最初の一歩である。`register: true` と併せて渡されたら黙って無視せず、
-   構築時に弾く。
+   `register` が `Credential::Auth0` の中にあるので、**無人経路では書きようがない**。
+   無人経路の登録は選択肢ではなく最初の一歩であり、それを言うのに実行時の検査は要らない。
 
 5. **`spawn_token_renewal` は変えない。** いまも `issue_endpoint_token(&cfg)` を呼ぶだけで、
    分岐は 4 の中にある。`renew_delay` / `retry_delay` もそのまま使える。
+
+   **ただし `expires_in` の欠落を決めておく。** §2.1 の `Enrolled` は `expires_in` を
+   省略可にしているのに、更新ループは `renew_delay(Some(token.expires_in))` を通る
+   （`EndpointToken` の側は `i64`）。**欠けていたら 300 を入れる** — §8.2.1 が
+   `ttl` を 300〜900 にクランプしているので、300 は「分かっていないときの最悪ケース」で
+   あり、`renew_delay(Some(300))` は 240 秒、すなわち `RENEW_UNKNOWN` と同じ値になる。
+   **0 を入れてはならない**: `renew_delay` の下限 30 秒に落ち、ジョブのあいだ 30 秒ごとに
+   更新を打ち続ける。
    ただし **更新の成功が `ephemeral` の「最終利用」を押し上げる**（§8.8.8）ことは
    コメントに書く — この更新ループが止まった瞬間から `endpoint_idle_ttl` の時計が
    動きはじめる、というのが CI の枠の返り方そのものである。
@@ -390,7 +439,7 @@ pub fn keep_the_grant(directory: Arc<PeerDirectory>, key: String,
 
 すなわち `Reach` に列挙子は要らない。引き換えは接続の前段で済み、そのあとは
 既存の `Reach::Grant { peer }` がそのまま働く — **これは偶然ではなく、Grant が
-Listener を鍵に含まないという §8.8 の設計の帰結**である。
+Listener を鍵に含まないという Proxy 仕様 §8.8 の設計の帰結**である。
 
 加えて 2 つ。
 
@@ -399,8 +448,15 @@ Listener を鍵に含まないという §8.8 の設計の帰結**である。
 - **すべての転送を bind し終えたら `ready` を 1 行 stdout に出す。** CI の待ちループが
   掴む点が要る。`camera-core` の `synthetic_server` が同じことをしていて、
   `ios-ffi.yml` はそれを `grep -q '^ready$'` で待っている。
-- **出るときに枠を返す**（§2.1 の 5）。`connected.close()` の直後、
-  `portal_core::shutdown::leave` の手前で失効を 1 回打つ。
+- **出るときに枠を返す**（§2.1 の 5）。置く場所は **`main` の中、`run` が返ったあと、
+  `portal_core::shutdown::leave` の手前**である。
+
+  > **`connected.close()` の隣ではない。** `run` は登録が済んだあとにも複数の経路で
+  > 抜ける — `--map` が無いときの `return Ok(())`、`session::connect` の `?`、
+  > `start_forwards` が失敗したときの `return Err(e)`。`connected.close()` の隣に
+  > 置くと、そのどれもが枠を持ち逃げする。**転送が始まる前に落ちた run こそ、
+  > 枠を返してほしい run である**（§4.6 / §2.7 が言っているのと同じこと）。
+  > `run` が返す値に関わらず 1 回だけ打つ。
   - **失敗しても終了コードを変えない。** 掃引という保険が後ろにあり、転送は成功していた
     のだから、片付けの失敗を仕事の失敗として報告しない。`warn!` で言うだけにする。
   - **締切を付ける**（3 秒程度）。ここで待つのは終了を遅らせるだけの往復であり、
@@ -414,6 +470,12 @@ Listener を鍵に含まないという §8.8 の設計の帰結**である。
 枠を返す経路を足しても、CI がそれを呼ばない形になる。Unix では
 `signal::unix::SignalKind::terminate()` を同じ腕に足す。
 
+> **捕まえたら、逃げ道も塞ぎ直す。** `shutdown::hard_exit_on_second_interrupt` が
+> 再武装するのは **SIGINT だけ**である。TERM を捕まえた以降、失効の 3 秒や
+> `leave` の msquic ドレイン中に届いた 2 度目の TERM は飲み込まれる。
+> ハッチにも TERM を足す（`kill -KILL` に頼るのは §2.7 の後始末だけで、
+> ジョブのキャンセルやコンテナの停止はそこを通らない）。
+
 ### 2.6 `portal-server`
 
 **責務: Provisioning Key を出す側。**
@@ -423,7 +485,7 @@ Listener を鍵に含まないという §8.8 の設計の帰結**である。
 
 | フラグ | 対応 |
 | --- | --- |
-| `--provisioning-key` | §8.13.3 発行。`--provisioning-ttl` / `--grant-ttl` / `--max-live-grants` / `--provisioning-label` / `--bind-oidc <issuer> <subject>` |
+| `--provisioning-key` | Proxy 仕様 §8.13.3 発行。`--provisioning-ttl` / `--grant-ttl` / `--max-live-grants` / `--provisioning-label` / `--binding-oidc <issuer>` / `--binding-subject <subject>` |
 | `--provisioning-keys` | §8.13.7 一覧（`live_grants` と `redemption_count` つき） |
 | `--provisioning-redemptions <id>` | §8.13.7 引き換え記録。**誰が入ったか**を後から辿る唯一の口 |
 | `--revoke-provisioning-key <id>` | §8.13.7 失効。**派生 Grant も消える** |
@@ -466,6 +528,9 @@ steps:
 
 - **`if:` で 2 本とも要求する。** `ios-ffi.yml` が 2 つのシークレットに対して同じことを
   している。半分だけ設定されたリポジトリが枠を静かに食う状態を作らない。
+- `./target/debug/portal-client` と書けるのは、`portal.yml` の当該ジョブが
+  `defaults.run.working-directory: rust` を置いているからである。**別のジョブへ置くなら
+  パスを直す。**
 - `--key` は `$RUNNER_TEMP` に置く。**毎回新しい鍵ペアであることが正しい**（§4.4）。
 - **止め方は `if: always()` の後始末ステップで、シグナルを送って待つ。**
 
@@ -506,13 +571,13 @@ sequenceDiagram
     OIDC-->>CI: assertion(proxy)
     CI->>Px: POST /v1/peer/provisioning-keys/redeem (pvk1_…, assertion)
     Px-->>CI: Grant (origin=provisioning) + listeners
-    CI->>Px: GET /v1/peer/reachable-listeners
+    CI->>Px: GET /v1/peer/listeners
     Px-->>CI: portal-server の現在の Listener
     CI->>Px: POST /v1/peer/connect
     CI->>Srv: peer QUIC（リレー → 直接）
     Note over CI: ready を出力し、転送を開始
 
-    loop 約 4 分ごと
+    loop 最初は 4 分後、以後は約 14 分ごと
         CI->>OIDC: aud=isekai-identity（キャッシュが切れていれば）
         CI->>Id: POST /v1/tokens/endpoint/refresh/challenge (enr1_…)
         CI->>Id: POST /v1/tokens/endpoint/refresh (署名 + PoP + assertion)
@@ -548,8 +613,8 @@ sequenceDiagram
 **「ジョブの頭で 1 本取って渡す」では動かない。** Identity 仕様 §8.8.7 は
 `binding` を**更新のたびに**検証すると定めており、しかもそれは緩められる制限ではなく、
 `oidc` の鍵が「ジョブが終われば更新できなくなる」という**歯止めそのもの**である。
-更新は 4 分おきに走り、GitHub の ID トークンは 5〜15 分で切れる。1 本渡しは
-2〜3 回目の更新から `403 enrollment-binding-invalid` になる。
+更新は最初の 1 回が 4 分後、以後およそ 14 分ごとに走り（§1.3）、GitHub の ID トークンは
+5〜15 分で切れる。**定常の間隔のほうが長いので、1 本渡しは 2 回目の更新でもう切れている。**
 
 したがって `AssertionSource` は「値」ではなく「取り方」を持つ。§2.3 の 3 を参照。
 
@@ -600,7 +665,7 @@ Proxy 仕様の書きぶりであり、クライアントがそれをやらな�
 
 **それでも `endpoint_idle_ttl` は短く置く。** 失効が呼ばれないケースは残る —
 ランナーの強制終了、`kill -9`、ネットワークが切れたまま終わるジョブ。生きている
-ランナーは 4 分ごとにトークンを更新するので、1,800 で足りる。
+ランナーは 15 分に 1 度はトークンを更新するので（§1.3）、1,800 で足りる。
 
 **掃引を主経路にしない。** §2.5 の終了処理と §2.7 の後始末ステップは、どちらもこの
 ためにある。返せるはずの枠を掃引に任せると、`idle_ttl` を短くするしかなくなり、
@@ -674,13 +739,15 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 ### フェーズ 2 — 資格情報の継ぎ目
 
 §2.3。`Credential` / `Enrollment` / `AssertionSource` と `issue_endpoint_token` の分岐。
-14 か所の構築サイトの移行を含む。
+13 か所の構築サイトの移行を含む。
 
 **受け入れ条件**
 - `cargo build --workspace` が通る（camera 系・FFI・agent を含む）。
 - `tests/token_flow.rs` に無人経路の対を足す: 1 回目が enroll を打ち、
   2 回目以降が refresh を打つこと。**`P2pConfig` をクローンしてから 2 回目を呼んでも
-  enroll に戻らないこと** — これが `OnceLock` を共有する理由そのものである。
+  enroll に戻らないこと** — これが `OnceCell` を共有する理由そのものである。
+  **並行に 2 本呼んでも enroll が 1 回しか出ないこと**も見る（`get_or_try_init` が
+  効いているかは、逐次のテストでは分からない）。
 - `GithubActionsOidc` が audience ごとにキャッシュし、`exp` の手前で捨てる。
   環境変数が無ければ、何を設定すべきか（`permissions: id-token: write`）を名指しで言う。
 
@@ -747,8 +814,8 @@ $ portal-client --issue-enrollment-key \
 
 ```console
 $ portal-server --provisioning-key \
-    --bind-oidc token.actions.githubusercontent.com \
-    --bind-subject 'repo:<org>/<repo>:ref:refs/heads/main' \
+    --binding-oidc token.actions.githubusercontent.com \
+    --binding-subject 'repo:<org>/<repo>:ref:refs/heads/main' \
     --grant-ttl 1800 --max-live-grants 8 \
     --provisioning-label gha-main
 ```
@@ -784,7 +851,12 @@ $ portal-server --provisioning-key \
 
 ### 6.4 交換
 
-クォータが両方 4 あるので停止時間は要らない。
+**鍵そのものの本数のクォータが両方 4 ある**ので停止時間は要らない
+（Identity 仕様 §8.8.2 の `ENROLLMENT_KEY_QUOTA` は `(tenant_id, owner_sub)` あたり 4、
+Proxy 仕様 §8.13.3 の `--p2p-provisioning-key-quota` は Endpoint あたり 4。どちらも
+「交換の窓のあいだ新旧 2 枚が生きられるように 1 ではなく 4 にした」と書いてある）。
+`max_live_endpoints` の既定 4 とは**別の数**である — あちらは 1 本の鍵が同時に
+生かせる派生 Endpoint の枠で、こちらは持てる鍵の本数である。
 新しい鍵を発行 → シークレットを差し替え → 数回のジョブが通るのを確認 → 旧鍵を失効。
 
 **旧鍵の失効は、それぞれ別のことをする。**
@@ -850,3 +922,41 @@ $ portal-server --grants                               # いま入っている�
    Proxy 仕様 §8.13.9-5）。
 6. **`portal-server` 自身を CI で立てるか。** 本計画は「CI が client 側」を対象にしている。
    server 側を CI で立てるなら、鍵のピン留め（§4.4）と ACME の枠が別の制約として効く。
+
+---
+
+## 8. 改訂の記録
+
+### 改訂 2 — `/code-review high` の指摘
+
+**事実として誤っていたもの**（実装すると壊れていた）。
+
+| | 誤り | 正 |
+| --- | --- | --- |
+| §1.3 | 更新は 4 分おき | 初回 4 分後、以後 `expires_in − 60` = 900 秒なら **14 分**。240 秒は寿命が分からないときだけの値 |
+| §2.3 | `Arc<OnceLock<String>>` | `std::sync::OnceLock` は初期化子が同期で、`.await` を跨ぐ check-then-act になる。並行呼び出しが両方 enroll を打ち、負けたほうが回復不能な `409` を受ける。**`tokio::sync::OnceCell::get_or_try_init`** |
+| §2.5 | 失効は `connected.close()` の隣 | 登録後の `return` 経路が 3 本あり、そのどれもが枠を持ち逃げする。**`main` で `run` の戻り値に関わらず 1 回** |
+| §3 | `GET /v1/peer/reachable-listeners` | `GET /v1/peer/listeners`（`?scope=owned` が enrollable のほう） |
+
+**誤りに連なって落としたもの。**
+
+- **assertion のキャッシュを撤回した**（§2.3）。14 分間隔と 5〜15 分のトークンでは
+  当たらず、当たらないキャッシュは期限切れを掴む経路を増やすだけである。
+- **`register` を `Credential::Auth0` へ入れた**（§2.3）。上に残すと「無人経路では
+  黙って無視されるフィールド」ができ、`enrollment: Option<…>` を退けたのと同じ欠陥になる。
+  `P2pConfig` は全フィールド公開のプレーン構造体で構築は 13 か所すべてリテラルなので、
+  「構築時に弾く」場所は存在しない。
+- **`Enrolled.expires_in` の欠落時の値を決めた**（§2.3）。300 を入れる。0 だと
+  `renew_delay` の下限 30 秒に落ちて更新を打ち続ける。
+- **`reason` を `IdentityAuth::Auth0` へ入れた**（§2.1）。`Option` 1 つで通さない、と
+  書いておきながら署名が `Option<&str>` だった。
+- **SIGTERM のハッチ**（§2.5）。`hard_exit_on_second_interrupt` は SIGINT しか再武装しない。
+- 表記の統一: `--binding-oidc` / `--binding-subject`（`--bind-oidc` を廃止）、
+  構築サイトは 13 か所、節番号の読み方を前書きに明記。
+
+**指摘のうち採らなかったもの。**
+
+- 「§6.4 の『クォータが両方 4』に根拠が無い」— 値は正しい。Identity 仕様 §8.8.2 と
+  Proxy 仕様 §8.13.3 が明示しており、**どちらも交換の窓のために 1 ではなく 4 にした**と
+  書いてある。ただし出典が無いと確かめようが無いので、§6.4 に引用を足し、
+  `max_live_endpoints` の既定 4 と**別の数**であることを言い足した。
