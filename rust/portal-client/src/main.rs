@@ -70,8 +70,11 @@ so the server can restart without breaking anything.
 A TICKET, when nobody is reading a code aloud: they run `portal-server
 --ticket` and send you the one string it prints; you run `--redeem <string>`
 once. Same standing grant afterwards, except it expires on its own -- which is
-the point, for work that ends. The string says which proxy to redeem at, so
---proxy-url does not have to be right for this.
+the point, for work that ends.
+
+Either of those can be given together with --map, and then the same run goes
+on to forward -- there is no reason to start this twice, and the second run
+would only have to be told the peer the first one was just told.
 
 A CAPABILITY, for being let in once: run --whoami, send them the Endpoint ID,
 and they issue one with --allow. Pass it with --capability and --listener. It
@@ -129,14 +132,16 @@ struct Args {
     /// print this Endpoint's ID and exit -- what the server needs for --allow
     #[argh(switch)]
     whoami: bool,
-    /// redeem a pairing code the server's operator showed, and exit. What it
-    /// makes is a standing grant: after this, connecting needs neither
-    /// --listener nor --capability, and survives the server restarting
+    /// redeem a pairing code the server's operator showed. What it makes is a
+    /// standing grant: after this, connecting needs neither --listener nor
+    /// --capability, and survives the server restarting. Add --map to go
+    /// straight on and forward; without one this stops after pairing
     #[argh(option)]
     pair: Option<String>,
-    /// redeem a TICKET the server's operator sent you, and exit. Takes the
-    /// one string --ticket printed, which says which proxy to redeem at. What
-    /// it makes is a grant that expires on its own
+    /// redeem a TICKET the server's operator sent you. Takes the one string
+    /// --ticket printed, which says which proxy to redeem at. What it makes is
+    /// a grant that expires on its own. Add --map to go straight on and
+    /// forward; without one this stops after redeeming
     #[argh(option)]
     redeem: Option<String>,
     /// a name for this device, recorded with the grant so the operator can see
@@ -243,6 +248,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let (Some(_), Some(_)) = (&args.pair, &args.redeem) {
+        anyhow::bail!("--pair and --redeem are two ways in; use one");
+    }
+    // **Refused on the arguments alone, before anything is spent.** Redeeming
+    // is what says which peer, so naming one as well is either redundant or
+    // wrong -- and finding out which would mean using up a single-use ticket
+    // first, only to stop.
+    if args.peer.is_some() && (args.pair.is_some() || args.redeem.is_some()) {
+        anyhow::bail!("--peer is not needed here: being let in is what names the peer");
+    }
     if let Some(code) = &args.pair {
         // **A ticket put in the wrong flag must not be sent as a code.** The
         // proxy would refuse it, but only after the secret had travelled in a
@@ -255,17 +270,42 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 isekai_p2p::agent::redact_tickets(code),
             );
         }
-        return redeem(&args, &tokens, key, code).await;
     }
-
-    if let Some(ticket) = &args.redeem {
-        return redeem_ticket(&args, &tokens, key, ticket).await;
-    }
+    // Everything a ticket can be wrong about is settled before authenticating.
+    let ticket = args
+        .redeem
+        .as_deref()
+        .map(|t| check_ticket(&args, t))
+        .transpose()?;
 
     let maps = maps(&args.map, args.bind)?;
-    if maps.is_empty() {
+    let letting_in = args.pair.is_some() || ticket.is_some();
+    if maps.is_empty() && !letting_in {
         anyhow::bail!("nothing to forward; pass at least one --map port:service");
     }
+
+    let cfg = config(&args, &tokens, key).await?;
+
+    // **Being let in and connecting are one command when both were asked for.**
+    // Redeeming used to exit, so anyone starting out ran the same client twice
+    // -- and the second run had to be told which peer, which the first one had
+    // just been told. Without `--map` there is nothing to forward, so it still
+    // stops after saying what it got.
+    let admitted_by = match (&args.pair, &ticket) {
+        (Some(code), _) => Some(redeem(&cfg, code, args.label.as_deref(), !maps.is_empty()).await?),
+        (None, Some(transfer)) => {
+            Some(redeem_ticket(&cfg, transfer, args.label.as_deref(), !maps.is_empty()).await?)
+        }
+        (None, None) => None,
+    };
+    if maps.is_empty() {
+        return Ok(());
+    }
+    // **The peer we were just let in by**, which is better than working it out:
+    // a client paired with more than one server would otherwise have to be told
+    // by hand what it has this second been told by the proxy. The two cannot
+    // both be set -- that is refused above, on the arguments.
+    let peer = admitted_by.as_deref().or(args.peer.as_deref());
     // **A grant unless a capability was handed over.** The two are not
     // alternatives of equal standing: a grant is what an installation should be
     // running on, and the capability path is for the guest who was let in once.
@@ -281,12 +321,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             "--listener is only for the --capability path. On a grant the current listener \
              is found for you -- drop it, or add --capability"
         ),
-        (None, None) => portal_core::session::Reach::Grant {
-            peer: args.peer.as_deref(),
-        },
+        (None, None) => portal_core::session::Reach::Grant { peer },
     };
 
-    let cfg = config(&args, &tokens, key).await?;
     let shutdown = CancellationToken::new();
     let connected = portal_core::session::connect(&cfg, reach, &shutdown)
         .await
@@ -345,79 +382,51 @@ async fn run(args: Args) -> anyhow::Result<()> {
 }
 
 /// Redeem a pairing code, and say what it paired with.
+///
+/// Returns the Endpoint that let us in, so a caller that also has `--map` can
+/// go straight there rather than working out which peer this was.
 async fn redeem(
-    args: &Args,
-    tokens: &std::path::Path,
-    key: isekai_p2p::agent::EndpointKey,
+    cfg: &P2pConfig,
     code: &str,
-) -> anyhow::Result<()> {
-    let cfg = config(args, tokens, key).await?;
+    label: Option<&str>,
+    then_connect: bool,
+) -> anyhow::Result<String> {
     // Whatever was scanned, pasted or typed: a URI from a QR, or the eight
     // characters with or without their dash.
     let code = isekai_p2p::agent::pairing_code_from_input(code);
-    let directory = isekai_p2p::PeerDirectory::open(&cfg)
+    let directory = isekai_p2p::PeerDirectory::open(cfg)
         .await
         .context("open the proxy control plane")?;
     let grant = directory
-        .pair(&code, args.label.as_deref())
+        .pair(&code, label)
         .await
         .context("redeem the pairing code")?;
     println!("paired with : {}", grant.owner_endpoint);
     println!("grant       : {}", grant.grant_id);
-    println!("\nConnect with --map alone; the listener is found for you.");
-    Ok(())
+    if !then_connect {
+        println!("\nConnect with --map alone; the listener is found for you.");
+    }
+    Ok(grant.owner_endpoint)
 }
 
 /// Redeem a ticket, and say what it let us into.
 ///
-/// **The ticket says which proxy to present it at**, and that wins over
-/// `--proxy-url` — a ticket redeemed anywhere else is simply not a ticket that
-/// proxy has ever heard of, and the answer would be `403 ticket-invalid` with
-/// nothing to suggest the address was the problem. A bare `tkt1_` secret
-/// carries no proxy, and then the configured one is used.
+/// The transfer has already been checked by [`check_ticket`], which runs before
+/// anything authenticates — including the authority check, which is why this
+/// takes a [`TicketTransfer`] rather than a string.
+///
+/// Returns the Endpoint that let us in, for the same reason [`redeem`] does.
 async fn redeem_ticket(
-    args: &Args,
-    tokens: &std::path::Path,
-    key: isekai_p2p::agent::EndpointKey,
-    ticket: &str,
-) -> anyhow::Result<()> {
-    let Some(transfer) = isekai_p2p::agent::ticket_from_transfer(ticket) else {
-        // Deliberately does not echo the value back: it is a secret until it is
-        // spent, and a failed paste is exactly the moment somebody copies the
-        // whole line into a bug report.
-        anyhow::bail!(
-            "that is not a ticket -- expected the `iskt1_` string the operator sent, \
-             or a bare `tkt1_` secret"
-        );
-    };
-    // **The string says which proxy, and that is not the same as choosing it.**
-    // Redeeming sends this Endpoint's token, and PoP signs the method, path and
-    // body but not the authority — so nothing binds those credentials to the
-    // proxy they were meant for. Taking the address out of a pasted string
-    // would mean whoever composed the string picks where the token goes.
-    //
-    // So a mismatch stops here and names the flag to pass. It also keeps the
-    // advice at the end of this function true: every later `--map` builds its
-    // config from `--proxy-url` again, and a grant made at some other proxy
-    // would be looked up at this one and not found.
-    let configured = isekai_p2p::agent::proxy_authority(&args.proxy_url);
-    if !transfer.proxy.is_empty() && transfer.proxy != configured {
-        anyhow::bail!(
-            "this ticket is for {}, but --proxy-url is {configured}.\n\
-             Redeeming sends this Endpoint's token to whichever proxy is used, so \
-             the address is not taken from the ticket on its own.\n\
-             If you trust it: --proxy-url https://{} --redeem …\n\
-             Pass it to every later command too -- that is where the grant lives.",
-            transfer.proxy,
-            transfer.proxy,
-        );
-    }
-    let cfg = config(args, tokens, key).await?;
-    let directory = isekai_p2p::PeerDirectory::open(&cfg)
+    cfg: &P2pConfig,
+    transfer: &isekai_p2p::agent::TicketTransfer,
+    label: Option<&str>,
+    then_connect: bool,
+) -> anyhow::Result<String> {
+    let directory = isekai_p2p::PeerDirectory::open(cfg)
         .await
         .context("open the proxy control plane")?;
     let redeemed = directory
-        .redeem_ticket(&transfer.ticket, args.label.as_deref())
+        .redeem_ticket(&transfer.ticket, label)
         .await
         .context("redeem the ticket")?;
     let grant = &redeemed.grant;
@@ -430,13 +439,51 @@ async fn redeem_ticket(
         // "access that never lapses" is the one thing tickets exist to avoid.
         None => println!("expires at  : never -- unexpected for a ticket"),
     }
-    if redeemed.listeners.is_empty() {
+    if redeemed.listeners.is_empty() && !then_connect {
         println!("\nNothing is listening on that Endpoint yet. That is not a failure:");
         println!("you are authorised, and --map will find it once the server is up.");
-    } else {
+    } else if !then_connect {
         println!("\nConnect with --map alone; the listener is found for you.");
     }
-    Ok(())
+    Ok(grant.owner_endpoint.clone())
+}
+
+/// Check a ticket's shape and where it wants to be redeemed, before anything
+/// on the network happens.
+///
+/// **The string says which proxy, and that is not the same as choosing it.**
+/// Redeeming presents this Endpoint's token, and PoP signs the method, path and
+/// body but not the authority — so nothing binds those credentials to the proxy
+/// they were meant for. Taking the address out of a pasted string would mean
+/// whoever composed the string picks where the token goes.
+///
+/// So a mismatch stops here, before `--auth0-token` is even read, and names the
+/// flag to pass. It also keeps what follows honest: every later `--map` builds
+/// its config from `--proxy-url` again, and a grant made at some other proxy
+/// would be looked up at this one and not found.
+fn check_ticket(args: &Args, ticket: &str) -> anyhow::Result<isekai_p2p::agent::TicketTransfer> {
+    let Some(transfer) = isekai_p2p::agent::ticket_from_transfer(ticket) else {
+        // Deliberately does not echo the value back: it is a secret until it is
+        // spent, and a failed paste is exactly the moment somebody copies the
+        // whole line into a bug report.
+        anyhow::bail!(
+            "that is not a ticket -- expected the `iskt1_` string the operator sent, \
+             or a bare `tkt1_` secret"
+        );
+    };
+    let configured = isekai_p2p::agent::proxy_authority(&args.proxy_url);
+    if !transfer.proxy.is_empty() && transfer.proxy != configured {
+        anyhow::bail!(
+            "this ticket is for {}, but --proxy-url is {configured}.\n\
+             Redeeming sends this Endpoint's token to whichever proxy is used, so \
+             the address is not taken from the ticket on its own.\n\
+             If you trust it: --proxy-url https://{} --redeem …\n\
+             Pass it to every later command too -- that is where the grant lives.",
+            transfer.proxy,
+            transfer.proxy,
+        );
+    }
+    Ok(transfer)
 }
 
 /// Bind each mapped port and start forwarding it.

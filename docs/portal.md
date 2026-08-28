@@ -306,16 +306,24 @@ the proxy's answer**: it is shown once and never again, so nothing optional gets
 to come between you and it.
 
 ```sh
-portal-client --redeem iskt1_eyJwIjoi…
+portal-client --redeem iskt1_eyJwIjoi… --map 5432:db
 ```
 
 ```
 let in by   : ep:9z8y7x…
 grant       : gr_AbC12345
 expires at  : 2026-09-28T09:32:00Z
-
-Connect with --map alone; the listener is found for you.
+connection id: b7f0c1…
+tcp 127.0.0.1:5432 -> db
 ```
+
+**Redeeming and connecting are one command.** Add `--map` and the same run goes
+on to forward, using the Endpoint it was just let in by — there is no reason to
+start the client twice, and the second run would only have to be told the peer
+the first one had this second been told. Leave `--map` off and it stops after
+redeeming, which is what you want when the ticket arrives before the work does.
+
+The same goes for `--pair`.
 
 After that it is an ordinary grant — `--map` alone, the listener looked up each
 time, restarts survived — until its expiry, at which point access ends without
