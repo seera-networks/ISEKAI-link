@@ -98,10 +98,20 @@ pub async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<EndpointTok
 /// token is exactly the one whose slot should come back. No reason either:
 /// Identity writes `enrollment_released`, which is what keeps "the job tidied
 /// up" tellable apart from "the sweep did".
-pub async fn release_enrollment(cfg: &P2pConfig) -> anyhow::Result<()> {
+/// Returns whether anything was actually revoked: `false` means this Endpoint
+/// never enrolled, so there was no slot to give back.
+pub async fn release_enrollment(cfg: &P2pConfig) -> anyhow::Result<bool> {
     let Credential::Enrollment(enrollment) = &cfg.credential else {
         anyhow::bail!("only an Endpoint enrolled with a key can return its own slot");
     };
+    // **Nothing to give back if nothing was ever taken.** Enrolment happens on
+    // the first token, so a run that failed before that — a bound key with no
+    // workload identity to mint from, an unreachable Identity — has no slot and
+    // no Endpoint. Revoking anyway spends a round trip to be told so, and warns
+    // the operator that a slot leaked when none was ever spent.
+    if enrollment.endpoint_id().is_none() {
+        return Ok(false);
+    }
     let auth = RevokeAuth::Enrollment {
         key: &enrollment.key,
         endpoint: &cfg.key,
@@ -113,7 +123,7 @@ pub async fn release_enrollment(cfg: &P2pConfig) -> anyhow::Result<()> {
         let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
         client.revoke_endpoint(auth, None).await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A control-plane client for `cfg`'s proxy, authenticated with `endpoint_token`.

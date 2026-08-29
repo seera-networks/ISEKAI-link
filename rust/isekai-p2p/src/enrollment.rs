@@ -72,16 +72,34 @@ pub async fn list(
 }
 
 /// §8.8.9 — which Endpoints a key registered, and how each of them ended.
+///
+/// **Follows the cursor.** These records outlive the key precisely because "who
+/// came in on it" matters most at the moment somebody revokes one, and a key a
+/// CI has been using accumulates a row per job within the retention window. A
+/// first page presented as the whole answer would be a truncated audit with
+/// nothing saying so.
 pub async fn enrollments(
     identity: &Identity,
     auth0_token: &str,
     key_id: &str,
 ) -> anyhow::Result<Vec<EnrollmentRecord>> {
     Ok(on_transport!(identity, |client| {
-        client
-            .enrollment_key_enrollments(auth0_token, key_id, None)
-            .await?
-            .0
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        // A bound, because the cursor comes from the server: a page that keeps
+        // pointing at itself would otherwise loop for as long as the process
+        // lives. Deep enough that no real key reaches it.
+        for _ in 0..100 {
+            let (rows, next) = client
+                .enrollment_key_enrollments(auth0_token, key_id, cursor.as_deref())
+                .await?;
+            all.extend(rows);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        all
     }))
 }
 

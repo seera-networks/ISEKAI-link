@@ -275,9 +275,17 @@ fn secret_from(file: Option<&Path>, var: &str) -> anyhow::Result<Option<String>>
         }
         return Ok(Some(value.to_owned()));
     }
+    // **Trimmed like the file, and for the same reason.** A secret written with
+    // `echo "K=$(cat f)" >> $GITHUB_ENV`, or pasted, carries a trailing
+    // newline; sending it makes Identity hash a different string and answer
+    // `403 enrollment-key-invalid`, which says nothing about whitespace.
+    //
     // An empty variable is the same as an unset one: that is what a workflow
-    // that referenced a secret nobody configured actually produces.
-    Ok(std::env::var(var).ok().filter(|v| !v.trim().is_empty()))
+    // referencing a secret nobody configured actually produces.
+    Ok(std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty()))
 }
 
 /// Where a bound key's workload identity tokens come from.
@@ -376,7 +384,11 @@ async fn release_the_slot(cfg: &P2pConfig) {
     )
     .await;
     match released {
-        Ok(Ok(())) => tracing::info!("returned the enrolment slot"),
+        Ok(Ok(true)) => tracing::info!("returned the enrolment slot"),
+        // **Nothing was taken, so say nothing.** A run that failed before
+        // enrolling has no slot out, and announcing one either way would tell
+        // an operator reading the log that something happened that did not.
+        Ok(Ok(false)) => {}
         Ok(Err(e)) => {
             tracing::warn!("could not return the enrolment slot; the idle sweep will: {e:#}")
         }
@@ -454,7 +466,9 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // is what says which peer, so naming one as well is either redundant or
     // wrong -- and finding out which would mean using up a single-use ticket
     // first, only to stop.
-    if args.peer.is_some() && (args.pair.is_some() || args.redeem.is_some()) {
+    if args.peer.is_some()
+        && (args.pair.is_some() || args.redeem.is_some() || provisioning.is_some())
+    {
         anyhow::bail!("--peer is not needed here: being let in is what names the peer");
     }
     if let Some(code) = &args.pair {
@@ -506,6 +520,12 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // -- and the second run had to be told which peer, which the first one had
     // just been told. Without `--map` there is nothing to forward, so it still
     // stops after saying what it got.
+    // **Made before anything that needs stopping**, so the grant keeper can
+    // take it rather than a token nobody holds — with a throwaway, its
+    // cooperative arm never fires and the only stop is `Drop`'s `abort`, which
+    // can cut a redemption mid-request and leave msquic a handle for the drain
+    // to wait on.
+    let shutdown = CancellationToken::new();
     // **The keeper outlives this block**, which is why it is bound here: a
     // provisioning grant is capped at an hour precisely because redeeming again
     // extends it, so a client that redeemed once would inherit the narrow
@@ -525,6 +545,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
                 assertions(&args)?,
                 args.label.as_deref(),
                 !maps.is_empty(),
+                shutdown.clone(),
             )
             .await?;
             keeper = held;
@@ -558,7 +579,19 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         (None, None) => portal_core::session::Reach::Grant { peer },
     };
 
-    let shutdown = CancellationToken::new();
+    // **Installed before the connect, and the hatch armed with it.**
+    // Registering it replaces SIGTERM's default disposition for the rest of the
+    // process, so from here a `kill` does nothing unless something polls — and
+    // the select below is a long way off, past a proxy connect that can hang.
+    // Registering early means a SIGTERM arriving during the connect is queued
+    // and delivered the moment the select starts, which is a clean stop with
+    // the slot returned; arming the hatch means a second one leaves at once
+    // even if the connect never returns.
+    let terminate = terminate_signal();
+    tokio::pin!(terminate);
+    #[cfg(unix)]
+    portal_core::shutdown::hard_exit_on_terminate();
+
     let connected = portal_core::session::connect(&cfg, reach, &shutdown)
         .await
         .context("connect to the portal server")?;
@@ -599,13 +632,9 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // skip reporting the connection closed — which leaves the relay leg
     // reserved until the proxy expires it.
     let mut interrupted = false;
-    // **SIGTERM as well as SIGINT**, because a job that stops this with a plain
-    // `kill` is the ordinary case in CI — and on the enrolment path the exit
-    // path is what returns the slot. Nothing else in this workspace catches
-    // SIGTERM, so the default disposition would have killed the process before
-    // it could.
-    let terminate = terminate_signal();
-    tokio::pin!(terminate);
+    // SIGTERM as well as SIGINT, because a job that stops this with a plain
+    // `kill` is the ordinary case in CI, and on the enrolment path the way out
+    // is what returns the slot.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => { interrupted = true; }
         _ = &mut terminate => { interrupted = true; }
@@ -624,6 +653,11 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     if interrupted {
         portal_core::shutdown::hard_exit_on_second_interrupt();
     }
+    // **Told to stop before it is dropped.** Dropping the keeper aborts it,
+    // which can cut a redemption mid-request and leave msquic a handle the
+    // drain then waits on; cancelling first lets it finish what it is doing
+    // and return.
+    shutdown.cancel();
     connected.close().await;
     Ok(())
 }
@@ -717,6 +751,7 @@ async fn redeem_provisioning(
     assertions: Option<Arc<dyn isekai_p2p::AssertionSource>>,
     label: Option<&str>,
     then_connect: bool,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<(String, Option<portal_core::grant::GrantKeeper>)> {
     let directory = isekai_p2p::PeerDirectory::open(cfg)
         .await
@@ -757,7 +792,7 @@ async fn redeem_provisioning(
         assertions,
         grant.expires_at.clone(),
         label.map(str::to_owned),
-        CancellationToken::new(),
+        shutdown,
     );
     Ok((owner, Some(keeper)))
 }

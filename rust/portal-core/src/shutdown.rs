@@ -55,15 +55,31 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// from trapping whoever meets it.
 pub fn hard_exit_on_second_interrupt() {
     // SAFETY: `handler` is the address of an `extern "C"` function with the
-    // signature `signal(2)` requires, and both numbers are valid signals.
+    // signature `signal(2)` requires, and `SIGINT` is a valid signal number.
     unsafe {
         signal(SIGINT, hard_exit as extern "C" fn(i32) as usize);
-        // **SIGTERM as well, on the same reasoning.** `portal-client` now
-        // listens for it, which means it has taken SIGTERM's default
-        // disposition away too — so a second `kill` during a blocked close
-        // would be swallowed exactly as a second Ctrl+C was. A CI job with
-        // `kill -TERM` in its teardown is the ordinary way this is stopped.
-        #[cfg(unix)]
+    }
+}
+
+/// Make a `kill` leave immediately, from the moment SIGTERM is listened for.
+///
+/// **Call this as soon as the listener is installed, not when stopping.**
+/// `tokio::signal::unix::signal` replaces SIGTERM's default disposition for the
+/// rest of the process and never puts it back, so from that instant a `kill`
+/// does nothing unless something is polling for it — and the paths that are not
+/// polling are exactly the ones that can block: `close()` waiting on a rundown
+/// reference, and [`leave`]'s drain.
+///
+/// **This is why it is unconditional where the interrupt hatch is not.** That
+/// one is armed only once somebody has pressed Ctrl+C, because arming it
+/// earlier would turn a first press into a hard exit that skips reporting the
+/// connection closed. SIGTERM has no such case: nothing has been "pressed", the
+/// default has already been taken away, and a CI teardown's `kill` has to keep
+/// working.
+#[cfg(unix)]
+pub fn hard_exit_on_terminate() {
+    // SAFETY: as above, with `SIGTERM` in place of `SIGINT`.
+    unsafe {
         signal(SIGTERM, hard_exit as extern "C" fn(i32) as usize);
     }
 }

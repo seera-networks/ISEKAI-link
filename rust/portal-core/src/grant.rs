@@ -67,7 +67,13 @@ pub fn keep_the_grant(
     label: Option<String>,
     shutdown: CancellationToken,
 ) -> GrantKeeper {
-    let mut delay = renew_delay(expires_at.as_deref());
+    // **Kept across attempts so a failure can be rescheduled against it.**
+    // Leaving `delay` where it was would put the retry at the moment the grant
+    // expires and the one after that well beyond — one attempt, landing at the
+    // deadline, which is not what "as much room to retry as it had to happen
+    // in" means.
+    let mut expiry = expires_at;
+    let mut delay = renew_delay(expiry.as_deref());
     GrantKeeper(tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -81,6 +87,7 @@ pub fn keep_the_grant(
                 Some(source) => match source.assertion(PROXY_AUDIENCE).await {
                     Ok(assertion) => Some(assertion),
                     Err(e) => {
+                        delay = renew_delay(expiry.as_deref());
                         tracing::warn!(
                             retry_in = ?delay,
                             "could not mint a token to extend the grant: {e:#}",
@@ -95,7 +102,8 @@ pub fn keep_the_grant(
                 .await
             {
                 Ok(redeemed) => {
-                    delay = renew_delay(redeemed.grant.expires_at.as_deref());
+                    expiry = redeemed.grant.expires_at.clone();
+                    delay = renew_delay(expiry.as_deref());
                     tracing::debug!(
                         expires_at = redeemed.grant.expires_at.as_deref().unwrap_or("?"),
                         next = ?delay,
@@ -103,6 +111,10 @@ pub fn keep_the_grant(
                     );
                 }
                 Err(e) => {
+                    // Rescheduled against the expiry rather than repeating the
+                    // last wait, so the attempts keep halving into what is left
+                    // instead of stepping past it.
+                    delay = renew_delay(expiry.as_deref());
                     // Deliberately not fatal: see the function's documentation.
                     tracing::warn!(
                         retry_in = ?delay,
@@ -157,6 +169,27 @@ mod tests {
         let at = OffsetDateTime::now_utc() + time::Duration::hours(10);
         let formatted = at.format(&Rfc3339).unwrap();
         assert_eq!(renew_delay(Some(&formatted)), Duration::from_secs(1800));
+    }
+
+    /// Attempts keep halving into what is left rather than stepping past it.
+    ///
+    /// The failure mode this rules out: a first wait of half an hour, a failed
+    /// attempt, and the next one scheduled another half hour on — at the moment
+    /// the grant expires, with everything after it too late.
+    #[test]
+    fn a_retry_is_scheduled_against_the_expiry_not_the_last_wait() {
+        let at = OffsetDateTime::now_utc() + time::Duration::seconds(3600);
+        let formatted = at.format(&Rfc3339).unwrap();
+        let first = renew_delay(Some(&formatted));
+        assert!(first.as_secs().abs_diff(1800) <= 1, "{first:?}");
+
+        // The same expiry, half an hour later: what is left has halved, so the
+        // next attempt is half of that rather than another 1800.
+        let at = OffsetDateTime::now_utc() + time::Duration::seconds(1800);
+        let formatted = at.format(&Rfc3339).unwrap();
+        let second = renew_delay(Some(&formatted));
+        assert!(second.as_secs().abs_diff(900) <= 1, "{second:?}");
+        assert!(second < first);
     }
 
     /// A date this cannot read is not a reason to stop keeping the grant.
