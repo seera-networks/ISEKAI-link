@@ -140,6 +140,17 @@ jobs:
   ci-enrolment:
     name: Enrol both halves and forward (ubuntu-latest)
     runs-on: ubuntu-latest
+    # **`main` only, because the keys are bound to `main`.** §8.8.3 matches the
+    # binding subject exactly — no wildcards, no prefixes — so a key issued for
+    # `repo:…:ref:refs/heads/main` cannot be used from a branch, and the run
+    # answers `403 enrollment-binding-invalid`. That is the binding working, not
+    # a fault: covering another branch means issuing another key, which is a
+    # decision rather than something a workflow should paper over.
+    #
+    # The first version of this job ignored that and failed on its own pull
+    # request, which the plan had already written down (§6.2, "a key for
+    # refs/heads/main will not let a PR job in; that narrowness is intended").
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     timeout-minutes: 25
     permissions:
       # **Without this the runner mints no workload identity token**, and keys

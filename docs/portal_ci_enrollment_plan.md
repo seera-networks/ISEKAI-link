@@ -1824,6 +1824,35 @@ portal-server --revoke-provisioning-key <id>   あり
 `portal-client --revoke-endpoint <id> --reason device_lost` 相当を足すのが筋だが、
 本計画の範囲外なので**次にやることとして残す**。
 
+### 15.9 CI が設計どおりに落ちた
+
+シークレットを入れて最初の run が `403 enrollment-binding-invalid` で落ちた。
+**鍵は `refs/heads/main` に束縛されていて、run はブランチ上だった。**
+
+```text
+Error: stand the portal server up: could not enrol this Endpoint:
+       Identity API returned 403: enrollment-binding-invalid
+```
+
+**binding が効いている証拠である。** §8.8.3 は subject を完全一致で照合し、
+ワイルドカードもプレフィックスも認めない。鍵の文字列を持っていても、その
+ワークフロー・そのブランチ・そのリポジトリでなければ入れない — CI 用の鍵を
+公開リポジトリに置ける唯一の理由がこれで、**それがそのまま働いた。**
+
+**そして、この挙動は §6.2 に自分で書いてあった。**
+
+> `subject` が完全一致であることは、ブランチを跨ぐなら鍵を分けることを意味する。
+> `refs/heads/main` の鍵で PR のジョブは通らない。それは意図した狭さである。
+
+書いておきながら、その前提を無視したワークフローを書いた。ジョブを
+`main` への push に限定した — ブランチごとに鍵を分けるのは**判断**であって、
+ワークフローが黙って回避してよいものではない。
+
+**つまりこのジョブは、マージされて初めて走る。** PR の上では skip される。
+`ios-ffi.yml` の live test が secrets の有無で skip されるのと同じ性質のもので、
+「PR で緑だからマージ後も緑」とは言えない範囲が 1 つ増える。**それは binding の
+狭さの代償であり、狭さのほうを取る。**
+
 ---
 
 ## 16. フェーズ 6 の結果
