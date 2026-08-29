@@ -288,6 +288,24 @@ struct Args {
     /// being authorised -- unlike --revoke-ticket, which leaves them
     #[argh(option)]
     revoke_provisioning_key: Option<String>,
+    /// register this Endpoint with an ENROLLMENT KEY instead of signing in, so
+    /// a server can run where nobody can sign one in -- a self-contained CI
+    /// job being the case. The key comes from ISEKAI_SERVER_ENROLLMENT_KEY or
+    /// --enrollment-key-file, never from an argument
+    #[argh(switch)]
+    enroll: bool,
+    /// read the Enrollment Key from this file rather than
+    /// ISEKAI_SERVER_ENROLLMENT_KEY
+    #[argh(option)]
+    enrollment_key_file: Option<PathBuf>,
+    /// where to get the workload identity token a bound key needs: `github`
+    /// (GitHub Actions), `files` (one per audience, see --oidc-token-file) or
+    /// `none`. Default `none`
+    #[argh(option, default = "String::from(\"none\")")]
+    oidc: String,
+    /// an `audience=path` pair for --oidc files. Repeatable
+    #[argh(option)]
+    oidc_token_file: Vec<String>,
 }
 
 /// Answer `--grants` and `--revoke`, which need no listener.
@@ -314,16 +332,33 @@ async fn config(args: &Args, tokens: &std::path::Path) -> anyhow::Result<P2pConf
     // token bailed without writing anything; passing the key in as an argument
     // quietly reversed that and left a new Endpoint identity on disk before
     // failing.
-    let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
+    let credential = if args.enroll {
+        // **A different variable from the client's**, because it is a different
+        // key: a server has to create a listener and accept connections, so its
+        // permissions differ, and one key carrying both roles' would be the
+        // ceiling problem §8.8.2 exists to avoid.
+        portal_core::ci::enrollment_credential(
+            args.enrollment_key_file.as_deref(),
+            portal_core::ci::SERVER_ENROLLMENT_KEY_VAR,
+            &args.oidc,
+            &args.oidc_token_file,
+        )?
+    } else {
+        // **Authentication first, then the key.** The struct literal this
+        // replaced evaluated the token before the key, so a run with neither a
+        // sign-in nor a token bailed without writing anything.
+        let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
+        // **The whole point of the source.** With it the Endpoint Token
+        // renewal, which runs every few minutes for the life of the session,
+        // asks for a current Auth0 token instead of reusing one that expired.
+        isekai_p2p::Credential::auth0(auth.token, auth.source, args.register)
+    };
     let key = load_or_generate_key(&args.key)?;
     Ok(P2pConfig {
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
-        // **The whole point of the source.** With it the Endpoint Token
-        // renewal, which runs every few minutes for the life of the session,
-        // asks for a current Auth0 token instead of reusing one that expired.
-        credential: isekai_p2p::Credential::auth0(auth.token, auth.source, args.register),
+        credential,
         protocol: args.protocol.clone(),
         device_name: args.device_name.clone(),
         token_ttl: None,
@@ -711,7 +746,10 @@ async fn main() -> anyhow::Result<()> {
     // runtime and then the registrations, and `RegistrationClose` blocks
     // uninterruptibly on a configuration's rundown reference that no timeout
     // covers. `portal_core::shutdown` has the whole of it.
-    let code = match run(args).await {
+    // **Filled in by `run` once an Endpoint exists**, so returning the slot does
+    // not depend on which way `run` left. The client does the same.
+    let mut enrolled: Option<P2pConfig> = None;
+    let code = match run(args, &mut enrolled).await {
         Ok(()) => 0,
         Err(e) => {
             // Printed here because `_exit` skips the reporting `main` would
@@ -720,10 +758,39 @@ async fn main() -> anyhow::Result<()> {
             1
         }
     };
+    // **Here, and not beside the listener.** `run` returns from several places
+    // once the Endpoint exists, and the run that fails before serving starts is
+    // exactly the one whose slot should come back.
+    if let Some(cfg) = enrolled {
+        portal_core::ci::release_the_slot(&cfg).await;
+    }
     portal_core::shutdown::leave(code).await
 }
 
-async fn run(args: Args) -> anyhow::Result<()> {
+/// SIGTERM on Unix, and a future that never completes elsewhere.
+///
+/// Windows has no SIGTERM; `ctrl_c` covers the interactive case there, and the
+/// unattended one does not arise because CI runs this on Linux.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            // A process that cannot install the handler should still run; it
+            // simply dies on SIGTERM the way it always did.
+            Err(e) => {
+                tracing::warn!("could not listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
+}
+
+async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()> {
     if args.example_config {
         // Before the key, the token and the catalogue: this is what somebody
         // runs when they have none of the three yet.
@@ -748,6 +815,23 @@ async fn run(args: Args) -> anyhow::Result<()> {
         // Before the key, the catalogue and the network: this is what somebody
         // runs when they have none of them.
         return portal_core::login::sign_in(&tokens).await;
+    }
+
+    portal_core::ci::check_unattended_args(
+        args.enroll,
+        args.auth0_token.is_some(),
+        args.register,
+        &args.oidc,
+        &args.oidc_token_file,
+    )?;
+    // **Before the catalogue and before the network.** A missing key is a fact
+    // about the arguments; reported later it hides behind whatever else fails
+    // first, and the operator fixes the wrong thing.
+    if args.enroll {
+        portal_core::ci::require_key(
+            args.enrollment_key_file.as_deref(),
+            portal_core::ci::SERVER_ENROLLMENT_KEY_VAR,
+        )?;
     }
 
     // Everything here is an Endpoint-token call that names no listener
@@ -814,6 +898,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let cfg = config(&args, &tokens).await?;
+    // From here on this Endpoint may exist, so every way out owes a slot back.
+    if args.enroll {
+        *enrolled = Some(cfg.clone());
+    }
 
     let shutdown = CancellationToken::new();
     // `AutoNotify` rather than `Manual`: there is no operator watching a window
@@ -856,6 +944,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // across iterations rather than restarted.
     let signalled = tokio::signal::ctrl_c();
     tokio::pin!(signalled);
+    // **SIGTERM too, and the hatch armed with it.** A CI job stops this with a
+    // plain `kill`, and on the enrolment path the way out is what returns the
+    // slot. Registering takes SIGTERM's default disposition away for the rest
+    // of the process, so the hatch has to cover it from that moment or a second
+    // `kill` during a blocked close is swallowed.
+    let terminate = terminate_signal();
+    tokio::pin!(terminate);
+    #[cfg(unix)]
+    portal_core::shutdown::hard_exit_on_terminate();
     // Only an interrupt arms the hatch: the loop also ends when the signaling
     // stream breaks, and turning a user's *first* press into a hard exit there
     // would skip withdrawing the Peer Listener — the one thing the comment
@@ -864,6 +961,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = &mut signalled => { interrupted = true; break }
+            _ = &mut terminate => { interrupted = true; break }
             event = events.recv() => match event {
                 Ok(event) => tracing::info!("signaling: {event:?}"),
                 // Lagged only loses log lines; the session is unaffected.

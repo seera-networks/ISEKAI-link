@@ -252,64 +252,6 @@ struct Args {
 /// The audience the **proxy** checks a binding assertion against (§8.13.4).
 const PROXY_AUDIENCE: &str = "isekai-proxy";
 
-/// Where the Enrollment Key is looked for when `--enroll` is given.
-const ENROLLMENT_KEY_VAR: &str = "ISEKAI_ENROLLMENT_KEY";
-/// Where the Provisioning Key is looked for.
-const PROVISIONING_KEY_VAR: &str = "ISEKAI_PROVISIONING_KEY";
-
-/// A secret from a file, or from the environment variable that carries it.
-///
-/// **There is deliberately no flag that takes the value itself.** On Linux any
-/// process running as the same user can read `/proc/<pid>/cmdline`, and a CI
-/// runner is a machine that runs other people's code; `set -x`, a failed step's
-/// log and a stray `ps` all print an argument list too. `--auth0-token` has the
-/// same shape and predates this, but it is for a person at a terminal and
-/// `--login` is the answer there — an unattended path has no such excuse.
-fn secret_from(file: Option<&Path>, var: &str) -> anyhow::Result<Option<String>> {
-    if let Some(path) = file {
-        let value = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read the key at {}", path.display()))?;
-        let value = value.trim();
-        if value.is_empty() {
-            anyhow::bail!("{} is empty", path.display());
-        }
-        return Ok(Some(value.to_owned()));
-    }
-    // **Trimmed like the file, and for the same reason.** A secret written with
-    // `echo "K=$(cat f)" >> $GITHUB_ENV`, or pasted, carries a trailing
-    // newline; sending it makes Identity hash a different string and answer
-    // `403 enrollment-key-invalid`, which says nothing about whitespace.
-    //
-    // An empty variable is the same as an unset one: that is what a workflow
-    // referencing a secret nobody configured actually produces.
-    Ok(std::env::var(var)
-        .ok()
-        .map(|v| v.trim().to_owned())
-        .filter(|v| !v.is_empty()))
-}
-
-/// Where a bound key's workload identity tokens come from.
-///
-/// Both servers want one, for **different audiences**, so this is a source
-/// rather than a value — see `isekai_p2p::oidc`.
-fn assertions(args: &Args) -> anyhow::Result<Option<Arc<dyn isekai_p2p::AssertionSource>>> {
-    match args.oidc.as_str() {
-        "none" => Ok(None),
-        "github" => Ok(Some(Arc::new(
-            isekai_p2p::oidc::GithubActionsOidc::from_env()?,
-        ))),
-        "files" => {
-            let pairs = args
-                .oidc_token_file
-                .iter()
-                .map(|arg| isekai_p2p::oidc::TokenFiles::parse_pair(arg))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok(Some(Arc::new(isekai_p2p::oidc::TokenFiles::new(pairs))))
-        }
-        other => anyhow::bail!("--oidc takes `github`, `files` or `none`, not `{other}`"),
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // **stderr, and `info` unless `RUST_LOG` says otherwise.**
@@ -365,35 +307,9 @@ async fn main() -> anyhow::Result<()> {
     // starts is exactly the one whose slot should come back. Doing it on the
     // way out covers all of them, and a new early return cannot forget it.
     if let Some(cfg) = enrolled {
-        release_the_slot(&cfg).await;
+        portal_core::ci::release_the_slot(&cfg).await;
     }
     portal_core::shutdown::leave(code).await
-}
-
-/// Give the enrolment slot back, best effort.
-///
-/// **Never changes the exit code.** The idle sweep is behind this, so failing
-/// costs a slot until then and nothing else; work that otherwise succeeded must
-/// not be reported as failed because the tidying up did not land.
-async fn release_the_slot(cfg: &P2pConfig) {
-    // **Bounded.** This runs after the work is done, so waiting on a silent
-    // Identity only delays a job that has already finished.
-    let released = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        isekai_p2p::config::release_enrollment(cfg),
-    )
-    .await;
-    match released {
-        Ok(Ok(true)) => tracing::info!("returned the enrolment slot"),
-        // **Nothing was taken, so say nothing.** A run that failed before
-        // enrolling has no slot out, and announcing one either way would tell
-        // an operator reading the log that something happened that did not.
-        Ok(Ok(false)) => {}
-        Ok(Err(e)) => {
-            tracing::warn!("could not return the enrolment slot; the idle sweep will: {e:#}")
-        }
-        Err(_) => tracing::warn!("timed out returning the enrolment slot; the idle sweep will"),
-    }
 }
 
 async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()> {
@@ -438,27 +354,26 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     if let (Some(_), Some(_)) = (&args.pair, &args.redeem) {
         anyhow::bail!("--pair and --redeem are two ways in; use one");
     }
-    // **Which credential is this?** Answering "both" is not a thing the
-    // Identity API can do, and picking one silently would leave the operator
-    // with a session standing on something they did not choose.
-    if args.enroll && args.auth0_token.is_some() {
-        anyhow::bail!("--enroll registers with an Enrollment Key; --auth0-token is the other way");
+    portal_core::ci::check_unattended_args(
+        args.enroll,
+        args.auth0_token.is_some(),
+        args.register,
+        &args.oidc,
+        &args.oidc_token_file,
+    )?;
+    // **Before the catalogue and before the network.** A missing key is a fact
+    // about the arguments; reported later it hides behind whatever else fails
+    // first, and the operator fixes the wrong thing.
+    if args.enroll {
+        portal_core::ci::require_key(
+            args.enrollment_key_file.as_deref(),
+            portal_core::ci::ENROLLMENT_KEY_VAR,
+        )?;
     }
-    // §8.1 registration wants Auth0 authentication state, so it is not a choice
-    // the unattended path has — enrolling *is* the registration.
-    if args.enroll && args.register {
-        anyhow::bail!("--enroll already registers this Endpoint; --register is the attended way");
-    }
-    // **Refused rather than dropped**, which is the mistake `--allow` on the
-    // server side exists to avoid: a run that ignored these would mint no
-    // token and fail later against a bound key, naming nothing.
-    if args.oidc != "files" && !args.oidc_token_file.is_empty() {
-        anyhow::bail!("--oidc-token-file describes `--oidc files`, which this run is not using");
-    }
-    if args.oidc == "files" && args.oidc_token_file.is_empty() {
-        anyhow::bail!("--oidc files needs at least one --oidc-token-file `audience=path`");
-    }
-    let provisioning = secret_from(args.provisioning_key_file.as_deref(), PROVISIONING_KEY_VAR)?;
+    let provisioning = portal_core::ci::secret_from(
+        args.provisioning_key_file.as_deref(),
+        portal_core::ci::PROVISIONING_KEY_VAR,
+    )?;
     if provisioning.is_some() && (args.pair.is_some() || args.redeem.is_some()) {
         anyhow::bail!("a Provisioning Key and --pair/--redeem are different ways in; use one");
     }
@@ -543,7 +458,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
             let (owner, held) = redeem_provisioning(
                 &cfg,
                 key,
-                assertions(&args)?,
+                portal_core::ci::assertions(&args.oidc, &args.oidc_token_file)?,
                 args.label.as_deref(),
                 !maps.is_empty(),
                 shutdown.clone(),
@@ -912,7 +827,15 @@ async fn config(
     key: isekai_p2p::agent::EndpointKey,
 ) -> anyhow::Result<P2pConfig> {
     let credential = if args.enroll {
-        enrollment_credential(args)?
+        // The client's own variable: this key carries `peer-connect:initiate`
+        // and the server's carries what a listener needs, so they are two keys
+        // and two variables.
+        portal_core::ci::enrollment_credential(
+            args.enrollment_key_file.as_deref(),
+            portal_core::ci::ENROLLMENT_KEY_VAR,
+            &args.oidc,
+            &args.oidc_token_file,
+        )?
     } else {
         let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
         // **The whole point of the source.** The Endpoint Token renewal runs
@@ -1156,28 +1079,6 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
         }
         other => println!("bound to    : {other}"),
     }
-}
-
-/// The unattended credential, with whatever its binding needs attached.
-///
-/// **No sign-in happens on this path.** That is the point of `--enroll`: §4.3
-/// registration wants Auth0 authentication state and a job has none, so the key
-/// stands in for it — under a binding, a slot count and a finite life.
-fn enrollment_credential(args: &Args) -> anyhow::Result<isekai_p2p::Credential> {
-    let key = secret_from(args.enrollment_key_file.as_deref(), ENROLLMENT_KEY_VAR)?.with_context(
-        || {
-            format!(
-                "--enroll needs an Enrollment Key in {ENROLLMENT_KEY_VAR} or \
-                 --enrollment-key-file. It is not an argument on purpose: an argument list is \
-                 readable by anything running as this user"
-            )
-        },
-    )?;
-    let mut enrollment = isekai_p2p::Enrollment::new(key);
-    if let Some(source) = assertions(args)? {
-        enrollment = enrollment.with_assertions(source);
-    }
-    Ok(enrollment.into())
 }
 
 /// Parse `port:name` or `udp:port:name` into what to bind and what to ask for.
