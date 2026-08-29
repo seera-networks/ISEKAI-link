@@ -194,6 +194,59 @@ struct Args {
     /// different tokens
     #[argh(option)]
     oidc_token_file: Vec<String>,
+    /// issue an ENROLLMENT KEY and print it once, then exit. This is what lets
+    /// a job register an Endpoint of its own. Needs a sign-in: you are
+    /// delegating what you can already do
+    #[argh(switch)]
+    issue_enrollment_key: bool,
+    /// which protocols the derived Endpoints may use. Defaults to --protocol.
+    /// Cannot exceed what you have yourself
+    #[argh(option)]
+    enrollment_protocols: Vec<String>,
+    /// which permissions the derived Endpoints get. Defaults to
+    /// `peer-connect:initiate` alone, which is all a job needs -- see the
+    /// --issue-enrollment-key note
+    #[argh(option)]
+    permissions: Vec<String>,
+    /// how long the key stays usable, in seconds. Clamped to 60..=2592000
+    /// (30 days), default 604800. There is no unlimited
+    #[argh(option)]
+    enrollment_ttl: Option<i64>,
+    /// how many derived Endpoints may be alive at once. Clamped to 1..=32,
+    /// default 4. Match it to how many jobs run in parallel
+    #[argh(option)]
+    max_live_endpoints: Option<i64>,
+    /// how long a derived Endpoint may go unused before it is retired, in
+    /// seconds. Clamped to 900..=604800, default 3600. It is the insurance for
+    /// a job that could not return its own slot, so shorter is safer
+    #[argh(option)]
+    endpoint_idle_ttl: Option<i64>,
+    /// bind the key to a workload identity issuer, so the key alone will not
+    /// register anything. Needs --binding-subject. REQUIRED unless you pass
+    /// --binding-none
+    #[argh(option)]
+    binding_oidc: Option<String>,
+    /// the exact `sub` the bound workload must present. No wildcards
+    #[argh(option)]
+    binding_subject: Option<String>,
+    /// issue a key that anything holding it can use. Only for a machine whose
+    /// secret store is yours -- never for a public repository
+    #[argh(switch)]
+    binding_none: bool,
+    /// what the key is for. Shown only to you. 128 bytes at most
+    #[argh(option)]
+    enrollment_label: Option<String>,
+    /// print the enrollment keys you have issued, and exit
+    #[argh(switch)]
+    enrollment_keys: bool,
+    /// print which Endpoints came in on a key and how each ended, by the id
+    /// --enrollment-keys prints, and exit
+    #[argh(option)]
+    enrollment_key_enrollments: Option<String>,
+    /// stop an enrollment key, by the id --enrollment-keys prints. An
+    /// `ephemeral` key takes its derived Endpoints with it
+    #[argh(option)]
+    revoke_enrollment_key: Option<String>,
 }
 
 /// The audience the **proxy** checks a binding assertion against (§8.13.4).
@@ -341,6 +394,17 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // do with it. `portal-server` orders these the same way.
     if args.login {
         return portal_core::login::sign_in(&tokens).await;
+    }
+
+    // **Before the key**, because none of these need an Endpoint of this
+    // client's own: issuing a key is route A, and §8.8.2 asks for no PoP
+    // precisely because the caller is a person.
+    if args.issue_enrollment_key
+        || args.enrollment_keys
+        || args.enrollment_key_enrollments.is_some()
+        || args.revoke_enrollment_key.is_some()
+    {
+        return enrollment_admin(&args, &tokens).await;
     }
 
     // **Said out loud, because a generated key looks exactly like a loaded one
@@ -830,6 +894,232 @@ async fn config(
         token_ttl: None,
         key,
     })
+}
+
+/// Answer the Enrollment Key commands, which need no key of this Endpoint's own.
+///
+/// **Route A, with no PoP.** The caller is a person rather than an Endpoint, so
+/// there is no Endpoint private key to bind the request to (§8.8.2) — which is
+/// also why `--login` is the whole of what these need.
+async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
+    // **Settled on the arguments, before anything authenticates.** A missing or
+    // half-given binding is a typo, and a sign-in tells the operator nothing
+    // they did not already know. `portal-server` does the same with its own
+    // binding flags, and `portal-client` with a ticket's authority.
+    let request = args
+        .issue_enrollment_key
+        .then(|| enrollment_request(args))
+        .transpose()?;
+    let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
+    let identity = isekai_p2p::enrollment::Identity::new(&args.identity_url, args.identity_http3);
+    let token = &auth.token;
+
+    if let Some(key_id) = &args.revoke_enrollment_key {
+        let revoked = isekai_p2p::enrollment::revoke(&identity, token, key_id)
+            .await
+            .with_context(|| format!("revoke enrollment key {key_id}"))?;
+        println!("revoked     : {}", revoked.key_id);
+        // **The two lists are the answer, not decoration.** An `ephemeral` key
+        // takes its Endpoints down; one that is not leaves them running,
+        // because an Endpoint revocation cannot be undone and one key
+        // registers one Endpoint — retiring a long-lived runner's Endpoint
+        // means it cannot come back until somebody makes it a new keypair.
+        if let Some(effects) = &revoked.effects {
+            for id in &effects.revoked_endpoints {
+                println!("  retired   : {id}");
+            }
+            for id in &effects.remaining_endpoints {
+                println!("  still up  : {id}  (revoke it yourself if you meant to)");
+            }
+        }
+        println!("No new Endpoints can be registered with it, and no derived Endpoint");
+        println!("can renew its token. The record of who came in stays.");
+    }
+
+    if let Some(request) = &request {
+        let issued = isekai_p2p::enrollment::issue(&identity, token, request)
+            .await
+            .context("issue an enrollment key")?;
+        // The secret first: everything else in the response is optional, and a
+        // missing `created_at` must not cost the operator the one string they
+        // came for.
+        println!("\nPut this in the job's secret store as ISEKAI_ENROLLMENT_KEY:\n");
+        println!("  {}", issued.key);
+        println!();
+        match &issued.key_id {
+            Some(id) => println!("key id      : {id}  (--revoke-enrollment-key takes this)"),
+            None => println!("key id      : not reported -- --enrollment-keys will list it"),
+        }
+        if let Some(at) = &issued.expires_at {
+            println!("expires at  : {at}");
+        }
+        if !issued.permissions.is_empty() {
+            println!("permissions : {}", issued.permissions.join(", "));
+        }
+        if !issued.protocols.is_empty() {
+            println!("protocols   : {}", issued.protocols.join(", "));
+        }
+        if let Some(slots) = issued.max_live_endpoints {
+            println!("slots       : {slots} Endpoints alive at once");
+        }
+        print_enrollment_binding(issued.binding.as_ref());
+        // **Not authorization, and said so.** §8.8.2 is explicit that issuing
+        // succeeds with these present; they name the §8.8.10 mismatches that
+        // otherwise surface in CI days later.
+        for warning in &issued.warnings {
+            println!("warning     : {warning}");
+        }
+        println!("\nThe job also needs a Provisioning Key from the server side --");
+        println!("portal-server --provisioning-key. They are different objects issued");
+        println!("by different servers, and revoked at different ones.");
+    }
+
+    if args.enrollment_keys {
+        let keys = isekai_p2p::enrollment::list(&identity, token)
+            .await
+            .context("list enrollment keys")?;
+        if keys.is_empty() {
+            println!("No enrollment keys issued.");
+        }
+        for key in &keys {
+            let label = key
+                .label
+                .as_deref()
+                .map(|l| format!(", {l}"))
+                .unwrap_or_default();
+            let slots = match (key.live_endpoints, key.max_live_endpoints) {
+                (Some(live), Some(max)) => format!("{live}/{max} slots"),
+                (Some(live), None) => format!("{live} live"),
+                _ => "slots unknown".to_owned(),
+            };
+            // Which of these is a bare bearer credential is the question worth
+            // answering here, the same as on the server's side.
+            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
+                Some("oidc") => "oidc".to_owned(),
+                Some("none") | Some("") | None => "UNBOUND".to_owned(),
+                Some(other) => other.to_owned(),
+            };
+            println!(
+                "key         : {}  {bound}, {slots}, {}{label}",
+                key.key_id,
+                key.status.as_deref().unwrap_or("?"),
+            );
+        }
+    }
+
+    if let Some(key_id) = &args.enrollment_key_enrollments {
+        let rows = isekai_p2p::enrollment::enrollments(&identity, token, key_id)
+            .await
+            .with_context(|| format!("list enrollments of {key_id}"))?;
+        if rows.is_empty() {
+            println!("Nothing has registered with {key_id}.");
+        }
+        for row in &rows {
+            let subject = row
+                .binding_subject
+                .as_deref()
+                .map(|s| format!("  as {s}"))
+                .unwrap_or_default();
+            // **`enrollment_released` against `enrollment_idle` is the axis
+            // worth watching.** The first means the job tidied up after itself;
+            // the second means nothing did and the sweep got there, which is a
+            // CI problem rather than a capacity one.
+            let ended = match (row.status.as_deref(), row.revoke_reason.as_deref()) {
+                (_, Some(reason)) => format!("  ended {reason}"),
+                (Some(status), None) => format!("  {status}"),
+                _ => String::new(),
+            };
+            println!("registered  : {}{subject}{ended}", row.endpoint_id);
+        }
+    }
+    Ok(())
+}
+
+/// What to ask for when issuing, refused before anything authenticates.
+///
+/// **`binding` cannot be omitted**, and this insists on the same thing §8.8.2
+/// does: every other knob fails closed, so letting the shortest request be the
+/// most dangerous one would be backwards. `--binding-none` is how somebody says
+/// they meant it.
+fn enrollment_request(args: &Args) -> anyhow::Result<isekai_p2p::agent::NewEnrollmentKey> {
+    // **The contradiction is matched first.** Reaching the half-given arms with
+    // `--binding-none` also set answers a narrower question than the one the
+    // operator got wrong.
+    if args.binding_none && (args.binding_oidc.is_some() || args.binding_subject.is_some()) {
+        anyhow::bail!("--binding-none and --binding-oidc are two answers; give one");
+    }
+    let binding = match (&args.binding_oidc, &args.binding_subject, args.binding_none) {
+        (Some(issuer), Some(subject), false) => isekai_p2p::agent::Binding::Oidc {
+            issuer: issuer.clone(),
+            subject: subject.clone(),
+        },
+        (None, None, true) => isekai_p2p::agent::Binding::None,
+        (None, None, false) => anyhow::bail!(
+            "--issue-enrollment-key needs a binding: --binding-oidc with --binding-subject, \
+             or --binding-none to say the key alone is enough. Omitting it would make the \
+             shortest command the most dangerous one"
+        ),
+        (Some(_), None, _) => anyhow::bail!(
+            "--binding-oidc needs --binding-subject: an issuer without a subject would let any \
+             workload that issuer knows about register"
+        ),
+        (None, Some(_), _) => anyhow::bail!(
+            "--binding-subject needs --binding-oidc, which says who vouches for that subject"
+        ),
+        // Unreachable: the contradiction is refused above.
+        (_, _, true) => unreachable!("--binding-none with a binding is refused above"),
+    };
+    let mut request = isekai_p2p::agent::NewEnrollmentKey::new(binding);
+    // **Narrow by default, and this is the one place it matters.** The server
+    // burns the *ceiling* into the key when `permissions` is omitted, and the
+    // ceiling is the deployment's `DEFAULT_PERMISSIONS` — so in a deployment
+    // that enabled `peer-provisioning:create` for its portal server, an omitted
+    // list would hand every CI Endpoint the power to mint Provisioning Keys of
+    // its own. A job needs `peer-connect:initiate` and nothing else.
+    request.permissions = Some(if args.permissions.is_empty() {
+        vec!["peer-connect:initiate".to_owned()]
+    } else {
+        args.permissions.clone()
+    });
+    request.protocols = Some(if args.enrollment_protocols.is_empty() {
+        vec![args.protocol.clone()]
+    } else {
+        args.enrollment_protocols.clone()
+    });
+    request.ttl = args.enrollment_ttl;
+    request.max_live_endpoints = args.max_live_endpoints;
+    request.endpoint_idle_ttl = args.endpoint_idle_ttl;
+    request.label = args.enrollment_label.clone();
+    Ok(request)
+}
+
+/// Show a key's binding, including the audience the job has to mint for.
+fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
+    let Some(binding) = binding else {
+        println!("bound to    : not reported -- check with --enrollment-keys");
+        return;
+    };
+    match binding.kind.as_str() {
+        "oidc" => {
+            println!(
+                "bound to    : {} / {}",
+                binding.issuer.as_deref().unwrap_or("?"),
+                binding.subject.as_deref().unwrap_or("?"),
+            );
+            // **The value the job cannot guess and nobody can set.** Identity
+            // takes it from its own configuration, and it is deliberately not
+            // the proxy's — a token minted for one is refused by the other.
+            match binding.audience.as_deref() {
+                Some(audience) => println!("audience    : {audience}  (the job mints for this)"),
+                None => println!("audience    : not reported -- ask the Identity operator"),
+            }
+        }
+        "none" | "" => {
+            println!("bound to    : nothing -- the key alone can register Endpoints.");
+            println!("              Never do this for a public repository's CI.");
+        }
+        other => println!("bound to    : {other}"),
+    }
 }
 
 /// The unattended credential, with whatever its binding needs attached.

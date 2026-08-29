@@ -789,7 +789,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 - `--revoke-provisioning-key` の出力が、派生 Grant も消えること・走行中のジョブが
   落ちることを言う。`--revoke-ticket` の出力と読み比べて矛盾しない。
 
-### フェーズ 5 — `portal-client` の CI 経路
+### フェーズ 5 — `portal-client` の CI 経路 — **完了**
 
 §2.5 と §2.4（`keep_the_grant`）。
 
@@ -1547,3 +1547,67 @@ bearer か」は、この PR 自身の言い分では**最も安全に関わる�
 
 フェーズ 5（`portal-client` の CI 経路と `keep_the_grant`）。§9.5 のとおり
 `--issue-enrollment-key` は `--permissions` を既定で `peer-connect:initiate` に絞る。
+
+---
+
+## 14. フェーズ 5 の結果
+
+`portal-client` に CI 経路と、鍵を発行する側のコマンド。`portal-core::grant` に
+Grant の維持。ワークスペースはビルドでき、触ったクレートのテスト・`fmt` ・
+`clippy -D warnings` はクリーン。
+
+### 14.1 入ったもの
+
+| フラグ | 何をするか |
+| --- | --- |
+| `--enroll` | Enrollment Key で登録する。鍵は env かファイルから |
+| `--enrollment-key-file` / `--provisioning-key-file` | 既定は `ISEKAI_ENROLLMENT_KEY` / `ISEKAI_PROVISIONING_KEY` |
+| `--oidc github\|files\|none` / `--oidc-token-file <aud>=<path>` | assertion の出どころ |
+| `--issue-enrollment-key` ほか 3 つ | 鍵の発行・一覧・登録記録・失効（系統 A、PoP 無し） |
+
+`isekai-p2p::enrollment` を足した。`issue_endpoint_token` と同じ理由で、
+**transport の選択をここに閉じる**（Identity は同じポートで h1/h2 と h3 を出す）。
+
+### 14.2 実際に走らせて確かめたこと
+
+フェーズ 4 で `cargo run` を使えばよいと分かったので、今回は**最初から走らせた**。
+
+**モックの Identity に対して端から端まで通した。** 出たのは 3 本の要求で、
+順に `enroll/challenge`（`Authorization` 無し・ボディに鍵）、`enroll`（同じ）、
+そして **`revoke`（PoP あり・`Authorization` 無し）**。3 本目が出たのは
+**接続に失敗した run** である — フェーズ 1 のレビューが「最も枠を返してほしいのは
+転送が始まる前に落ちた run だ」と言った、まさにその経路が動いている。
+
+引数のガードも 5 つとも実際に叩いて確認した。
+
+### 14.3 同じ間違いを 2 度した
+
+**binding の検証を、また認証の後ろに置いていた。** フェーズ 4 のレビューで
+`portal-server` について直したのとまったく同じ形を、`portal-client` で繰り返した。
+`--issue-enrollment-key` に binding を付け忘れると、sign-in を要求されてから
+「binding が要る」と言われる。走らせたので気づいたが、**走らせなければ
+また指摘されるまで残っていた。**
+
+直したうえで、`--binding-none` と `--binding-oidc` の同時指定が
+「`--binding-subject` が要る」という**より狭い質問**に答えていたのも直した。
+
+### 14.4 決めたこと
+
+- **秘密を取るフラグは無い。** env かファイルのみ。`--auth0-token` は同じ形だが
+  人が端末で使うもので `--login` という答えがある。無人経路にその言い訳は無い。
+- **`--permissions` の既定は `peer-connect:initiate` 1 つだけ。** §9.5 のとおり、
+  省略するとサーバが**天井を焼き付ける** — `peer-provisioning:create` を有効にした
+  配備では、CI の Endpoint が自分で Provisioning Key を発行できてしまう。
+- **枠を返すのは `main` から。** `run` は Endpoint ができたあと複数の経路で抜ける。
+  `run` の戻り値に関わらず 1 回打ち、3 秒で打ち切り、終了コードは変えない。
+- **SIGTERM をハッチにも足した。** 捕まえた以上、閉じ込み中の 2 度目の `kill` が
+  飲み込まれる — 2 度目の Ctrl+C について既に分かっていたのと同じ話である。
+  `hard_exit` は 128 + シグナル番号を返すようにした。
+- **Identity 側の `binding` も型にした。** フェーズ 4 で Proxy 側に作った
+  `BindingView` を共有する。仕様が同じ形を定めているので、2 つ持つ理由が無い。
+
+### 14.5 次
+
+フェーズ 6（ワークフローと `docs/portal.md`）。`portal-server` の
+`--provisioning-key` の出力にある「この build では引き換えられない」の但し書きを
+**消せるようになった**ので、それも含める。

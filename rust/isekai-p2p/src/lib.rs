@@ -20,6 +20,8 @@
 pub mod auth;
 pub mod auth0;
 pub mod config;
+/// Managing Enrollment Keys from the owner's side (§8.8.2 / §8.8.9).
+pub mod enrollment;
 pub mod initiator;
 pub mod listener;
 /// Where an unattended job's workload identity assertion comes from.

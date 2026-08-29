@@ -436,7 +436,7 @@ pub struct IssuedEnrollmentKey {
     #[serde(default)]
     pub max_live_endpoints: Option<i64>,
     #[serde(default)]
-    pub binding: Option<Value>,
+    pub binding: Option<crate::proxy::BindingView>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -472,7 +472,7 @@ pub struct EnrollmentKeyRecord {
     #[serde(default)]
     pub ephemeral: Option<bool>,
     #[serde(default)]
-    pub binding: Option<Value>,
+    pub binding: Option<crate::proxy::BindingView>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
