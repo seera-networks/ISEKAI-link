@@ -2021,3 +2021,44 @@ CI 経路が動くには、残るのはこの 1 つだけになった。
 **確認のために Endpoint を 1 つ登録した**（`device_name: phase6-check`、
 `ep:243119b51e99d90b7c241201251e145ebfed7838d46e13e932c4c501dc38b3b9`）。権限を読むためだけのもので、要らなければ
 `POST /v1/endpoints/{id}/revoke` で失効させてよい。
+
+---
+
+## 17. 初回の実走で分かったこと
+
+マージ後、`ci-enrolment` が初めて `main` で走った。**server 側は通り**（登録・listener・
+Provisioning Key の発行）、client の引き換えが `403 provisioning-key-invalid` で落ちた。
+
+### 17.1 原因はレビュー修正のほうだった
+
+§15.10-2 で「鍵を発行する run も枠を使うのに返していない」を直した。**その修正が
+壊した。**
+
+CI では `portal-server --enroll --provisioning-key` が、**すでに serving している
+`portal-server` と同じ鍵ペア**で走る。2 つ目のプロセスは登録を試み、`409` を受け、
+更新へ落ちる — ここまでは意図どおり。ところが終了時に枠を返すので、**1 つ目が
+serving している Endpoint を失効させていた。** §8.13.6 は「owner の Endpoint が
+失効している」を一様な `403 provisioning-key-invalid` に畳むので、client には
+「鍵が無効」としか見えない。
+
+### 17.2 セルが覚えていることが足りなかった
+
+`OnceCell` は「どの Endpoint か」しか持たず、**「この run が登録したのか、既に
+あったのか」を区別できなかった**。枠を返すべきなのは**取った側**だけである。
+
+```rust
+struct Registered { endpoint_id: String, by_us: bool }
+```
+
+`409` の枝は `by_us: false` を書き、`release_enrollment` はそこで何もしない。
+**フェーズ 5 のレビューが `409` を「このセルにとって成功」と扱わせたのは正しかったが、
+成功の中身が 2 種類あることまでは見えていなかった。**
+
+### 17.3 これも走らせて分かった
+
+モックのテストでは出ない。**同じ鍵ペアに対する 2 つのプロセスが、片方は serving 中**
+という状況が要るからで、それは CI の形そのものである。テストは後から書いた
+（`a_run_that_only_found_the_endpoint_does_not_own_its_slot`）。
+
+フェーズ 4・5・6 に続いて 4 度目の「走らせて初めて分かった」であり、しかも今回は
+**レビューを受けて入れた修正が原因**だった。指摘は正しく、修正の粒度が粗かった。

@@ -109,7 +109,11 @@ pub async fn release_enrollment(cfg: &P2pConfig) -> anyhow::Result<bool> {
     // workload identity to mint from, an unreachable Identity — has no slot and
     // no Endpoint. Revoking anyway spends a round trip to be told so, and warns
     // the operator that a slot leaked when none was ever spent.
-    if enrollment.endpoint_id().is_none() {
+    // **Only the run that registered owes the slot.** A process that found the
+    // Endpoint already there spent nothing, and revoking on its way out would
+    // destroy an Endpoint another process is still serving on — which is what a
+    // key-issuing invocation beside a running server does.
+    if !enrollment.registered_here() {
         return Ok(false);
     }
     let auth = RevokeAuth::Enrollment {
@@ -215,7 +219,10 @@ async fn unattended<T: ControlPlaneTransport>(
                     // already bound the id to the public key, so the echo adds
                     // nothing and would make the guard depend on the server
                     // agreeing about a value we derived.
-                    Ok(cfg.key.endpoint_id())
+                    Ok(crate::auth::Registered {
+                        endpoint_id: cfg.key.endpoint_id(),
+                        by_us: true,
+                    })
                 }
                 // **`409` means it is already there, which is a success for
                 // this cell's purpose.** The enrolment can reach the server and
@@ -229,7 +236,13 @@ async fn unattended<T: ControlPlaneTransport>(
                     tracing::info!(
                         "this Endpoint is already enrolled; renewing instead of registering",
                     );
-                    Ok(cfg.key.endpoint_id())
+                    Ok(crate::auth::Registered {
+                        endpoint_id: cfg.key.endpoint_id(),
+                        // **Not ours.** Somebody else registered this keypair —
+                        // another process, or an earlier run — so the slot is
+                        // not this run's to give back.
+                        by_us: false,
+                    })
                 }
                 Err(e) => Err(e),
             }
@@ -243,9 +256,11 @@ async fn unattended<T: ControlPlaneTransport>(
     // renew an Endpoint that was never registered. Each keypair needs its own
     // `Credential`, and saying so here beats a `403` from §8.2.3 that names
     // nothing.
-    if enrolled_id != &cfg.key.endpoint_id() {
+    if enrolled_id.endpoint_id != cfg.key.endpoint_id() {
         anyhow::bail!(
-            "this Enrollment Key credential already enrolled {enrolled_id}, but this config              carries {}. One key registers one Endpoint per keypair — give each keypair its              own Credential.",
+            "this Enrollment Key credential already enrolled {}, but this config carries {}. \
+             One key registers one Endpoint per keypair — give each keypair its own Credential.",
+            enrolled_id.endpoint_id,
             cfg.key.endpoint_id(),
         );
     }

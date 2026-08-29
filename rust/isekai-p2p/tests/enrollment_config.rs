@@ -408,3 +408,85 @@ async fn a_credential_will_not_stand_in_for_a_second_keypair() {
         "and it must not have gone on to renew",
     );
 }
+
+/// A run that found the Endpoint already registered does not own the slot.
+///
+/// **This is what a second invocation beside a running one looks like.** The
+/// CI job runs `portal-server --enroll --provisioning-key` while a
+/// `portal-server` is already serving on the same keypair: the second process
+/// enrols, takes `409`, and renews. If it then returned the slot on its way
+/// out it would revoke the Endpoint the first one is serving on — and the next
+/// redemption answers `403 provisioning-key-invalid`, because §8.13.6 counts
+/// "the owner's Endpoint is revoked" among the uniform refusals.
+///
+/// Which is exactly what happened the first time this ran for real.
+#[tokio::test]
+async fn a_run_that_only_found_the_endpoint_does_not_own_its_slot() {
+    let hits = Hits::default();
+    let app = Router::new()
+        .route(
+            "/v1/endpoints/enroll/challenge",
+            post(|| async { challenge_response() }),
+        )
+        .route(
+            "/v1/endpoints/enroll",
+            post(
+                |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
+                    record(&s, "enroll", b).await;
+                    (
+                        axum::http::StatusCode::CONFLICT,
+                        Json(json!({ "type": "endpoint-already-registered" })),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1/tokens/endpoint/refresh/challenge",
+            post(|| async { challenge_response() }),
+        )
+        .route(
+            "/v1/tokens/endpoint/refresh",
+            post(|| async {
+                Json(json!({
+                    "endpoint_token": "T",
+                    "token_type": "Bearer",
+                    "expires_in": 900,
+                    "endpoint_id": "ep:abc",
+                }))
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let credential = Credential::enrollment("enr1_SECRET");
+    let cfg = config(format!("http://{addr}"), credential.clone());
+    issue_endpoint_token(&cfg).await.expect("renews via 409");
+
+    let Credential::Enrollment(enrollment) = &credential else {
+        unreachable!("built as an enrolment credential");
+    };
+    // It knows which Endpoint it is on …
+    assert!(enrollment.endpoint_id().is_some());
+    // … and that it is not the one that took the slot.
+    assert!(
+        !enrollment.registered_here(),
+        "a 409 means somebody else registered; revoking here would take their Endpoint down",
+    );
+}
+
+/// And the run that did register does own it.
+#[tokio::test]
+async fn a_run_that_registered_owns_its_slot() {
+    let hits = Hits::default();
+    let url = serve(hits).await;
+    let credential = Credential::enrollment("enr1_SECRET");
+    let cfg = config(url, credential.clone());
+    issue_endpoint_token(&cfg).await.expect("enrol");
+
+    let Credential::Enrollment(enrollment) = &credential else {
+        unreachable!("built as an enrolment credential");
+    };
+    assert!(enrollment.registered_here());
+}
