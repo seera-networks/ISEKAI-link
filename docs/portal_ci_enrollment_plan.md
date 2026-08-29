@@ -1680,8 +1680,10 @@ proxy と identity がデプロイ済みとのことなので、**変更を伴�
 
 | # | 項目 | 結果 |
 | --- | --- | :---: |
-| 1 | `ENROLLMENT_KEYS_ENABLED` | ❌ **立っていない** |
+| 1 | `ENROLLMENT_KEYS_ENABLED` | ✅ **有効化された**（下記） |
 | 3 | Proxy の §8.13 の経路 | ✅ 生きている（h3 で `401`） |
+
+最初に見たとき、Identity 側は**無効だった**。
 
 ```text
 POST /v1/endpoints/enroll/challenge   → 404
@@ -1690,13 +1692,20 @@ POST /v1/endpoints/register/challenge → 401   ← 比較用。経路はある
 POST /v1/peer/provisioning-keys       → 401   ← h3。経路はある
 ```
 
-**404 と 401 の差がそのまま答えである。** 既存の登録経路は認証を要求して `401` を
-返すのに、§8.8 の 2 つは `404` — つまり router にマウントされていない。
-仕様どおり「要ると言った配備にだけ開く」ままになっている。
+**404 と 401 の差がそのまま答えだった。** 既存の登録経路は認証を要求して `401` を
+返すのに、§8.8 の 2 つは `404` — router にマウントされていない。仕様どおり
+「要ると言った配備にだけ開く」ままだったということで、実装の問題ではない。
 
-**したがって、いまの配備では CI 経路は端から端まで動かない。** Identity 側で
-`ENROLLMENT_KEYS_ENABLED=1` を立てるまで、`--issue-enrollment-key` も `--enroll` も
-`404` を受ける。実装の問題ではなく、運用者が明示的に開く決定をしていないだけである。
+**その後 `ENROLLMENT_KEYS_ENABLED=1` が立てられ、経路が現れた。**
+
+```text
+POST /v1/endpoints/enroll/challenge   → 400   ← 空のボディが検証まで届いている
+POST /v1/enrollment-keys              → 401   ← Auth0 を要求している
+```
+
+`400` と `401` の違いも意味を持つ。前者は `Authorization` を持たない第 3 の資格の
+経路で、ボディの検証まで進んでいる（§8.8.4）。後者は系統 A なので認証で止まる。
+**どちらも「マウントされている」ことを別々に言っている。**
 
 残る 2 点（`ENROLLMENT_OIDC_ISSUERS` の中身、`--p2p-provisioning-oidc-issuer` の有無）は
 **鍵を発行しないと分からない**。発行はクォータ 4 を 1 消費し、本物の資格情報を作るので、
@@ -1727,8 +1736,8 @@ POST /v1/peer/provisioning-keys       → 401   ← h3。経路はある
 
 ### 15.4 残っていること
 
-**実地の確認はできていない。** §15.1 のとおり Identity 側の機能が無効なので、
-CI ジョブは書けたが走っていない。有効化されたら、次の順で確かめるのがよい。
+**実地の確認はできていない。** 経路は開いたが、鍵をまだ 1 本も発行していない
+（クォータと本物の資格情報を作るため）。次の順で確かめるのがよい。
 
 1. `portal-client --issue-enrollment-key`（`404` でなく鍵が返ること）
 2. `portal-server --provisioning-key`（`peer-provisioning:create` が天井にあること）
