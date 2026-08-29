@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::https::HttpsTransport;
-use isekai_p2p_core::identity::{EndpointToken, IdentityAuth, IdentityClient};
+use isekai_p2p_core::identity::{EndpointToken, IdentityAuth, IdentityClient, RevokeAuth};
 use isekai_p2p_core::proxy::{ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
@@ -84,6 +84,36 @@ pub async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<EndpointTok
         let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
         issue(&client, cfg).await
     }
+}
+
+/// Give an unattended Endpoint's slot back (§8.7 with an Enrollment Key).
+///
+/// **Only meaningful on [`Credential::Enrollment`]**, and an error on anything
+/// else: an attended Endpoint is a device's identity, not something a process
+/// exiting should retire.
+///
+/// The request carries the key and a PoP and nothing else. No `binding`
+/// evidence — that answers "who may *get* something with this key", and this
+/// gets nothing, so the job that died badly enough to be unable to mint an OIDC
+/// token is exactly the one whose slot should come back. No reason either:
+/// Identity writes `enrollment_released`, which is what keeps "the job tidied
+/// up" tellable apart from "the sweep did".
+pub async fn release_enrollment(cfg: &P2pConfig) -> anyhow::Result<()> {
+    let Credential::Enrollment(enrollment) = &cfg.credential else {
+        anyhow::bail!("only an Endpoint enrolled with a key can return its own slot");
+    };
+    let auth = RevokeAuth::Enrollment {
+        key: &enrollment.key,
+        endpoint: &cfg.key,
+    };
+    if cfg.identity_http3 {
+        let client = IdentityClient::new(MasqueH3Transport::connect(&cfg.identity_url)?);
+        client.revoke_endpoint(auth, None).await?;
+    } else {
+        let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
+        client.revoke_endpoint(auth, None).await?;
+    }
+    Ok(())
 }
 
 /// A control-plane client for `cfg`'s proxy, authenticated with `endpoint_token`.

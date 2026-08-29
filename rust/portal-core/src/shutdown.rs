@@ -55,14 +55,25 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// from trapping whoever meets it.
 pub fn hard_exit_on_second_interrupt() {
     // SAFETY: `handler` is the address of an `extern "C"` function with the
-    // signature `signal(2)` requires, and `SIGINT` is a valid signal number.
+    // signature `signal(2)` requires, and both numbers are valid signals.
     unsafe {
         signal(SIGINT, hard_exit as extern "C" fn(i32) as usize);
+        // **SIGTERM as well, on the same reasoning.** `portal-client` now
+        // listens for it, which means it has taken SIGTERM's default
+        // disposition away too — so a second `kill` during a blocked close
+        // would be swallowed exactly as a second Ctrl+C was. A CI job with
+        // `kill -TERM` in its teardown is the ordinary way this is stopped.
+        #[cfg(unix)]
+        signal(SIGTERM, hard_exit as extern "C" fn(i32) as usize);
     }
 }
 
 /// SIGINT's number on every platform this builds for.
 const SIGINT: i32 = 2;
+
+/// SIGTERM's number on the Unix platforms this builds for. Windows has none.
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
 
 /// **A raw handler, not a spawned task**, and the difference is the case this
 /// exists for. A task needs a free worker to run on; the thing it is meant to
@@ -74,9 +85,10 @@ const SIGINT: i32 = 2;
 /// involved. `_exit` is async-signal-safe, which is the whole of what a handler
 /// is allowed to do — no allocation, no locks, and no message, because printing
 /// one is not.
-extern "C" fn hard_exit(_signal: i32) {
-    // 128 + SIGINT, which is what a shell reports for an interrupted program.
-    unsafe { libc_exit(130) }
+extern "C" fn hard_exit(signal: i32) {
+    // 128 + the signal, which is what a shell reports for a program killed by
+    // one: 130 for an interrupt, 143 for a terminate.
+    unsafe { libc_exit(128 + signal) }
 }
 
 unsafe extern "C" {

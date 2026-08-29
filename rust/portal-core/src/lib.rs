@@ -30,6 +30,8 @@ pub mod client;
 pub mod config;
 pub mod datagram;
 pub mod frame;
+/// Keeping a Provisioning Key's Grant alive while the work runs.
+pub mod grant;
 pub mod login;
 pub mod path;
 pub mod server;

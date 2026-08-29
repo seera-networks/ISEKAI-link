@@ -13,7 +13,8 @@ use anyhow::Context as _;
 use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay, RelayOptions};
 use isekai_p2p_core::observed::ObservedAddressWatch;
 use isekai_p2p_core::proxy::{
-    Candidate, Grant, PeerConnection, ProxyClient, ProxyError, ReachableListener, RedeemedTicket,
+    Candidate, Grant, PeerConnection, ProxyClient, ProxyError, ReachableListener,
+    RedeemedProvisioningKey, RedeemedTicket,
 };
 use isekai_p2p_core::transport::MasqueH3Transport;
 use time::format_description::well_known::Rfc3339;
@@ -352,6 +353,28 @@ impl PeerDirectory {
         label: Option<&str>,
     ) -> anyhow::Result<RedeemedTicket> {
         Ok(self.proxy.redeem_ticket(ticket, label).await?)
+    }
+
+    /// Redeem a Provisioning Key, binding this Endpoint to it (spec §8.13.5).
+    ///
+    /// **Unlike a Ticket, doing this again is the point.** A second redemption
+    /// answers `200` and moves `expires_at` to `max(existing, now + grant_ttl)`,
+    /// never backwards — which is how a job that outlives `grant_ttl` keeps its
+    /// authorization, and why that ceiling is an hour rather than a day.
+    ///
+    /// `assertion` is required when the key was issued with an `oidc` binding,
+    /// and has to be **minted for this call** rather than reused: the proxy
+    /// verifies it every time.
+    pub async fn redeem_provisioning_key(
+        &self,
+        key: &str,
+        assertion: Option<&str>,
+        label: Option<&str>,
+    ) -> anyhow::Result<RedeemedProvisioningKey> {
+        Ok(self
+            .proxy
+            .redeem_provisioning_key(key, assertion, label)
+            .await?)
     }
 
     /// Connect to one of these listeners on a grant, over the control-plane
