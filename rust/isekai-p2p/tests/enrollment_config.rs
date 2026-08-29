@@ -490,3 +490,78 @@ async fn a_run_that_registered_owns_its_slot() {
     };
     assert!(enrollment.registered_here());
 }
+
+/// A `409` after our *own* attempt means we spent the slot.
+///
+/// **The case the 409 branch exists for.** An enrolment that reaches the server
+/// and loses its answer leaves the cell empty, so the next call re-enrols and
+/// meets a `409` — this process registered, and owes the slot back. Recording
+/// otherwise would leak it silently until the idle sweep, which is worse than
+/// the bug that made `by_us` necessary in the first place.
+#[tokio::test]
+async fn a_conflict_after_our_own_attempt_still_owns_the_slot() {
+    // First enrol drops the connection after the server has registered; the
+    // second answers `409`, as the real one would.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let seen = attempts.clone();
+    let app = Router::new()
+        .route(
+            "/v1/endpoints/enroll/challenge",
+            post(|| async { challenge_response() }),
+        )
+        .route(
+            "/v1/endpoints/enroll",
+            post(move || {
+                let seen = seen.clone();
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // A shape `Enrolled` cannot read: the registration
+                        // happened, the caller cannot tell.
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(json!({ "unexpected": true })),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::CONFLICT,
+                            Json(json!({ "type": "endpoint-already-registered" })),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/tokens/endpoint/refresh/challenge",
+            post(|| async { challenge_response() }),
+        )
+        .route(
+            "/v1/tokens/endpoint/refresh",
+            post(|| async {
+                Json(json!({
+                    "endpoint_token": "T",
+                    "token_type": "Bearer",
+                    "expires_in": 900,
+                    "endpoint_id": "ep:abc",
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let credential = Credential::enrollment("enr1_SECRET");
+    let cfg = config(format!("http://{addr}"), credential.clone());
+
+    // The first call fails: the response could not be read.
+    assert!(issue_endpoint_token(&cfg).await.is_err());
+    // The second meets the `409` its own predecessor caused, and recovers.
+    issue_endpoint_token(&cfg).await.expect("renews via 409");
+
+    let Credential::Enrollment(enrollment) = &credential else {
+        unreachable!("built as an enrolment credential");
+    };
+    assert!(
+        enrollment.registered_here(),
+        "our own lost enrolment spent the slot; it has to come back",
+    );
+}

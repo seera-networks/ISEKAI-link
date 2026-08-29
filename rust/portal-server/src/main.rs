@@ -314,25 +314,23 @@ struct Args {
 /// Endpoint, and the answer lives on the proxy — a Peer Listener is what a peer
 /// connects *through*, and standing one up to ask would put a second row under
 /// this Endpoint for every client that then looks one up.
-async fn administer_grants(
-    args: &Args,
-    tokens: &std::path::Path,
-    enrolled: &mut Option<P2pConfig>,
-) -> anyhow::Result<()> {
+async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Result<()> {
     // **Settled on the arguments, before anything authenticates.** A half-given
     // binding is a typo, and finding it out after a sign-in and an Identity
     // round trip tells the operator nothing extra. `portal-client` checks a
     // ticket's authority the same way and for the same reason.
     let binding = provisioning_binding(args)?;
     let cfg = config(args, tokens).await?;
-    // **These enrol too.** `grant_admin` issues an Endpoint Token, which on the
-    // unattended path is what registers — so a `--enroll --provisioning-key`
-    // run spends a slot exactly as a serving run does, and owes it back the
-    // same way. Missing this made four such invocations exhaust a four-slot key
-    // until the idle sweep caught up.
-    if args.enroll {
-        *enrolled = Some(cfg.clone());
-    }
+    // **These enrol, and still must not give the slot back.** `grant_admin`
+    // issues an Endpoint Token, which on the unattended path is what registers,
+    // so it does spend a slot. But what these runs make — a Provisioning Key —
+    // **belongs to the Endpoint and outlives the process**: revoking on the way
+    // out makes the key invalid the moment it is handed over, because §8.13.6
+    // counts a revoked owner among the uniform refusals.
+    //
+    // So the slot stays taken, and it is not leaked: it is held by the Endpoint
+    // that owns the key. Retiring it means revoking the key and then the
+    // Endpoint, which is a decision rather than a process exiting.
     grant_admin(args, &cfg, binding.as_ref()).await
 }
 
@@ -882,7 +880,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         );
     }
     if administering {
-        return administer_grants(&args, &tokens, enrolled).await;
+        return administer_grants(&args, &tokens).await;
     }
 
     // Read before anything else touches the network: a typo in the catalogue
