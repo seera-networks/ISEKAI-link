@@ -347,6 +347,31 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // **Before the key**, because none of these need an Endpoint of this
     // client's own: issuing a key is route A, and §8.8.2 asks for no PoP
     // precisely because the caller is a person.
+    // **Before the dispatch below, not after it.** Put after, these never fire
+    // for a run that takes the admin path — `--endpoints --reason device_lost`
+    // dropped `--reason` exactly as a forwarding run did, which is the bug this
+    // guard was written to close, entered from a different flag.
+    if args.reason.is_some() || args.note.is_some() {
+        anyhow::ensure!(
+            args.revoke_endpoint.is_some(),
+            "--reason and --note describe a --revoke-endpoint, and this run has none",
+        );
+    }
+    if let Some(status) = &args.endpoint_status {
+        anyhow::ensure!(
+            args.endpoints,
+            "--endpoint-status describes --endpoints, which this run is not asking for",
+        );
+        // **Checked here rather than left to the server.** An unknown value
+        // answers `400`, but a *plausible* typo — `revoked_only`, `everything` —
+        // is what somebody writes while hunting a row they cannot find, and
+        // being told the accepted words beats being told the request was bad.
+        anyhow::ensure!(
+            matches!(status.as_str(), "active" | "revoked" | "all"),
+            "--endpoint-status takes `active`, `revoked` or `all`, not `{status}`",
+        );
+    }
+
     if args.issue_enrollment_key
         || args.enrollment_keys
         || args.enrollment_key_enrollments.is_some()
@@ -375,16 +400,6 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
 
     if let (Some(_), Some(_)) = (&args.pair, &args.redeem) {
         anyhow::bail!("--pair and --redeem are two ways in; use one");
-    }
-    // **Refused rather than dropped**, the fourth time this shape has come up
-    // here: these mean something only to `--revoke-endpoint`, and a run that
-    // ignored them would go on to forward while the operator believed they had
-    // just retired a device.
-    if args.revoke_endpoint.is_none() && (args.reason.is_some() || args.note.is_some()) {
-        anyhow::bail!("--reason and --note describe a --revoke-endpoint, and this run has none");
-    }
-    if args.revoke_endpoint.is_none() && args.endpoint_status.is_some() && !args.endpoints {
-        anyhow::bail!("--endpoint-status describes --endpoints, which this run is not asking for");
     }
     portal_core::ci::check_unattended_args(
         args.enroll,
@@ -976,10 +991,10 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
         // emergency exit that looks taken while the door is open is the one
         // thing §8.7 must not be. A failed lookup does not stop the
         // revocation — that is what was asked for.
-        let siblings = isekai_p2p::endpoints::get(&identity, token, endpoint_id)
-            .await
-            .map(|d| d.duplicate_key_siblings)
-            .unwrap_or_default();
+        // **A failed lookup is not "no siblings".** Treating the two as one
+        // would print a clean revocation while the key may still work
+        // elsewhere, which is the state this whole command exists to refuse.
+        let before = isekai_p2p::endpoints::get(&identity, token, endpoint_id).await;
         let revoked = isekai_p2p::endpoints::revoke(
             &identity,
             token,
@@ -1014,35 +1029,83 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
             ),
             other => println!("proxy       : {}", other.unwrap_or("not reported")),
         }
-        if !siblings.is_empty() {
-            println!("\nTHE KEY STILL WORKS. Another Endpoint shares it, so revoking this row");
-            println!("stopped a name and not a credential:");
-            for id in &siblings {
-                println!("  still live : {id}");
+        // **The server's word for why**, which is what decides whether repeating
+        // helps: `unreachable` and `gave up after …` are worth another try once
+        // the path is open, and the rest usually are not.
+        if let Some(detail) = &revoked.proxy_notification_detail {
+            println!("              ({detail})");
+        }
+        match &before {
+            // **`duplicate_key` decides, and the list only names names.** A row
+            // can be flagged with an empty list — the siblings are same-tenant
+            // only — and gating on the list alone would print nothing in
+            // exactly the case the flag was raised for.
+            Ok(detail)
+                if detail.summary.duplicate_key || !detail.duplicate_key_siblings.is_empty() =>
+            {
+                println!("\nTHE KEY STILL WORKS. Another Endpoint shares it, so revoking this row");
+                println!("stopped a name and not a credential.");
+                for id in &detail.duplicate_key_siblings {
+                    println!("  still live : {id}");
+                }
+                if detail.duplicate_key_siblings.is_empty() {
+                    println!("  (the other rows are not in this tenant, so they are not named)");
+                }
             }
+            Ok(_) => {}
+            Err(e) => println!(
+                "\ncould not check whether another Endpoint shares this key: {e:#}\n\
+                 Look it up with --endpoints before trusting that the key is stopped.",
+            ),
         }
     }
 
     if args.endpoints {
         let status = args.endpoint_status.as_deref();
-        let page = isekai_p2p::endpoints::list(&identity, token, status, None)
-            .await
-            .context("list endpoints")?;
-        if page.items.is_empty() {
-            println!("No endpoints.");
+        // **Paged through, because the point is finding a row to act on.**
+        // Printing one page and saying more exist leaves the id somebody came
+        // for out of reach, with no flag to go further. The enrolment records
+        // follow their cursor for the same reason.
+        let mut cursor: Option<String> = None;
+        let mut shown = 0usize;
+        let mut hidden = None;
+        let mut truncated = false;
+        for _ in 0..100 {
+            let page = isekai_p2p::endpoints::list(&identity, token, status, cursor.as_deref())
+                .await
+                .context("list endpoints")?;
+            for endpoint in &page.items {
+                print_endpoint(endpoint);
+                shown += 1;
+            }
+            // The count is over the whole filter rather than the page, so the
+            // first answer is the one to keep.
+            hidden = hidden.or(page.revoked_count);
+            match page.next_cursor {
+                Some(next) => {
+                    cursor = Some(next);
+                    truncated = true;
+                }
+                None => {
+                    truncated = false;
+                    break;
+                }
+            }
         }
-        for endpoint in &page.items {
-            print_endpoint(endpoint);
+        if shown == 0 {
+            println!("No endpoints.");
         }
         // **Said even when it is zero.** The default filter hides revoked rows,
         // and the server counts them separately so that the hiding is visible
         // rather than silent.
-        if let Some(hidden) = page.revoked_count {
+        if let Some(hidden) = hidden {
             println!("\n{hidden} revoked endpoint(s) not shown -- --endpoint-status all");
         }
-        // `None` is "no more here", not "that was everything".
-        if page.next_cursor.is_some() {
-            println!("More rows follow; this printed one page.");
+        // **"No more here" is not "that was everything".** Rows can be
+        // registered or revoked while the pages are walked, so a listing that
+        // ended is a snapshot rather than a census.
+        if truncated {
+            println!("Stopped after 100 pages; there are more rows than this shows.");
         }
     }
 
@@ -1150,11 +1213,18 @@ fn print_effects(effects: Option<&isekai_p2p::agent::RevokeEffects>) {
     let Some(effects) = effects else {
         return;
     };
+    // **Every counter, because a missing one reads as nothing happened.** An
+    // Endpoint with only a public listener and live tokens would otherwise be
+    // reported as "nothing was there to remove" while both were torn down.
     let counted: Vec<String> = [
-        ("listeners", effects.deleted_peer_listeners),
+        ("tokens", effects.revoked_tokens),
+        ("peer listeners", effects.deleted_peer_listeners),
+        ("public listeners", effects.deleted_public_listeners),
         ("grants", effects.deleted_grants),
         ("capabilities", effects.deleted_capabilities),
         ("connections", effects.closed_connections),
+        ("pairing codes", effects.deleted_pairing_codes),
+        ("policy leases", effects.revoked_policy_leases),
     ]
     .iter()
     .filter_map(|(label, n)| match n {

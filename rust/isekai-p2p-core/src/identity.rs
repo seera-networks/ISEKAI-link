@@ -938,12 +938,16 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
         status: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<EndpointList, IdentityError> {
+        // **Percent-encoded.** A cursor is the server's opaque value and may
+        // carry anything; splicing it in raw would let it end the query string
+        // or add a parameter, and the failure would look like the listing
+        // simply ignoring the page.
         let mut query = Vec::new();
         if let Some(status) = status {
-            query.push(format!("status={status}"));
+            query.push(format!("status={}", encode_query(status)));
         }
         if let Some(cursor) = cursor {
-            query.push(format!("cursor={cursor}"));
+            query.push(format!("cursor={}", encode_query(cursor)));
         }
         let path = if query.is_empty() {
             "/v1/endpoints".to_owned()
@@ -1237,6 +1241,24 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     }
 }
 
+/// Percent-encode a query-string value.
+///
+/// Small and local rather than a dependency: the two values this escapes are a
+/// status word and an opaque cursor, and the rule for both is "keep the
+/// unreserved set, escape the rest".
+fn encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 /// Sign a registration/refresh challenge (spec §4.3): a base64url(DER)
 /// signature over the concatenation `challenge ‖ endpoint_id ‖ timestamp`.
 pub fn sign_challenge(
@@ -1281,6 +1303,17 @@ mod tests {
         let vk = p256::ecdsa::VerifyingKey::from(public);
         let msg = signed_message("chal-value", &endpoint_id, "2026-07-13T00:00:00Z");
         assert!(vk.verify(&msg, &sig).is_ok());
+    }
+
+    /// A cursor is the server's opaque value, so it has to survive the trip
+    /// back unchanged — and must not be able to end the query or add to it.
+    #[test]
+    fn a_query_value_cannot_escape_its_parameter() {
+        assert_eq!(encode_query("all"), "all");
+        assert_eq!(encode_query("MTIzNA-_~.x"), "MTIzNA-_~.x");
+        assert_eq!(encode_query("a&b=c"), "a%26b%3Dc");
+        assert_eq!(encode_query("a b"), "a%20b");
+        assert_eq!(encode_query("こ"), "%E3%81%93");
     }
 
     #[test]
