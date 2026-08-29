@@ -1707,9 +1707,33 @@ POST /v1/enrollment-keys              → 401   ← Auth0 を要求している
 経路で、ボディの検証まで進んでいる（§8.8.4）。後者は系統 A なので認証で止まる。
 **どちらも「マウントされている」ことを別々に言っている。**
 
-残る 2 点（`ENROLLMENT_OIDC_ISSUERS` の中身、`--p2p-provisioning-oidc-issuer` の有無）は
-**鍵を発行しないと分からない**。発行はクォータ 4 を 1 消費し、本物の資格情報を作るので、
-了解を取らずには行っていない。
+さらに `DEFAULT_PERMISSIONS` に `peer-provisioning:create` が追加され、実際に発行して
+確かめた。**§9.4 の 4 項目はこれで全部埋まった。**
+
+| # | 項目 | 結果 |
+| --- | --- | :---: |
+| 1 | `ENROLLMENT_KEYS_ENABLED` | ✅ 有効 |
+| 2 | `ENROLLMENT_OIDC_ISSUERS` に GitHub | ❌ **入っていない** |
+| 3 | Proxy の `--p2p-provisioning-oidc-issuer` | ❌ **設定されていない** |
+| 4 | protocol の天井に `isekai-portal-v1` | ✅ ある |
+| 5 | `peer-provisioning:create` | ✅ トークンに載る |
+
+**4 と 5 は Endpoint Token を 1 本発行して読んだ。** 鍵を作らずに答えられる質問なので
+そうした。返ってきた `permissions` に `peer-provisioning:create` があり、`protocols` に
+`isekai-portal-v1` がある — ISEKAI-identity#33 で「鋳造できない」と報告した権限が、
+#34 と配備の設定を経て**実際にトークンへ載るところまで来た**。
+
+**2 と 3 は、鍵を作ろうとして拒否されたことで分かった。** どちらも
+`400 binding-not-supported` で、**binding が通らなければ鍵は作られない**ので
+クォータは消費していない。
+
+```text
+Identity: issuer is not on the allow list: https://token.actions.githubusercontent.com
+Proxy:    binding-not-supported: this issuer is not configured
+```
+
+**両側に同じ設定が要る**（§8.8.10）ことが、そのまま両側からのエラーとして出た形である。
+CI 経路が動くには、残るのはこの 1 つだけになった。
 
 ### 15.2 入ったもの
 
@@ -1736,12 +1760,15 @@ POST /v1/enrollment-keys              → 401   ← Auth0 を要求している
 
 ### 15.4 残っていること
 
-**実地の確認はできていない。** 経路は開いたが、鍵をまだ 1 本も発行していない
-（クォータと本物の資格情報を作るため）。次の順で確かめるのがよい。
+**残るのは issuer の許可リスト 1 つである**（§15.1 の 2 と 3）。両サーバに
+`https://token.actions.githubusercontent.com` を足せば、次の順で通せるはずである。
 
-1. `portal-client --issue-enrollment-key`（`404` でなく鍵が返ること）
-2. `portal-server --provisioning-key`（`peer-provisioning:create` が天井にあること）
-3. `ci-enrolment` ジョブ（`ready` に到達し、`enrollment_released` で終わること）
+1. `portal-client --issue-enrollment-key` — 鍵が返る
+2. `portal-server --provisioning-key` — 鍵が返る（権限は確認済み）
+3. 2 本をリポジトリのシークレットへ入れ、`ci-enrolment` ジョブが `ready` に到達する
+4. `portal-client --enrollment-key-enrollments` が `enrollment_released` を示す。
+   `enrollment_idle` が並んでいたら後始末が走っていない（§6.5）
 
-3 の最後は `portal-client --enrollment-key-enrollments` で見る。
-`enrollment_idle` が並んでいたら後始末が走っていない（§6.5）。
+**確認のために Endpoint を 1 つ登録した**（`device_name: phase6-check`、
+`ep:243119b51e99d90b7c241201251e145ebfed7838d46e13e932c4c501dc38b3b9`）。権限を読むためだけのもので、要らなければ
+`POST /v1/endpoints/{id}/revoke` で失効させてよい。
