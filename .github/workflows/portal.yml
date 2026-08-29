@@ -121,102 +121,188 @@ jobs:
       - name: Build the binaries
         run: cargo build -p portal-server -p portal-client
 
-  # **The unattended path, run the way a job would run it** (docs/portal.md,
-  # "Letting a CI job in"). Everything above proves the code compiles and that
-  # two halves talk over a loopback; this is the only thing that says a runner
-  # can get an Endpoint of its own and reach a server with it.
+  # **The unattended path, both halves, over the real proxy.**
   #
-  # It is skipped wherever the two secrets are not set -- forks, and this
-  # repository until somebody configures them -- so a half-configured setup
-  # cannot quietly spend enrolment slots. `ios-ffi.yml` gates its live test the
-  # same way and for the same reason.
+  # Everything above proves the code compiles and that two halves talk over a
+  # loopback. This is the only thing that says a job with nobody at the keyboard
+  # can make itself an Endpoint, be authorised, and reach a service — through
+  # the deployment rather than around it.
+  #
+  # **Both halves enrol.** The server needs a key too, which is why
+  # `portal-server --enroll` exists (plan §15): a self-contained job has no
+  # sign-in for either side. The two keys carry different permissions, so they
+  # are two secrets — one key holding both roles' would be the ceiling problem
+  # §8.8.2 avoids.
+  #
+  # Skipped wherever the secrets are not set — forks, and anywhere nobody has
+  # configured them — so a half-configured repository cannot quietly spend
+  # enrolment slots. `ios-ffi.yml` gates its live test the same way.
   ci-enrolment:
-    name: Enrol and forward (ubuntu-latest)
+    name: Enrol both halves and forward (ubuntu-latest)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
-      # **Without this the runner mints no workload identity token**, and a key
-      # bound with --binding-oidc is refused with nothing pointing at the
+      # **Without this the runner mints no workload identity token**, and keys
+      # bound with --binding-oidc are refused with nothing pointing at the
       # workflow file. It has to be on the job, not only the workflow.
       id-token: write
       contents: read
     env:
       ISEKAI_ENROLLMENT_KEY: ${{ secrets.ISEKAI_ENROLLMENT_KEY }}
-      ISEKAI_PROVISIONING_KEY: ${{ secrets.ISEKAI_PROVISIONING_KEY }}
+      ISEKAI_SERVER_ENROLLMENT_KEY: ${{ secrets.ISEKAI_SERVER_ENROLLMENT_KEY }}
+      HAVE_KEYS: ${{ secrets.ISEKAI_ENROLLMENT_KEY != '' && secrets.ISEKAI_SERVER_ENROLLMENT_KEY != '' }}
     defaults:
       run:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        if: env.HAVE_KEYS == 'true'
       - uses: ./.github/actions/submodules
-        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        if: env.HAVE_KEYS == 'true'
       - name: Prepare machine for seera-msquic
-        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        if: env.HAVE_KEYS == 'true'
         run: scripts/prepare-machine.ps1 -Tls quictls -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
-        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        if: env.HAVE_KEYS == 'true'
       - uses: Swatinem/rust-cache@v2
-        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        if: env.HAVE_KEYS == 'true'
         with:
           workspaces: rust
 
-      - name: Enrol and forward
-        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+      # Something for the forward to actually reach. A port that answers and
+      # closes is enough: what the far side offers is the catalogue's business,
+      # and that a job got through to it is this workflow's.
+      - name: Stand up a service to forward
+        if: env.HAVE_KEYS == 'true'
+        run: |
+          set -euo pipefail
+          python3 -c "
+          import socket, threading
+          s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(('127.0.0.1', 15099)); s.listen(8)
+          def serve():
+              while True:
+                  c, _ = s.accept(); c.sendall(b'ok\n'); c.close()
+          threading.Thread(target=serve, daemon=True).start()
+          import time; time.sleep(1200)
+          " &
+          echo $! > "$RUNNER_TEMP/service.pid"
+          printf '[service.db]\nprotocol = "tcp"\ntarget = "127.0.0.1:15099"\n' \
+            > "$RUNNER_TEMP/portal-server.toml"
+
+      # **`cargo run`, not the built binary**: libmsquic lives only inside
+      # cargo's build-script output and nothing installs it (docs/Build.md).
+      #
+      # A fresh keypair per run for each half: one key registers one Endpoint,
+      # so a reused one is refused the second time. The forwarding side orders
+      # no certificate; the serving side does, which is why its key is the one
+      # that would matter if this ran often enough to meet the ACME limits.
+      - name: Enrol the server and offer the service
+        if: env.HAVE_KEYS == 'true'
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/portal-server.log"
+          cargo run -q -p portal-server -- \
+            --enroll --oidc github \
+            --key "$RUNNER_TEMP/server-endpoint.pem" \
+            --cert-key "$RUNNER_TEMP/server-cert.pem" \
+            --config "$RUNNER_TEMP/portal-server.toml" \
+            --device-name "gha-server-${GITHUB_RUN_ID}" \
+            > "$LOG" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/portal-server.pid"
+          for _ in $(seq 1 240); do
+            grep -q '^ready$' "$LOG" && exit 0
+            kill -0 "$(cat "$RUNNER_TEMP/portal-server.pid")" 2>/dev/null || break
+            sleep 1
+          done
+          echo "portal-server never came up:"; cat "$LOG"; exit 1
+
+      # The server mints the Provisioning Key at run time rather than it being a
+      # repository secret: it belongs to the Endpoint that just enrolled, which
+      # is different every run. Handed over on the filesystem because both halves
+      # are on this runner.
+      - name: Let the client in
+        if: env.HAVE_KEYS == 'true'
+        run: |
+          set -euo pipefail
+          # No --config: the key-issuing paths answer and exit without
+          # reading the catalogue, because a Grant names an Endpoint rather
+          # than a listener.
+          cargo run -q -p portal-server -- \
+            --key "$RUNNER_TEMP/server-endpoint.pem" \
+            --enroll --oidc github \
+            --provisioning-key \
+            --binding-oidc https://token.actions.githubusercontent.com \
+            --binding-subject "repo:${GITHUB_REPOSITORY}:ref:${GITHUB_REF}" \
+            --grant-ttl 1800 --max-live-grants 2 \
+            --provisioning-label "gha-${GITHUB_RUN_ID}" \
+            > "$RUNNER_TEMP/provisioning.out" 2>&1
+          # The secret is on the line after "Put this in", and never echoed.
+          grep -oE 'pvk1_[A-Za-z0-9_-]+' "$RUNNER_TEMP/provisioning.out" \
+            | head -1 > "$RUNNER_TEMP/provisioning.key"
+          chmod 600 "$RUNNER_TEMP/provisioning.key"
+          test -s "$RUNNER_TEMP/provisioning.key" || {
+            echo "no provisioning key was issued:"
+            sed -E 's/pvk1_[A-Za-z0-9_-]+/pvk1_…/g' "$RUNNER_TEMP/provisioning.out"
+            exit 1
+          }
+
+      - name: Enrol the client and forward
+        if: env.HAVE_KEYS == 'true'
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/portal-client.log"
-          # **A fresh keypair every run**: one key registers one Endpoint, so a
-          # reused one is refused the second time. The forwarding side orders no
-          # certificate, so this costs nothing but a slot -- which the teardown
-          # gives back.
-          #
-          # `cargo run` rather than the built binary: libmsquic lives only in
-          # cargo's build-script output and nothing installs it (docs/Build.md).
           cargo run -q -p portal-client -- \
             --enroll --oidc github \
-            --key "$RUNNER_TEMP/ci-endpoint.pem" \
-            --device-name "gha-${GITHUB_RUN_ID}" \
+            --provisioning-key-file "$RUNNER_TEMP/provisioning.key" \
+            --key "$RUNNER_TEMP/client-endpoint.pem" \
+            --device-name "gha-client-${GITHUB_RUN_ID}" \
             --label "gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --map 15432:db > "$LOG" 2>&1 < /dev/null &
           echo $! > "$RUNNER_TEMP/portal-client.pid"
           # `ready` is printed once every forward is bound. Waiting on that
           # rather than a sleep is the difference between a flaky job and a job.
-          for _ in $(seq 1 180); do
+          for _ in $(seq 1 240); do
             grep -q '^ready$' "$LOG" && exit 0
             kill -0 "$(cat "$RUNNER_TEMP/portal-client.pid")" 2>/dev/null || break
             sleep 1
           done
-          echo "portal-client never became ready:"
-          cat "$LOG"
-          exit 1
+          echo "portal-client never became ready:"; cat "$LOG"; exit 1
 
-      - name: Reach the forwarded service
-        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+      # The whole point: bytes from the service, through the proxy, out of a
+      # local port that a job opened for itself.
+      - name: Reach the service through the forward
+        if: env.HAVE_KEYS == 'true'
         run: |
           set -euo pipefail
-          # The port is bound and something answers on it. What the far side
-          # offers is the deployment's business; that a job got through to it is
-          # this workflow's.
-          timeout 10 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/15432); do sleep 1; done'
+          got=$(timeout 20 bash -c 'exec 3<>/dev/tcp/127.0.0.1/15432; head -1 <&3')
+          echo "got: $got"
+          test "$got" = "ok"
 
-      # **`always()`, because stopping the client is what returns the enrolment
-      # slot** -- and the run whose slot is most worth having back is the one
-      # where the step above failed. SIGTERM is what the client listens for; the
-      # KILL is only for a client that will not go.
-      - name: Stop it and give the slot back
+      # **`always()`, because stopping these is what returns the enrolment
+      # slots** -- and the run whose slots are most worth having back is the one
+      # where a step above failed. SIGTERM is what both listen for; the KILL is
+      # only for one that will not go.
+      - name: Stop both halves and give the slots back
         if: always()
         run: |
-          PID=$(cat "$RUNNER_TEMP/portal-client.pid" 2>/dev/null) || exit 0
-          kill -TERM "$PID" 2>/dev/null || exit 0
-          for _ in $(seq 1 10); do kill -0 "$PID" 2>/dev/null || exit 0; sleep 1; done
-          kill -KILL "$PID" 2>/dev/null || true
+          for name in portal-client portal-server service; do
+            PID=$(cat "$RUNNER_TEMP/$name.pid" 2>/dev/null) || continue
+            kill -TERM "$PID" 2>/dev/null || continue
+            for _ in $(seq 1 10); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+            kill -KILL "$PID" 2>/dev/null || true
+          done
 
-      - name: What the client logged
+      - name: What they logged
         if: always()
-        run: cat "$RUNNER_TEMP/portal-client.log" || true
+        run: |
+          for f in portal-server portal-client; do
+            echo "=== $f ==="
+            sed -E 's/(pvk1_|enr1_|tkt1_)[A-Za-z0-9_-]+/\1…/g' \
+              "$RUNNER_TEMP/$f.log" 2>/dev/null || true
+          done
 
   compile:
     name: Compile (windows-latest)

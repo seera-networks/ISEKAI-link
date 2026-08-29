@@ -1750,6 +1750,36 @@ Error: failed to read the service catalogue at portal-server.toml: ...
 **走らせなければ、また見つからなかった。** 変数名を間違えた運用者が
 「カタログが無い」と言われる形は、テストでは出てこない。
 
+### 15.6 CI ジョブの形（B）
+
+同じジョブで両側を動かす。**外部に立っている server に依存しない**ので、この
+repository の CI がそのまま回せる。
+
+```text
+service (127.0.0.1:15099)  ← 転送先。ポートが答えるだけのもの
+   ↑
+portal-server --enroll     ← 登録し、listener を立て、実行時に Provisioning Key を発行
+   ↑ proxy
+portal-client --enroll     ← 登録し、その鍵を引き換え、15432 を転送
+   ↑
+curl 127.0.0.1:15432       ← ここまで来れば端から端まで通っている
+```
+
+**Provisioning Key はリポジトリのシークレットにしない。** 鍵は Endpoint に属し、
+その Endpoint は毎回違う（毎回登録するので）。server が実行時に発行し、同じ runner の
+ファイルで渡す。シークレットは Enrollment Key 2 本だけである。
+
+### 15.7 実装しながら見つけたこと
+
+**`portal-server` に `ready` に相当する行が無かった。** client には CI の待ちループの
+ために付けてあるのに、server 側は `endpoint id` と `listener id` を出すだけで、
+しかもそれは `--allow` の capability を発行する**前**である。待つ先として使うと、
+`--allow` が終わる前に client を起動しうる。同じ理由で `ready` を足した。
+
+**鍵を発行するコマンドはカタログを読まない。** `administering` の分岐がカタログの
+読み取りより前で返るので、`--provisioning-key` に `--config` は要らない。
+Grant が listener ではなく Endpoint を名指すことの帰結である（§8.8）。
+
 ---
 
 ## 16. フェーズ 6 の結果

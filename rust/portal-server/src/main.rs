@@ -935,6 +935,13 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         println!("One-shot, and it expires -- give the client this and the listener id now.");
     }
 
+    // **One line, last, on stdout.** A CI step needs a point to wait for that
+    // means "this is serving", and the ids above are printed before the
+    // capabilities are issued, so waiting on one of them can start a client
+    // before `--allow` has finished. `portal-client` prints the same word for
+    // the same reason, and `camera-core`'s `synthetic_server` before both.
+    println!("ready");
+
     let mut events = server.signaling.subscribe();
     // **Made once, outside the loop.** `ctrl_c()` builds a future over signals
     // that arrive *after* it is created, so calling it inside the select meant
