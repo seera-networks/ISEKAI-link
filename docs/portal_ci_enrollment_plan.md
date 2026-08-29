@@ -1806,6 +1806,26 @@ Capability / 接続は残る。
 §8.8.8 の掃引が `ephemeral` な Endpoint を失効させるときも同じ経路を通るので、
 **CI が返した枠が Proxy 側に伝わらない**ことにもなる。
 
+> **解決した。** 上流へ
+> [ISEKAI-link-server#252](https://github.com/seera-networks/ISEKAI-link-server/issues/252)
+> として報告し、#253 が `/internal/v1` を専用リスナ（`--internal-listen`）へ移した。
+> 配備側で URL を向け直し、ファイアウォールを開けたところ `delivered` になった。
+>
+> ```text
+> disabled                     PROXY_INTERNAL_URL 未設定
+>   → failed / unreachable     8443 は h3 専用。TCP が即座に失敗
+>   → failed / gave up 3000ms  専用リスナへ向いたが firewall で落ちていた
+>   → delivered                届いた。newly_revoked: true
+> ```
+>
+> **`newly_revoked` が 4 回目で初めて `true` になった。** それまでの 3 回は
+> Identity 側だけで失効しており、**Proxy には一度も届いていなかった**ことを
+> この値が言っている。§8.7 が `newly_revoked` を持っている理由がそのまま出た形である。
+>
+> 上流の PR は、報告した診断より 1 つ悪いことも見つけている: `--service-addr` の
+> TCP 側は 3 経路の H2 router で、`/internal/v1` は**どの構成でも h1/h2 から
+> 到達できなかった**（QMUX の有無に関わらず）。
+
 **2. 自分の Endpoint を失効させる CLI が無い。**
 
 フェーズ 1 で `revoke_endpoint` を有人・無人の両経路とも実装したが、バイナリに
