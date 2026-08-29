@@ -450,6 +450,171 @@ take the record of who came in on it with it — the grant does not say where it
 came from, so that listing is the only place it is written down. It ages out
 with the rest.
 
+## Letting a CI job in
+
+A ticket suits work that ends. **CI is work that ends over and over**, and
+nobody is there to cut a new ticket each time — so a job needs two things a
+ticket does not give it: a way to have an Endpoint at all, and a way in that
+does not expire between runs.
+
+Those are two keys, issued by two servers, and **both are needed**. One without
+the other is either an Endpoint that can reach nobody or a standing welcome for
+a runner that cannot register.
+
+| | plugs | issued by | revoked at |
+| --- | --- | --- | --- |
+| **Enrollment Key** | a runner has no Endpoint, and registering wants a sign-in | Identity | Identity |
+| **Provisioning Key** | you cannot cut a ticket per run | the proxy | the proxy |
+
+### Issue them once
+
+```sh
+# Yours: what lets the job register an Endpoint. Sign in first.
+portal-client --issue-enrollment-key \
+    --binding-oidc https://token.actions.githubusercontent.com \
+    --binding-subject 'repo:your-org/your-repo:ref:refs/heads/main' \
+    --max-live-endpoints 4 --endpoint-idle-ttl 1800
+
+# The server's: what lets that Endpoint reach this one.
+portal-server --provisioning-key \
+    --binding-oidc https://token.actions.githubusercontent.com \
+    --binding-subject 'repo:your-org/your-repo:ref:refs/heads/main' \
+    --grant-ttl 1800 --max-live-grants 4
+```
+
+Each prints its secret **once**. Put them in the repository's secrets as
+`ISEKAI_ENROLLMENT_KEY` and `ISEKAI_PROVISIONING_KEY`.
+
+**`--binding-oidc` is what stops the key alone being enough.** With it, whoever
+holds the secret still cannot use it unless they are that workflow, on that
+branch, in that repository. Without it the string is the whole credential —
+acceptable on a build machine whose secret store is yours, and **never for a
+public repository**. `--binding-none` is how you say you meant it.
+
+The `subject` is matched **exactly**: no wildcards, no prefixes. Covering
+another branch means another key, which is the point rather than a limitation.
+
+### Run it
+
+```yaml
+permissions:
+  id-token: write          # without this the runner mints no token and the
+  contents: read           # bound key is refused
+
+env:
+  ISEKAI_ENROLLMENT_KEY:   ${{ secrets.ISEKAI_ENROLLMENT_KEY }}
+  ISEKAI_PROVISIONING_KEY: ${{ secrets.ISEKAI_PROVISIONING_KEY }}
+
+steps:
+  - name: Forward the server's ports into this runner
+    if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+    run: |
+      set -euo pipefail
+      LOG="$RUNNER_TEMP/portal-client.log"
+      portal-client --enroll --oidc github \
+        --key "$RUNNER_TEMP/ci-endpoint.pem" \
+        --label "gha-${GITHUB_RUN_ID}" \
+        --map 15432:db > "$LOG" 2>&1 < /dev/null &
+      echo $! > "$RUNNER_TEMP/portal-client.pid"
+      for _ in $(seq 1 120); do grep -q '^ready$' "$LOG" && exit 0; sleep 1; done
+      cat "$LOG"; exit 1
+
+  # … your tests, reaching the service at 127.0.0.1:15432 …
+
+  - name: Stop it and give the slot back
+    if: always()
+    run: |
+      PID=$(cat "$RUNNER_TEMP/portal-client.pid" 2>/dev/null) || exit 0
+      kill -TERM "$PID" 2>/dev/null || exit 0
+      for _ in $(seq 1 10); do kill -0 "$PID" 2>/dev/null || exit 0; sleep 1; done
+      kill -KILL "$PID" 2>/dev/null || true
+```
+
+Four things in there are load-bearing.
+
+**`--key` under `$RUNNER_TEMP`.** One key registers one Endpoint, so a reused
+keypair is refused on the second run — a fresh one per job is the design, not
+waste. (The forwarding side orders no certificate, so this costs nothing.)
+
+**Neither secret is ever an argument.** They are read from the environment
+because an argument list is readable by anything running as the same user, and
+a CI runner runs other people's code.
+
+**`if: always()` on the teardown.** Stopping the client is what returns the
+enrolment slot, and the run whose slot you most want back is the one where the
+tests failed.
+
+**`grep -q '^ready$'`.** The client prints `ready` once every forward is bound.
+Waiting on that rather than on a sleep is the difference between a flaky job and
+a job.
+
+### Sizing the slots
+
+`max_live_endpoints` and `max_live_grants` are **how many at once**, not how
+many a day: a job that finishes returns its slot, and re-redeeming does not take
+a second grant. Match them to how many jobs run in parallel, plus a little for
+runs that were killed before they could tidy up.
+
+`endpoint_idle_ttl` is the insurance for those. A running job renews its token
+every few minutes, so 1800 is generous; shorter means a slot lost to a
+`kill -9` comes back sooner.
+
+### Seeing who came in, and stopping them
+
+```sh
+portal-client --enrollment-keys                     # your keys
+portal-client --enrollment-key-enrollments enk_…    # which jobs registered
+portal-server --provisioning-keys                   # the server's keys
+portal-server --provisioning-redemptions pvk_…      # which Endpoints came in
+```
+
+The enrolment records say how each Endpoint ended. **`enrollment_released` means
+the job tidied up after itself; `enrollment_idle` means nothing did and the
+sweep got there.** The second one climbing is a CI problem — a teardown that is
+not running — rather than a capacity one.
+
+### Rotating, and stopping
+
+Four of each may be live at once, so rotation needs no downtime: issue a new
+one, swap the secret, watch a few runs pass, revoke the old one.
+
+**Revoking is where the two differ, and it matters.**
+
+```sh
+portal-client --revoke-enrollment-key enk_…   # no new Endpoints; ephemeral ones go too
+portal-server --revoke-provisioning-key pvk_…  # AND deletes the grants it made
+```
+
+Revoking a ticket leaves whoever already walked in — tearing up the paper does
+not remove them. **Revoking a Provisioning Key closes the door it opened**,
+because you cannot see who came in on a key without asking, and "stop this key"
+that left them connected would leave you watching a door you cannot shut.
+Running jobs lose their authorisation. Do it when that is what you mean.
+
+### Before any of this works
+
+The two deployments have to be configured for it:
+
+- Identity needs `ENROLLMENT_KEYS_ENABLED=1`. **It is off by default**, and
+  while it is off every `--issue-enrollment-key` and `--enroll` answers `404` —
+  opening a way past a sign-in is a decision an operator makes deliberately.
+- Both need the GitHub issuer allowed: `ENROLLMENT_OIDC_ISSUERS` on Identity and
+  `--p2p-provisioning-oidc-issuer` on the proxy. A caller cannot name one,
+  because the server fetches its JWKS.
+- The Endpoint issuing Provisioning Keys needs `peer-provisioning:create`, which
+  is **not** in the default permission set. Adding it to `DEFAULT_PERMISSIONS`
+  grants it to every Endpoint that deployment registers — which is why
+  `--issue-enrollment-key` narrows a CI key to `peer-connect:initiate` alone.
+- The protocol has to be in the issuing user's ceiling. A personal account's
+  default is empty, so this is usually a per-user setting rather than something
+  that just works.
+
+**The two `audience` values are different on purpose** — Identity wants
+`isekai-identity` and the proxy `isekai-proxy` — so a token minted for one is
+refused by the other. `--issue-enrollment-key` and `--provisioning-key` each
+print the one their side expects; the client mints both and you configure
+neither.
+
 ## Letting somebody in just once
 
 Pairing is standing access. For a guest — someone who should reach a service

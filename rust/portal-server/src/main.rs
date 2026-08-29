@@ -127,10 +127,9 @@ keeps working. And revoking DELETES the grants it made, so running jobs stop --
 the opposite of --revoke-ticket, and deliberately: you cannot see who came in
 on a key without asking, so stopping one has to close the door it opened.
 
-NOTHING IN THIS BUILD REDEEMS ONE YET. The proxy accepts these keys and this
-issues them, but portal-client has no flag for spending one, so a key made now
-sits in a secret store until that arrives. Issue one to prepare, not to hand
-over."
+The peer spends it with portal-client, which reads it from
+ISEKAI_PROVISIONING_KEY -- see 'Letting a CI job in' in docs/portal.md, and note
+that the job also needs an Enrollment Key from the Identity side."
 )]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -568,15 +567,10 @@ async fn grant_admin(
         print_binding(key.binding.as_ref());
         println!("\nThe peer redeems it with its own Endpoint Token; it does not need");
         println!("--pair or a ticket as well.");
-        // **Said out loud, because the two halves landed apart.** The proxy
-        // takes these and this issues them, but no client in this build spends
-        // one — so an operator following the obvious next step would put a live
-        // standing credential somewhere and find out later that nothing can use
-        // it. `--ticket` never had this gap; this one does until the client's
-        // CI path lands.
-        println!("\nNothing redeems this yet: portal-client has no flag for it in this");
-        println!("build. The key is real and the clock is running -- if you are only");
-        println!("preparing, note that --provisioning-ttl is already counting down.");
+        println!("\nThe job reads it from ISEKAI_PROVISIONING_KEY. It also needs an");
+        println!("Enrollment Key from the Identity side -- portal-client");
+        println!("--issue-enrollment-key -- because a runner has no Endpoint of its own");
+        println!("until something gives it one.");
         println!("\nIt is shown once and it is a standing power: whoever holds it can");
         println!("reach this Endpoint until the key expires or is revoked.");
     }

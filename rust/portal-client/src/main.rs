@@ -526,11 +526,12 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // can cut a redemption mid-request and leave msquic a handle for the drain
     // to wait on.
     let shutdown = CancellationToken::new();
-    // **The keeper outlives this block**, which is why it is bound here: a
-    // provisioning grant is capped at an hour precisely because redeeming again
-    // extends it, so a client that redeemed once would inherit the narrow
-    // ceiling without the thing that makes it workable.
-    let mut keeper = None;
+    // **Held, not used** — underscored so that reads as intent rather than an
+    // oversight. It is bound this far out because a provisioning grant is
+    // capped at an hour precisely because redeeming again extends it: a client
+    // that redeemed once would inherit the narrow ceiling without the thing
+    // that makes it workable, and dropping the guard early is exactly that.
+    let mut _keeper = None;
     let admitted_by = match (&args.pair, &ticket, &provisioning) {
         (Some(code), _, _) => {
             Some(redeem(&cfg, code, args.label.as_deref(), !maps.is_empty()).await?)
@@ -548,7 +549,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
                 shutdown.clone(),
             )
             .await?;
-            keeper = held;
+            _keeper = held;
             Some(owner)
         }
         (None, None, None) => None,

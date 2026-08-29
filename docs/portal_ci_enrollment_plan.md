@@ -804,7 +804,7 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 - 有人経路（`--enroll` なし）では失効を**打たない**。
 - 失敗の表示が §4.7 の表のとおりに分かれる。
 
-### フェーズ 6 — CI と文書
+### フェーズ 6 — CI と文書 — **完了**
 
 §2.7 と `docs/portal.md`。
 
@@ -1665,3 +1665,74 @@ revoke を打ち、**取っていない枠が漏れた**と警告していた。
 フェーズ 6（ワークフローと `docs/portal.md`）。`portal-server` の
 `--provisioning-key` の出力にある「この build では引き換えられない」の但し書きを
 **消せるようになった**ので、それも含める。
+
+---
+
+## 15. フェーズ 6 の結果
+
+`docs/portal.md` に「Letting a CI job in」、`portal.yml` に `ci-enrolment` ジョブ、
+そしてフェーズ 4 が出力に入れた但し書きの削除。**これで計画の全フェーズが終わった。**
+
+### 15.1 稼働中の配備を確認した — §9.4 の答え
+
+proxy と identity がデプロイ済みとのことなので、**変更を伴わない問い合わせだけ**
+実際に投げた。
+
+| # | 項目 | 結果 |
+| --- | --- | :---: |
+| 1 | `ENROLLMENT_KEYS_ENABLED` | ❌ **立っていない** |
+| 3 | Proxy の §8.13 の経路 | ✅ 生きている（h3 で `401`） |
+
+```text
+POST /v1/endpoints/enroll/challenge   → 404
+POST /v1/enrollment-keys              → 404
+POST /v1/endpoints/register/challenge → 401   ← 比較用。経路はある
+POST /v1/peer/provisioning-keys       → 401   ← h3。経路はある
+```
+
+**404 と 401 の差がそのまま答えである。** 既存の登録経路は認証を要求して `401` を
+返すのに、§8.8 の 2 つは `404` — つまり router にマウントされていない。
+仕様どおり「要ると言った配備にだけ開く」ままになっている。
+
+**したがって、いまの配備では CI 経路は端から端まで動かない。** Identity 側で
+`ENROLLMENT_KEYS_ENABLED=1` を立てるまで、`--issue-enrollment-key` も `--enroll` も
+`404` を受ける。実装の問題ではなく、運用者が明示的に開く決定をしていないだけである。
+
+残る 2 点（`ENROLLMENT_OIDC_ISSUERS` の中身、`--p2p-provisioning-oidc-issuer` の有無）は
+**鍵を発行しないと分からない**。発行はクォータ 4 を 1 消費し、本物の資格情報を作るので、
+了解を取らずには行っていない。
+
+### 15.2 入ったもの
+
+**`docs/portal.md`** — 「画面を持たないものを入れる」（Ticket）の次に置いた。
+鍵が 2 本要ること、`--binding-oidc` が「鍵だけでは足りなくする」ものであること、
+枠は「同時に何本か」であって「1 日に何本か」ではないこと、そして
+**失効が Ticket と逆であること**。最後に「これが動く前に配備が満たすべきこと」を
+節にした — §15.1 で分かったとおり、そこが今いちばん効く。
+
+**`portal.yml` の `ci-enrolment` ジョブ。** 2 つのシークレットが揃っている配備でだけ
+走る（`ios-ffi.yml` と同じ守り方）。`permissions: id-token: write`、
+`$RUNNER_TEMP` の鍵、`ready` を待つループ、`if: always()` の後始末。
+`cargo run` を使うのはフェーズ 4 で学んだとおりである。
+
+**但し書きの削除。** フェーズ 4 は「この build では引き換えられない」と help と
+出力の両方に書いた。フェーズ 5 で引き換えられるようになったので、docs への
+案内に置き換えた。**一時的に正しかった文が、そのまま残ると嘘になる。**
+
+### 15.3 ついでに直した
+
+`portal-client` に `keeper is assigned but never used` の警告が出ていた。
+フェーズ 5 で入れて見落としていたもので、RAII のガードなので**読まないのが正しい** —
+`_keeper` にして、それが意図であることを名前とコメントで言うようにした。
+
+### 15.4 残っていること
+
+**実地の確認はできていない。** §15.1 のとおり Identity 側の機能が無効なので、
+CI ジョブは書けたが走っていない。有効化されたら、次の順で確かめるのがよい。
+
+1. `portal-client --issue-enrollment-key`（`404` でなく鍵が返ること）
+2. `portal-server --provisioning-key`（`peer-provisioning:create` が天井にあること）
+3. `ci-enrolment` ジョブ（`ready` に到達し、`enrollment_released` で終わること）
+
+3 の最後は `portal-client --enrollment-key-enrollments` で見る。
+`enrollment_idle` が並んでいたら後始末が走っていない（§6.5）。

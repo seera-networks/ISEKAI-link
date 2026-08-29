@@ -121,6 +121,103 @@ jobs:
       - name: Build the binaries
         run: cargo build -p portal-server -p portal-client
 
+  # **The unattended path, run the way a job would run it** (docs/portal.md,
+  # "Letting a CI job in"). Everything above proves the code compiles and that
+  # two halves talk over a loopback; this is the only thing that says a runner
+  # can get an Endpoint of its own and reach a server with it.
+  #
+  # It is skipped wherever the two secrets are not set -- forks, and this
+  # repository until somebody configures them -- so a half-configured setup
+  # cannot quietly spend enrolment slots. `ios-ffi.yml` gates its live test the
+  # same way and for the same reason.
+  ci-enrolment:
+    name: Enrol and forward (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # **Without this the runner mints no workload identity token**, and a key
+      # bound with --binding-oidc is refused with nothing pointing at the
+      # workflow file. It has to be on the job, not only the workflow.
+      id-token: write
+      contents: read
+    env:
+      ISEKAI_ENROLLMENT_KEY: ${{ secrets.ISEKAI_ENROLLMENT_KEY }}
+      ISEKAI_PROVISIONING_KEY: ${{ secrets.ISEKAI_PROVISIONING_KEY }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+      - uses: ./.github/actions/submodules
+        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+      - name: Prepare machine for seera-msquic
+        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        run: scripts/prepare-machine.ps1 -Tls quictls -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+      - uses: Swatinem/rust-cache@v2
+        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        with:
+          workspaces: rust
+
+      - name: Enrol and forward
+        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/portal-client.log"
+          # **A fresh keypair every run**: one key registers one Endpoint, so a
+          # reused one is refused the second time. The forwarding side orders no
+          # certificate, so this costs nothing but a slot -- which the teardown
+          # gives back.
+          #
+          # `cargo run` rather than the built binary: libmsquic lives only in
+          # cargo's build-script output and nothing installs it (docs/Build.md).
+          cargo run -q -p portal-client -- \
+            --enroll --oidc github \
+            --key "$RUNNER_TEMP/ci-endpoint.pem" \
+            --device-name "gha-${GITHUB_RUN_ID}" \
+            --label "gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --map 15432:db > "$LOG" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/portal-client.pid"
+          # `ready` is printed once every forward is bound. Waiting on that
+          # rather than a sleep is the difference between a flaky job and a job.
+          for _ in $(seq 1 180); do
+            grep -q '^ready$' "$LOG" && exit 0
+            kill -0 "$(cat "$RUNNER_TEMP/portal-client.pid")" 2>/dev/null || break
+            sleep 1
+          done
+          echo "portal-client never became ready:"
+          cat "$LOG"
+          exit 1
+
+      - name: Reach the forwarded service
+        if: env.ISEKAI_ENROLLMENT_KEY != '' && env.ISEKAI_PROVISIONING_KEY != ''
+        run: |
+          set -euo pipefail
+          # The port is bound and something answers on it. What the far side
+          # offers is the deployment's business; that a job got through to it is
+          # this workflow's.
+          timeout 10 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/15432); do sleep 1; done'
+
+      # **`always()`, because stopping the client is what returns the enrolment
+      # slot** -- and the run whose slot is most worth having back is the one
+      # where the step above failed. SIGTERM is what the client listens for; the
+      # KILL is only for a client that will not go.
+      - name: Stop it and give the slot back
+        if: always()
+        run: |
+          PID=$(cat "$RUNNER_TEMP/portal-client.pid" 2>/dev/null) || exit 0
+          kill -TERM "$PID" 2>/dev/null || exit 0
+          for _ in $(seq 1 10); do kill -0 "$PID" 2>/dev/null || exit 0; sleep 1; done
+          kill -KILL "$PID" 2>/dev/null || true
+
+      - name: What the client logged
+        if: always()
+        run: cat "$RUNNER_TEMP/portal-client.log" || true
+
   compile:
     name: Compile (windows-latest)
     runs-on: windows-latest
