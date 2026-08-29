@@ -534,7 +534,14 @@ impl ProvisioningBinding {
 /// types as an open question.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BindingView {
-    #[serde(rename = "type")]
+    /// **Defaulted, because this sits inside a response that must always
+    /// parse.** [`ProvisioningKey`] documents why every field but the secret
+    /// is optional: an issue response this cannot read has already cost a
+    /// minted key and one of four quota slots. A `binding` object arriving
+    /// without a `type` would otherwise fail the whole response — which is the
+    /// hole that typing this field opened, since the `serde_json::Value` it
+    /// replaced parsed anything.
+    #[serde(rename = "type", default)]
     pub kind: String,
     #[serde(default)]
     pub issuer: Option<String>,

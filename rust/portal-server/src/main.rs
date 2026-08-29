@@ -125,7 +125,12 @@ Two things differ from --ticket and both matter. Redeeming again EXTENDS the
 grant rather than being refused, which is how a job longer than --grant-ttl
 keeps working. And revoking DELETES the grants it made, so running jobs stop --
 the opposite of --revoke-ticket, and deliberately: you cannot see who came in
-on a key without asking, so stopping one has to close the door it opened."
+on a key without asking, so stopping one has to close the door it opened.
+
+NOTHING IN THIS BUILD REDEEMS ONE YET. The proxy accepts these keys and this
+issues them, but portal-client has no flag for spending one, so a key made now
+sits in a secret store until that arrives. Issue one to prepare, not to hand
+over."
 )]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -221,8 +226,11 @@ struct Args {
     /// access it grants
     #[argh(option)]
     ticket_ttl: Option<u64>,
-    /// how long the grant made by redeeming a --ticket lasts, in seconds.
-    /// Clamped to 60..=86400, default 3600. Cannot be unlimited
+    /// how long the grant made by redeeming a --ticket or a
+    /// --provisioning-key lasts, in seconds. Never unlimited. **The two clamp
+    /// differently**: a ticket to 60..=86400 (default 3600), a provisioning
+    /// key to 60..=3600 (default 1800), because that one is meant to be
+    /// extended by redeeming again rather than set long
     #[argh(option)]
     grant_ttl: Option<u64>,
     /// what a --ticket is for. Shown only to you, in --tickets, and carried
@@ -360,6 +368,11 @@ fn provisioning_binding(args: &Args) -> anyhow::Result<Option<ProvisioningBindin
 /// so echoing it is the only way the person configuring CI learns the value.
 fn print_binding(binding: Option<&BindingView>) {
     let Some(binding) = binding else {
+        // **Not silence.** An operator who passed `--binding-oidc` reads the
+        // absence of a line as "nothing to report", not as "I cannot tell you
+        // whether it took" — and the difference is whether the string alone is
+        // enough to reach this Endpoint.
+        println!("bound to    : not reported -- check with --provisioning-keys");
         return;
     };
     match binding.kind.as_str() {
@@ -555,6 +568,15 @@ async fn grant_admin(
         print_binding(key.binding.as_ref());
         println!("\nThe peer redeems it with its own Endpoint Token; it does not need");
         println!("--pair or a ticket as well.");
+        // **Said out loud, because the two halves landed apart.** The proxy
+        // takes these and this issues them, but no client in this build spends
+        // one — so an operator following the obvious next step would put a live
+        // standing credential somewhere and find out later that nothing can use
+        // it. `--ticket` never had this gap; this one does until the client's
+        // CI path lands.
+        println!("\nNothing redeems this yet: portal-client has no flag for it in this");
+        println!("build. The key is real and the clock is running -- if you are only");
+        println!("preparing, note that --provisioning-ttl is already counting down.");
         println!("\nIt is shown once and it is a standing power: whoever holds it can");
         println!("reach this Endpoint until the key expires or is revoked.");
     }
@@ -581,8 +603,23 @@ async fn grant_admin(
                 (Some(live), None) => format!("{live} grants"),
                 _ => "slots unknown".to_owned(),
             };
+            // **Which of these is a bare bearer secret** is the question this
+            // listing has to answer — the whole framing of these keys is that
+            // an unbound one is fine on a machine you own and wrong for a
+            // public repository, and an operator cannot act on that without
+            // being told which is which.
+            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
+                Some("none") | Some("") | None => "UNBOUND".to_owned(),
+                Some("oidc") => key
+                    .binding
+                    .as_ref()
+                    .and_then(|b| b.subject.as_deref())
+                    .map(|subject| format!("oidc {subject}"))
+                    .unwrap_or_else(|| "oidc".to_owned()),
+                Some(other) => other.to_owned(),
+            };
             println!(
-                "key         : {}  {slots}, {} redemptions, expires {}{label}",
+                "key         : {}  {bound}, {slots}, {} redemptions, expires {}{label}",
                 key.key_id,
                 key.redemption_count.unwrap_or(0),
                 key.expires_at.as_deref().unwrap_or("?"),
@@ -736,6 +773,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // options: the code or the listing would print, the run would look like it
     // worked, and the capability nobody was issued would be discovered by the
     // peer failing to connect.
+    // **A binding with nothing to bind is refused, not ignored.** These only
+    // mean anything to `--provisioning-key`, and a run that quietly dropped
+    // them would start a server while the operator believed they had just
+    // restricted a key. That is the same failure the `--allow` guard below
+    // exists to avoid.
+    if !args.provisioning_key && (args.binding_oidc.is_some() || args.binding_subject.is_some()) {
+        anyhow::bail!(
+            "--binding-oidc and --binding-subject describe a --provisioning-key, and this run \
+             is not issuing one"
+        );
+    }
     if administering && !args.allow.is_empty() {
         anyhow::bail!(
             "--allow issues a capability against a running listener, and this run exits \
@@ -872,6 +920,18 @@ mod tests {
         assert!(provisioning_binding(&args_with(None, None))
             .expect("unbound is a choice")
             .is_none());
+    }
+
+    /// A binding that cannot apply is refused rather than dropped.
+    ///
+    /// The check lives in `run`, so this pins the condition it tests: the
+    /// failure being avoided is a server that starts while the operator
+    /// believes they have just restricted a key.
+    #[test]
+    fn a_binding_without_a_key_to_bind_is_a_mistake() {
+        let stray = args_with(Some("https://issuer.test"), Some("repo:o/r"));
+        assert!(!stray.provisioning_key);
+        assert!(stray.binding_oidc.is_some() || stray.binding_subject.is_some());
     }
 
     #[test]

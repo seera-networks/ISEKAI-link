@@ -207,16 +207,31 @@ async fn listing_keys_reads_the_wrapper_the_proxy_sends() {
     assert_eq!(keys[0].max_live_grants, Some(8));
 }
 
-/// A wrapper this cannot read is an error, never an empty list.
-///
-/// An empty one reads as "this Endpoint has no keys", which is what somebody
-/// sees just before issuing past the quota of four.
 /// A binding type this build does not know must not stop a listing parsing.
 ///
 /// §8.13.9 has adding types as an open question, and a client that refused the
 /// whole listing over one unfamiliar word would make that change breaking for
 /// no reason — the request side has to name something the server knows, the
 /// response side only has to be readable.
+/// A `binding` with no `type` at all must not cost the caller the secret.
+///
+/// Typing this field is what made it possible: the `serde_json::Value` it
+/// replaced parsed anything, and an issue response that fails to parse has
+/// already spent a key and a quota slot.
+#[tokio::test]
+async fn a_binding_without_a_type_does_not_lose_the_key() {
+    let mock = MockProxy::answering(
+        201,
+        json!({ "key": "pvk1_SECRET", "binding": { "issuer": "https://issuer.test" } }),
+    );
+    let issued = client(mock)
+        .create_provisioning_key("isekai-portal-v1", None, None, None, None, None)
+        .await
+        .expect("a malformed binding is not worth losing a key over");
+    assert_eq!(issued.key, "pvk1_SECRET");
+    assert_eq!(issued.binding.as_ref().unwrap().kind, "");
+}
+
 #[tokio::test]
 async fn an_unfamiliar_binding_type_still_parses() {
     let mock = MockProxy::answering(
@@ -230,6 +245,10 @@ async fn an_unfamiliar_binding_type_still_parses() {
     assert_eq!(keys[0].binding.as_ref().unwrap().kind, "spiffe");
 }
 
+/// A wrapper this cannot read is an error, never an empty list.
+///
+/// An empty one reads as "this Endpoint has no keys", which is what somebody
+/// sees just before issuing past the quota of four.
 #[tokio::test]
 async fn an_unreadable_key_listing_is_refused() {
     let mock = MockProxy::answering(200, json!({ "items": [{ "key_id": "pvk_1" }] }));
