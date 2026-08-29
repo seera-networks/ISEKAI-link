@@ -1780,6 +1780,50 @@ curl 127.0.0.1:15432       ← ここまで来れば端から端まで通って�
 読み取りより前で返るので、`--provisioning-key` に `--config` は要らない。
 Grant が listener ではなく Endpoint を名指すことの帰結である（§8.8）。
 
+### 15.8 後片付けで見つかった 2 点
+
+検証用に作ったものを片付ける過程で、どちらも実装ではなく**運用と道具立て**の穴が出た。
+
+**1. `PROXY_INTERNAL_URL` が設定されていない。**
+
+`ep:243119b5…` を §8.7 で失効させたときの応答:
+
+```json
+{ "status": "revoked", "proxy_notification": "disabled", "effects": { … 全て 0 } }
+```
+
+`disabled` は §8.7 の表で **`PROXY_INTERNAL_URL` 未設定**を意味する。Identity 側の
+失効は確定しているが、**Proxy へは通知されない** — Proxy の Grant / Listener /
+Capability / 接続は残る。
+
+今回は `effects` が全て 0 で実害は無かったが、**本番のインシデント対応ではここが効く**。
+端末を紛失して失効させても、Proxy はその Endpoint を通し続ける。§8.7 が
+「**`200` は『Endpoint が止まった』ことを意味しない**」と書いているのは、まさにこの
+状態のことである。
+
+**これは配備の設定であって、この計画が直せるものではない。** ただし CI の枠と違って
+「気づかないまま正しく動いているように見える」種類なので、記録しておく。
+§8.8.8 の掃引が `ephemeral` な Endpoint を失効させるときも同じ経路を通るので、
+**CI が返した枠が Proxy 側に伝わらない**ことにもなる。
+
+**2. 自分の Endpoint を失効させる CLI が無い。**
+
+フェーズ 1 で `revoke_endpoint` を有人・無人の両経路とも実装したが、バイナリに
+繋がっているのは**自己失効（枠を返す）だけ**である。所有者が端末を退役させるには、
+curl を書くしかない。
+
+```text
+portal-server --revoke <grant_id>              あり
+portal-client --revoke-enrollment-key <id>     あり
+portal-server --revoke-provisioning-key <id>   あり
+（Endpoint そのもの）                          無い
+```
+
+**§8.7 は非常口である。** 他の失効はすべて CLI にあるのに、いちばん強いものだけが
+無いのは不揃いで、しかも「端末を無くした」は運用者が最も慌てている場面である。
+`portal-client --revoke-endpoint <id> --reason device_lost` 相当を足すのが筋だが、
+本計画の範囲外なので**次にやることとして残す**。
+
 ---
 
 ## 16. フェーズ 6 の結果
