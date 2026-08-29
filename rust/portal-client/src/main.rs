@@ -505,8 +505,6 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // even if the connect never returns.
     let terminate = terminate_signal();
     tokio::pin!(terminate);
-    #[cfg(unix)]
-    portal_core::shutdown::hard_exit_on_terminate();
 
     let connected = portal_core::session::connect(&cfg, reach, &shutdown)
         .await
@@ -567,7 +565,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         }
     }
     if interrupted {
-        portal_core::shutdown::hard_exit_on_second_interrupt();
+        portal_core::shutdown::hard_exit_on_second_signal();
     }
     // **Told to stop before it is dropped.** Dropping the keeper aborts it,
     // which can cut a redemption mid-request and leave msquic a handle the

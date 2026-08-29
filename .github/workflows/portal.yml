@@ -151,7 +151,9 @@ jobs:
     # request, which the plan had already written down (§6.2, "a key for
     # refs/heads/main will not let a PR job in; that narrowness is intended").
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    timeout-minutes: 25
+    # As much as the sibling job gets: this builds the same workspace, and its
+    # cache key is its own, so the first run after a change is always cold.
+    timeout-minutes: 45
     permissions:
       # **Without this the runner mints no workload identity token**, and keys
       # bound with --binding-oidc are refused with nothing pointing at the
@@ -197,7 +199,11 @@ jobs:
               while True:
                   c, _ = s.accept(); c.sendall(b'ok\n'); c.close()
           threading.Thread(target=serve, daemon=True).start()
-          import time; time.sleep(1200)
+          # No deadline: the teardown step kills it. A timed sleep started
+          # before the Rust build raced a cold cache, and losing the target
+          # mid-run reads like a portal failure rather than a helper exiting.
+          import time
+          while True: time.sleep(3600)
           " &
           echo $! > "$RUNNER_TEMP/service.pid"
           printf '[service.db]\nprotocol = "tcp"\ntarget = "127.0.0.1:15099"\n' \
@@ -251,8 +257,11 @@ jobs:
             --provisioning-label "gha-${GITHUB_RUN_ID}" \
             > "$RUNNER_TEMP/provisioning.out" 2>&1
           # The secret is on the line after "Put this in", and never echoed.
+          # `|| true`, because `pipefail` + `set -e` would abort here when the
+          # key is missing -- taking the diagnostic below, which is the only
+          # thing that shows what the server actually said, with it.
           grep -oE 'pvk1_[A-Za-z0-9_-]+' "$RUNNER_TEMP/provisioning.out" \
-            | head -1 > "$RUNNER_TEMP/provisioning.key"
+            | head -1 > "$RUNNER_TEMP/provisioning.key" || true
           chmod 600 "$RUNNER_TEMP/provisioning.key"
           test -s "$RUNNER_TEMP/provisioning.key" || {
             echo "no provisioning key was issued:"
@@ -296,8 +305,11 @@ jobs:
       # slots** -- and the run whose slots are most worth having back is the one
       # where a step above failed. SIGTERM is what both listen for; the KILL is
       # only for one that will not go.
+      # `HAVE_KEYS` as well as `always()`: without the secrets nothing was
+      # checked out, and a step inheriting `working-directory: rust` into a
+      # directory that does not exist fails the job the guard exists to skip.
       - name: Stop both halves and give the slots back
-        if: always()
+        if: always() && env.HAVE_KEYS == 'true'
         run: |
           for name in portal-client portal-server service; do
             PID=$(cat "$RUNNER_TEMP/$name.pid" 2>/dev/null) || continue
@@ -307,7 +319,7 @@ jobs:
           done
 
       - name: What they logged
-        if: always()
+        if: always() && env.HAVE_KEYS == 'true'
         run: |
           for f in portal-server portal-client; do
             echo "=== $f ==="

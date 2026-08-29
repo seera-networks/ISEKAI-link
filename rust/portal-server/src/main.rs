@@ -314,13 +314,25 @@ struct Args {
 /// Endpoint, and the answer lives on the proxy — a Peer Listener is what a peer
 /// connects *through*, and standing one up to ask would put a second row under
 /// this Endpoint for every client that then looks one up.
-async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Result<()> {
+async fn administer_grants(
+    args: &Args,
+    tokens: &std::path::Path,
+    enrolled: &mut Option<P2pConfig>,
+) -> anyhow::Result<()> {
     // **Settled on the arguments, before anything authenticates.** A half-given
     // binding is a typo, and finding it out after a sign-in and an Identity
     // round trip tells the operator nothing extra. `portal-client` checks a
     // ticket's authority the same way and for the same reason.
     let binding = provisioning_binding(args)?;
     let cfg = config(args, tokens).await?;
+    // **These enrol too.** `grant_admin` issues an Endpoint Token, which on the
+    // unattended path is what registers — so a `--enroll --provisioning-key`
+    // run spends a slot exactly as a serving run does, and owes it back the
+    // same way. Missing this made four such invocations exhaust a four-slot key
+    // until the idle sweep caught up.
+    if args.enroll {
+        *enrolled = Some(cfg.clone());
+    }
     grant_admin(args, &cfg, binding.as_ref()).await
 }
 
@@ -870,7 +882,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         );
     }
     if administering {
-        return administer_grants(&args, &tokens).await;
+        return administer_grants(&args, &tokens, enrolled).await;
     }
 
     // Read before anything else touches the network: a typo in the catalogue
@@ -958,8 +970,6 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // `kill` during a blocked close is swallowed.
     let terminate = terminate_signal();
     tokio::pin!(terminate);
-    #[cfg(unix)]
-    portal_core::shutdown::hard_exit_on_terminate();
     // Only an interrupt arms the hatch: the loop also ends when the signaling
     // stream breaks, and turning a user's *first* press into a hard exit there
     // would skip withdrawing the Peer Listener — the one thing the comment
@@ -980,7 +990,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         }
     }
     if interrupted {
-        portal_core::shutdown::hard_exit_on_second_interrupt();
+        portal_core::shutdown::hard_exit_on_second_signal();
     }
     // Not just `shutdown.cancel()`: returning from `main` drops the runtime, and
     // the session withdraws the Peer Listener on its way out. Cancel-and-return

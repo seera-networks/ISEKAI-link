@@ -1853,6 +1853,48 @@ Error: stand the portal server up: could not enrol this Endpoint:
 「PR で緑だからマージ後も緑」とは言えない範囲が 1 つ増える。**それは binding の
 狭さの代償であり、狭さのほうを取る。**
 
+### 15.10 `/code-review high` の指摘 — SIGTERM の扱いが根本から誤っていた
+
+**1. ハッチを武装すると、非同期の腕が走らなくなる。** フェーズ 5・6 で足した
+SIGTERM 対応は、**まったく機能していなかった。**
+
+`tokio::signal` は `signal_hook_registry` を通り、そのハンドラは登録済みアクションの
+**前に**「以前の処理」を呼ぶ（`slot.prev.execute(sig)`）。したがって:
+
+| 武装の順序 | 起きること |
+| --- | --- |
+| tokio より先 | tokio が `hard_exit` を `prev` として捕まえ、毎回それが先に走って `_exit(143)` |
+| tokio より後 | tokio のハンドラを**置き換える**ので、非同期側は信号を一切受け取らない |
+
+**どちらの順序でも正常停止の経路は死ぬ。** 実際に測った:
+
+```text
+armed-first        exit=143         （非同期の腕に到達しない）
+armed-after        exit=143         （同上）
+（武装しない）      GRACEFUL  exit=0
+armed-on-receipt   GRACEFUL  exit=143（正常停止し、2 度目で即離脱）
+```
+
+つまり `kill -TERM` は **listener を畳まず、枠も返さずに** プロセスを落としていた。
+docs/portal.md の「停止させることが枠を返す」は、起きないことを書いていた。
+
+**SIGINT が「押されてから武装する」のは作法ではなく必然だった。** そこに
+「SIGTERM には押す/押さないの区別が無い」という理由を付けたのが誤りで、本当の理由は
+**早く武装すると最初の信号が壊れる**ことである。両方を、停止を決めた時点で武装する
+1 つの関数（`hard_exit_on_second_signal`）にまとめた。
+
+> **測って直した。** ソースを読んだだけでは「順序を入れ替えれば直る」と判断していた。
+> 実際には後から武装しても壊れる。一時的な example を書いて 4 通り走らせたので分かった。
+
+**2. 鍵を発行する run も枠を使い、返していなかった。** `administering` の分岐は
+`*enrolled` を書く前に return するが、`grant_admin` は `issue_endpoint_token` を呼ぶ
+（＝無人経路では登録する）。`--enroll --provisioning-key` を 4 回打つと、4 枠の鍵が
+掃引まで埋まる。
+
+**3〜5. ワークフローの 3 点。** `always()` のステップがシークレット未設定の配備で
+チェックアウト無しに走って job を赤くする、`pipefail` が診断出力を殺していた、
+helper の `sleep 1200` がコールドビルドと競合し job の 25 分もコールドには足りない。
+
 ---
 
 ## 16. フェーズ 6 の結果

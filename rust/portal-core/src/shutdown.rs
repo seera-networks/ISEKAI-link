@@ -53,33 +53,26 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// So: call this at the moment the decision to stop is made, and the second
 /// press is a hard exit. It does not replace understanding a hang; it stops one
 /// from trapping whoever meets it.
-pub fn hard_exit_on_second_interrupt() {
+/// **Covers SIGTERM too, and arming late is required rather than tidy.**
+///
+/// A program that also waits on a signal asynchronously cannot arm this early.
+/// `tokio::signal` goes through `signal_hook_registry`, whose handler calls the
+/// *previous* disposition before running any registered action
+/// (`slot.prev.execute(sig)`). So a raw handler installed first is chained to
+/// and `_exit`s before tokio's wakeup runs; one installed afterwards simply
+/// replaces tokio's, so the async side never hears the signal at all.
+/// **Either order defeats the graceful path.**
+///
+/// That was measured rather than reasoned: both spellings exited 143 with the
+/// async arm never reached, while arming on receipt stopped gracefully and left
+/// immediately on a second signal. Which is why this is called at the moment
+/// the decision to stop is made — for both signals, for one reason.
+pub fn hard_exit_on_second_signal() {
     // SAFETY: `handler` is the address of an `extern "C"` function with the
-    // signature `signal(2)` requires, and `SIGINT` is a valid signal number.
+    // signature `signal(2)` requires, and both are valid signal numbers.
     unsafe {
         signal(SIGINT, hard_exit as extern "C" fn(i32) as usize);
-    }
-}
-
-/// Make a `kill` leave immediately, from the moment SIGTERM is listened for.
-///
-/// **Call this as soon as the listener is installed, not when stopping.**
-/// `tokio::signal::unix::signal` replaces SIGTERM's default disposition for the
-/// rest of the process and never puts it back, so from that instant a `kill`
-/// does nothing unless something is polling for it — and the paths that are not
-/// polling are exactly the ones that can block: `close()` waiting on a rundown
-/// reference, and [`leave`]'s drain.
-///
-/// **This is why it is unconditional where the interrupt hatch is not.** That
-/// one is armed only once somebody has pressed Ctrl+C, because arming it
-/// earlier would turn a first press into a hard exit that skips reporting the
-/// connection closed. SIGTERM has no such case: nothing has been "pressed", the
-/// default has already been taken away, and a CI teardown's `kill` has to keep
-/// working.
-#[cfg(unix)]
-pub fn hard_exit_on_terminate() {
-    // SAFETY: as above, with `SIGTERM` in place of `SIGINT`.
-    unsafe {
+        #[cfg(unix)]
         signal(SIGTERM, hard_exit as extern "C" fn(i32) as usize);
     }
 }
