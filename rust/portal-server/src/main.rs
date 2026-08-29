@@ -227,8 +227,8 @@ struct Args {
     #[argh(option)]
     ticket_ttl: Option<u64>,
     /// how long the grant made by redeeming a --ticket or a
-    /// --provisioning-key lasts, in seconds. Never unlimited. **The two clamp
-    /// differently**: a ticket to 60..=86400 (default 3600), a provisioning
+    /// --provisioning-key lasts, in seconds. Never unlimited. THE TWO CLAMP
+    /// DIFFERENTLY: a ticket to 60..=86400 (default 3600), a provisioning
     /// key to 60..=3600 (default 1800), because that one is meant to be
     /// extended by redeeming again rather than set long
     #[argh(option)]
@@ -284,8 +284,8 @@ struct Args {
     /// a key went
     #[argh(option)]
     provisioning_redemptions: Option<String>,
-    /// stop a provisioning key, by the id --provisioning-keys prints. **This
-    /// also deletes the grants it made**, so anything connected on one stops
+    /// stop a provisioning key, by the id --provisioning-keys prints. THIS
+    /// ALSO DELETES THE GRANTS IT MADE, so anything connected on one stops
     /// being authorised -- unlike --revoke-ticket, which leaves them
     #[argh(option)]
     revoke_provisioning_key: Option<String>,
@@ -768,11 +768,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         || args.provisioning_keys
         || args.provisioning_redemptions.is_some()
         || args.revoke_provisioning_key.is_some();
-    // **`--allow` is the one that does need a listener**, and these paths exit
-    // before there is one. Dropping it quietly is the worst of the three
-    // options: the code or the listing would print, the run would look like it
-    // worked, and the capability nobody was issued would be discovered by the
-    // peer failing to connect.
     // **A binding with nothing to bind is refused, not ignored.** These only
     // mean anything to `--provisioning-key`, and a run that quietly dropped
     // them would start a server while the operator believed they had just
@@ -784,6 +779,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
              is not issuing one"
         );
     }
+    // **`--allow` is the one that does need a listener**, and these paths exit
+    // before there is one. Dropping it quietly is the worst of the three
+    // options: the code or the listing would print, the run would look like it
+    // worked, and the capability nobody was issued would be discovered by the
+    // peer failing to connect.
     if administering && !args.allow.is_empty() {
         anyhow::bail!(
             "--allow issues a capability against a running listener, and this run exits \

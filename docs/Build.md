@@ -257,9 +257,19 @@ Binary crates can be run with `cargo run` (from within the `rust/` directory):
 ```sh
 cargo run -p camera-server
 cargo run -p camera-client
+cargo run -p portal-server
+cargo run -p portal-client
 cargo run -p agent
 cargo run -p webrtc-app
 ```
+
+> [!IMPORTANT]
+> Use `cargo run` rather than the binary under `target/`. `libmsquic` is built by
+> `seera-msquic`'s build script and lives only inside cargo's output directory,
+> under a path with a build hash in it — nothing installs it. `cargo run` puts
+> that directory on the loader's path; invoking `./target/debug/portal-server`
+> directly does not, and fails with
+> `error while loading shared libraries: libmsquic.so.2`.
 
 Check the command-line arguments of each binary with `-- --help`:
 
@@ -352,6 +362,16 @@ knowing:
 ---
 
 ## Troubleshooting
+
+- **`error while loading shared libraries: libmsquic.so.2`**
+  The build succeeded and the library exists; the loader cannot find it. It is
+  only ever written to cargo's build-script output
+  (`target/<profile>/build/seera-msquic-*/out/lib`), so run through `cargo run`,
+  or bundle the binary with its libraries the way a release is built:
+
+  ```sh
+  scripts/bundle-apps.sh rust/target/release dist portal portal-server portal-client
+  ```
 
 - **`msquic`-related link/build errors**
   Make sure the submodules are initialized (steps 2-1 and 2-2) and that `prepare-machine.ps1` has been run for your OS (step 2-3). Also confirm the TLS provider is correct (Windows: `schannel` / Linux: `quictls`).
