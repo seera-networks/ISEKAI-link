@@ -247,6 +247,26 @@ struct Args {
     /// `ephemeral` key takes its derived Endpoints with it
     #[argh(option)]
     revoke_enrollment_key: Option<String>,
+    /// print the Endpoints this account owns, and exit. Revoked ones are
+    /// hidden unless --endpoint-status says otherwise, and how many were
+    /// hidden is printed so you know to ask
+    #[argh(switch)]
+    endpoints: bool,
+    /// which Endpoints to list: `active` (default), `revoked` or `all`
+    #[argh(option)]
+    endpoint_status: Option<String>,
+    /// retire an Endpoint, by the id --endpoints prints. NEEDS --reason. THIS
+    /// CANNOT BE UNDONE, and the keypair cannot register again -- a device
+    /// that comes back needs a new key
+    #[argh(option)]
+    revoke_endpoint: Option<String>,
+    /// why an Endpoint is being retired: `device_lost`, `endpoint_deleted`,
+    /// `admin_revoke` or `security_incident`. It lands in the audit log
+    #[argh(option)]
+    reason: Option<String>,
+    /// free text kept with the revocation, for whoever reads the audit log
+    #[argh(option)]
+    note: Option<String>,
 }
 
 /// The audience the **proxy** checks a binding assertion against (§8.13.4).
@@ -331,6 +351,8 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         || args.enrollment_keys
         || args.enrollment_key_enrollments.is_some()
         || args.revoke_enrollment_key.is_some()
+        || args.endpoints
+        || args.revoke_endpoint.is_some()
     {
         return enrollment_admin(&args, &tokens).await;
     }
@@ -353,6 +375,16 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
 
     if let (Some(_), Some(_)) = (&args.pair, &args.redeem) {
         anyhow::bail!("--pair and --redeem are two ways in; use one");
+    }
+    // **Refused rather than dropped**, the fourth time this shape has come up
+    // here: these mean something only to `--revoke-endpoint`, and a run that
+    // ignored them would go on to forward while the operator believed they had
+    // just retired a device.
+    if args.revoke_endpoint.is_none() && (args.reason.is_some() || args.note.is_some()) {
+        anyhow::bail!("--reason and --note describe a --revoke-endpoint, and this run has none");
+    }
+    if args.revoke_endpoint.is_none() && args.endpoint_status.is_some() && !args.endpoints {
+        anyhow::bail!("--endpoint-status describes --endpoints, which this run is not asking for");
     }
     portal_core::ci::check_unattended_args(
         args.enroll,
@@ -867,6 +899,13 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
         .issue_enrollment_key
         .then(|| enrollment_request(args))
         .transpose()?;
+    // Same reasoning: a missing or misspelled reason is a fact about the
+    // arguments, and a sign-in adds nothing to saying so.
+    let reason = args
+        .revoke_endpoint
+        .is_some()
+        .then(|| revoke_reason(args))
+        .transpose()?;
     let auth = portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await?;
     let identity = isekai_p2p::enrollment::Identity::new(&args.identity_url, args.identity_http3);
     let token = &auth.token;
@@ -931,6 +970,82 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
         println!("by different servers, and revoked at different ones.");
     }
 
+    if let (Some(endpoint_id), Some(reason)) = (&args.revoke_endpoint, reason) {
+        // **Looked up first, so the answer can say what stays.** A row whose
+        // key another live row shares keeps working after this (#16), and an
+        // emergency exit that looks taken while the door is open is the one
+        // thing §8.7 must not be. A failed lookup does not stop the
+        // revocation — that is what was asked for.
+        let siblings = isekai_p2p::endpoints::get(&identity, token, endpoint_id)
+            .await
+            .map(|d| d.duplicate_key_siblings)
+            .unwrap_or_default();
+        let revoked = isekai_p2p::endpoints::revoke(
+            &identity,
+            token,
+            endpoint_id,
+            reason,
+            args.note.as_deref(),
+        )
+        .await
+        .with_context(|| format!("revoke {endpoint_id}"))?;
+        println!("revoked     : {}", revoked.endpoint_id);
+        if let Some(at) = &revoked.revoked_at {
+            println!("at          : {at}");
+        }
+        print_effects(revoked.effects.as_ref());
+        // **A `200` does not mean the Endpoint stopped**, and §8.7 says so.
+        // Identity's own record is settled either way; whether the proxy heard
+        // is a separate fact, and the one that decides if anything is still
+        // reachable.
+        match revoked.proxy_notification.as_deref() {
+            Some("delivered") => println!("proxy       : told, and enforcing it"),
+            Some("partial") => println!(
+                "proxy       : TOLD BUT NOT ENFORCING -- its revocation set is full, and this \
+                 Endpoint keeps getting through until it restarts",
+            ),
+            Some("failed") => println!(
+                "proxy       : NOT TOLD -- its grants and listeners for this Endpoint stand. \
+                 Repeat this once the proxy is reachable; it is idempotent",
+            ),
+            Some("disabled") => println!(
+                "proxy       : not told -- this deployment has no PROXY_INTERNAL_URL, so \
+                 nothing there has changed",
+            ),
+            other => println!("proxy       : {}", other.unwrap_or("not reported")),
+        }
+        if !siblings.is_empty() {
+            println!("\nTHE KEY STILL WORKS. Another Endpoint shares it, so revoking this row");
+            println!("stopped a name and not a credential:");
+            for id in &siblings {
+                println!("  still live : {id}");
+            }
+        }
+    }
+
+    if args.endpoints {
+        let status = args.endpoint_status.as_deref();
+        let page = isekai_p2p::endpoints::list(&identity, token, status, None)
+            .await
+            .context("list endpoints")?;
+        if page.items.is_empty() {
+            println!("No endpoints.");
+        }
+        for endpoint in &page.items {
+            print_endpoint(endpoint);
+        }
+        // **Said even when it is zero.** The default filter hides revoked rows,
+        // and the server counts them separately so that the hiding is visible
+        // rather than silent.
+        if let Some(hidden) = page.revoked_count {
+            println!("\n{hidden} revoked endpoint(s) not shown -- --endpoint-status all");
+        }
+        // `None` is "no more here", not "that was everything".
+        if page.next_cursor.is_some() {
+            println!("More rows follow; this printed one page.");
+        }
+    }
+
     if args.enrollment_keys {
         let keys = isekai_p2p::enrollment::list(&identity, token)
             .await
@@ -990,6 +1105,102 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The reason these arguments name, refused before anything authenticates.
+///
+/// **Required, and not defaulted.** §8.7 makes it mandatory, and a default
+/// would write somebody else's word into an audit log that gets read during an
+/// incident. The vocabulary is closed and half of it is Identity's own —
+/// `enrollment_idle` and `enrollment_released` are what the sweep and a job
+/// write, and naming one here is refused by the server.
+fn revoke_reason(args: &Args) -> anyhow::Result<isekai_p2p::agent::RevokeReason> {
+    use isekai_p2p::agent::RevokeReason;
+    let Some(reason) = args.reason.as_deref() else {
+        anyhow::bail!(
+            "--revoke-endpoint needs --reason: device_lost, endpoint_deleted, admin_revoke \
+             or security_incident. It goes in the audit log, so it is not guessed for you"
+        );
+    };
+    match reason {
+        "device_lost" => Ok(RevokeReason::DeviceLost),
+        "endpoint_deleted" => Ok(RevokeReason::EndpointDeleted),
+        "admin_revoke" => Ok(RevokeReason::AdminRevoke),
+        "security_incident" => Ok(RevokeReason::SecurityIncident),
+        // Named rather than lumped in with a typo: somebody reaching for these
+        // has read them in a listing, and the answer is that Identity writes
+        // them and a request may not.
+        "enrollment_idle" | "enrollment_released" | "enrollment_key_revoked" => anyhow::bail!(
+            "`{reason}` is a reason Identity writes for itself -- the idle sweep, a job \
+             returning its slot, a key being revoked. A request cannot claim one"
+        ),
+        other => anyhow::bail!(
+            "unknown --reason `{other}`: device_lost, endpoint_deleted, admin_revoke \
+             or security_incident"
+        ),
+    }
+}
+
+/// Say what the revocation destroyed, when there was anything.
+///
+/// **Zero is not silence.** "Nothing was torn down" and "the proxy was never
+/// told" produce the same zeros, which is why the notification line is printed
+/// beside this rather than instead of it.
+fn print_effects(effects: Option<&isekai_p2p::agent::RevokeEffects>) {
+    let Some(effects) = effects else {
+        return;
+    };
+    let counted: Vec<String> = [
+        ("listeners", effects.deleted_peer_listeners),
+        ("grants", effects.deleted_grants),
+        ("capabilities", effects.deleted_capabilities),
+        ("connections", effects.closed_connections),
+    ]
+    .iter()
+    .filter_map(|(label, n)| match n {
+        Some(n) if *n > 0 => Some(format!("{n} {label}")),
+        _ => None,
+    })
+    .collect();
+    if counted.is_empty() {
+        println!("torn down   : nothing was there to remove");
+    } else {
+        println!("torn down   : {}", counted.join(", "));
+    }
+    // **Worth saying when it is false.** Repeating a revocation whose
+    // notification failed is the documented recovery, and this is what tells
+    // the operator whether the repeat did anything or the first one had.
+    if effects.newly_revoked == Some(false) {
+        println!("note        : it was already revoked; this call changed nothing at Identity");
+    }
+}
+
+/// Print one Endpoint the way somebody looking for what to stop needs it.
+fn print_endpoint(e: &isekai_p2p::agent::EndpointSummary) {
+    let name = e.device_name.as_deref().unwrap_or("(no name)");
+    let status = e.status.as_deref().unwrap_or("?");
+    let mut notes = Vec::new();
+    if e.ephemeral {
+        notes.push("ephemeral".to_owned());
+    }
+    if let Some(key) = &e.enrollment_key_id {
+        notes.push(format!("from {key}"));
+    }
+    if let Some(reason) = &e.revoke_reason {
+        notes.push(reason.clone());
+    }
+    // **First, and in capitals.** Revoking a row whose key another live row
+    // shares does not stop the key (ISEKAI-identity#16), and somebody reading
+    // this list is choosing what to stop.
+    if e.duplicate_key {
+        notes.insert(0, "SHARES ITS KEY".to_owned());
+    }
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", notes.join(", "))
+    };
+    println!("endpoint    : {}  {status}  {name}{notes}", e.endpoint_id);
 }
 
 /// What to ask for when issuing, refused before anything authenticates.
@@ -1111,4 +1322,57 @@ fn maps(
             Ok((protocol, SocketAddr::new(bind, port), service.to_owned()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use isekai_p2p::agent::RevokeReason;
+
+    fn args_with(reason: Option<&str>) -> Args {
+        let mut args: Args = argh::FromArgs::from_args(&["portal-client"], &[]).expect("defaults");
+        args.revoke_endpoint = Some("ep:abc".to_owned());
+        args.reason = reason.map(str::to_owned);
+        args
+    }
+
+    #[test]
+    fn a_reason_is_required() {
+        let err = revoke_reason(&args_with(None)).unwrap_err();
+        assert!(format!("{err:#}").contains("--reason"));
+    }
+
+    /// **Identity's own vocabulary is refused with its own message.** Somebody
+    /// reaching for one of these has read it in a listing, and "unknown reason"
+    /// would not answer why it cannot be used.
+    #[test]
+    fn identitys_own_reasons_are_refused_by_name() {
+        for reason in [
+            "enrollment_idle",
+            "enrollment_released",
+            "enrollment_key_revoked",
+        ] {
+            let err = revoke_reason(&args_with(Some(reason))).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("Identity writes for itself"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_typo_names_what_is_accepted() {
+        let err = revoke_reason(&args_with(Some("lost"))).unwrap_err();
+        assert!(format!("{err:#}").contains("device_lost"));
+    }
+
+    #[test]
+    fn the_four_the_caller_may_use_parse() {
+        for (text, expected) in [
+            ("device_lost", RevokeReason::DeviceLost),
+            ("endpoint_deleted", RevokeReason::EndpointDeleted),
+            ("admin_revoke", RevokeReason::AdminRevoke),
+            ("security_incident", RevokeReason::SecurityIncident),
+        ] {
+            assert_eq!(revoke_reason(&args_with(Some(text))).unwrap(), expected);
+        }
+    }
 }

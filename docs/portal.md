@@ -653,6 +653,49 @@ A grant stands until revoked, so this is the counterpart of pairing and not an
 afterthought. Grants belong to the Endpoint rather than to a listener, so they
 survive restarts — which means nothing expires them by accident either.
 
+### Taking a device away
+
+A grant says who may reach you. Retiring the **device itself** is a different
+and larger act, and it is the one for a laptop that was lost:
+
+```sh
+portal-client --endpoints                     # what this account owns
+portal-client --revoke-endpoint ep:4d5e6f… --reason device_lost
+```
+
+```
+revoked     : ep:4d5e6f…
+torn down   : 1 listeners, 2 grants
+proxy       : told, and enforcing it
+```
+
+**`--reason` is required**, because it lands in an audit log somebody reads
+during an incident and a default would put a word there that nobody chose.
+
+Three things this prints are worth reading rather than skipping.
+
+**What was torn down.** Revoking an Endpoint takes its listeners, grants,
+capabilities and open connections with it. "Nothing was there to remove" is a
+real answer and not an error.
+
+**Whether the proxy heard.** Identity settles its own record either way, so a
+success here does **not** mean the device stopped: if the proxy was not told,
+its grants and listeners stand until it is. Repeating the command once the
+proxy is reachable is the fix, and it is safe to repeat.
+
+**Whether the key is still good elsewhere.** If another Endpoint shares the same
+public key, revoking this one stopped a name and not a credential — the output
+names the rows that keep working, and you want all of them.
+
+Revoked Endpoints are hidden from `--endpoints` by default, and the count of
+what was hidden is printed so that the hiding is visible; `--endpoint-status
+all` shows them. Their `revoke_reason` is worth a look on a CI account:
+`enrollment_released` means a job tidied up after itself, `enrollment_idle`
+means nothing did and the sweep got there.
+
+**This cannot be undone.** One key registers one Endpoint, so the device needs
+a new key to come back.
+
 ---
 
 ## When it does not work

@@ -20,6 +20,8 @@
 pub mod auth;
 pub mod auth0;
 pub mod config;
+/// Reading and retiring the Endpoints an account owns (§8.1.3 / §8.1.4 / §8.7).
+pub mod endpoints;
 /// Managing Enrollment Keys from the owner's side (§8.8.2 / §8.8.9).
 pub mod enrollment;
 pub mod initiator;
@@ -50,9 +52,9 @@ pub mod agent {
     /// Whether a peer certificate names the host that was dialled (#134).
     pub use isekai_p2p_core::hostname::certificate_matches;
     pub use isekai_p2p_core::identity::{
-        Binding, EndpointToken, Enrolled, EnrollmentKeyRecord, EnrollmentRecord, IdentityAuth,
-        IdentityError, IssuedEnrollmentKey, NewEnrollmentKey, RevokeAuth, RevokeReason, Revoked,
-        RevokedEnrollmentKey,
+        Binding, EndpointDetail, EndpointList, EndpointSummary, EndpointToken, Enrolled,
+        EnrollmentKeyRecord, EnrollmentRecord, IdentityAuth, IdentityError, IssuedEnrollmentKey,
+        NewEnrollmentKey, RevokeAuth, RevokeEffects, RevokeReason, Revoked, RevokedEnrollmentKey,
     };
     pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::proxy::{

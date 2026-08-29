@@ -528,6 +528,75 @@ struct EnrollmentList {
     next_cursor: Option<String>,
 }
 
+/// One row of `GET /v1/endpoints` (§8.1.3).
+#[derive(Debug, Clone, Deserialize)]
+pub struct EndpointSummary {
+    pub endpoint_id: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub registered_at: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+    #[serde(default)]
+    pub revoke_reason: Option<String>,
+    /// **Another live Endpoint shares this public key** (ISEKAI-identity#16).
+    ///
+    /// While this is true, **revoking this row does not stop the key** — the
+    /// other row keeps working. §8.7 is the emergency exit, and an exit that
+    /// looks taken while the door is open is the one thing it must not be, so
+    /// anything that revokes has to say this out loud.
+    #[serde(default)]
+    pub duplicate_key: bool,
+    /// Which Enrollment Key grew this row; `None` for an attended registration.
+    #[serde(default)]
+    pub enrollment_key_id: Option<String>,
+    /// Whether the idle sweep will retire it (§8.8.8) — so a row visible today
+    /// may not be tomorrow.
+    #[serde(default)]
+    pub ephemeral: bool,
+    /// Last time a token was issued or renewed. **Not "connected now".**
+    #[serde(default)]
+    pub last_token_issued_at: Option<String>,
+}
+
+/// `GET /v1/endpoints` (§8.1.3).
+#[derive(Debug, Clone, Deserialize)]
+pub struct EndpointList {
+    /// **Not defaulted**, for the reason the enrolment-key listing is not: an
+    /// empty answer to a shape this cannot read says "you have no Endpoints",
+    /// which is the worst possible answer to somebody looking for one to stop.
+    pub items: Vec<EndpointSummary>,
+    /// How many rows this filter hid because they are revoked.
+    ///
+    /// **`Some(0)` and `None` mean different things**, and the server is
+    /// deliberate about it: `Some(0)` is "nothing revoked matched", `None` is
+    /// "not counted, because you asked for revoked rows anyway". Showing them
+    /// as the same would undo what the field is for — making the default
+    /// filter's hiding visible.
+    #[serde(default)]
+    pub revoked_count: Option<u64>,
+    /// **`None` is "no more here", not "that was everything"** — rows can be
+    /// registered or revoked while a listing is being paged.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// `GET /v1/endpoints/{endpoint_id}` (§8.1.4) — a row, plus what shares its key.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EndpointDetail {
+    #[serde(flatten)]
+    pub summary: EndpointSummary,
+    /// The other live Endpoints holding this same public key, within this
+    /// tenant. **These are what keeps working after revoking this one.**
+    #[serde(default)]
+    pub duplicate_key_siblings: Vec<String>,
+}
+
 /// What revoking an Endpoint did (§8.7).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Revoked {
@@ -549,7 +618,43 @@ pub struct Revoked {
     #[serde(default)]
     pub proxy_notification_detail: Option<String>,
     #[serde(default)]
-    pub effects: Option<Value>,
+    pub effects: Option<RevokeEffects>,
+}
+
+/// What a revocation tore down (§8.7).
+///
+/// **Every field is optional and zero is not silence.** "Nothing was there to
+/// remove" and "the proxy was never told" both produce zeros, which is why
+/// [`Revoked::proxy_notification`] has to be read beside this rather than
+/// instead of it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RevokeEffects {
+    #[serde(default)]
+    pub revoked_tokens: Option<u64>,
+    #[serde(default)]
+    pub deleted_peer_listeners: Option<u64>,
+    #[serde(default)]
+    pub deleted_public_listeners: Option<u64>,
+    #[serde(default)]
+    pub deleted_capabilities: Option<u64>,
+    #[serde(default)]
+    pub closed_connections: Option<u64>,
+    #[serde(default)]
+    pub deleted_grants: Option<u64>,
+    #[serde(default)]
+    pub deleted_pairing_codes: Option<u64>,
+    /// Absent rather than zero when the store could not be reached, so that a
+    /// failure is not read as "there were none".
+    #[serde(default)]
+    pub revoked_policy_leases: Option<u64>,
+    /// Whether this call is what made it stick.
+    ///
+    /// **`false` means somebody already revoked it** — a previous attempt, or
+    /// the idle sweep. Worth printing: repeating a revocation whose
+    /// notification failed is the documented recovery, and this says whether
+    /// the repeat did anything.
+    #[serde(default)]
+    pub newly_revoked: Option<bool>,
 }
 
 /// What revoking an Enrollment Key did (§8.8.9).
@@ -820,6 +925,55 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
         }
         auth.apply_to_body(&mut body);
         self.post("/v1/endpoints/enroll", auth, None, body).await
+    }
+
+    /// §8.1.3 — the Endpoints this caller owns.
+    ///
+    /// **Revoked rows are hidden unless asked for**, which is why
+    /// [`EndpointList::revoked_count`] exists and why anything showing this
+    /// should show that too.
+    pub async fn list_endpoints(
+        &self,
+        auth0_token: &str,
+        status: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<EndpointList, IdentityError> {
+        let mut query = Vec::new();
+        if let Some(status) = status {
+            query.push(format!("status={status}"));
+        }
+        if let Some(cursor) = cursor {
+            query.push(format!("cursor={cursor}"));
+        }
+        let path = if query.is_empty() {
+            "/v1/endpoints".to_owned()
+        } else {
+            format!("/v1/endpoints?{}", query.join("&"))
+        };
+        self.request(
+            "GET",
+            &path,
+            IdentityAuth::Auth0(auth0_token),
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// §8.1.4 — one Endpoint, and what else holds its key.
+    pub async fn get_endpoint(
+        &self,
+        auth0_token: &str,
+        endpoint_id: &str,
+    ) -> Result<EndpointDetail, IdentityError> {
+        self.request(
+            "GET",
+            &format!("/v1/endpoints/{endpoint_id}"),
+            IdentityAuth::Auth0(auth0_token),
+            None,
+            Vec::new(),
+        )
+        .await
     }
 
     // ---- §8.7: revocation ----
