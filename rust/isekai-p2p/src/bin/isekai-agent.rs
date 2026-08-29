@@ -221,6 +221,11 @@ struct Bind {
     /// local UDP address to forward inbound relay traffic to
     #[argh(option)]
     forward_to: SocketAddr,
+    /// relay ticket for this Endpoint's leg (proxy spec §8.14), from
+    /// `POST /v1/peer/connections/{id}/ticket`. Omit against a proxy that
+    /// predates §8.14, or one running with `--relay-require-ticket` off.
+    #[argh(option)]
+    relay_ticket: Option<String>,
 }
 
 fn main() {
@@ -422,6 +427,7 @@ async fn run_bind(a: Bind) -> anyhow::Result<()> {
         &key,
         &a.connection_id,
         a.forward_to,
+        a.relay_ticket.as_deref(),
         // The CLI does not migrate paths, so the leg keeps its plain connected
         // socket and its own registration.
         isekai_p2p_core::bind::RelayOptions::default(),

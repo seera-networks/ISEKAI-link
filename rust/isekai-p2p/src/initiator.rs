@@ -22,6 +22,7 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{issue_endpoint_token, spawn_token_renewal, P2pConfig, TokenRenewal};
+use crate::relay_lease::RelayLegLease;
 
 /// An initiator-side P2P session. Holds the relay connect leg open until dropped
 /// or [`close`](InitiatorSession::close)d.
@@ -44,6 +45,19 @@ pub struct InitiatorSession {
     /// dropped, it also stops when the process is killed, which is what lets
     /// the proxy expire the connection and the camera release its relay leg.
     lease: ConnectionLease,
+    /// Keeps this side's **relay leg** alive (proxy spec §8.14).
+    ///
+    /// **A second lease, on a different thing.** `lease` above carries the
+    /// connection row by reporting state; this one re-tickets the leg. Since
+    /// §8.14 the proxy stopped extending the leg when a state report arrives,
+    /// so a session that renewed only the row would keep a live connection with
+    /// nothing flowing over it — and the visible symptom would be video that
+    /// stops twenty minutes in with the control plane insisting everything is
+    /// fine.
+    ///
+    /// Against a proxy that predates §8.14 this stops itself on the first
+    /// attempt and nothing else changes.
+    relay_lease: RelayLegLease,
     /// Cancelled when the proxy stops accepting this Endpoint for this
     /// connection — see [`ended`](Self::ended).
     ended: CancellationToken,
@@ -621,6 +635,14 @@ impl InitiatorSession {
         let relay = connection.relay.as_ref().context(
             "connect response has no relay info; the proxy did not allocate a relay edge",
         )?;
+        // **The ticket is what brings the leg into existence** (spec §8.14).
+        // It rides along in the `connect` response, so no extra round trip.
+        //
+        // `None` means either a proxy that predates §8.14 — which asks for no
+        // ticket — or one that could not sign. Opening the leg without one is
+        // right in both cases: the first accepts it, and the second answers
+        // `relay-ticket-required`, which names the real problem.
+        let ticket = connection.ticket.clone();
         let handle = open_connect_relay(
             &cfg.proxy_url,
             endpoint_token,
@@ -628,6 +650,7 @@ impl InitiatorSession {
             &connection.connection_id,
             &relay.masque_uri,
             local_bind,
+            ticket.as_ref().map(|t| t.ticket.as_str()),
             opts,
         )
         .await?;
@@ -640,12 +663,24 @@ impl InitiatorSession {
             handle.shutdown_token(),
             ended.clone(),
         );
+        // Timed off the lease the ticket just wrote, so the first renewal lands
+        // where every one after it does. `ended` rather than a token of its
+        // own: a leg the proxy will not re-ticket is this Endpoint being told
+        // it may not hold the connection any more, which is the same thing
+        // `ended` already means to the application.
+        let relay_lease = RelayLegLease::spawn(
+            proxy.clone(),
+            connection.connection_id.clone(),
+            ticket.map(|t| t.lease_expires_at),
+            ended.clone(),
+        );
         Ok(Self {
             local_addr: handle.local_addr,
             connection,
             relay: handle,
             proxy: proxy.clone(),
             lease,
+            relay_lease,
             ended,
             _renewal: renewal,
         })
@@ -710,8 +745,11 @@ impl InitiatorSession {
     /// there is nothing a disconnecting application could do with the error.
     pub async fn close(self) {
         // Before the report: `closed` is terminal, so a renewal arriving behind
-        // it is refused and logged as a failure that is only bad timing.
+        // it is refused and logged as a failure that is only bad timing. Both
+        // leases, for the same reason — a re-ticket would be refused with
+        // `connection-closed` just as a state report would.
         self.lease.stop();
+        self.relay_lease.stop();
         if self.ended.is_cancelled() {
             // Revoked. `report_state` goes through the same auth layer that
             // just refused the renewal, so it can only be refused too — and

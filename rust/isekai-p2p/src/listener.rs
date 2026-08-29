@@ -36,6 +36,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{issue_endpoint_token, spawn_token_renewal, P2pConfig, TokenRenewal};
+use crate::relay_lease::RelayLegLease;
 
 /// How long [`ListenerSession::close`] waits for the proxy to take the listener
 /// down before giving up and letting the lease do it.
@@ -268,6 +269,17 @@ struct BindGuard {
     /// [`renew_connections`](ListenerSession::renew_connections) last looked.
     inbound: InboundActivity,
     seen: u64,
+    /// Re-tickets this leg so the proxy does not reclaim it (spec §8.14).
+    ///
+    /// **Not what `renew_connections` does.** That reports state, which carries
+    /// the connection *row*; since §8.14 a report no longer touches the leg.
+    /// Held here rather than in the session so that dropping a leg stops
+    /// claiming it — a listener that unbinds a peer should stop asserting it
+    /// needs that leg in the same moment.
+    ///
+    /// `None` against a proxy that predates §8.14, where the leg has no lease
+    /// to carry.
+    _lease: Option<RelayLegLease>,
 }
 
 impl BindGuard {
@@ -452,6 +464,27 @@ impl ListenerSession {
         if self.binds.contains_key(connection_id) {
             return Ok(());
         }
+        // **The target's only way to get a ticket** (proxy spec §8.14.2). The
+        // `connect` response that carries the initiator's goes to the initiator,
+        // and the event that told this listener about the connection carries
+        // none on purpose — an event is a fast path, not a record.
+        //
+        // A proxy that predates §8.14 has no such route and asks for no ticket,
+        // so a refusal here is not a reason to refuse the leg: it is opened
+        // without one, exactly as it always was. A §8.14 proxy running
+        // `--relay-require-ticket` then answers `relay-ticket-required` on the
+        // leg itself, which names the real problem where an error about a
+        // missing ticket route would not.
+        let ticket = match self.proxy.issue_relay_ticket(connection_id).await {
+            Ok(ticket) => Some(ticket),
+            Err(e) => {
+                tracing::debug!(
+                    connection_id = %connection_id,
+                    "no relay ticket for this leg; opening it without one: {e}",
+                );
+                None
+            }
+        };
         let session = open_bind_session(
             &self.proxy_url,
             // The current one, not the one the session started with: a leg
@@ -460,6 +493,7 @@ impl ListenerSession {
             &self.key,
             connection_id,
             self.forward_to,
+            ticket.as_ref().map(|t| t.ticket.as_str()),
             self.opts.clone(),
         )
         .await?;
@@ -472,12 +506,36 @@ impl ListenerSession {
             self.observed_tx.clone(),
             self.legs.clone(),
         ));
+        // Timed off the lease the ticket just wrote. The token it is handed goes
+        // nowhere on purpose — a listener does not tear its session down
+        // because one peer's leg lapsed; it stops holding that leg, and
+        // `poll_and_bind` picks the peer up if it comes back.
+        //
+        // **Unconditional, unlike `renew_connections`.** That pass renews only
+        // the rows of legs something is arriving on, because holding a leg says
+        // nothing about whether a peer is still there. A leg's *lease* is a
+        // different question, and asking it that way would break the case the
+        // relay exists for: a session that has migrated to a direct path sends
+        // nothing this way, and dropping its leg would take the fallback with
+        // it — while the proxy cuts an edge at the shorter of the two parties'
+        // leases, so this side going quiet would end the leg outright. What
+        // ends this is the leg being unbound, which happens when the proxy
+        // stops listing the connection.
+        let lease = ticket.map(|t| {
+            RelayLegLease::spawn(
+                self.proxy.clone(),
+                connection_id.to_owned(),
+                Some(t.lease_expires_at),
+                CancellationToken::new(),
+            )
+        });
         self.binds.insert(
             connection_id.to_owned(),
             BindGuard {
                 handle,
                 inbound,
                 seen: 0,
+                _lease: lease,
             },
         );
         Ok(())
@@ -1369,6 +1427,7 @@ mod tests {
             handle: tokio::spawn(std::future::ready(())),
             inbound,
             seen: 0,
+            _lease: None,
         }
     }
 

@@ -119,6 +119,28 @@ fn header_value(value: &str) -> anyhow::Result<HeaderValue> {
     HeaderValue::from_str(value).context("PoP header value is not a valid HTTP header value")
 }
 
+/// Header the relay ticket travels in (spec §8.14.3).
+const RELAY_TICKET_HEADER: &str = "seera-relay-ticket";
+
+/// Add `Seera-Relay-Ticket` to a leg's request when there is one to add.
+///
+/// **A leg with no ticket is not an error here.** A proxy that predates §8.14
+/// issues none and asks for none; one that has `--relay-require-ticket` off
+/// still binds the leg, on a single lease it will not renew. Only a proxy with
+/// the flag on refuses, and it says so with `relay-ticket-required` — which is
+/// the signal that this side is the one that needs upgrading, not the proxy.
+fn ticket_layer(
+    ticket: Option<&str>,
+) -> anyhow::Result<Option<SetRequestHeaderLayer<HeaderValue>>> {
+    let Some(ticket) = ticket else {
+        return Ok(None);
+    };
+    Ok(Some(SetRequestHeaderLayer::appending(
+        HeaderName::from_static(RELAY_TICKET_HEADER),
+        HeaderValue::from_str(ticket).context("relay ticket is not a valid header value")?,
+    )))
+}
+
 /// A running MASQUE bind session. Keep it alive for the duration of the P2P
 /// connection; dropping it cancels the session.
 pub struct BindSession {
@@ -208,17 +230,24 @@ impl Drop for BindSession {
 /// the connection: the proxy authorizes the relay edge against the Endpoint the
 /// PoP signature proves possession of, not against the user.
 ///
+/// `ticket` is the relay ticket for **this Endpoint's** leg (spec §8.14),
+/// fetched with `ProxyClient::issue_relay_ticket`. It is what brings the leg
+/// into existence on a proxy that has §8.14; `None` is the pre-§8.14 behaviour
+/// and is refused by a proxy running `--relay-require-ticket`.
+///
 /// Returns only once the CONNECT-UDP bind session is **established** — i.e. the
 /// proxy has bound the relay edge and the leg can carry datagrams. Awaiting
 /// this before the application starts relaying closes a startup race where the
 /// far peer's first packets reached the edge before this leg was ready and were
 /// dropped (the tunneled QUIC handshake then stalled).
+#[allow(clippy::too_many_arguments)]
 pub async fn open_bind_session(
     target: &str,
     endpoint_token: &str,
     key: &EndpointKey,
     connection_id: &str,
     forward_to: SocketAddr,
+    ticket: Option<&str>,
     opts: RelayOptions,
 ) -> anyhow::Result<BindSession> {
     let uri: Uri = target.parse().context("invalid proxy target URI")?;
@@ -255,6 +284,7 @@ pub async fn open_bind_session(
             HeaderName::from_static("seera-signaling-session-id"),
             HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
         ))
+        .option_layer(ticket_layer(ticket)?)
         .service(channel);
 
     let (out_tx, out_rx) = mpsc::channel(32);
@@ -368,6 +398,9 @@ impl Drop for ConnectRelay {
 /// target's bind leg uses. Returns the bound local address.
 ///
 /// Authenticated with the initiator's Endpoint Token + PoP, like the bind leg.
+/// `ticket` is the initiator's relay ticket (spec §8.14) — the `connect`
+/// response carries it, so this side rarely has to ask for one.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_connect_relay(
     proxy_url: &str,
     endpoint_token: &str,
@@ -375,6 +408,7 @@ pub async fn open_connect_relay(
     connection_id: &str,
     masque_uri: &str,
     local_bind: SocketAddr,
+    ticket: Option<&str>,
     opts: RelayOptions,
 ) -> anyhow::Result<ConnectRelay> {
     let masque: Uri = masque_uri.parse().context("invalid masque_uri")?;
@@ -414,6 +448,7 @@ pub async fn open_connect_relay(
             HeaderName::from_static("seera-signaling-session-id"),
             HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
         ))
+        .option_layer(ticket_layer(ticket)?)
         .service(channel);
 
     let socket = Arc::new(
@@ -510,6 +545,23 @@ mod tests {
             b"",
         );
         assert_ne!(canonical, other);
+    }
+
+    /// A leg with no ticket adds no header, and one with a ticket adds
+    /// exactly it.
+    ///
+    /// **`None` is not an error here** (spec §8.14.5): a proxy that predates
+    /// tickets asks for none, and one that wants one says so on the leg with
+    /// `relay-ticket-required` — which names the real problem where a local
+    /// error about a missing ticket would not.
+    #[test]
+    fn the_ticket_header_is_added_only_when_there_is_a_ticket() {
+        assert!(ticket_layer(None).unwrap().is_none());
+        assert!(ticket_layer(Some("eyJ.JWT.sig")).unwrap().is_some());
+        // A ticket is a JWT, so this cannot normally happen — but a value that
+        // would not survive as a header must fail here rather than silently
+        // opening an unticketed leg.
+        assert!(ticket_layer(Some("bad\nvalue")).is_err());
     }
 
     /// Every PoP value must survive as an HTTP header value.

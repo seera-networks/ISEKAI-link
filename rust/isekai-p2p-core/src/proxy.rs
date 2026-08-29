@@ -253,6 +253,53 @@ pub struct RelayInfo {
     pub session_id: String,
 }
 
+/// Which leg of a relay a ticket is for (spec §8.14.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayRole {
+    /// The side that ran `peer_connect`. Binds an ephemeral loopback source and
+    /// forwards to the edge.
+    Initiator,
+    /// The listener's side. Binds the edge itself.
+    Target,
+}
+
+/// **The proxy's signed statement that a relay leg may exist** (spec §8.14.1).
+///
+/// Presented in `Seera-Relay-Ticket` on the leg's CONNECT-UDP request. Until
+/// the proxy shipped §8.14, a leg was authorized by the proxy's own record of
+/// having allocated the edge — which works only while its control plane and
+/// data path share a process. This is that authorization in a form that can
+/// travel, and holding one is what brings the leg into existence.
+///
+/// # The two times are not the same quantity
+///
+/// [`expires_at`](Self::expires_at) is how long the *paper* may be presented —
+/// tens of seconds, because it goes straight from the proxy to the leg.
+/// [`lease_expires_at`](Self::lease_expires_at) is how long the *leg* it buys
+/// will live — tens of minutes. **Renewal is timed off the second**; a client
+/// that watched the first would re-ticket every half minute for nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayTicket {
+    /// The ES256 JWT itself.
+    pub ticket: String,
+    pub role: RelayRole,
+    /// When this ticket stops being presentable.
+    pub expires_at: String,
+    /// When the leg it materializes lapses, unless renewed before then.
+    pub lease_expires_at: String,
+}
+
+/// What `POST /v1/relay/sessions/{id}/renew` answers (spec §8.14.3).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayLease {
+    #[allow(dead_code)]
+    pub session_id: String,
+    pub role: RelayRole,
+    /// When the leg now lapses.
+    pub lease_expires_at: String,
+}
+
 /// A per-endpoint relay TLS certificate downloaded from the proxy
 /// (`GET /v1/peer/certificate`). The listener presents it on the video QUIC so
 /// the initiator, dialing the matching [`PeerConnection::video_host`] FQDN, can
@@ -1051,6 +1098,16 @@ pub struct PeerConnection {
     pub target_endpoint: Option<String>,
     #[serde(default)]
     pub relay: Option<RelayInfo>,
+    /// **The initiator's relay ticket**, carried in the `connect` response so
+    /// it does not cost a second round trip (spec §8.14.1).
+    ///
+    /// `None` from a proxy that predates §8.14 — and, rarely, from one that
+    /// could not sign. Either way the leg is opened without a ticket, which
+    /// such a proxy accepts (`--relay-require-ticket` false) and a newer one
+    /// refuses with `relay-ticket-required`. Only this response carries it; the
+    /// connection reads never do.
+    #[serde(default)]
+    pub ticket: Option<RelayTicket>,
     #[serde(default)]
     pub relay_session_id: Option<String>,
     /// The loopback FQDN the initiator should dial for the video QUIC over the
@@ -1248,6 +1305,53 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             "POST",
             &format!("/v1/peer/connections/{connection_id}/state"),
             to_vec(&serde_json::json!({})),
+        )
+        .await
+    }
+
+    /// `POST /v1/peer/connections/{id}/ticket` (spec §8.14.2) — get a relay
+    /// ticket for this Endpoint's leg of `connection_id`.
+    ///
+    /// **The target has no other way to get one.** Only the initiator sees the
+    /// `connect` response, and the §8.11 event that tells a listener about a
+    /// connection deliberately carries no ticket — an event is a fast path, not
+    /// a record, so a value that could not be fetched again has no business
+    /// being on it.
+    ///
+    /// **This is also how both sides re-ticket**, and re-ticketing is not a
+    /// renewal of an old decision: the proxy looks at the authorization again
+    /// (is the grant still in force, is the peer still un-revoked, has the
+    /// connection ended) and refuses if it has changed. That is what makes a
+    /// revoked grant reach a session that is already running.
+    ///
+    /// A proxy that predates §8.14 answers `404`. The caller carries on without
+    /// a ticket, which that same proxy does not ask for.
+    pub async fn issue_relay_ticket(&self, connection_id: &str) -> Result<RelayTicket, ProxyError> {
+        self.request_json(
+            "POST",
+            &format!("/v1/peer/connections/{connection_id}/ticket"),
+            to_vec(&serde_json::json!({})),
+        )
+        .await
+    }
+
+    /// `POST /v1/relay/sessions/{id}/renew` (spec §8.14.3) — spend a fresh
+    /// ticket to push this leg's lease out.
+    ///
+    /// **The leg has to already exist.** This replaces a lease; it does not
+    /// create one, and a session whose leg was never opened answers `404`.
+    ///
+    /// The lease only ever moves forward, so a renewal that overtakes a later
+    /// one cannot pull the leg back in.
+    pub async fn renew_relay_lease(
+        &self,
+        session_id: &str,
+        ticket: &str,
+    ) -> Result<RelayLease, ProxyError> {
+        self.request_json(
+            "POST",
+            &format!("/v1/relay/sessions/{session_id}/renew"),
+            to_vec(&serde_json::json!({ "ticket": ticket })),
         )
         .await
     }
@@ -1918,6 +2022,95 @@ mod tests {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The `connect` response carries the initiator's relay ticket, and the
+    /// two times on it mean different things (spec §8.14.1).
+    #[tokio::test]
+    async fn peer_connect_reads_the_relay_ticket() {
+        let resp = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
+            "protocol":"isekai-validator-v1","peer_endpoint":"ep:B",
+            "relay":{"masque_uri":"https://p/x/","session_id":"sess_1"},
+            "ticket":{"ticket":"eyJ.JWT.sig","role":"initiator",
+                      "expires_at":"2026-07-13T08:40:45Z",
+                      "lease_expires_at":"2026-07-13T09:00:00Z"},
+            "peer_candidates":[],"created_at":"t","expires_at":"t"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        let conn = client
+            .peer_connect("cap_x", "pl_1", "isekai-validator-v1", &[])
+            .await
+            .unwrap();
+        let ticket = conn.ticket.expect("a proxy with §8.14 sends one");
+        assert_eq!(ticket.ticket, "eyJ.JWT.sig");
+        assert_eq!(ticket.role, RelayRole::Initiator);
+        // The lease outlives the paper — renewal is timed off the second.
+        assert_ne!(ticket.expires_at, ticket.lease_expires_at);
+    }
+
+    /// **A proxy that predates §8.14 sends no ticket, and that is not an
+    /// error.** The leg is opened without one, which that proxy accepts.
+    #[tokio::test]
+    async fn a_connect_response_without_a_ticket_still_parses() {
+        let resp = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
+            "protocol":"isekai-validator-v1","peer_endpoint":"ep:B",
+            "relay":{"masque_uri":"https://p/x/","session_id":"sess_1"},
+            "peer_candidates":[],"created_at":"t","expires_at":"t"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        let conn = client
+            .peer_connect("cap_x", "pl_1", "isekai-validator-v1", &[])
+            .await
+            .unwrap();
+        assert!(conn.ticket.is_none());
+    }
+
+    /// Both relay-ticket calls go where §8.14 says, and carry a PoP over the
+    /// body actually sent.
+    #[tokio::test]
+    async fn the_relay_ticket_calls_hit_the_right_paths() {
+        let resp = r#"{"ticket":"eyJ.JWT.sig","role":"target",
+            "expires_at":"t","lease_expires_at":"t2"}"#;
+        let (client, key) = client(MockTransport::with_response(201, resp));
+        let ticket = client.issue_relay_ticket("conn_1").await.unwrap();
+        assert_eq!(ticket.role, RelayRole::Target);
+        {
+            let calls = client.transport.calls.lock().unwrap();
+            let (method, path, headers, body) = calls.last().unwrap();
+            assert_eq!(
+                (method.as_str(), path.as_str()),
+                ("POST", "/v1/peer/connections/conn_1/ticket")
+            );
+            assert_eq!(
+                header(headers, pop::HEADER_ENDPOINT_ID),
+                Some(key.endpoint_id().as_str())
+            );
+            assert_eq!(body, b"{}");
+        }
+
+        client
+            .transport
+            .responses
+            .lock()
+            .unwrap()
+            .push(HttpResponse {
+                status: 200,
+                body: br#"{"session_id":"conn_1","role":"target","lease_expires_at":"t3"}"#
+                    .to_vec(),
+                ..HttpResponse::default()
+            });
+        let lease = client
+            .renew_relay_lease("conn_1", "eyJ.JWT.sig")
+            .await
+            .unwrap();
+        assert_eq!(lease.lease_expires_at, "t3");
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, body) = calls.last().unwrap();
+        // Named for the relay session, not filed under /v1/peer: this route is
+        // the data plane's, and moves with it.
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/relay/sessions/conn_1/renew"),
+        );
+        assert!(String::from_utf8_lossy(body).contains("eyJ.JWT.sig"));
     }
 
     #[tokio::test]

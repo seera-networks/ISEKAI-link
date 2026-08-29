@@ -579,8 +579,12 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // is gone, so anything connecting to them is accepted and then goes quiet
     // rather than being refused.
     //
-    // `ended` is the proxy withdrawing the session -- a revoked Grant, a lease
-    // that could not be renewed. The connection ending is the server exiting.
+    // `ended` is the proxy withdrawing the session -- a revoked Endpoint, or a
+    // relay leg the proxy would not re-ticket. That second one is what a
+    // revoked Grant looks like from here since the proxy started leasing legs
+    // (proxy spec §8.14): it reaches a session that is already running, at its
+    // next lease rather than at its next connect. The connection ending is the
+    // server exiting.
     //
     // `ended()` is bound rather than awaited inline because it hands back an
     // owned token, and a temporary inside the `select!` is dropped before it is

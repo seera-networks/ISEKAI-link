@@ -28,6 +28,8 @@ pub mod initiator;
 pub mod listener;
 /// Where an unattended job's workload identity assertion comes from.
 pub mod oidc;
+/// Holding a relay leg's lease open (proxy spec §8.14).
+pub mod relay_lease;
 pub mod secret;
 
 pub use auth::{AssertionSource, Auth0TokenSource, Credential, Enrollment, StaticAuth0Token};
