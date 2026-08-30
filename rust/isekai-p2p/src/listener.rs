@@ -469,21 +469,44 @@ impl ListenerSession {
         // and the event that told this listener about the connection carries
         // none on purpose — an event is a fast path, not a record.
         //
-        // A proxy that predates §8.14 has no such route and asks for no ticket,
-        // so a refusal here is not a reason to refuse the leg: it is opened
-        // without one, exactly as it always was. A §8.14 proxy running
-        // `--relay-require-ticket` then answers `relay-ticket-required` on the
-        // leg itself, which names the real problem where an error about a
-        // missing ticket route would not.
-        let ticket = match self.proxy.issue_relay_ticket(connection_id).await {
-            Ok(ticket) => Some(ticket),
-            Err(e) => {
-                tracing::debug!(
-                    connection_id = %connection_id,
-                    "no relay ticket for this leg; opening it without one: {e}",
-                );
-                None
-            }
+        // **Which refusals may be opened through, and which may not.** A proxy
+        // that predates §8.14 has no such route and asks for no ticket, so its
+        // bare 404 is not a reason to refuse the leg: it is opened without one,
+        // exactly as it always was. A transient failure is the same case for
+        // now — during the migration window the proxy still binds a ticketless
+        // leg — but the renewal loop has to run for it, because that leg is
+        // leased and nothing else will extend it.
+        //
+        // A *refusal* is different, and swallowing it was a hole: while
+        // `--relay-require-ticket` is false the proxy binds whatever arrives,
+        // so opening the leg anyway would hand a twenty-minute lease to a
+        // connection whose grant has just been withdrawn. The whole point of
+        // asking for a ticket is that the control plane gets to say no.
+        let (ticket, renewable) = match self.proxy.issue_relay_ticket(connection_id).await {
+            Ok(ticket) => (Some(ticket), true),
+            Err(e) => match crate::relay_lease::verdict(&e) {
+                crate::relay_lease::Verdict::Refused | crate::relay_lease::Verdict::LegGone => {
+                    return Err(anyhow::anyhow!(
+                        "the proxy will not authorize a relay leg for {connection_id}: {e}"
+                    ));
+                }
+                // No such route: this proxy does not lease legs at all.
+                crate::relay_lease::Verdict::NotLeased => {
+                    tracing::debug!(
+                        connection_id = %connection_id,
+                        "this proxy does not issue relay tickets; opening the leg without one",
+                    );
+                    (None, false)
+                }
+                crate::relay_lease::Verdict::Retry => {
+                    tracing::warn!(
+                        connection_id = %connection_id,
+                        "could not get a relay ticket; opening the leg without one, \
+                         and renewing it from the next: {e}",
+                    );
+                    (None, true)
+                }
+            },
         };
         let session = open_bind_session(
             &self.proxy_url,
@@ -521,11 +544,20 @@ impl ListenerSession {
         // leases, so this side going quiet would end the leg outright. What
         // ends this is the leg being unbound, which happens when the proxy
         // stops listing the connection.
-        let lease = ticket.map(|t| {
+        //
+        // **Spawned even when the ticket did not arrive.** The proxy leases a
+        // ticketless leg too — once, with no way to extend it from its own side
+        // — and it accepts a `/renew` for one, so this loop is what takes such a
+        // leg over. Skipping it left a leg the proxy had leased for twenty
+        // minutes with nothing renewing it, and since the proxy cuts an edge at
+        // the shorter of the two parties' leases, that took the initiator's leg
+        // down with it.
+        let lease = renewable.then(|| {
             RelayLegLease::spawn(
                 self.proxy.clone(),
                 connection_id.to_owned(),
-                Some(t.lease_expires_at),
+                ticket.as_ref(),
+                CancellationToken::new(),
                 CancellationToken::new(),
             )
         });

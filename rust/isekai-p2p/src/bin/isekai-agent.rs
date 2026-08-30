@@ -224,6 +224,9 @@ struct Bind {
     /// relay ticket for this Endpoint's leg (proxy spec §8.14), from
     /// `POST /v1/peer/connections/{id}/ticket`. Omit against a proxy that
     /// predates §8.14, or one running with `--relay-require-ticket` off.
+    /// **The leg is not renewed**: a ticket buys one lease (twenty minutes by
+    /// default) and this command does not go back for another, so the leg goes
+    /// quiet when it lapses. Renewal is `ListenerSession`'s job, not the CLI's.
     #[argh(option)]
     relay_ticket: Option<String>,
 }

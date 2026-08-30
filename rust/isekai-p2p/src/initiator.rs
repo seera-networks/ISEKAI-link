@@ -664,14 +664,16 @@ impl InitiatorSession {
             ended.clone(),
         );
         // Timed off the lease the ticket just wrote, so the first renewal lands
-        // where every one after it does. `ended` rather than a token of its
-        // own: a leg the proxy will not re-ticket is this Endpoint being told
-        // it may not hold the connection any more, which is the same thing
-        // `ended` already means to the application.
+        // where every one after it does. The same two tokens `ConnectionLease`
+        // takes, and they part company here: a leg the proxy has simply
+        // forgotten winds the relay down, while a leg it *refuses* to re-ticket
+        // is this Endpoint being told it may not hold the connection at all,
+        // which is what `ended` means to the application.
         let relay_lease = RelayLegLease::spawn(
             proxy.clone(),
             connection.connection_id.clone(),
-            ticket.map(|t| t.lease_expires_at),
+            ticket.as_ref(),
+            handle.shutdown_token(),
             ended.clone(),
         );
         Ok(Self {

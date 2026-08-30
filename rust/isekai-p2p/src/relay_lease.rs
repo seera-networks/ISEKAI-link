@@ -34,7 +34,7 @@
 
 use std::time::Duration;
 
-use isekai_p2p_core::proxy::{ProxyClient, ProxyError};
+use isekai_p2p_core::proxy::{ProxyClient, ProxyError, RelayTicket};
 use isekai_p2p_core::transport::MasqueH3Transport;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -47,10 +47,10 @@ use tokio_util::sync::CancellationToken;
 /// proxy that is briefly unreachable costs nothing. The proxy's own default
 /// lease is twenty minutes, so this is a request every ten.
 const LEASE_RENEW_FRACTION: f64 = 0.5;
-/// Never renew more often than this, whatever a deadline works out to.
+/// Never renew more often than this, whatever a lease works out to.
 ///
-/// A lease that is already gone, or a clock that disagrees, must not turn into
-/// a spin against the control plane.
+/// A lease shorter than the round trip must not turn into a spin against the
+/// control plane.
 const RENEW_MIN: Duration = Duration::from_secs(30);
 /// Nor less often. Well under the proxy's default lease, so an unusually long
 /// one is still renewed rather than trusted to the end.
@@ -62,35 +62,59 @@ const RENEW_MAX: Duration = Duration::from_secs(600);
 /// sign one (where the leg holds a single lease that this will take over). Short
 /// enough to beat the shortest lease an operator would plausibly configure.
 const RENEW_UNKNOWN: Duration = Duration::from_secs(120);
-
-/// When to renew, given the deadline the proxy just wrote on this leg.
+/// How long to wait after an attempt that might still work.
 ///
-/// Measured against the local clock, unlike the connection row's lease
-/// (`initiator::renew_delay`), because a ticket carries no "as of" timestamp to
-/// measure from. The consequence of a skewed clock here is bounded by
-/// [`RENEW_MIN`] and costs at worst a few extra renewals.
-fn renew_delay(lease_expires_at: Option<&str>, now: OffsetDateTime) -> Duration {
-    let Some(deadline) = lease_expires_at.and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
-    else {
+/// **Not the renewal interval.** Renewing at half the lease is only survivable
+/// if the second half holds *several* attempts; re-sleeping the interval would
+/// put the one retry at the exact moment the lease runs out, which is the one
+/// moment it cannot help. The lease's own deadline is what stops this from
+/// running on after there is nothing left to renew.
+const RETRY_IN: Duration = Duration::from_secs(30);
+
+/// How long the lease runs, measured **without consulting the local clock**.
+///
+/// A ticket carries two proxy timestamps minted in the same breath — when the
+/// ticket stops being presentable, and when the leg it buys lapses — so their
+/// difference is the lease minus the ticket's TTL. Both sides of the
+/// subtraction come from the proxy, so a clock that disagrees with it cancels
+/// out; what is left is a slight *under*estimate of the lease, which errs
+/// towards renewing early.
+///
+/// The alternative — `lease_expires_at` against the local clock — fails badly
+/// rather than gracefully: a clock ahead by more than the lease reads every
+/// lease as already gone and settles into a request every [`RENEW_MIN`],
+/// forever. `initiator::renew_delay` measures from a server `updated_at` for
+/// exactly this reason; this is the same move with the pair a ticket has.
+fn lease_span(ticket: &RelayTicket) -> Option<Duration> {
+    let parse = |s: &str| OffsetDateTime::parse(s, &Rfc3339).ok();
+    let span = parse(&ticket.lease_expires_at)? - parse(&ticket.expires_at)?;
+    span.is_positive()
+        .then(|| Duration::from_secs_f64(span.as_seconds_f64()))
+}
+
+/// When to renew a leg whose lease runs for `span`.
+fn renew_delay(span: Option<Duration>) -> Duration {
+    let Some(span) = span else {
         return RENEW_UNKNOWN;
     };
-    let remaining = deadline - now;
-    if !remaining.is_positive() {
-        return RENEW_MIN;
-    }
-    Duration::from_secs_f64(remaining.as_seconds_f64() * LEASE_RENEW_FRACTION)
-        .clamp(RENEW_MIN, RENEW_MAX)
+    Duration::from_secs_f64(span.as_secs_f64() * LEASE_RENEW_FRACTION).clamp(RENEW_MIN, RENEW_MAX)
 }
 
 /// What a failed renewal means for the loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
+pub(crate) enum Verdict {
     /// Might work next time. The lease outlives several of these.
     Retry,
-    /// No later attempt succeeds. Stop asking, and the leg is finished — either
-    /// because the connection is over or because this Endpoint is no longer
-    /// allowed to hold it.
-    Over,
+    /// **Permission is gone**, not just the leg: the connection was closed, the
+    /// grant withdrawn, this Endpoint revoked. Nothing this process does with
+    /// the connection is allowed any more, so the session ends with the leg.
+    Refused,
+    /// **The leg is gone, and only the leg.** The proxy has no edge for this
+    /// session — it restarted, or the other party's lease lapsed and took the
+    /// edge with it (the proxy cuts an edge at the shorter of the two). The
+    /// connection itself may be perfectly alive and running over a direct path,
+    /// so this stops the relay and says nothing about the session.
+    LegGone,
     /// This proxy does not lease legs. Stop asking; nothing is wrong.
     NotLeased,
 }
@@ -102,7 +126,7 @@ enum Verdict {
 /// `404 connection-not-found` — an RFC 9457 body with a type — for a connection
 /// that is gone or a caller that is not a party. A proxy without the route
 /// answers a bare `404` with nothing in it, because no handler ran.
-fn verdict(error: &ProxyError) -> Verdict {
+pub(crate) fn verdict(error: &ProxyError) -> Verdict {
     let ProxyError::Problem {
         status, problem, ..
     } = error
@@ -111,12 +135,19 @@ fn verdict(error: &ProxyError) -> Verdict {
         return Verdict::Retry;
     };
     match problem.as_ref().map(|p| p.kind()) {
-        // The connection has ended, this caller is no longer a party, or the
-        // authorization it was made under is gone. §8.14.2 re-checks all three
-        // on every ticket, which is the point of re-ticketing.
-        Some(
-            "connection-not-found" | "connection-closed" | "grant-invalid" | "endpoint-revoked",
-        ) => Verdict::Over,
+        // The authorization is gone, and §8.14.2 re-checks it on every ticket —
+        // which is the point of re-ticketing.
+        Some("connection-closed" | "grant-invalid" | "endpoint-revoked") => Verdict::Refused,
+        // **Not the same answer**, though it arrives on the same route. The
+        // proxy sends this for a connection that is over *and* for one whose
+        // relay edge it no longer holds, and it cannot tell the two apart for
+        // us — `/ticket` looks the edge up in memory, so a proxy restart
+        // answers this about a connection that is still listed. Ending the
+        // application's session on it would let a data-plane fact take down a
+        // session that had already migrated to a direct path. The connection
+        // row has its own lease, renewed by its own loop; that is what is
+        // entitled to decide the connection is over.
+        Some("connection-not-found") => Verdict::LegGone,
         // No problem body on a 404: there is no such route here.
         None if *status == 404 => Verdict::NotLeased,
         // `token-expired` and `insufficient-permission` included: both are
@@ -124,6 +155,15 @@ fn verdict(error: &ProxyError) -> Verdict {
         // minutes, so the next attempt carries a new one.
         _ => Verdict::Retry,
     }
+}
+
+/// Whether the lease this loop is carrying has already run out.
+///
+/// `None` — a leg opened without a ticket, so its length was never known — is
+/// not lapsed: there is nothing to compare against, and giving up on a leg the
+/// proxy may well still be holding would be worse than asking again.
+fn lapsed(lapses_at: Option<tokio::time::Instant>) -> bool {
+    lapses_at.is_some_and(|at| tokio::time::Instant::now() >= at)
 }
 
 /// Holds one relay leg's lease open until dropped.
@@ -137,23 +177,31 @@ pub struct RelayLegLease(tokio::task::JoinHandle<()>);
 impl RelayLegLease {
     /// Start renewing the leg `connection_id` names.
     ///
-    /// `lease_expires_at` is what the ticket that opened the leg said, so the
-    /// first renewal is timed off the real lease exactly like every one after
-    /// it. `None` when the leg was opened without a ticket — see
-    /// [`RENEW_UNKNOWN`].
+    /// `first` is the ticket that opened the leg, so the first renewal is timed
+    /// off the real lease exactly like every one after it. `None` when the leg
+    /// was opened without one — see [`RENEW_UNKNOWN`].
     ///
-    /// `lost` is cancelled when the leg can no longer be renewed **because
-    /// permission for it is gone** — the connection ended, this Endpoint was
-    /// revoked, the grant was withdrawn. It is deliberately *not* cancelled for
-    /// a proxy that does not lease legs, which is not a loss of anything.
+    /// **Two tokens, for two different facts** — the same pair
+    /// `initiator::ConnectionLease` takes, and for the same reason. `leg` says
+    /// the relay is finished, whatever else is true; `ended` says this process
+    /// is no longer allowed to hold the connection at all. A leg that lapsed
+    /// because the proxy forgot it cancels only the first: the peers may be on
+    /// a direct path, where the relay was never going to be used again anyway.
+    /// A leg refused because the grant was withdrawn cancels both.
     pub fn spawn(
         proxy: ProxyClient<MasqueH3Transport>,
         connection_id: String,
-        lease_expires_at: Option<String>,
-        lost: CancellationToken,
+        first: Option<&RelayTicket>,
+        leg: CancellationToken,
+        ended: CancellationToken,
     ) -> Self {
-        let mut delay = renew_delay(lease_expires_at.as_deref(), OffsetDateTime::now_utc());
+        let mut span = first.and_then(lease_span);
+        let mut delay = renew_delay(span);
         Self(tokio::spawn(async move {
+            // Monotonic, so this is the one deadline a disagreeing wall clock
+            // cannot move. It is what keeps `RETRY_IN` from running on against
+            // an unreachable proxy long after there is nothing left to renew.
+            let mut lapses_at = span.map(|s| tokio::time::Instant::now() + s);
             loop {
                 tokio::time::sleep(delay).await;
 
@@ -163,12 +211,22 @@ impl RelayLegLease {
                 let ticket = match proxy.issue_relay_ticket(&connection_id).await {
                     Ok(ticket) => ticket,
                     Err(e) => match verdict(&e) {
-                        Verdict::Over => {
+                        Verdict::Refused => {
                             tracing::info!(
                                 connection_id = %connection_id,
-                                "this relay leg will not be re-ticketed; letting it lapse: {e}",
+                                "this endpoint may no longer hold this connection: {e}",
                             );
-                            lost.cancel();
+                            leg.cancel();
+                            ended.cancel();
+                            return;
+                        }
+                        Verdict::LegGone => {
+                            tracing::info!(
+                                connection_id = %connection_id,
+                                "the proxy has no relay edge for this session; \
+                                 winding the leg down: {e}",
+                            );
+                            leg.cancel();
                             return;
                         }
                         Verdict::NotLeased => {
@@ -179,11 +237,20 @@ impl RelayLegLease {
                             return;
                         }
                         Verdict::Retry => {
+                            if lapsed(lapses_at) {
+                                tracing::warn!(
+                                    connection_id = %connection_id,
+                                    "gave up renewing a relay leg that has lapsed: {e}",
+                                );
+                                leg.cancel();
+                                return;
+                            }
                             tracing::warn!(
                                 connection_id = %connection_id,
-                                retry_in = ?delay,
+                                retry_in = ?RETRY_IN,
                                 "could not get a relay ticket: {e}",
                             );
+                            delay = RETRY_IN;
                             continue;
                         }
                     },
@@ -194,8 +261,12 @@ impl RelayLegLease {
                     .await
                 {
                     Ok(lease) => {
-                        delay =
-                            renew_delay(Some(&lease.lease_expires_at), OffsetDateTime::now_utc());
+                        // From the ticket just spent, not from the response:
+                        // the pair is what makes this immune to a clock that
+                        // disagrees with the proxy's (`lease_span`).
+                        span = lease_span(&ticket).or(span);
+                        lapses_at = span.map(|s| tokio::time::Instant::now() + s);
+                        delay = renew_delay(span);
                         tracing::trace!(
                             connection_id = %connection_id,
                             role = ?lease.role,
@@ -204,25 +275,45 @@ impl RelayLegLease {
                         );
                     }
                     Err(e) => match verdict(&e) {
-                        // The leg is gone from the proxy's side. Nothing this
-                        // task does brings it back.
-                        Verdict::Over => {
+                        Verdict::Refused => {
+                            tracing::info!(
+                                connection_id = %connection_id,
+                                "this endpoint may no longer hold this connection: {e}",
+                            );
+                            leg.cancel();
+                            ended.cancel();
+                            return;
+                        }
+                        // The proxy has no edge for this session. Nothing this
+                        // task does brings it back — but the connection may
+                        // still be running over a direct path, so this is the
+                        // relay's end and not the session's.
+                        Verdict::LegGone => {
                             tracing::info!(
                                 connection_id = %connection_id,
                                 "the relay leg is no longer there to renew: {e}",
                             );
-                            lost.cancel();
+                            leg.cancel();
                             return;
                         }
                         Verdict::NotLeased => return,
                         Verdict::Retry => {
+                            if lapsed(lapses_at) {
+                                tracing::warn!(
+                                    connection_id = %connection_id,
+                                    "gave up renewing a relay leg that has lapsed: {e}",
+                                );
+                                leg.cancel();
+                                return;
+                            }
                             // The ticket is spent either way — they are
                             // single-use — so the next pass fetches another.
                             tracing::warn!(
                                 connection_id = %connection_id,
-                                retry_in = ?delay,
+                                retry_in = ?RETRY_IN,
                                 "could not renew the relay leg's lease: {e}",
                             );
+                            delay = RETRY_IN;
                         }
                     },
                 }
@@ -249,32 +340,80 @@ impl Drop for RelayLegLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use isekai_p2p_core::proxy::Problem;
+    use isekai_p2p_core::proxy::{Problem, RelayRole};
 
-    fn at(offset_secs: i64) -> String {
-        (OffsetDateTime::now_utc() + time::Duration::seconds(offset_secs))
-            .format(&Rfc3339)
-            .unwrap()
+    /// A ticket as the proxy mints it: `expires_at` a ticket TTL out,
+    /// `lease_expires_at` a lease out, both on **its** clock. `skew` moves both
+    /// together, which is what a clock that disagrees actually looks like.
+    fn ticket(ttl_secs: i64, lease_secs: i64, skew: i64) -> RelayTicket {
+        // One instant for both, as the proxy mints them — reading the clock
+        // twice would put the microseconds between the reads into the span.
+        let minted = OffsetDateTime::now_utc() + time::Duration::seconds(skew);
+        let stamp = |secs: i64| {
+            (minted + time::Duration::seconds(secs))
+                .format(&Rfc3339)
+                .unwrap()
+        };
+        RelayTicket {
+            ticket: "eyJ.JWT.sig".to_owned(),
+            role: RelayRole::Initiator,
+            expires_at: stamp(ttl_secs),
+            lease_expires_at: stamp(lease_secs),
+        }
     }
 
     #[test]
     fn renewal_lands_at_half_the_lease() {
-        let now = OffsetDateTime::now_utc();
-        // The proxy's default: twenty minutes, so ten.
-        let deadline = (now + Duration::from_secs(1_200)).format(&Rfc3339).unwrap();
-        assert_eq!(renew_delay(Some(&deadline), now), Duration::from_secs(600));
+        // The proxy's defaults: a 45 s ticket on a twenty-minute lease, so ten
+        // minutes less the ticket's own TTL — an underestimate, erring early.
+        let span = lease_span(&ticket(45, 1_200, 0)).unwrap();
+        assert_eq!(span, Duration::from_secs(1_155));
+        assert_eq!(renew_delay(Some(span)), Duration::from_secs_f64(577.5));
+    }
+
+    /// **The failure this measurement exists to avoid.** Reading
+    /// `lease_expires_at` against the local clock, a machine an hour fast sees
+    /// every lease as already gone and renews at the floor forever. Both
+    /// timestamps come from the proxy, so the skew cancels.
+    #[test]
+    fn a_clock_that_disagrees_does_not_change_the_lease() {
+        let straight = lease_span(&ticket(45, 1_200, 0)).unwrap();
+        for skew in [-3_600, -60, 60, 3_600, 86_400] {
+            assert_eq!(
+                lease_span(&ticket(45, 1_200, skew)).unwrap(),
+                straight,
+                "skew {skew}",
+            );
+        }
     }
 
     #[test]
-    fn a_lapsed_or_unreadable_lease_does_not_spin() {
-        let now = OffsetDateTime::now_utc();
-        // Already gone: try at once, but no faster than the floor.
-        assert_eq!(renew_delay(Some(&at(-60)), now), RENEW_MIN);
-        // Unparseable, and no lease at all: the fallback, not the floor.
-        assert_eq!(renew_delay(Some("not a timestamp"), now), RENEW_UNKNOWN);
-        assert_eq!(renew_delay(None, now), RENEW_UNKNOWN);
-        // A very long lease is still renewed rather than trusted to the end.
-        assert_eq!(renew_delay(Some(&at(86_400)), now), RENEW_MAX);
+    fn an_unreadable_or_backwards_lease_does_not_spin() {
+        // No ticket at all: the fallback, not the floor.
+        assert_eq!(renew_delay(None), RENEW_UNKNOWN);
+        // Unparseable, or a lease that does not outlast the ticket: nothing to
+        // measure, so the same fallback.
+        let mut bad = ticket(45, 1_200, 0);
+        bad.expires_at = "not a timestamp".to_owned();
+        assert_eq!(lease_span(&bad), None);
+        assert_eq!(lease_span(&ticket(1_200, 45, 0)), None);
+        // A short lease is floored, a very long one still renewed rather than
+        // trusted to the end.
+        assert_eq!(renew_delay(Some(Duration::from_secs(10))), RENEW_MIN);
+        assert_eq!(renew_delay(Some(Duration::from_secs(86_400))), RENEW_MAX);
+    }
+
+    /// A retry has to fit **inside** what is left of the lease. Re-sleeping the
+    /// renewal interval put the one retry at the exact moment the lease ran
+    /// out, which is the one moment it cannot help.
+    #[test]
+    fn a_retry_leaves_room_for_more_than_one() {
+        let span = lease_span(&ticket(45, 1_200, 0)).unwrap();
+        let remaining = span - renew_delay(Some(span));
+        assert!(
+            RETRY_IN * 4 < remaining,
+            "a retry every {RETRY_IN:?} must fit several times into {remaining:?}",
+        );
     }
 
     fn problem(status: u16, kind: Option<&str>) -> ProxyError {
@@ -296,12 +435,33 @@ mod tests {
     /// old proxy look like a lost connection or make a lost connection look
     /// like an old proxy.
     #[test]
-    fn a_bare_404_is_an_old_proxy_and_a_typed_one_is_a_lost_connection() {
+    fn a_bare_404_is_an_old_proxy_and_a_typed_one_is_a_lost_leg() {
         assert_eq!(verdict(&problem(404, None)), Verdict::NotLeased);
         assert_eq!(
             verdict(&problem(404, Some("connection-not-found"))),
-            Verdict::Over,
+            Verdict::LegGone,
         );
+    }
+
+    /// **A forgotten leg is not a finished session.** The proxy answers
+    /// `connection-not-found` from `/ticket` when its in-memory edge is gone —
+    /// a restart, or the other party's lease lapsing and cutting the edge — and
+    /// the connection may be running over a direct path where the relay was
+    /// never going to be used again. Only the answers that say *this Endpoint
+    /// is not allowed* may end the session.
+    #[test]
+    fn only_a_refusal_ends_the_session() {
+        assert_eq!(
+            verdict(&problem(404, Some("connection-not-found"))),
+            Verdict::LegGone,
+        );
+        for kind in ["grant-invalid", "endpoint-revoked", "connection-closed"] {
+            assert_eq!(
+                verdict(&problem(403, Some(kind))),
+                Verdict::Refused,
+                "{kind}"
+            );
+        }
     }
 
     /// Re-ticketing is re-authorization, so the answers that mean "not any
@@ -310,7 +470,11 @@ mod tests {
     #[test]
     fn losing_the_authorization_ends_the_loop() {
         for kind in ["grant-invalid", "endpoint-revoked", "connection-closed"] {
-            assert_eq!(verdict(&problem(403, Some(kind))), Verdict::Over, "{kind}");
+            assert_eq!(
+                verdict(&problem(403, Some(kind))),
+                Verdict::Refused,
+                "{kind}"
+            );
         }
     }
 
