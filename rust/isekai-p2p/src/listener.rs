@@ -1192,13 +1192,22 @@ pub async fn run(
                     // Read the connection first: a bind asked for by id alone
                     // still has to land on the relay the ticket names, and
                     // only the connection view says which that is.
-                    let relay = session
-                        .proxy
-                        .get_connection(&connection_id)
-                        .await
-                        .ok()
-                        .and_then(|c| c.relay_base_url);
-                    let result = session.bind(&connection_id, relay.as_deref()).await;
+                    //
+                    // **A failed read is not "no relay".** Swallowing it would
+                    // bind against the control plane while the ticket names
+                    // the registered relay, which the data path then refuses
+                    // for naming another relay — the exact confusion this
+                    // change exists to remove, reintroduced by a `.ok()`.
+                    let result = match session.proxy.get_connection(&connection_id).await {
+                        Ok(c) => {
+                            session
+                                .bind(&connection_id, c.relay_base_url.as_deref())
+                                .await
+                        }
+                        Err(e) => Err(anyhow::anyhow!(
+                            "could not read {connection_id} to find its relay: {e}"
+                        )),
+                    };
                     let _ = reply.send(result);
                 }
                 Some(ListenerCommand::ShowPairingCode { ttl, reply }) => {

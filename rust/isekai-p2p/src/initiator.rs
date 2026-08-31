@@ -651,6 +651,7 @@ impl InitiatorSession {
             &relay.masque_uri,
             local_bind,
             ticket.as_ref().map(|t| t.ticket.as_str()),
+            relay.dp_id.as_deref(),
             opts,
         )
         .await?;

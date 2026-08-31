@@ -251,6 +251,20 @@ pub struct Capability {
 pub struct RelayInfo {
     pub masque_uri: String,
     pub session_id: String,
+    /// The relay this connection was routed to, when the control plane chose a
+    /// registered one.
+    ///
+    /// **This, not the shape of `masque_uri`, is what says to dial elsewhere.**
+    /// The URI always carries an authority — with no registered relay it is
+    /// built from `--p2p-relay-base-url`, whose default is a hardcoded
+    /// production host — so treating "has an authority" as "go there" sends a
+    /// local development client, and its Endpoint Token, to that host.
+    #[serde(default)]
+    pub dp_id: Option<String>,
+    /// SHA-256 of the relay's TLS SubjectPublicKeyInfo, base64url. Several
+    /// during a certificate rotation; empty when nothing is pinned.
+    #[serde(default)]
+    pub spki_sha256: Vec<String>,
 }
 
 /// Which leg of a relay a ticket is for (spec §8.14.1).

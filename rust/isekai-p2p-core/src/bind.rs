@@ -77,22 +77,48 @@ pub struct RelayOptions {
 
 /// Where a relay leg is actually dialled.
 ///
-/// **The authority of the `masque_uri`**, when it has one. This used to be the
-/// proxy URL with the `masque_uri` contributing only its path, so a relay named
-/// in the `connect` response was never reached — the control plane's choice of
-/// data plane travelled in the answer and was thrown away on arrival.
+/// **Only when the control plane says it chose a relay**, which `dp_id` is.
 ///
-/// A relative `masque_uri` falls back to the proxy, which is what a control
-/// plane with no registered relay returns.
-fn relay_target(masque: &Uri, proxy_url: &str) -> anyhow::Result<Uri> {
-    match masque.authority() {
-        Some(_) => {
-            let mut parts = masque.clone().into_parts();
-            parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
-            Uri::from_parts(parts).context("invalid masque_uri")
-        }
-        None => proxy_url.parse().context("invalid proxy target URI"),
+/// Not "when the `masque_uri` has an authority" — it always does. With no
+/// registered relay the control plane builds it from `--p2p-relay-base-url`,
+/// whose default is a hardcoded production host, so a local development
+/// instance emits a URI pointing at that host. Reading the authority as an
+/// instruction would send a dev client's Endpoint Token and PoP there: an
+/// origin nobody configured, and a credential that never should have left the
+/// one that was.
+///
+/// So the signal is the explicit one. No relay chosen, dial what we are
+/// configured to trust.
+fn relay_target(masque: &Uri, proxy_url: &str, dp_id: Option<&str>) -> anyhow::Result<Uri> {
+    let Some(_) = dp_id else {
+        return proxy_url.parse().context("invalid proxy target URI");
+    };
+    let Some(_) = masque.authority() else {
+        return proxy_url.parse().context("invalid proxy target URI");
+    };
+    let mut parts = masque.clone().into_parts();
+    parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+    let uri = Uri::from_parts(parts).context("invalid masque_uri")?;
+    check_relay_uri(&uri)?;
+    Ok(uri)
+}
+
+/// A URL we are about to open a QUIC connection to.
+///
+/// **Checked here rather than left to the transport.** `h3-util` unwraps the
+/// scheme, so a value with an authority and none — which `http::Uri` parses
+/// happily from `host:port` — panics inside the buffered H3 worker, where it
+/// surfaces as a hang rather than an error. This value comes from the control
+/// plane, and a server field is not a reason to skip validating it.
+fn check_relay_uri(uri: &Uri) -> anyhow::Result<()> {
+    let scheme = uri
+        .scheme_str()
+        .context("relay URL has no scheme (expected https://...)")?;
+    if scheme != "https" {
+        anyhow::bail!("relay URL scheme must be https, not {scheme}");
     }
+    uri.host().context("relay URL has no host")?;
+    Ok(())
 }
 
 /// Build the H3 connector for a relay leg, along with the observed-address
@@ -410,9 +436,12 @@ impl Drop for ConnectRelay {
 /// `masque_uri` through the proxy at `proxy_url`, bridging a local UDP socket
 /// bound at `local_bind` (the local application sends/receives there).
 ///
-/// The H3 connection targets `proxy_url` (the proxy we already dial); only the
-/// **path** of `masque_uri` is used as the CONNECT-UDP target, since the
-/// masque_uri authority may differ from `proxy_url`. The session carries
+/// **Where the connection goes** is the relay the control plane chose — the one
+/// `dp_id` names — and `proxy_url` when it chose none. What travels as the
+/// CONNECT-UDP target is the **path** of `masque_uri`, which is also what the
+/// PoP signs over; the two are separate, and were conflated before: the
+/// authority was parsed and thrown away, so a relay on another host was named
+/// in the response and never reached. The session carries
 /// `seera-signaling-session-id: <connection_id>` so the proxy binds this leg to
 /// the relay rendezvous (ephemeral loopback source) — the same identifier the
 /// target's bind leg uses. Returns the bound local address.
@@ -429,6 +458,9 @@ pub async fn open_connect_relay(
     masque_uri: &str,
     local_bind: SocketAddr,
     ticket: Option<&str>,
+    // The relay the control plane chose, from `RelayInfo::dp_id`. `None` — no
+    // registered relay — dials `proxy_url`.
+    dp_id: Option<&str>,
     opts: RelayOptions,
 ) -> anyhow::Result<ConnectRelay> {
     let masque: Uri = masque_uri.parse().context("invalid masque_uri")?;
@@ -450,7 +482,7 @@ pub async fn open_connect_relay(
     //
     // `proxy_url` remains the fallback for a `masque_uri` with no authority,
     // which is what a control plane that has no registered relay still returns.
-    let uri = relay_target(&masque, proxy_url)?;
+    let uri = relay_target(&masque, proxy_url, dp_id)?;
     let shutdown = CancellationToken::new();
     let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
@@ -536,35 +568,59 @@ pub async fn open_connect_relay(
 #[cfg(test)]
 mod tests {
 
-    /// **The authority in the `masque_uri` is where the leg goes.**
+    /// **Where a leg is dialled is what the control plane chose**, and the
+    /// choice arrives as `dp_id`, not as the shape of the URI.
     ///
     /// This took the path and discarded the host, so every leg went to the
-    /// control plane whatever the response said — which made "the control
-    /// plane decides which data plane you use, in its answer" false, and made
-    /// a relay on another host something that was named and never dialled. The
-    /// symptom was a ticket refused for naming another relay, which points at
-    /// the ticket rather than at the host that was dialled.
+    /// control plane whatever the response said — which made a relay on
+    /// another host something that was named and never dialled.
     #[test]
-    fn a_leg_is_dialled_at_the_host_the_masque_uri_names() {
-        let masque = "https://dp1abc.relay.example:8443/.well-known/masque/udp/127.0.0.1/30001/";
-        let uri: Uri = masque.parse().unwrap();
-        let dialled = relay_target(&uri, "https://cp.example:6443").unwrap();
+    fn a_chosen_relay_is_where_the_leg_is_dialled() {
+        let masque: Uri =
+            "https://dp1abc.relay.example:8443/.well-known/masque/udp/127.0.0.1/30001/"
+                .parse()
+                .unwrap();
+        let dialled = relay_target(&masque, "https://cp.example:6443", Some("dp1abc")).unwrap();
         assert_eq!(dialled.host(), Some("dp1abc.relay.example"));
         assert_eq!(dialled.port_u16(), Some(8443));
-
-        // ...and the path is still the masque_uri's, because that is what the
-        // PoP is signed over and what the proxy routes on.
-        assert_eq!(uri.path(), "/.well-known/masque/udp/127.0.0.1/30001/",);
+        // The connection goes to the relay's root; the masque_uri's path is
+        // what travels as `:path`, and the two are separate values.
+        assert_eq!(dialled.path(), "/");
     }
 
-    /// A `masque_uri` with no authority is what a control plane with no
-    /// registered relay returns, and it still has to work.
+    /// **A URI pointing elsewhere is not an instruction to go there.**
+    ///
+    /// With no registered relay the control plane builds `masque_uri` from
+    /// `--p2p-relay-base-url`, whose default is a hardcoded production host —
+    /// so a local development instance emits a URI naming that host. Reading
+    /// the authority as the destination would send a dev client's Endpoint
+    /// Token and PoP to an origin nobody configured.
     #[test]
-    fn a_relative_masque_uri_falls_back_to_the_proxy() {
-        let uri: Uri = "/.well-known/masque/udp/127.0.0.1/30001/".parse().unwrap();
-        let dialled = relay_target(&uri, "https://cp.example:6443").unwrap();
-        assert_eq!(dialled.host(), Some("cp.example"));
-        assert_eq!(dialled.port_u16(), Some(6443));
+    fn no_chosen_relay_dials_the_configured_proxy_however_the_uri_looks() {
+        let masque: Uri =
+            "https://tokyo.link.isekai.tools:8443/.well-known/masque/udp/127.0.0.1/30001/"
+                .parse()
+                .unwrap();
+        let dialled = relay_target(&masque, "https://localhost:8443", None).unwrap();
+        assert_eq!(
+            dialled.host(),
+            Some("localhost"),
+            "a client with no relay chosen was sent to the URI's host",
+        );
+        assert_eq!(dialled.port_u16(), Some(8443));
+    }
+
+    /// A relay URL with no scheme parses as an authority and panics deep in
+    /// the H3 worker, where it shows up as a hang. Refused here instead.
+    #[test]
+    fn a_relay_url_without_a_scheme_is_refused() {
+        let masque: Uri = "dp1abc.relay.example:8443".parse().unwrap();
+        assert!(relay_target(&masque, "https://cp.example:6443", Some("dp1abc")).is_err());
+        let plain: Uri = "http://dp1abc.relay.example:8443/x".parse().unwrap();
+        assert!(
+            relay_target(&plain, "https://cp.example:6443", Some("dp1abc")).is_err(),
+            "a relay leg must not be opened over plaintext",
+        );
     }
     use super::*;
     use base64::Engine as _;

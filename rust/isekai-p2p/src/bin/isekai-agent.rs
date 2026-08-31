@@ -229,6 +229,13 @@ struct Bind {
     /// quiet when it lapses. Renewal is `ListenerSession`'s job, not the CLI's.
     #[argh(option)]
     relay_ticket: Option<String>,
+
+    /// where the relay this connection was routed to answers, from the
+    /// connection's `relay_base_url`. Without it the leg is opened against
+    /// --proxy-url, and a ticket naming a registered relay is refused there
+    /// for naming another relay.
+    #[argh(option)]
+    relay_url: Option<String>,
 }
 
 fn main() {
@@ -425,7 +432,7 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
 async fn run_bind(a: Bind) -> anyhow::Result<()> {
     let key = load_key(&a.key)?;
     let mut session = isekai_p2p_core::bind::open_bind_session(
-        &a.proxy_url,
+        a.relay_url.as_deref().unwrap_or(&a.proxy_url),
         &a.token,
         &key,
         &a.connection_id,
