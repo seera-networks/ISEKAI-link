@@ -683,6 +683,14 @@ success here does **not** mean the device stopped: if the proxy was not told,
 its grants and listeners stand until it is. Repeating the command once the
 proxy is reachable is the fix, and it is safe to repeat.
 
+Once it *has* heard, a session already running ends too, rather than lasting
+until the device next reconnects. A relay leg lives to the lease its ticket
+wrote (proxy spec §8.14), and extending it means fetching a fresh ticket, which
+the proxy will not write for a revoked Endpoint. **Assume the full lease** — 20
+minutes by default. A well-behaved client folds at half that, when its renewal
+is refused, but a lost device is exactly where that assumption does not hold;
+the lease is what the relay enforces regardless.
+
 **Whether the key is still good elsewhere.** If another Endpoint shares the same
 public key, revoking this one stopped a name and not a credential — the output
 names the rows that keep working, and you want all of them.
