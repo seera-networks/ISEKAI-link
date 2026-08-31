@@ -75,6 +75,26 @@ pub struct RelayOptions {
     pub registration: Option<Arc<msquic_async::Registration>>,
 }
 
+/// Where a relay leg is actually dialled.
+///
+/// **The authority of the `masque_uri`**, when it has one. This used to be the
+/// proxy URL with the `masque_uri` contributing only its path, so a relay named
+/// in the `connect` response was never reached — the control plane's choice of
+/// data plane travelled in the answer and was thrown away on arrival.
+///
+/// A relative `masque_uri` falls back to the proxy, which is what a control
+/// plane with no registered relay returns.
+fn relay_target(masque: &Uri, proxy_url: &str) -> anyhow::Result<Uri> {
+    match masque.authority() {
+        Some(_) => {
+            let mut parts = masque.clone().into_parts();
+            parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+            Uri::from_parts(parts).context("invalid masque_uri")
+        }
+        None => proxy_url.parse().context("invalid proxy target URI"),
+    }
+}
+
 /// Build the H3 connector for a relay leg, along with the observed-address
 /// watch fed by whatever connections it opens.
 ///
@@ -417,10 +437,20 @@ pub async fn open_connect_relay(
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| masque.path().to_owned());
     // Signed over the path actually sent as `:path`, which is the masque_uri's
-    // path — not the proxy URL we dial.
+    // path.
     let pop = sign_connect_udp(key, &target_path);
 
-    let uri: Uri = proxy_url.parse().context("invalid proxy target URI")?;
+    // **Dial the host the `masque_uri` names**, not the control plane.
+    //
+    // This used to take the path and discard the authority, so every leg went
+    // to the proxy the control plane happens to live on. That was invisible
+    // while the two were one process — and it is exactly what "the control
+    // plane decides which data plane you use, in its answer" was supposed to
+    // mean. A relay on another host was named in the response and never dialled.
+    //
+    // `proxy_url` remains the fallback for a `masque_uri` with no authority,
+    // which is what a control plane that has no registered relay still returns.
+    let uri = relay_target(&masque, proxy_url)?;
     let shutdown = CancellationToken::new();
     let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
@@ -505,6 +535,37 @@ pub async fn open_connect_relay(
 
 #[cfg(test)]
 mod tests {
+
+    /// **The authority in the `masque_uri` is where the leg goes.**
+    ///
+    /// This took the path and discarded the host, so every leg went to the
+    /// control plane whatever the response said — which made "the control
+    /// plane decides which data plane you use, in its answer" false, and made
+    /// a relay on another host something that was named and never dialled. The
+    /// symptom was a ticket refused for naming another relay, which points at
+    /// the ticket rather than at the host that was dialled.
+    #[test]
+    fn a_leg_is_dialled_at_the_host_the_masque_uri_names() {
+        let masque = "https://dp1abc.relay.example:8443/.well-known/masque/udp/127.0.0.1/30001/";
+        let uri: Uri = masque.parse().unwrap();
+        let dialled = relay_target(&uri, "https://cp.example:6443").unwrap();
+        assert_eq!(dialled.host(), Some("dp1abc.relay.example"));
+        assert_eq!(dialled.port_u16(), Some(8443));
+
+        // ...and the path is still the masque_uri's, because that is what the
+        // PoP is signed over and what the proxy routes on.
+        assert_eq!(uri.path(), "/.well-known/masque/udp/127.0.0.1/30001/",);
+    }
+
+    /// A `masque_uri` with no authority is what a control plane with no
+    /// registered relay returns, and it still has to work.
+    #[test]
+    fn a_relative_masque_uri_falls_back_to_the_proxy() {
+        let uri: Uri = "/.well-known/masque/udp/127.0.0.1/30001/".parse().unwrap();
+        let dialled = relay_target(&uri, "https://cp.example:6443").unwrap();
+        assert_eq!(dialled.host(), Some("cp.example"));
+        assert_eq!(dialled.port_u16(), Some(6443));
+    }
     use super::*;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;

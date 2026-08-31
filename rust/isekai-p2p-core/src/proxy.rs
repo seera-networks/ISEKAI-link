@@ -1110,6 +1110,15 @@ pub struct PeerConnection {
     pub ticket: Option<RelayTicket>,
     #[serde(default)]
     pub relay_session_id: Option<String>,
+    /// Where this connection's relay answers, when the control plane chose a
+    /// registered one.
+    ///
+    /// **The target's only way to learn it.** The initiator is handed a
+    /// `masque_uri`; a listener sees connections and nothing else, so without
+    /// this it has nowhere to bind but the control plane — which is not where
+    /// its ticket may be redeemed.
+    #[serde(default)]
+    pub relay_base_url: Option<String>,
     /// The loopback FQDN the initiator should dial for the video QUIC over the
     /// relay, so it can validate the per-endpoint certificate the listener
     /// downloaded. `None` when the proxy has relay certificates disabled — in
