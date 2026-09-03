@@ -679,6 +679,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
 async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
     let proxy = isekai_p2p::proxy_client(cfg, &token)?;
+    tracing::debug!(proxy_url = cfg.proxy_url, "asking which relays to measure");
     let Some(candidates) = proxy.list_relays().await.context("list relays")? else {
         // Said plainly, because the operator asking this question is trying to
         // explain a slow connection and needs to know this cannot be the cause.

@@ -72,12 +72,27 @@ pub const FRESHNESS_WINDOW: Duration = Duration::from_secs(3_600);
 /// reported.
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(FRESHNESS_WINDOW.as_secs() / 2);
 
-/// How soon to try again after a round that produced nothing worth sending.
+/// How soon to try again after the *first* round that produced nothing worth
+/// sending, doubling from there up to [`REPORT_INTERVAL`].
 ///
-/// Short, because the usual cause is a moment of local trouble rather than a
-/// pool that has gone away, and the cost of waiting is that this side stays
-/// unranked.
+/// Short at first, because the usual cause is a moment of local trouble rather
+/// than a pool that has gone away, and the cost of waiting is that this side
+/// stays unranked.
+///
+/// **Backed off rather than fixed, because the other cause is a deployment
+/// whose relays this host genuinely cannot reach** — a `base_url` on a network
+/// this side has no route to, say. That does not get better by asking again,
+/// and each attempt costs a QUIC connection whose failure the transport logs at
+/// `ERROR`. A fixed minute would make a misconfiguration print an unexplained
+/// error every minute for the life of the process.
 const RETRY_IN: Duration = Duration::from_secs(60);
+
+/// The retry interval after `failures` consecutive unproductive rounds,
+/// doubling and never exceeding the ordinary cadence.
+fn retry_delay(failures: u32) -> Duration {
+    let doubled = RETRY_IN.saturating_mul(1u32 << failures.min(16));
+    doubled.min(REPORT_INTERVAL)
+}
 
 /// How a round of measurement is bounded.
 #[derive(Debug, Clone)]
@@ -217,6 +232,7 @@ const MAX_RTT_MS: u32 = 10_000;
 /// way keeps what was already measured. Leaving `best` untouched is what says
 /// unreachable.
 async fn probe(base_url: &str, probes: usize, best: Arc<AtomicU32>) {
+    tracing::debug!(base_url, "probing a relay over h3 GET /health");
     let transport = match MasqueH3Transport::connect(base_url) {
         Ok(transport) => transport,
         Err(err) => {
@@ -224,7 +240,16 @@ async fn probe(base_url: &str, probes: usize, best: Arc<AtomicU32>) {
             return;
         }
     };
-    time_exchanges(probes, &best, || health(&transport)).await
+    time_exchanges(probes, &best, || health(&transport)).await;
+    let landed = best.load(Ordering::Relaxed);
+    if landed == NOTHING_YET {
+        tracing::debug!(
+            base_url,
+            "nothing came back; reporting this relay as unreachable"
+        );
+    } else {
+        tracing::debug!(base_url, rtt_ms = landed, "measured a relay");
+    }
 }
 
 /// Warm up once, then time `probes` exchanges and keep the fastest.
@@ -261,11 +286,25 @@ where
 /// One `GET /health`. `None` unless the relay answered a success status.
 async fn health(transport: &MasqueH3Transport) -> Option<()> {
     use isekai_p2p_core::proxy::ControlPlaneTransport as _;
-    let response = transport
-        .send("GET", "/health", &[], Vec::new())
-        .await
-        .ok()?;
-    (200..300).contains(&response.status).then_some(())
+    // **Said out loud rather than swallowed.** A probe that cannot connect is
+    // the normal way this is misconfigured, and the QUIC stack's own error
+    // names no host — so without this the operator sees
+    // `QUIC_STATUS_UNREACHABLE` with nothing to point it at. The span this runs
+    // inside carries the relay it belongs to.
+    match transport.send("GET", "/health", &[], Vec::new()).await {
+        Ok(response) if (200..300).contains(&response.status) => Some(()),
+        Ok(response) => {
+            tracing::debug!(
+                status = response.status,
+                "the relay answered /health with a non-success status"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::debug!(%err, "the relay did not answer /health");
+            None
+        }
+    }
 }
 
 /// A listener's standing measurement task.
@@ -289,9 +328,13 @@ impl RelayRttReporter {
         opts: ProbeOptions,
     ) -> Self {
         Self(tokio::spawn(async move {
+            let mut failures = 0u32;
             loop {
                 let next = match round(&proxy, &listener_id, &opts).await {
-                    Ok(()) => REPORT_INTERVAL,
+                    Ok(()) => {
+                        failures = 0;
+                        REPORT_INTERVAL
+                    }
                     Err(err) => {
                         // Never fatal. Losing a round costs ranking, never the
                         // listener: the control plane falls back to pool order,
@@ -308,7 +351,9 @@ impl RelayRttReporter {
                         // spends that whole margin on one bad moment, and a
                         // listener whose *first* round fails would go half an
                         // hour with nothing published at all.
-                        RETRY_IN
+                        let delay = retry_delay(failures);
+                        failures = failures.saturating_add(1);
+                        delay
                     }
                 };
                 tokio::time::sleep(next).await;
@@ -334,16 +379,33 @@ async fn round(
     listener_id: &str,
     opts: &ProbeOptions,
 ) -> anyhow::Result<()> {
+    tracing::debug!(listener_id, "asking the proxy which relays to measure");
     let Some(candidates) = proxy.list_relays().await? else {
         // A proxy from before relay selection. Nothing to measure, and nothing
         // wrong: this is an optimization on top of a control plane that already
         // worked.
+        //
+        // **Worth a line even though nothing happens.** "This dialled nothing"
+        // is what rules the probe out when some other QUIC connection in the
+        // process is failing, and that is the question an operator arrives with.
+        tracing::debug!("this proxy does not choose relays; measuring nothing, dialling nothing");
         return Ok(());
     };
     if candidates.is_empty() {
         // No registered relay: the control plane's own data path is the only
         // one there is, and there is nothing to choose between.
+        tracing::debug!("the proxy has no registered relays; nothing to measure");
         return Ok(());
+    }
+    // **The list, before anything is dialled.** These base URLs are the
+    // deployment's, not this process's, so when they are unreachable the answer
+    // is here rather than in anything this side is configured with.
+    for candidate in &candidates {
+        tracing::debug!(
+            dp_id = candidate.dp_id,
+            base_url = candidate.base_url,
+            "a relay to measure"
+        );
     }
     let samples = measure(&candidates, opts).await;
     if samples.is_empty() {
@@ -389,7 +451,10 @@ pub async fn measure_for_connect(
     let listed = tokio::time::timeout(opts.budget / 2, proxy.list_relays()).await;
     let candidates = match listed {
         Ok(Ok(Some(candidates))) if !candidates.is_empty() => candidates,
-        Ok(Ok(_)) => return Vec::new(),
+        Ok(Ok(_)) => {
+            tracing::debug!("no relays to measure; connecting unmeasured");
+            return Vec::new();
+        }
         Ok(Err(err)) => {
             tracing::debug!(%err, "could not read the relay candidates; connecting unmeasured");
             return Vec::new();
@@ -649,6 +714,23 @@ mod tests {
         .await;
         assert!(best.load(Ordering::Relaxed) <= MAX_RTT_MS);
         assert_ne!(MAX_RTT_MS, NOTHING_YET);
+    }
+
+    #[test]
+    fn retrying_backs_off_to_the_ordinary_cadence() {
+        // The first failure is probably a moment of trouble, so ask again soon.
+        assert_eq!(retry_delay(0), RETRY_IN);
+        assert_eq!(retry_delay(1), RETRY_IN * 2);
+        // A deployment this host cannot reach does not improve by asking, and
+        // every attempt costs a QUIC connection the transport logs at ERROR.
+        // Settling at the ordinary cadence stops a misconfiguration printing
+        // an unexplained error every minute forever.
+        assert_eq!(retry_delay(20), REPORT_INTERVAL);
+        assert!(retry_delay(9) <= REPORT_INTERVAL);
+        // Doubling must not wrap and hand back something tiny.
+        for n in 0..64 {
+            assert!(retry_delay(n) >= RETRY_IN, "failure {n} retried too soon");
+        }
     }
 
     #[test]
