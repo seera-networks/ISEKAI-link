@@ -620,15 +620,40 @@ impl InitiatorSession {
         local_bind: SocketAddr,
         opts: RelayOptions,
     ) -> anyhow::Result<Self> {
+        // **Measured here, in front of the request that decides**
+        // (the relay proximity plan §4). The relay is chosen once, during
+        // this `connect`, and the target is not present for it — so an
+        // initiator that wants a say has to have measured by now. The target's
+        // numbers were reported against its listener long before.
+        //
+        // Bounded tightly and never fatal: this sits in front of a connection
+        // somebody is waiting on. Measuring nothing means the target's
+        // measurements decide alone, which is a worse relay and not a failure.
+        let relay_rtt = crate::relay_rtt::measure_for_connect(
+            proxy,
+            &crate::relay_rtt::ProbeOptions::initiator_defaults(),
+        )
+        .await;
         let connection = match auth {
             Authorization::Capability(capability) => {
                 proxy
-                    .peer_connect(capability, listener_id, &cfg.protocol, candidates)
+                    .peer_connect_measured(
+                        capability,
+                        listener_id,
+                        &cfg.protocol,
+                        candidates,
+                        &relay_rtt,
+                    )
                     .await?
             }
             Authorization::Grant => {
                 proxy
-                    .peer_connect_with_grant(listener_id, &cfg.protocol, candidates)
+                    .peer_connect_with_grant_measured(
+                        listener_id,
+                        &cfg.protocol,
+                        candidates,
+                        &relay_rtt,
+                    )
                     .await?
             }
         };

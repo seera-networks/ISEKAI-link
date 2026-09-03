@@ -252,6 +252,11 @@ struct Args {
     /// hidden is printed so you know to ask
     #[argh(switch)]
     endpoints: bool,
+    /// measure the relays this Endpoint could be routed through, print what
+    /// they answered, and exit. This is the number the control plane ranks on,
+    /// so it is also the answer to "why did my connection go that way"
+    #[argh(switch)]
+    relays: bool,
     /// which Endpoints to list: `active` (default), `revoked` or `all`
     #[argh(option)]
     endpoint_status: Option<String>,
@@ -355,6 +360,18 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         anyhow::ensure!(
             args.revoke_endpoint.is_some(),
             "--reason and --note describe a --revoke-endpoint, and this run has none",
+        );
+    }
+    // **The fifth time this shape has come up.** `--relays` returns before
+    // anything is forwarded or redeemed, so anything describing the session
+    // would be accepted and then quietly ignored. Refuse instead of dropping.
+    if args.relays {
+        anyhow::ensure!(
+            args.map.is_empty()
+                && args.pair.is_none()
+                && args.redeem.is_none()
+                && args.peer.is_none(),
+            "--relays only measures and prints; it forwards nothing, so drop the rest of the run",
         );
     }
     if let Some(status) = &args.endpoint_status {
@@ -467,7 +484,9 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
 
     let maps = maps(&args.map, args.bind)?;
     let letting_in = args.pair.is_some() || ticket.is_some() || provisioning.is_some();
-    if maps.is_empty() && !letting_in {
+    // `--relays` forwards nothing on purpose: it is a question about the
+    // network, asked before deciding to trust it with a session.
+    if maps.is_empty() && !letting_in && !args.relays {
         anyhow::bail!("nothing to forward; pass at least one --map port:service");
     }
 
@@ -475,6 +494,10 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // From here on this Endpoint may exist, so every way out owes a slot back.
     if args.enroll {
         *enrolled = Some(cfg.clone());
+    }
+
+    if args.relays {
+        return show_relays(&cfg).await;
     }
 
     // **Being let in and connecting are one command when both were asked for.**
@@ -641,6 +664,64 @@ fn what_it_is(prefix: &str) -> &'static str {
 ///
 /// Returns the Endpoint that let us in, so a caller that also has `--map` can
 /// go straight there rather than working out which peer this was.
+/// `--relays` — measure this Endpoint's relay candidates and print them.
+///
+/// **The same probe a real session runs**, so what this prints is what the
+/// control plane would be given, not an approximation of it. It reports
+/// nothing: a diagnostic that quietly replaced the stored measurements would
+/// make looking at the system change it.
+async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
+    let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
+    let proxy = isekai_p2p::proxy_client(cfg, &token)?;
+    let Some(candidates) = proxy.list_relays().await.context("list relays")? else {
+        // Said plainly, because the operator asking this question is trying to
+        // explain a slow connection and needs to know this cannot be the cause.
+        println!("This proxy does not choose relays by proximity.");
+        return Ok(());
+    };
+    if candidates.is_empty() {
+        // Not a failure. With no registered relay the control plane's own data
+        // path is the only one there is, and nothing is being chosen between.
+        println!("No registered relays; the control plane relays for itself.");
+        return Ok(());
+    }
+
+    let opts = isekai_p2p::relay_rtt::ProbeOptions::default();
+    let samples = isekai_p2p::relay_rtt::measure(&candidates, &opts).await;
+    let measured: std::collections::HashMap<_, _> = samples
+        .iter()
+        .map(|s| (s.dp_id.as_str(), s.rtt_ms))
+        .collect();
+
+    for candidate in &candidates {
+        // Three states, kept apart because they mean different things to the
+        // choice: a number ranks, `unreachable` is dropped from a session's
+        // candidates, and `not measured` leaves the node unranked.
+        let verdict = match measured.get(candidate.dp_id.as_str()) {
+            Some(Some(ms)) => format!("{ms} ms"),
+            Some(None) => "unreachable".to_owned(),
+            None => "not measured (the round ran out of time)".to_owned(),
+        };
+        println!(
+            "{:<14} {:<28} {}",
+            verdict, candidate.dp_id, candidate.base_url
+        );
+    }
+
+    let fastest = samples
+        .iter()
+        .filter_map(|s| s.rtt_ms.map(|ms| (ms, &s.dp_id)))
+        .min();
+    match fastest {
+        // **"Would prefer", not "will get".** This side is half the answer: the
+        // control plane takes the worse of the two parties' numbers for each
+        // relay and minimises that, so the peer's measurements can move it.
+        Some((ms, dp_id)) => println!("\nThis end would prefer {dp_id} at {ms} ms."),
+        None => println!("\nNothing answered; selection falls back to pool order."),
+    }
+    Ok(())
+}
+
 async fn redeem(
     cfg: &P2pConfig,
     code: &str,

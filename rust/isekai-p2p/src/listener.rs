@@ -75,6 +75,14 @@ pub struct ListenerSession {
     /// Replaces the Endpoint Token before it expires, for as long as this
     /// session lives. Held, not read.
     _renewal: TokenRenewal,
+    /// Measures the relays and reports them, so that an initiator arriving
+    /// later can be routed through a near one. Held, not read.
+    ///
+    /// **This side has to have measured before anyone connects**, because the
+    /// initiator's `connect` is where the relay is chosen and the target is not
+    /// present for it. Being the party that exists first is what makes that
+    /// possible (the relay proximity plan §4).
+    _relay_rtt: crate::relay_rtt::RelayRttReporter,
 }
 
 /// What a listener does when a connection is waiting for it.
@@ -386,6 +394,13 @@ impl ListenerSession {
         // poll first, and then the bind that would have admitted a new viewer.
         // The caller's token has no stated lifetime here, hence `None`.
         let renewal = spawn_token_renewal(cfg.clone(), proxy.clone(), None);
+        // Cloned rather than shared by reference: the token lives behind the
+        // client's own handle, so this clone follows every renewal above.
+        let relay_rtt = crate::relay_rtt::RelayRttReporter::spawn(
+            proxy.clone(),
+            listener.listener_id.clone(),
+            crate::relay_rtt::ProbeOptions::default(),
+        );
         Ok(Self {
             listener_id: listener.listener_id,
             endpoint_id: cfg.endpoint_id(),
@@ -399,6 +414,7 @@ impl ListenerSession {
             observed_tx: watch::channel(None).0,
             legs: LegDirectory::default(),
             _renewal: renewal,
+            _relay_rtt: relay_rtt,
         })
     }
 

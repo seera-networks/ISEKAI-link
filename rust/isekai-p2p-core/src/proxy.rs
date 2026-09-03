@@ -1031,6 +1031,47 @@ impl ConnectionStateFilter {
     }
 }
 
+/// A relay this Endpoint could be sent through, as `GET /v1/peer/relays`
+/// offers it (the relay proximity plan §4.2).
+///
+/// The list is this Endpoint's own tenant pool plus the operator's, because one
+/// listener serves same-tenant and cross-tenant connections alike and both have
+/// to be measured. It is bounded at 16 and only contains nodes that could
+/// actually serve, so every entry is worth a probe.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayCandidate {
+    pub dp_id: String,
+    /// Where to reach it — the origin a leg would be dialled at, and so also
+    /// the one to measure.
+    pub base_url: String,
+    /// The relay's certificate pins, as the control plane knows them.
+    #[serde(default)]
+    pub spki_sha256: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RelayCandidateList {
+    #[serde(default)]
+    relays: Vec<RelayCandidate>,
+}
+
+/// One measurement, in the shape both places that take one expect
+/// (the relay proximity plan §5).
+///
+/// **`rtt_ms: None` means measured and unreachable, and it is not the same as
+/// leaving the entry out.** Omitting says "not measured", and the control plane
+/// reads the two differently: an unreachable relay is dropped from *this*
+/// session's candidates, while an unmeasured one simply does not rank. Getting
+/// this wrong is how a relay that has gone dark keeps being chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayRttSample {
+    pub dp_id: String,
+    /// Milliseconds, or `None` for measured-and-unreachable.
+    ///
+    /// Serialized even when `None` — that null *is* the message.
+    pub rtt_ms: Option<u32>,
+}
+
 /// A listener this Endpoint can reach or enrol on (spec §8.10).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReachableListener {
@@ -1272,11 +1313,31 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
     ) -> Result<PeerConnection, ProxyError> {
+        self.peer_connect_measured(capability, listener_id, protocol, candidates, &[])
+            .await
+    }
+
+    /// `POST /v1/peer/connect` carrying what the initiator measured
+    /// (the relay proximity plan §4).
+    ///
+    /// **The initiator's measurements travel with the request rather than
+    /// being stored.** It is here once, for this session; the target's are kept
+    /// because a target has to be rankable before anyone connects to it. That
+    /// asymmetry is what lets the relay be chosen with only one party present.
+    pub async fn peer_connect_measured(
+        &self,
+        capability: &str,
+        listener_id: &str,
+        protocol: &str,
+        candidates: &[Candidate],
+        relay_rtt: &[RelayRttSample],
+    ) -> Result<PeerConnection, ProxyError> {
         let body = serde_json::json!({
             "capability": capability,
             "listener_id": listener_id,
             "protocol": protocol,
             "candidates": candidates,
+            "relay_rtt": relay_rtt,
         });
         self.request_json("POST", "/v1/peer/connect", to_vec(&body))
             .await
@@ -1798,6 +1859,65 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         Ok(list.listeners)
     }
 
+    /// `GET /v1/peer/relays` — the relays this Endpoint might be routed
+    /// through, so that it can measure them (§4.2).
+    ///
+    /// Series B: an Endpoint Token authorizes it, which is why a listener can
+    /// call it before anyone has connected.
+    ///
+    /// **`Ok(None)` for a proxy that has no such route**, which is every proxy
+    /// deployed before relay selection existed. Measuring is an optimization
+    /// layered on top of a control plane that already worked, so meeting one
+    /// without it is a fact about the deployment and not an error — and a
+    /// listener that treated it as one would log a failure every half hour for
+    /// the life of the process. An empty `Some` is the different, later state:
+    /// the proxy chooses relays, and none are registered.
+    pub async fn list_relays(&self) -> Result<Option<Vec<RelayCandidate>>, ProxyError> {
+        let resp = self.send("GET", "/v1/peer/relays", Vec::new()).await?;
+        if resp.status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&resp.status) {
+            return Err(problem_error(&resp));
+        }
+        let list: RelayCandidateList =
+            serde_json::from_slice(&resp.body).map_err(ProxyError::Decode)?;
+        Ok(Some(list.relays))
+    }
+
+    /// `PUT /v1/peer-listeners/{id}/relay-rtt` — what this listener measured
+    /// (§4). Answers how many entries were stored.
+    ///
+    /// **A route of its own, on a cadence of its own.** A listener's lease is
+    /// renewed by the side effect of reads and, in the steady state, from
+    /// inside the event-stream task; a listener holding `/events` open never
+    /// calls another listener route, so there is no existing request to carry
+    /// this (§4.1).
+    ///
+    /// **The report replaces the set.** Anything this Endpoint reported before
+    /// and leaves out now is forgotten, so a relay that dropped out of the pool
+    /// cannot keep winning on a stale number.
+    pub async fn report_relay_rtt(
+        &self,
+        listener_id: &str,
+        samples: &[RelayRttSample],
+    ) -> Result<usize, ProxyError> {
+        #[derive(Deserialize)]
+        struct Stored {
+            #[serde(default)]
+            stored: usize,
+        }
+        let body = serde_json::json!({ "relay_rtt": samples });
+        let stored: Stored = self
+            .request_json(
+                "PUT",
+                &format!("/v1/peer-listeners/{listener_id}/relay-rtt"),
+                to_vec(&body),
+            )
+            .await?;
+        Ok(stored.stored)
+    }
+
     /// `POST /v1/peer/connect` authorized by a grant rather than a capability
     /// (spec §8.4). Nothing has to be carried to the initiator for this.
     pub async fn peer_connect_with_grant(
@@ -1806,10 +1926,24 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
     ) -> Result<PeerConnection, ProxyError> {
+        self.peer_connect_with_grant_measured(listener_id, protocol, candidates, &[])
+            .await
+    }
+
+    /// `POST /v1/peer/connect` on a grant, carrying what the initiator
+    /// measured (§4).
+    pub async fn peer_connect_with_grant_measured(
+        &self,
+        listener_id: &str,
+        protocol: &str,
+        candidates: &[Candidate],
+        relay_rtt: &[RelayRttSample],
+    ) -> Result<PeerConnection, ProxyError> {
         let body = serde_json::json!({
             "listener_id": listener_id,
             "protocol": protocol,
             "candidates": candidates,
+            "relay_rtt": relay_rtt,
         });
         self.request_json("POST", "/v1/peer/connect", to_vec(&body))
             .await
