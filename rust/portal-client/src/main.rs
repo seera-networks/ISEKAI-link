@@ -98,7 +98,7 @@ struct Args {
     /// proxy base URL. Defaults to the deployment the camera apps use
     #[argh(
         option,
-        default = "String::from(\"https://tokyo.link.isekai.tools:8443\")"
+        default = "String::from(\"https://link.isekai.tools:6443\")"
     )]
     proxy_url: String,
     /// auth0 access token, used only to obtain the Endpoint Token. Cannot be
@@ -912,7 +912,7 @@ fn check_ticket(args: &Args, ticket: &str) -> anyhow::Result<isekai_p2p::agent::
     };
     let configured = isekai_p2p::agent::proxy_authority(&args.proxy_url);
     // Case-insensitively, because host names are: a ticket issued against
-    // `Tokyo.link.…` would otherwise be refused by a client on the default
+    // `Link.isekai.…` would otherwise be refused by a client on the default
     // lowercase URL, with an error naming two addresses that read the same.
     // The security property is unchanged -- this still has to be the host the
     // operator passed.

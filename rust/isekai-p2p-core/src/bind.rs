@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn no_chosen_relay_dials_the_configured_proxy_however_the_uri_looks() {
         let masque: Uri =
-            "https://tokyo.link.isekai.tools:8443/.well-known/masque/udp/127.0.0.1/30001/"
+            "https://link.isekai.tools:6443/.well-known/masque/udp/127.0.0.1/30001/"
                 .parse()
                 .unwrap();
         let dialled = relay_target(&masque, "https://localhost:8443", None).unwrap();

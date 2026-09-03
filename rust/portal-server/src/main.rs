@@ -145,7 +145,7 @@ struct Args {
     /// proxy base URL. Defaults to the deployment the camera apps use
     #[argh(
         option,
-        default = "String::from(\"https://tokyo.link.isekai.tools:8443\")"
+        default = "String::from(\"https://link.isekai.tools:6443\")"
     )]
     proxy_url: String,
     /// auth0 access token, used only to obtain the Endpoint Token. Cannot be

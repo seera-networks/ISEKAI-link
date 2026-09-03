@@ -852,7 +852,7 @@ const SECRET_PREFIXES: [&str; 4] = [
     ENROLLMENT_KEY_PREFIX,
 ];
 
-/// The authority a proxy base URL names — `tokyo.link.isekai.tools:8443`.
+/// The authority a proxy base URL names — `link.isekai.tools:6443`.
 ///
 /// Shared so that the side writing a hand-over string and the side checking one
 /// agree on what counts as "the same proxy". Falls back to the whole input
@@ -870,7 +870,7 @@ pub fn proxy_authority(proxy_url: &str) -> &str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketTransfer {
     /// Where to redeem it: an **authority**, not a URL —
-    /// `tokyo.link.isekai.tools:8443`. The scheme is always `https`.
+    /// `link.isekai.tools:6443`. The scheme is always `https`.
     ///
     /// **[`ticket_transfer`] always writes the port**, which §8.12.8 asks for:
     /// a bare host means 443, and this project's proxies are not there, so
@@ -2836,7 +2836,7 @@ mod tests {
 
     #[test]
     fn a_ticket_transfer_round_trips() {
-        let packed = ticket_transfer("tokyo.link.isekai.tools:8443", "tkt1_QA81kTj0cA4Q8gL9");
+        let packed = ticket_transfer("link.isekai.tools:6443", "tkt1_QA81kTj0cA4Q8gL9");
         assert!(packed.starts_with(TICKET_TRANSFER_PREFIX));
         // The secret must not be readable in the packed form without decoding
         // it, or a shoulder-glance at a chat window is enough.
@@ -2844,7 +2844,7 @@ mod tests {
         assert_eq!(
             ticket_from_transfer(&packed),
             Some(TicketTransfer {
-                proxy: "tokyo.link.isekai.tools:8443".to_owned(),
+                proxy: "link.isekai.tools:6443".to_owned(),
                 ticket: "tkt1_QA81kTj0cA4Q8gL9".to_owned(),
             })
         );
@@ -2914,8 +2914,8 @@ mod tests {
     #[test]
     fn an_authority_is_what_two_sides_compare() {
         assert_eq!(
-            proxy_authority("https://tokyo.link.isekai.tools:8443"),
-            "tokyo.link.isekai.tools:8443"
+            proxy_authority("https://link.isekai.tools:6443"),
+            "link.isekai.tools:6443"
         );
         assert_eq!(proxy_authority("https://a.test/base?x=1#y"), "a.test");
         assert_eq!(proxy_authority("a.test:8443"), "a.test:8443");

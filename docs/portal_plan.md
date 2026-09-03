@@ -458,7 +458,7 @@ ep:40d25d…
 ```
 
 The Identity and proxy URLs default to the deployment the camera apps use
-(`identity.isekai.tools:9443`, `tokyo.link.isekai.tools:8443`); `--identity-url`
+(`identity.isekai.tools:9443`, `link.isekai.tools:6443`); `--identity-url`
 and `--proxy-url` are there for another one.
 
 **The server offers services and authorises that Endpoint.** The catalogue is

@@ -80,7 +80,7 @@ struct Token {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "create-listener")]
 struct CreateListener {
-    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
+    /// proxy base URL (e.g. https://link.isekai.tools:6443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)
@@ -101,7 +101,7 @@ struct CreateListener {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "issue-capability")]
 struct IssueCapability {
-    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
+    /// proxy base URL (e.g. https://link.isekai.tools:6443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)
@@ -128,7 +128,7 @@ struct IssueCapability {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "connect")]
 struct Connect {
-    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
+    /// proxy base URL (e.g. https://link.isekai.tools:6443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)
@@ -163,7 +163,7 @@ struct Connect {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "get-connection")]
 struct GetConnection {
-    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
+    /// proxy base URL (e.g. https://link.isekai.tools:6443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)
@@ -181,7 +181,7 @@ struct GetConnection {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "report-state")]
 struct ReportState {
-    /// proxy base URL (e.g. https://tokyo.link.isekai.tools:8443)
+    /// proxy base URL (e.g. https://link.isekai.tools:6443)
     #[argh(option)]
     proxy_url: String,
     /// path to the Endpoint PKCS#8 PEM key (for PoP)

@@ -76,7 +76,7 @@ of these you are using, and every command runs from wherever the key files and
 `portal-server.toml` should live.
 
 The binaries default to the public deployment (`identity.isekai.tools`,
-`tokyo.link.isekai.tools`); `--identity-url` and `--proxy-url` point them
+`link.isekai.tools`); `--identity-url` and `--proxy-url` point them
 somewhere else.
 
 ---
@@ -397,8 +397,8 @@ credentials go. If the ticket names a proxy other than `--proxy-url`, portal
 stops and tells you what to pass:
 
 ```
-Error: this ticket is for osaka.link.isekai.tools:8443, but --proxy-url is
-tokyo.link.isekai.tools:8443.
+Error: this ticket is for osaka.link.isekai.tools:6443, but --proxy-url is
+link.isekai.tools:6443.
 ```
 
 Pass that `--proxy-url` to the later commands too — **the grant lives at the

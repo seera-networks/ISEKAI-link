@@ -65,7 +65,7 @@ impl MasqueH3Transport {
             .context("failed to build request")
     }
 
-    /// Connect to the proxy at `target` (e.g. `https://tokyo.link.isekai.tools:8443`).
+    /// Connect to the proxy at `target` (e.g. `https://link.isekai.tools:6443`).
     pub fn connect(target: &str) -> anyhow::Result<Self> {
         let uri: Uri = target.parse().context("invalid proxy target URI")?;
         let (registration, config) = make_client_config(None, false)?;

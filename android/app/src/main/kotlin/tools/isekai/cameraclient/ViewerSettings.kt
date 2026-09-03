@@ -11,7 +11,7 @@ import android.content.SharedPreferences
  */
 data class ViewerSettings(
     var identityUrl: String = "https://identity.isekai.tools:9443",
-    var proxyUrl: String = "https://tokyo.link.isekai.tools:8443",
+    var proxyUrl: String = "https://link.isekai.tools:6443",
     var protocolName: String = "isekai-validator-v1",
     var capability: String = "",
     var listenerId: String = "",

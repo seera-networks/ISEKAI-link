@@ -454,7 +454,7 @@ impl MyApp {
             reg,
             is_open: false,
             identity_url: "https://identity.isekai.tools:9443".to_string(),
-            proxy_url: "https://tokyo.link.isekai.tools:8443".to_string(),
+            proxy_url: "https://link.isekai.tools:6443".to_string(),
             auth0_token: String::new(),
             auth0_store_path: "camera-server-auth0.json".to_string(),
             auth0_login: camera_core::auth0::DeviceSignIn::default(),

@@ -106,7 +106,7 @@ public deployment:
 | | |
 | --- | --- |
 | `Identity URL:` | `https://identity.isekai.tools:9443` |
-| `Proxy URL:` | `https://tokyo.link.isekai.tools:8443` |
+| `Proxy URL:` | `https://link.isekai.tools:6443` |
 | `Key path:` | `camera-server-endpoint.pem` |
 | `Protocol:` | `isekai-validator-v1` |
 

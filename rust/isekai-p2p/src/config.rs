@@ -29,7 +29,7 @@ pub struct P2pConfig {
     pub identity_url: String,
     /// Reach the Identity API over HTTP/3 (QUIC) instead of HTTP/1.1 + HTTP/2.
     pub identity_http3: bool,
-    /// Proxy base URL, e.g. `https://tokyo.link.isekai.tools:8443`.
+    /// Proxy base URL, e.g. `https://link.isekai.tools:6443`.
     pub proxy_url: String,
     /// How this session proves who it is to the Identity API — a person's Auth0
     /// sign-in, or an Enrollment Key for a job with nobody at the keyboard.

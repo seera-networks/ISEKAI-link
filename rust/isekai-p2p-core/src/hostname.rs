@@ -175,22 +175,22 @@ mod tests {
     #[test]
     fn a_certificate_for_another_host_is_refused() {
         let der = cert_for(vec!["attacker.example".to_owned()]);
-        let err = certificate_matches(&der, "tokyo.link.isekai.tools").unwrap_err();
+        let err = certificate_matches(&der, "link.isekai.tools").unwrap_err();
         assert!(err.contains("attacker.example"), "{err}");
     }
 
     /// The ordinary case, which must not become noisy.
     #[test]
     fn the_right_host_is_accepted() {
-        let der = cert_for(vec!["tokyo.link.isekai.tools".to_owned()]);
-        assert!(certificate_matches(&der, "tokyo.link.isekai.tools").is_ok());
+        let der = cert_for(vec!["link.isekai.tools".to_owned()]);
+        assert!(certificate_matches(&der, "link.isekai.tools").is_ok());
     }
 
     /// DNS is case-insensitive and certificates are not always lowercased.
     #[test]
     fn the_comparison_ignores_case() {
-        let der = cert_for(vec!["Tokyo.Link.Isekai.Tools".to_owned()]);
-        assert!(certificate_matches(&der, "tokyo.link.isekai.tools").is_ok());
+        let der = cert_for(vec!["Link.Isekai.Tools".to_owned()]);
+        assert!(certificate_matches(&der, "link.isekai.tools").is_ok());
     }
 
     /// A certificate that names nothing must not be read as naming us — which
@@ -200,14 +200,14 @@ mod tests {
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
         let mut params = CertificateParams::new(Vec::new()).expect("params");
         let mut dn = rcgen::DistinguishedName::new();
-        dn.push(rcgen::DnType::CommonName, "tokyo.link.isekai.tools");
+        dn.push(rcgen::DnType::CommonName, "link.isekai.tools");
         params.distinguished_name = dn;
         let der = params
             .self_signed(&key)
             .expect("self-signed")
             .der()
             .to_vec();
-        assert!(certificate_matches(&der, "tokyo.link.isekai.tools").is_err());
+        assert!(certificate_matches(&der, "link.isekai.tools").is_err());
     }
 
     /// Anything unparseable is a refusal rather than a panic mid-handshake.
