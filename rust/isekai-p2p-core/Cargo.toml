@@ -1,6 +1,6 @@
 [package]
 name = "isekai-p2p-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 # P2P Connect protocol primitives: Endpoint keys + PoP, the Identity API and

@@ -1,6 +1,6 @@
 [package]
 name = "isekai-client-ffi"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
 # Phase 1 of the iOS camera-client plan (docs/ios_camera_client_plan.md): a thin

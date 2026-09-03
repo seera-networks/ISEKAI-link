@@ -1,6 +1,6 @@
 [package]
 name = "portal-server"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
 # The side with the services (plan §4.2). Phase 1c-iii-c-ii: it connects for

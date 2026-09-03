@@ -1,6 +1,6 @@
 [package]
 name = "portal-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
 # Phase 0 of docs/portal_plan.md. TCP only, one service, no config, no UI.

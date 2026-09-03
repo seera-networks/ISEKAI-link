@@ -4,6 +4,11 @@ members = ["agent", "camera-client", "camera-core", "camera-server", "camera-ui"
 ]
 resolver = "3"
 package.edition = "2021"
+# **One version for the whole workspace.** Everything here is cut as a
+# single tag, so fourteen manifests each carrying their own number was an
+# invitation to bump thirteen of them. Members inherit with
+# `version.workspace = true`.
+package.version = "0.4.0"
 
 [workspace.dependencies]
 anyhow = "1"
