@@ -366,12 +366,32 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // anything is forwarded or redeemed, so anything describing the session
     // would be accepted and then quietly ignored. Refuse instead of dropping.
     if args.relays {
+        // **Every other way in, not just the obvious flags.** A Provisioning
+        // Key arrives from the environment rather than the command line, so
+        // leaving it out is the quiet version of the same bug: the key would be
+        // read, never redeemed, and its absence from the output would look like
+        // the key was wrong.
+        let provisioning_named = args.provisioning_key_file.is_some()
+            || std::env::var_os(portal_core::ci::PROVISIONING_KEY_VAR).is_some();
         anyhow::ensure!(
             args.map.is_empty()
                 && args.pair.is_none()
                 && args.redeem.is_none()
-                && args.peer.is_none(),
+                && args.peer.is_none()
+                && !provisioning_named,
             "--relays only measures and prints; it forwards nothing, so drop the rest of the run",
+        );
+        // The admin path returns before `--relays` is ever reached, so these
+        // would be silently ignored rather than refused.
+        anyhow::ensure!(
+            !(args.endpoints
+                || args.revoke_endpoint.is_some()
+                || args.issue_enrollment_key
+                || args.enrollment_keys
+                || args.enrollment_key_enrollments.is_some()
+                || args.revoke_enrollment_key.is_some()),
+            "--relays asks the proxy about this Endpoint; the account-level commands are a \
+             separate run",
         );
     }
     if let Some(status) = &args.endpoint_status {
@@ -650,20 +670,6 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     Ok(())
 }
 
-/// What a secret prefix means, in words a person can act on.
-fn what_it_is(prefix: &str) -> &'static str {
-    match prefix {
-        isekai_p2p::agent::TICKET_PREFIX | isekai_p2p::agent::TICKET_TRANSFER_PREFIX => "a ticket",
-        isekai_p2p::agent::PROVISIONING_KEY_PREFIX => "a Provisioning Key",
-        isekai_p2p::agent::ENROLLMENT_KEY_PREFIX => "an Enrollment Key",
-        _ => "a secret",
-    }
-}
-
-/// Redeem a pairing code, and say what it paired with.
-///
-/// Returns the Endpoint that let us in, so a caller that also has `--map` can
-/// go straight there rather than working out which peer this was.
 /// `--relays` — measure this Endpoint's relay candidates and print them.
 ///
 /// **The same probe a real session runs**, so what this prints is what the
@@ -722,6 +728,20 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a secret prefix means, in words a person can act on.
+fn what_it_is(prefix: &str) -> &'static str {
+    match prefix {
+        isekai_p2p::agent::TICKET_PREFIX | isekai_p2p::agent::TICKET_TRANSFER_PREFIX => "a ticket",
+        isekai_p2p::agent::PROVISIONING_KEY_PREFIX => "a Provisioning Key",
+        isekai_p2p::agent::ENROLLMENT_KEY_PREFIX => "an Enrollment Key",
+        _ => "a secret",
+    }
+}
+
+/// Redeem a pairing code, and say what it paired with.
+///
+/// Returns the Endpoint that let us in, so a caller that also has `--map` can
+/// go straight there rather than working out which peer this was.
 async fn redeem(
     cfg: &P2pConfig,
     code: &str,

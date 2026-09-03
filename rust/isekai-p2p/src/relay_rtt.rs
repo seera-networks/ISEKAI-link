@@ -47,6 +47,8 @@
 //! which is exactly what the reporting party could already do by hand, and is
 //! bounded the same way.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use isekai_p2p_core::proxy::{ProxyClient, RelayCandidate, RelayRttSample};
@@ -69,6 +71,13 @@ pub const FRESHNESS_WINDOW: Duration = Duration::from_secs(3_600);
 /// connection arriving in between is ranked as though nothing had ever been
 /// reported.
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(FRESHNESS_WINDOW.as_secs() / 2);
+
+/// How soon to try again after a round that produced nothing worth sending.
+///
+/// Short, because the usual cause is a moment of local trouble rather than a
+/// pool that has gone away, and the cost of waiting is that this side stays
+/// unranked.
+const RETRY_IN: Duration = Duration::from_secs(60);
 
 /// How a round of measurement is bounded.
 #[derive(Debug, Clone)]
@@ -124,8 +133,8 @@ impl ProbeOptions {
 /// one that answered, `None` for one that did not. A candidate that the budget
 /// cut short appears in neither state — it is simply absent.
 pub async fn measure(candidates: &[RelayCandidate], opts: &ProbeOptions) -> Vec<RelayRttSample> {
-    measure_with(candidates, opts, |base_url, probes| async move {
-        probe(&base_url, probes).await
+    measure_with(candidates, opts, |base_url, probes, best| async move {
+        probe(&base_url, probes, best).await
     })
     .await
 }
@@ -142,8 +151,8 @@ async fn measure_with<F, Fut>(
     prober: F,
 ) -> Vec<RelayRttSample>
 where
-    F: Fn(String, usize) -> Fut + Send + Sync + Clone + 'static,
-    Fut: std::future::Future<Output = Option<u32>> + Send + 'static,
+    F: Fn(String, usize, Arc<AtomicU32>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     if candidates.is_empty() {
         return Vec::new();
@@ -157,10 +166,23 @@ where
         let probes = opts.probes;
         let prober = prober.clone();
         set.spawn(async move {
-            let rtt = tokio::time::timeout(per_relay, prober(base_url, probes))
-                .await
-                .unwrap_or(None);
-            RelayRttSample { dp_id, rtt_ms: rtt }
+            // **Samples are published as they land, not returned at the end.**
+            // The timeout below cancels the probe wherever it has got to, and a
+            // relay that answered and was then cut off must not be reported as
+            // unreachable — that is the one verdict this design uses to *remove*
+            // a relay from the session. A far relay is slow, not absent, and
+            // condemning every relay past a few hundred milliseconds would
+            // empty the candidate list of exactly the cross-continent nodes
+            // proximity selection exists to rank.
+            let best = Arc::new(AtomicU32::new(NOTHING_YET));
+            let _ = tokio::time::timeout(per_relay, prober(base_url, probes, best.clone())).await;
+            let landed = best.load(Ordering::Relaxed);
+            RelayRttSample {
+                dp_id,
+                // Nothing at all — not even the warm-up — is the verdict the
+                // per-relay limit is for.
+                rtt_ms: (landed != NOTHING_YET).then_some(landed),
+            }
         });
     }
 
@@ -179,20 +201,30 @@ where
     out
 }
 
-/// One relay: connect, warm up, and time `probes` exchanges.
+/// The sentinel for "no exchange has completed yet".
 ///
-/// `None` at any step means unreachable — there is no partial credit, because a
-/// relay that cannot complete the cheapest possible request is not one to hand
-/// a session to.
-async fn probe(base_url: &str, probes: usize) -> Option<u32> {
+/// Distinct from every value that can be stored because samples are clamped to
+/// [`MAX_RTT_MS`], which the control plane clamps to anyway.
+const NOTHING_YET: u32 = u32::MAX;
+
+/// The slowest round trip worth recording, mirroring the control plane's own
+/// clamp. Anything slower is unusable as a relay.
+const MAX_RTT_MS: u32 = 10_000;
+
+/// One relay: connect, warm up, and time `probes` exchanges into `best`.
+///
+/// **Writes as it goes rather than returning**, so that being cancelled part
+/// way keeps what was already measured. Leaving `best` untouched is what says
+/// unreachable.
+async fn probe(base_url: &str, probes: usize, best: Arc<AtomicU32>) {
     let transport = match MasqueH3Transport::connect(base_url) {
         Ok(transport) => transport,
         Err(err) => {
             tracing::debug!(%err, base_url, "could not open a probe connection");
-            return None;
+            return;
         }
     };
-    time_exchanges(probes, || health(&transport)).await
+    time_exchanges(probes, &best, || health(&transport)).await
 }
 
 /// Warm up once, then time `probes` exchanges and keep the fastest.
@@ -200,14 +232,15 @@ async fn probe(base_url: &str, probes: usize) -> Option<u32> {
 /// The warm-up's result is thrown away on purpose: it is the handshake, the
 /// certificate check and a cold congestion window, none of which a leg pays
 /// twice. What is left is the round trip.
-async fn time_exchanges<F, Fut>(probes: usize, exchange: F) -> Option<u32>
+async fn time_exchanges<F, Fut>(probes: usize, best: &AtomicU32, exchange: F)
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<()>>,
 {
-    exchange().await?;
+    if exchange().await.is_none() {
+        return;
+    }
 
-    let mut best: Option<u32> = None;
     for _ in 0..probes {
         let started = Instant::now();
         // A relay that answered once and then stopped has still told us
@@ -216,10 +249,13 @@ where
         if exchange().await.is_none() {
             break;
         }
-        let ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
-        best = Some(best.map_or(ms, |b| b.min(ms)));
+        let ms = u32::try_from(started.elapsed().as_millis())
+            .unwrap_or(MAX_RTT_MS)
+            .min(MAX_RTT_MS);
+        // Published on each pass, so a cancellation between here and the next
+        // exchange still leaves the measurement behind.
+        best.fetch_min(ms, Ordering::Relaxed);
     }
-    best
 }
 
 /// One `GET /health`. `None` unless the relay answered a success status.
@@ -254,13 +290,28 @@ impl RelayRttReporter {
     ) -> Self {
         Self(tokio::spawn(async move {
             loop {
-                if let Err(err) = round(&proxy, &listener_id, &opts).await {
-                    // Never fatal. Losing a round costs ranking, never the
-                    // listener: the control plane falls back to pool order,
-                    // which is where it was before any of this existed.
-                    tracing::debug!(%err, listener_id, "a relay measurement round did not land");
-                }
-                tokio::time::sleep(REPORT_INTERVAL).await;
+                let next = match round(&proxy, &listener_id, &opts).await {
+                    Ok(()) => REPORT_INTERVAL,
+                    Err(err) => {
+                        // Never fatal. Losing a round costs ranking, never the
+                        // listener: the control plane falls back to pool order,
+                        // which is where it was before any of this existed.
+                        tracing::debug!(
+                            %err,
+                            listener_id,
+                            "a relay measurement round did not land"
+                        );
+                        // **But it must not spend the margin the half-window
+                        // cadence exists to provide.** The interval is half the
+                        // freshness window so a report always lands while the
+                        // last one is still good; sleeping it after a failure
+                        // spends that whole margin on one bad moment, and a
+                        // listener whose *first* round fails would go half an
+                        // hour with nothing published at all.
+                        RETRY_IN
+                    }
+                };
+                tokio::time::sleep(next).await;
             }
         }))
     }
@@ -301,6 +352,15 @@ async fn round(
         // still fresh because this one round ran out of budget.
         anyhow::bail!("no relay finished its probe within the budget");
     }
+    if samples.iter().all(|s| s.rtt_ms.is_none()) {
+        // **"I cannot reach any relay" is a statement about this host, not
+        // about the pool.** A few seconds of local trouble produces it, and
+        // reporting it replaces a good set with one that rules every node out,
+        // which makes the control plane skip this tenant's pool for half an
+        // hour. Retrying shortly is the better answer; if the pool really has
+        // gone, the stored rows lapse on their own window anyway.
+        anyhow::bail!("every relay was unreachable, which is more likely to be this end");
+    }
     let stored = proxy.report_relay_rtt(listener_id, &samples).await?;
     tracing::debug!(
         listener_id,
@@ -321,20 +381,36 @@ pub async fn measure_for_connect(
     proxy: &ProxyClient<MasqueH3Transport>,
     opts: &ProbeOptions,
 ) -> Vec<RelayRttSample> {
-    match proxy.list_relays().await {
-        Ok(Some(candidates)) if !candidates.is_empty() => measure(&candidates, opts).await,
-        Ok(_) => Vec::new(),
-        Err(err) => {
+    // **Inside the budget, because the budget is a promise to the person
+    // waiting on `connect`.** The control-plane transport has no request
+    // timeout of its own, so an unanswered read here is bounded only by QUIC's
+    // 30-second idle timeout — twenty times the delay this path advertises.
+    // Half the budget for the read, leaving half to measure with.
+    let listed = tokio::time::timeout(opts.budget / 2, proxy.list_relays()).await;
+    let candidates = match listed {
+        Ok(Ok(Some(candidates))) if !candidates.is_empty() => candidates,
+        Ok(Ok(_)) => return Vec::new(),
+        Ok(Err(err)) => {
             tracing::debug!(%err, "could not read the relay candidates; connecting unmeasured");
-            Vec::new()
+            return Vec::new();
         }
-    }
+        Err(_) => {
+            tracing::debug!(
+                "reading the relay candidates outran the budget; connecting unmeasured"
+            );
+            return Vec::new();
+        }
+    };
+    let opts = ProbeOptions {
+        budget: opts.budget / 2,
+        ..opts.clone()
+    };
+    measure(&candidates, &opts).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn reporting_is_well_inside_the_window() {
@@ -374,7 +450,7 @@ mod tests {
         let samples = measure_with(
             &[candidate("dp1_gone")],
             &ProbeOptions::default(),
-            |_, _| async { None },
+            |_, _, _| async {},
         )
         .await;
         // **Present with a null, not absent.** Absent would say "not measured",
@@ -398,9 +474,8 @@ mod tests {
             per_relay: Duration::from_millis(30),
             budget: Duration::from_secs(5),
         };
-        let samples = measure_with(&[candidate("dp1_slow")], &opts, |_, _| async {
+        let samples = measure_with(&[candidate("dp1_slow")], &opts, |_, _, _| async {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            Some(1)
         })
         .await;
         assert_eq!(samples.first().map(|s| s.rtt_ms), Some(None));
@@ -415,9 +490,8 @@ mod tests {
             per_relay: Duration::from_secs(30),
             budget: Duration::from_millis(30),
         };
-        let samples = measure_with(&[candidate("dp1_slow")], &opts, |_, _| async {
+        let samples = measure_with(&[candidate("dp1_slow")], &opts, |_, _, _| async {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            Some(1)
         })
         .await;
         assert!(samples.is_empty(), "got {samples:?}");
@@ -438,13 +512,13 @@ mod tests {
         let samples = measure_with(
             &[candidate("dp1_near"), candidate("dp1_stuck")],
             &opts,
-            |base_url, _| async move {
+            |base_url, _, best| async move {
                 if base_url.contains("dp1_stuck") {
                     // Never answers, and outlives both the budget and its own
                     // per-relay limit.
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
-                Some(7)
+                best.fetch_min(7, Ordering::Relaxed);
             },
         )
         .await;
@@ -463,7 +537,8 @@ mod tests {
     async fn the_warm_up_is_not_counted() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
-        let rtt = time_exchanges(3, || {
+        let best = AtomicU32::new(NOTHING_YET);
+        time_exchanges(3, &best, || {
             let calls = calls.clone();
             async move {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -471,7 +546,7 @@ mod tests {
             }
         })
         .await;
-        assert!(rtt.is_some());
+        assert_ne!(best.load(Ordering::Relaxed), NOTHING_YET);
         // Three timed exchanges plus the one that paid for the handshake.
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
@@ -480,7 +555,8 @@ mod tests {
     async fn a_relay_that_fails_its_warm_up_is_unreachable() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
-        let rtt = time_exchanges(3, || {
+        let best = AtomicU32::new(NOTHING_YET);
+        time_exchanges(3, &best, || {
             let calls = calls.clone();
             async move {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -488,7 +564,7 @@ mod tests {
             }
         })
         .await;
-        assert_eq!(rtt, None);
+        assert_eq!(best.load(Ordering::Relaxed), NOTHING_YET);
         // And it stopped there rather than timing three more failures.
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -498,7 +574,8 @@ mod tests {
         // The floor of the path is what is wanted; a slow sample is queueing,
         // not distance.
         let nth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let rtt = time_exchanges(3, || {
+        let best = AtomicU32::new(NOTHING_YET);
+        time_exchanges(3, &best, || {
             let nth = nth.clone();
             async move {
                 let n = nth.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -508,15 +585,16 @@ mod tests {
                 Some(())
             }
         })
-        .await
-        .expect("the relay answered");
+        .await;
+        let rtt = best.load(Ordering::Relaxed);
         assert!(rtt < 60, "kept {rtt}ms, which is not the fastest");
     }
 
     #[tokio::test]
     async fn a_relay_that_stops_answering_keeps_what_it_gave() {
         let nth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let rtt = time_exchanges(3, || {
+        let best = AtomicU32::new(NOTHING_YET);
+        time_exchanges(3, &best, || {
             let nth = nth.clone();
             async move {
                 let n = nth.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -527,7 +605,50 @@ mod tests {
         .await;
         // It answered once, so it is reachable. Reporting `None` here would
         // drop a working relay from the session over a single lost exchange.
-        assert!(rtt.is_some());
+        assert_ne!(best.load(Ordering::Relaxed), NOTHING_YET);
+    }
+
+    #[tokio::test]
+    async fn a_slow_relay_keeps_what_it_measured_when_its_time_runs_out() {
+        // **The regression.** The per-relay limit used to wrap the whole probe
+        // and throw away everything it had collected, so a relay that answered
+        // and was then cut off got reported as unreachable — the one verdict
+        // that *removes* a relay from the session. Far is not absent, and at
+        // roughly six round trips per probe a limit of 1.2s condemned every
+        // relay past about 190ms: precisely the cross-continent nodes this
+        // feature exists to rank.
+        let opts = ProbeOptions {
+            probes: 3,
+            per_relay: Duration::from_millis(150),
+            budget: Duration::from_secs(5),
+        };
+        let samples = measure_with(&[candidate("dp1_far")], &opts, |_, _, best| async move {
+            // One sample lands, then the probe hangs past its limit.
+            best.fetch_min(120, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        })
+        .await;
+        assert_eq!(
+            samples,
+            vec![RelayRttSample {
+                dp_id: "dp1_far".into(),
+                rtt_ms: Some(120),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sample_is_clamped_where_the_control_plane_would_clamp_it() {
+        // The sentinel has to stay distinct from every storable value, and the
+        // control plane clamps to the same ceiling anyway.
+        let best = AtomicU32::new(NOTHING_YET);
+        time_exchanges(1, &best, || async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some(())
+        })
+        .await;
+        assert!(best.load(Ordering::Relaxed) <= MAX_RTT_MS);
+        assert_ne!(MAX_RTT_MS, NOTHING_YET);
     }
 
     #[test]
