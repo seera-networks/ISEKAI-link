@@ -38,7 +38,7 @@ import java.net.URL
 // Hardcoded for this PoC -- pointed at one known portal-server. No settings
 // UI, per the plan's minimal-UI scope.
 private const val IDENTITY_URL = "https://identity.isekai.tools:9443"
-private const val PROXY_URL = "https://tokyo.link.isekai.tools:8443"
+private const val PROXY_URL = "https://link.isekai.tools:6443"
 // Deliberately NOT portal-core's own default ("isekai-portal-v1"): the
 // Identity API rejects that protocol string for this account with 403
 // protocol-not-allowed (confirmed against a brand-new, never-registered

@@ -88,10 +88,8 @@ fn build_p2p_config(
         identity_url: config.identity_url.clone(),
         identity_http3: false,
         proxy_url: config.proxy_url.clone(),
-        auth0_token: config.auth0_token.clone(),
-        auth0,
+        credential: isekai_p2p::Credential::auth0(config.auth0_token.clone(), auth0, register),
         protocol: config.protocol.clone(),
-        register,
         device_name: Some("portal-client-android".to_owned()),
         token_ttl: None,
         key,
@@ -122,13 +120,13 @@ pub fn pair_with_code(
 
     runtime.block_on(async {
         let cfg = build_p2p_config(&config, key, register, None);
-        if cfg.register {
+        if register {
             isekai_p2p::issue_endpoint_token(&cfg)
                 .await
                 .map_err(|e| PortalError::Pair(format!("{e:#}")))?;
         }
         let cfg = P2pConfig {
-            register: false,
+            credential: isekai_p2p::Credential::auth0(config.auth0_token.clone(), None, false),
             ..cfg
         };
 
