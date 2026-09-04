@@ -277,6 +277,65 @@ Check the command-line arguments of each binary with `-- --help`:
 cargo run -p camera-server -- --help
 ```
 
+### 5a. Running `camera-server` headlessly
+
+`scripts/run-camera-server.sh` launches `camera-server` with no GUI
+interaction needed for capture to start: it picks up a previously-restored
+Auth0 sign-in and sets `CAMERA_AUTOSTART=1`, which is the same as clicking
+**Start**.
+
+**It does not open the P2P listener automatically.** That still needs a
+human to click **Open** at least once — this is deliberate, not a missing
+feature. An earlier version tried to automate that too and opened the P2P
+listener (and, combined with `CAMERA_AUTOSTART`, started publishing to
+peers) before the privacy-consent gate had ever been shown to anyone.
+`CAMERA_AUTOSTART` alone never touches the network, so it doesn't have that
+problem — requiring the click for **Open** is what keeps consent genuinely
+interactive.
+
+`scripts/camera-server.service` is a systemd unit that runs the script under
+a virtual display (`xvfb-run`), restarting it if it exits. It expects
+`camera-server` already built (`cargo build [--release] -p camera-server`
+from `rust/`).
+
+The unit file itself never needs editing — every machine-specific value is
+supplied externally, two different ways depending on what systemd allows:
+
+- **This checkout's path, and `OPENCV_LIB_DIR`** live in a separate
+  `EnvironmentFile=` — systemd expands `${VAR}` from
+  `Environment=`/`EnvironmentFile=` inside `Exec*` command lines
+  (systemd.exec(5)):
+  ```sh
+  cp scripts/camera-server.env.example /etc/camera-server.env
+  # then edit /etc/camera-server.env: CAMERA_SERVER_CHECKOUT (this checkout's
+  # absolute path) and OPENCV_LIB_DIR (see the OpenCV build step above)
+  ```
+  The unit refuses to start if `/etc/camera-server.env` is missing, rather
+  than silently falling back to something wrong.
+- **`User=` and `SupplementaryGroups=`** can't be pulled from
+  `EnvironmentFile=` the same way — systemd only expands `${VAR}` inside
+  `Exec*` command lines, never in plain directives like these. The unit
+  ships with an obviously-invalid placeholder for both (so a forgotten
+  override fails loudly at start, rather than running as whatever it
+  happened to resolve to), overridden via a systemd drop-in — the standard
+  mechanism for customizing a vendored unit without editing it:
+  ```sh
+  sudo mkdir -p /etc/systemd/system/camera-server.service.d
+  sudo cp scripts/camera-server.service.d.example/override.conf \
+      /etc/systemd/system/camera-server.service.d/override.conf
+  # then edit that copy: User= (the user camera-server should run as), and
+  # SupplementaryGroups= if your setup differs from a single desktop user
+  # in the `video` group -- check `ls -la /dev/video0` if unsure
+  ```
+
+Install and enable it with:
+
+```sh
+sudo cp scripts/camera-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now camera-server.service
+```
+
 ---
 
 ## 6. Connecting, and path migration
