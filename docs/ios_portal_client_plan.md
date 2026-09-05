@@ -24,40 +24,42 @@ iOS ネイティブアプリとして実装するための計画書。
 iOS では「ローカルポートを開けて他のアプリに使わせ、その間ずっと動き続ける」が
 プラットフォームの設計に正面から反する。**アプリはフォアグラウンドを離れると数秒で
 サスペンドされ、「サーバを動かす」ための background mode は存在しない。** しかも
-フォアグラウンドは同時に 1 つなので、「portal を前面に置く」ことは「使いたいアプリを
-前面に置けない」ことと同義である。
+iPhone のフォアグラウンドは同時に 1 つなので、**「portal を前面に置く」ことは
+「使いたいアプリを前面に置けない」ことと同義**である。
 
 したがって本計画は**消費のしかたを 3 段に分け、下の段から積む**。
 
-| 段 | 誰がポートを使うか | 前提 | 動くか |
+| 段 | 誰がポートを使うか | 前提 | 状態 |
 | --- | --- | --- | --- |
-| **A** | **アプリ自身**（内蔵の WebView / コンソール） | 無し | **今日の技術で動く** |
-| **B** | 同一端末の**他アプリ**、portal が前面のあいだ | 無し | 動くが**前面限定** |
-| **C** | 端末全体、常時 | **Network Extension の entitlement**（Apple の審査）＋メモリ予算 | **未検証**（§7） |
+| **A** | **アプリ自身**（内蔵 WebView / コンソール） | 無し | **今日の技術で動く**。ただし HTTPS に判断が要る（§4.3） |
+| **B** | 同一端末の他アプリ | **iPad の Split View / Slide Over のみ** | iPhone では**動かない**（§6） |
+| **C** | 端末全体、常時 | NE entitlement（Apple の審査）＋メモリ予算＋不足部品 2 つ | **未検証**（§7） |
 
-**A を先に出す。** A は entitlement も審査も要らず、それでいて「NAT の向こうの
-社内 Web を iPhone から見る」という最も多い用途をそのまま満たす。C は価値が最も
-高いが、**Apple が entitlement を出すかと、NE のメモリ上限に収まるかの 2 つが
-未知**であり、それに全体の完成を賭ける形にしてはならない。
+**A を先に出す。** A は entitlement も審査も要らない。ただし
+「NAT の向こうの社内 Web を iPhone から見る」を**丸ごと満たすとは言えない** —
+その用途の多くは HTTPS であり、ループバック転送は証明書の名前検証を壊す。
+どこまでが A の守備範囲かは §4.3 に書く。
+
+C は価値が最も高いが、**未知が 3 つある**（§7）。それに全体の完成を賭けてはならない。
 
 ---
 
 ## 1. 既に通っている道 — ここが出発点である
 
 `ios/IsekaiCameraClient` が既に iOS 上で動いている。**そこで解けている問題を
-数え上げておくことが、この計画の見積もりの土台になる。**
+数え上げることが、この計画の見積もりの土台になる。**
 
 | 要素 | 実体 | portal 版で |
 | --- | --- | --- |
-| msquic / QUIC / MASQUE の iOS ビルド | `ios/build-rust.sh`（`aarch64-apple-ios` と `-sim` の xcframework） | **そのまま使う** |
-| UniFFI による Rust ↔ Swift | `rust/isekai-client-ffi`（`uniffi::setup_scaffolding!`） | **同じ枠組みで別クレート**（§3） |
-| Auth0 サインイン | `Auth0Client.swift` / `AuthStore.swift` / `Auth0TokenBridge.swift` | **再利用** |
+| msquic / QUIC / MASQUE の iOS ビルド | `ios/build-rust.sh`（`aarch64-apple-ios` と `-sim` の xcframework） | **使う。ただし要改造**（§8.1） |
+| UniFFI による Rust ↔ Swift | `rust/isekai-client-ffi` | **同じ枠組みで別クレート**（§3） |
+| Auth0 サインイン | `Auth0Client.swift` / `AuthStore.swift` | **再利用。ただし redirect の登録が要る**（§5.1） |
 | Endpoint 鍵の保管 | `EndpointKeyStore.swift` / `KeychainStore.swift`（Keychain） | **再利用** |
 | ペアリングコードの読み取り | `QRScannerView.swift` | **再利用**（§5.2） |
-| CI | `.github/workflows/ios-ffi.yml` | **同じ形を足す** |
+| メモリ実測 | `ProcessStats.swift`（`phys_footprint`） | **再利用**（§7.2 で効く） |
+| CI | `.github/workflows/ios-ffi.yml` | **同じ形を足す。実機ビルドは `main` 限定**（§8.1） |
 
-**つまり「iOS で QUIC が動くのか」は本計画では未知数ではない。** 既に動いている。
-残っているのは portal 固有の部分だけである。
+**「iOS で QUIC が動くのか」は本計画では未知数ではない。** 既に動いている。
 
 ---
 
@@ -65,18 +67,23 @@ iOS では「ローカルポートを開けて他のアプリに使わせ、そ�
 
 | レイヤ | 実体 | iOS 方針 |
 | --- | --- | --- |
-| P2P 制御・QUIC・MASQUE | `isekai-p2p` / `isekai-p2p-core` / `channel-masque` | **そのまま**（クロスコンパイル） |
-| portal のフレーミング | `portal-core::frame`（`Open` / `Status`）、`portal-core::udp` | **そのまま** |
-| ローカルポートの受け口 | `portal_core::client::forward`（`TcpListener` を張る） | **段 A/B ではそのまま使える**（§4.1）。段 C では使わない |
-| 認証 | `portal_core::login`（ブラウザ device flow、ファイル保管） | **使わない。** iOS の Auth0 実装に置き換え（§5.1） |
-| サービスカタログ | `portal_core::config`（TOML） | **無関係**（server 側の話） |
+| P2P 制御・QUIC・MASQUE | `isekai-p2p` / `isekai-p2p-core` / `channel-masque` | **そのまま** |
+| セッション確立 | `portal_core::session`（`connect`、`Reach`、`Connected`）、`transport`、`grant`、`path` | **そのまま** |
+| portal のフレーミング | `portal_core::frame`（`Open` / `Status`）、`server::Protocol`、`udp`、`datagram` | **そのまま** |
+| ローカルポートの受け口 | `portal_core::client::forward` | **段 A/B ではそのまま**（§3.2）。段 C では使わない |
+| 認証 | `portal_core::login` | **使わない**（§5.1） |
+| サービスカタログ | `portal_core::config`（TOML） | **無関係**（server 側） |
 | CLI 引数 | `portal-client/src/main.rs` | **SwiftUI で作り直す** |
 
-> **`portal-core` は iOS でそのまま乗るか。** `client.rs` / `udp.rs` / `frame.rs`
-> は tokio の TCP/UDP と QUIC しか使っておらず、iOS で動かない理由は無い。
-> ただし `login.rs` はブラウザを開き、トークンをファイルに書く。**クレート全体を
-> リンクするとこれも入る**ので、feature で切り分けるか、FFI からは
-> `client` / `frame` / `udp` だけを呼ぶ形にする（§3.2）。
+> **`portal-core` を「一部のモジュールだけ」使う、とは言えない。** `frame` は
+> `crate::server::Protocol` に依存し、`connect` は `session` / `transport` /
+> `grant` / `path` を引く。**クレートごと持っていく**のが実際の形である。
+>
+> `login` を避けたい理由は「リンクすると入ってしまうから」**ではない** —
+> 参照されない `pub fn` は最終バイナリに入らない。理由は**依存とファイル書き込みの
+> 面**である。`sign_in` はトークンをファイルに保存する（iOS では Keychain に置く
+> べきもの）。なお `login` は**ブラウザを開かない** — 検証 URL とコードを標準出力に
+> 印字して待つ device flow であり、iOS でそのまま動かす意味が無いのはそちらの理由による。
 
 ---
 
@@ -85,149 +92,208 @@ iOS では「ローカルポートを開けて他のアプリに使わせ、そ�
 ### 3.1 別クレートにする — `portal-client-ffi`
 
 `isekai-client-ffi` はカメラの形をしている（フレーム、カメラ一覧、映像シンク）。
-portal はバイトストリームであり、**同じクレートに同居させると、どちらのアプリも
-使わない API を半分ずつ抱える**ことになる。共有するのは `portal-core` と
-`isekai-p2p` であって、FFI の面ではない。
+portal はバイトストリームであり、同居させるとどちらのアプリも使わない API を
+半分ずつ抱える。共有するのは `portal-core` と `isekai-p2p` であって FFI の面ではない。
 
 ### 3.2 公開する面
 
 ```
-connect(config) -> Session          Endpoint 登録 → grant/capability → peer_connect
-Session.services() -> [String]      到達できるサービス名（§5.3 で議論）
-Session.map(service, local_port)    ローカルポートを張る（段 A/B）
-Session.open(service) -> Stream     ポートを経由しない直結（段 A の別解、§4.2）
-Session.status() -> Path/Relay      リレー経由か直接経路か
+connect(config) -> Session               session::connect をそのまま
+Session.map(service, port: u16) -> u16   ローカルポートを張り、実際に張れた番号を返す
+Session.open(service) -> Stream          ポートを介さない直結
+Session.path() -> Relay | Direct         いま relay か直接経路か
+Session.remembered_services() -> [String]  この端末が覚えている名前（§5.3）
 Session.close()
 ```
 
-**`map` と `open` の両方を出す。** `map` は既存の
-`portal_core::client::forward` をそのまま呼べる（WebView を向けるなら URL が要る）。
-`open` はポートを介さずストリームを Swift に渡す（`URLProtocol` や独自コンソール
-向け）。**どちらか一方に決め打ちしない**のは、段 A の 2 つの用途が別の形を
-要求するからである。
+**`map` は張れた番号を返す。** `portal_core::client::forward` は実際に bind した
+`SocketAddr` を返しており、段 A は WebView の URL を作るのにそれが要る。
+さらに **port は 0 を渡して OS に選ばせる**: 固定番号にすると、§6 の
+「復帰時に畳んで張り直す」で前のリスナが消えきる前に再 bind して `EADDRINUSE` に
+なり、**利用者が対処のしようがない失敗**になる。
 
-### 3.3 UniFFI で非同期ストリームをどう渡すか
+**`services()` とは呼ばない。** サーバに一覧を訊く経路は存在しない（§5.3）ので、
+返せるのは**この端末が覚えている名前だけ**である。`services()` という名前は
+持っていない知識を約束してしまう。
 
-UniFFI は `async fn` を扱えるが、**バイトストリームの往復は Record では表せない**。
-`Stream` は `uniffi::Object` として持ち、`read() -> Vec<u8>` / `write(Vec<u8>)` を
-async で出す。**ここは実装前に小さく試す価値がある**（P0、§8）。
+### 3.3 async をどう渡すか — 既に踏まれている地雷がある
+
+`rust/isekai-client-ffi/Cargo.toml` の uniffi は `features = ["cli"]` だけで、
+**`tokio` feature が入っていない。** msquic/tokio の I/O に触る `async fn` を
+`#[uniffi::export]` するには `#[uniffi::export(async_runtime = "tokio")]` が要り、
+それには uniffi の `tokio` feature が要る。無いまま出すと uniffi 自身の executor で
+future が回り、**最初の I/O で「there is no reactor running」で落ちる。**
+
+**そして既存クレートはこれを避ける形になっている。** `isekai-client-ffi` は
+`Runtime` を自分で持ち、`#[uniffi::export(callback_interface)] FrameSink` で
+データを Swift に**押し出して**いる（`src/lib.rs:192`）。**実機で動いている
+実績のある形はこちらである。**
+
+- 第一案: uniffi に `tokio` feature を足し、async で読み書きする
+- 退避案: `FrameSink` と同じ callback interface。`StreamSink` を Swift 側に置き、
+  Rust から押し出す
+
+**P0 はこの二択の決着である**（§8）。退避案が既に動いているので、**P0 が失敗しても
+計画は止まらない。**
 
 ---
 
 ## 4. 段 A — アプリ自身が使う
 
-### 4.1 ローカルポート＋内蔵 WebView（HTTP サービス向け）
+### 4.1 内蔵コンソール（任意 TCP）
 
-最も多い用途がこれである: 社内の Web アプリを iPhone から見る。
+`Session.open(service)` でストリームを取り、バイトを送受信する画面を出す。
+到達の確認が目的で、「繋がっているか」を人が見られることに意味がある。
+**証明書もホスト名も絡まないので、ここは素直に動く。**
+
+### 4.2 平文 HTTP — ループバック＋WebView
 
 ```
-Session.map("wiki", 18080)  →  WKWebView に http://127.0.0.1:18080 を読ませる
+Session.map("wiki", 0) -> 18080  →  WKWebView に http://127.0.0.1:18080
 ```
 
-**ループバックは iOS でも普通に使える。** Local Network のプライバシー許可が
-要るのは LAN であってループバックではないので、**追加のダイアログも entitlement も
-出ない**。アプリは前面に居るので、サスペンドの問題も起きない。
+ループバックは iOS でも使える。Local Network のプライバシー許可が要るのは LAN で
+あってループバックではないので、**追加のダイアログも entitlement も出ない。**
 
-> **確認事項（P0）。** `WKWebView` から `http://127.0.0.1:port` への平文アクセスは
-> ATS（App Transport Security）の対象になる。ループバックは既定で許可される
-> という理解だが、**`NSAllowsLocalNetworking` が要る可能性がある**ので実機で
-> 確かめる。要るなら Info.plist に入れる — これは entitlement ではなく、審査上の
-> 論点にもならない。
+> **確認事項（P0）。** 平文ループバックが ATS に引っかかるか。既定で許可される
+> という理解だが、`NSAllowsLocalNetworking` が要る可能性があるので実機で見る。
+> 要っても Info.plist の一行で、審査上の論点にはならない。
 
-### 4.2 内蔵コンソール（任意 TCP 向け）
+### 4.3 HTTPS — ここが段 A の本当の境界
 
-HTTP でないサービス（Redis、Postgres、独自プロトコル）に対しては、ポートを
-経由せず `Session.open(service)` でストリームを取り、**バイトを送受信する画面**を
-出す。実用というより**到達の確認**が目的で、「繋がっているか」を人が見られる
-ことに意味がある（デスクトップ版の `--map` 後に `psql` を打つ動作に相当する）。
+**「社内 Web を iPhone から」の多くは HTTPS であり、ループバック転送はそれを壊す。**
+
+- サーバは `wiki.internal` の証明書を出す。`https://127.0.0.1:18080` は
+  **名前検証で落ちる**
+- `http://127.0.0.1:18080` は TLS リスナとそもそも話せない
+- 通ったとしても、**絶対 URL のリダイレクト・Cookie の Domain・Origin 検査**が
+  正規ホスト名に対して書かれているので順に壊れる
+
+取りうる道は 3 つあり、**どれも「ポートを張って WebView を向ける」より重い**。
+
+| 案 | 中身 | 評価 |
+| --- | --- | --- |
+| 名前検証を切る | `WKWebView` の server-trust delegate で上書き | **採らない。** 検証を切るのは審査でも設計でも説明が立たない |
+| 平文だけ対象にする | 段 A は平文 HTTP と生 TCP に限る | **短期はこれ。** 正直で、実装が要らない |
+| **アプリが TLS クライアントになる** | portal のストリームの上で、アプリが `wiki.internal` として TLS を張る。WebView へは `WKURLSchemeHandler` で応答を返す | **中期はこれ。** ホスト名が正しいまま検証でき、Cookie も Origin も壊れない。ただし HTTP を自前で話す層が要る |
+
+**P3 では「平文だけ」で出す。** TLS クライアント案は P5 以降に置き、
+**§0 の「段 A で製品として完結する」は平文 HTTP と生 TCP の範囲での話**である、
+と書いておく。ここを曖昧にすると、最も多い用途で期待を外す。
 
 ---
 
-## 5. 認証・入り方・サービスの見つけ方
+## 5. 認証・入り方・サービス名
 
-### 5.1 サインイン
+### 5.1 サインイン — 設定の段取りが 1 つある
 
 `Auth0Client.swift`（PKCE + `ASWebAuthenticationSession`）を再利用する。
-**デスクトップの `--login`（device flow）は使わない** — iOS には正しいやり方が
-あり、既に実装されている。
+デスクトップの device flow は使わない（§2）。
 
-Endpoint 鍵は `EndpointKeyStore` で Keychain に置く。**ファイルに 0600 で置く
-デスクトップの流儀は持ち込まない。**
+> **`Auth0Config.swift` は `callbackScheme = "isekaiviewer"` を固定で持ち、
+> これは `ios/project.yml` の `CFBundleURLSchemes` と Auth0 側の
+> Allowed Callback URLs の両方に現れている。** 2 つ目のアプリは、
+> **同じスキームを 2 アプリが登録する**（端末上で衝突する）か、
+> **新しい redirect を Auth0 の管理画面に登録する**かのどちらかになる。
+> **これはコード変更ではなく設定作業**であり、P2 を止めうるので先に手配する。
+
+Endpoint 鍵は `EndpointKeyStore` で Keychain に置く。
 
 ### 5.2 入り方 — ペアリングと ticket
 
-デスクトップと同じ 3 通りを全部出す。
-
 | 入り方 | iOS での姿 |
 | --- | --- |
-| `--pair K7QM-3XPD` | コード入力欄。**QR も読む**（`QRScannerView` を再利用） |
-| `--redeem iskt1_…` | 貼り付け。**ticket は proxy を名指す**ので、設定中の proxy と違えば拒否する（デスクトップと同じ判断をそのまま移す） |
-| 標準の grant | ペアリング済みなら何もしなくてよい |
+| `--pair K7QM-3XPD` | コード入力欄。**QR も読む**（`QRScannerView` 再利用） |
+| `--redeem iskt1_…` | 貼り付け。**ticket は proxy を名指す**ので設定中の proxy と違えば拒否（`check_ticket` と同じ判断を移す） |
+| 標準の grant | ペアリング済みなら何も要らない |
 
-> **秘密の取り違えに同じ防御を入れる。** デスクトップ版は「ペアリングコード欄に
-> ticket や Enrollment Key を貼った」場合を prefix で検出して、**送る前に**止める。
-> 貼り付けが主な入力手段になる iOS では、この防御は**デスクトップより重要**である。
+> **秘密の取り違えに同じ防御を入れる。** デスクトップ版はペアリングコード欄に
+> ticket や Enrollment Key を貼った場合を prefix で検出し、**送る前に**止める。
+> 貼り付けが主な入力手段になる iOS では**デスクトップより重要**である。
 > `isekai_p2p::agent::secret_prefix` をそのまま FFI に出す。
 
-### 5.3 サービス名はどこから来るか
+### 5.3 サービス名 — 一覧を返す経路は無い
 
-デスクトップでは人が `--map 5432:db` と打つ。名前はサーバの都合であり、
-**線の上を流れない**（クライアントは名前を送るだけ）。
+**名前は線の上を流れる。** `Open::Tcp { service }` がそれを運ぶ。流れないのは
+**どのローカルポートがどの名前に対応するか**という対応表のほうで、それは
+この端末の都合である（`client.rs` のコメントが言っているのはこちら）。
 
-iOS では打たせたくない。しかし**「到達できるサービスの一覧」を返す API は
-現状のプロトコルに無い**（カタログはサーバ側の秘密で、名前を知らない相手に
-一覧を渡す設計になっていない）。
+したがって名前は**サーバのカタログの鍵と一字一句同じ**でなければならない。
+しかし**「到達できるサービスの一覧」を返す API は現状のプロトコルに無い。**
 
-- **短期**: 名前は手で入力・保存する。ペアリングの相手ごとに覚えておく
-- **中期**: サーバがペア相手に対してだけ名前を提示する経路を上流に提案する。
-  **本計画ではプロトコルを勝手に足さない** — カタログを見せる範囲は
-  `portal-server` 側の設計判断であり、ここで決めることではない
+- **短期**: 手で入力し、ペア相手ごとに覚える（`remembered_services()`）
+- **中期**: ペア相手にだけ名前を提示する経路を上流に提案する。
+  **本計画ではプロトコルを足さない** — カタログを見せる範囲は `portal-server` の
+  設計判断である
 
----
-
-## 6. 段 B — 同一端末の他アプリ
-
-段 A の `map` がそのまま他アプリからも使える。**ループバックはアプリ間で届く。**
-足すのは機構ではなく**正直さ**である。
-
-- **前面のあいだだけ動く**ことを画面に出す。「接続中」ではなく
-  「**この画面を離れると止まります**」と書く
-- サスペンドからの復帰で、張っていたポートと QUIC 接続を**畳んで張り直す**。
-  黙って死んだ接続を残さない
-- `beginBackgroundTask` で数十秒は延命できるが、**それは解決ではない**ので
-  そう書く
-
-**段 B に「頑張って生き延びる」実装を積まない。** iOS はそれを許さないし、
-中途半端に延命すると「たまに動く」という最も悪い挙動になる。常時必要なら段 C である。
+**この不在は段 C にも効く**（§7.3）。
 
 ---
 
-## 7. 段 C — Packet Tunnel Provider（未検証）
+## 6. 段 B — 他アプリから使う（iPad に限る）
 
-端末全体で、常時、他アプリから使えるようにする唯一の道。
+**iPhone では成立しない。** §0 のとおり、他アプリを前面にした瞬間 portal は
+背面に回ってサスペンドされ、リスナは accept を止め QUIC セッションも落ちる。
+`beginBackgroundTask` で 30 秒ほど延びるだけで、**相手アプリから見ると
+「繋がるが応答が来ない」**という最も分かりにくい壊れ方になる。
 
-```
-NEPacketTunnelProvider（別プロセス、システムが生かす）
-  → TUN から来たパケットを portal のストリームへ
-```
+**成立するのは iPad の Split View / Slide Over だけである。** 両方が前面に
+居るので、ループバックは素直に届く。段 B とはつまり **iPad マルチタスクの話**で
+あって、「フォアグラウンド限定でどの端末でも」ではない。
 
-**2 つの未知がある。着手前にこの順で潰す。**
+やることは機構ではなく**正直さ**である。
 
-1. **entitlement が下りるか。** `com.apple.developer.networking.networkextension`
-   の `packet-tunnel-provider` は **Apple への申請と承認**が要る。これは技術では
-   なく審査であり、**こちらの実装努力で確実にはできない**
-2. **メモリに収まるか。** NE の拡張プロセスには**厳しいメモリ上限**がある
-   （packet tunnel provider で概ね 50MB。歴史的にはもっと狭かった）。
-   msquic + tokio + P2P スタックがそこに入るかは**測っていない**。
-   入らなければ段 C は成立しない
+- iPhone では段 B を**提示しない**。できないことを設定画面に並べない
+- iPad では「**この画面を閉じると止まります**」と書く
+- サスペンド復帰時に、張っていたポートと QUIC を**畳んで張り直す**
+  （§3.2 のとおり port 0 で。固定番号だと再 bind が `EADDRINUSE` で失敗する）
+- **「頑張って生き延びる」実装を積まない。** iOS は許さないし、中途半端な延命は
+  「たまに動く」という最悪の挙動になる。常時必要なら段 C である
 
-> **1 より先に 2 を測る。** 申請は時間がかかるが、メモリは今日測れる。
-> 入らないと分かってから申請するのは順序が逆である。測り方は、段 A の実機ビルドで
-> 常駐時の RSS を見て、NE の予算に対する余裕を出す（P1、§8）。
+---
 
-段 C にはさらに、TUN のパケットを TCP ストリームに変換する層（ユーザ空間の
-TCP スタック、あるいは宛先ごとの接続への振り分け）が要る。**これは portal が
-今持っていない部品である。** 段 C に進むと決まってから設計する。
+## 7. 段 C — Packet Tunnel Provider（未検証、不足部品あり）
+
+端末全体・常時・他アプリから、を満たす唯一の道。**未知が 3 つあり、この順で潰す。**
+
+### 7.1 entitlement が下りるか
+
+`com.apple.developer.networking.networkextension` の `packet-tunnel-provider` は
+**Apple への申請と承認**が要る。これは技術ではなく審査であり、**こちらの実装努力で
+確実にはできない。**
+
+### 7.2 メモリに収まるか — 測る数字は RSS ではない
+
+NE の拡張プロセスには厳しいメモリ上限がある（packet tunnel provider で概ね 50MB）。
+msquic + tokio + P2P スタックがそこに入るかは**測っていない。**
+
+> **`phys_footprint` を測る。RSS ではない。** `ProcessStats.swift` が既にそう
+> していて、理由もそこに書いてある — jetsam が見るのは footprint であって、
+> 「アプリが代金を払っていないページまで数える」resident size ではない。
+> NE の上限も footprint に対して効く。**RSS を測ると、判断に必要な数字とは別の
+> 数字が出る。**
+>
+> 加えて、**段 A のアプリをそのまま測ると SwiftUI と WebView が混ざる。**
+> 拡張が背負うのは Rust コアだけなので、**何を切り離して測ったのか**を明記する。
+
+**申請より先に測る。** 入らないと分かってから申請するのは順序が逆である。
+
+### 7.3 足りない部品が 2 つある
+
+**どちらも今 portal が持っていない。**
+
+1. **名前と宛先アドレスの対応。** TUN から来るのは `IP:port` 宛のパケットだが、
+   portal のプロトコルが受け取るのは**サービス名**である（`Open::Tcp { service }`）。
+   間を埋めるには、サービスごとに合成 IP を配る **DNS レスポンダ**のような層が要る。
+   **そして §5.3 のとおり、名前の一覧を得る経路が無い** — 対応表を作る材料が
+   無いということである。段 C は §5.3 の中期案に依存する
+2. **portal 自身の QUIC をトンネルから除外すること。** パケットトンネルは端末の
+   通信を捕まえるので、proxy へ向かう自分の QUIC も捕まえてしまう。除外ルートを
+   設定するか、トンネル外に bind したソケットを使わないと、**トンネルが自分の
+   足を食べて何も繋がらない。**
+
+さらに TUN のパケットを TCP ストリームに変換する層（ユーザ空間 TCP スタック）が
+要る。**段 C に進むと決まってから設計する。**
 
 ---
 
@@ -235,26 +301,37 @@ TCP スタック、あるいは宛先ごとの接続への振り分け）が要�
 
 | # | やること | 出口 |
 | --- | --- | --- |
-| **P0** | UniFFI で **async のバイトストリーム**を Swift に渡せるか、最小の往復で確かめる。同時に **ATS とループバック**を実機で確認 | どちらも「できる/できない」がはっきりする |
-| **P1** | `portal-client-ffi` を作り、`connect` と `map` を出す。実機で 1 サービスに到達 | **iPhone から NAT 越しのサービスに繋がる**。ここが山 |
-| | 併せて**常駐時のメモリを測る**（段 C の可否、§7-2） | 数字が出る |
-| **P2** | SwiftUI: サインイン、ペアリング（QR 含む）、サービスの登録、状態表示 | 人が使える |
-| **P3** | 内蔵 WebView と内蔵コンソール（段 A の 2 用途） | **entitlement 無しで完結した製品になる** |
-| **P4** | 段 B の正直さ（前面限定の明示、復帰時の畳み直し） | 誤解を生まない |
-| **P5** | UDP。TCP と別物なので分ける（`portal-core::udp` のセッション多重） | — |
-| **P6** | 段 C。**P1 のメモリ実測が通っていれば**着手し、entitlement を申請 | 未定 |
+| **P0** | **async をどう渡すか決める**（§3.3 の二択）。併せて **ATS とループバック**を実機確認 | 決着する。退避案が既に動いているので**失敗しても止まらない** |
+| **P1** | `portal-client-ffi` を作り `connect` / `map` / `open` を出す。実機で 1 サービスに到達 | **iPhone から NAT 越しのサービスに繋がる**。ここが山 |
+| | 併せて **Rust コアの `phys_footprint` を測る**（§7.2） | 段 C の可否に使える数字が出る |
+| **P2** | SwiftUI: サインイン、ペアリング（QR 含む）、名前の登録、経路表示 | 人が使える。**Auth0 redirect の手配を先に済ませる**（§5.1） |
+| **P3** | 内蔵コンソールと、**平文 HTTP** の WebView | **entitlement 無しで完結する**（§4.3 の範囲で） |
+| **P4** | 段 B — **iPad 限定**として出す。復帰時の畳み直し | 誤解を生まない |
+| **P5** | HTTPS: アプリが TLS クライアントになる案（§4.3） | 社内 Web の大半が対象になる |
+| **P6** | UDP（`portal-core::udp` のセッション多重） | — |
+| **P7** | 段 C。**P1 の footprint が通り、§7.3 の部品を設計してから** | 未定 |
 
-**P3 で一度完成する。** P4 以降は無くても製品として成り立つ、という切り方に
-してある。
+**P3 で一度完成する** — ただし §4.3 の範囲で、と断ったうえで。
+
+### 8.1 ビルドと CI に要る手当て
+
+- `ios/build-rust.sh` は `-p isekai-client-ffi`、`APP_DIR=.../IsekaiCameraClient`、
+  `IsekaiClientFFI.xcframework` を**固定で持っている**。2 つ目の FFI クレートには
+  **引数化（またはフォーク）**が要る
+- `ios/project.yml` は単一アプリの構成なので、アプリを足すか別プロジェクトにする
+- `.github/workflows/ios-ffi.yml` に path filter を足す。
+  **実機ビルド（`ios-ipa`）は `main` と `workflow_dispatch` でしか走らない**ので、
+  **ブランチではシミュレータまでしか確認できない** — P1 の実機確認は
+  `workflow_dispatch` か手元の実機で行う
 
 ---
 
 ## 9. この計画で解かないもの
 
-1. **バックグラウンド常駐**（段 C 次第。§7）
-2. **サービス名の発見**（プロトコルの追加が要る。§5.3）
-3. **iOS を portal-server にすること。** 本計画は client 側だけである。
-   端末上のサービスを外に出す話は、iOS のバックグラウンド制約に真正面からぶつかる
-   ので、別に論じる
-4. **`--version` すら無い問題。** デスクトップのバイナリが自分の版を言えないのと
-   同様、iOS でも「どの版か」を出す口を最初から付ける（設定画面の末尾でよい）
+1. **iPhone でのバックグラウンド常駐**（段 C 次第。§7）
+2. **サービス名の発見**（プロトコルの追加が要る。§5.3。**段 C の前提でもある**）
+3. **HTTPS の完全な対応**（P5。§4.3）
+4. **iOS を portal-server にすること。** client 側だけを扱う。端末上のサービスを
+   外に出す話は iOS のバックグラウンド制約に真正面からぶつかるので、別に論じる
+5. **版を名乗る口。** デスクトップのバイナリに `--version` が無いのと同じ問題を
+   持ち込まないよう、設定画面の末尾に版を出す
