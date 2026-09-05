@@ -1,0 +1,25 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# The native libraries, cross-compiled from `portal-client-ffi`. Large build
+# artifacts (an unstripped debug `.so` statically linking OpenSSL/quictls is
+# ~200MB) produced by `cargo ndk` -- see the `generateJniLibs` task in
+# `app/build.gradle.kts`. Covers both `libportal_client_ffi.so` (the crate's
+# own cdylib) and `libmsquic.so` (seera-msquic's separate shared object,
+# copied in by the same task since it's dlopened at runtime).
+app/src/main/jniLibs/**/*.so
+
+# The Kotlin bindings, generated from the built library by `uniffi-bindgen`.
+#
+# **Not committed, deliberately.** Same reasoning as the camera app's own
+# android/.gitignore: they are generated from the Rust interface, so a copy in
+# the tree is a copy that goes stale silently. `generateUniFfiBindings` writes
+# them here.
+app/build/generated/uniffi/
