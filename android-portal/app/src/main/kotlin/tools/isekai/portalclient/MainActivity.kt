@@ -1,6 +1,8 @@
 package tools.isekai.portalclient
 
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -171,6 +173,83 @@ fun PortalScreen(keyFile: File) {
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
 
+    // Shared by the Connect button and the network-change auto-reconnect
+    // below -- both need the exact same "get a token, call connect(), record
+    // the session" sequence, and having two copies is how they'd drift.
+    // `reason` only changes what's shown on failure, so a dropped network
+    // mid-reconnect doesn't read as if the button itself failed.
+    suspend fun connectSession(reason: String) {
+        busy = true
+        try {
+            val token = currentAuth0Token()
+            val stored = authStore.tokens.value
+            val s = withContext(Dispatchers.IO) {
+                portalConnect(
+                    config = config.copy(auth0Token = token),
+                    endpointKeyPem = endpointKeyPem,
+                    refreshToken = stored?.refreshToken,
+                    accessTokenExpiresAtUnix = ((stored?.expiresAt ?: 0L) / 1000).toULong(),
+                )
+            }
+            session = s
+            localPort = s.localPort().toInt()
+            statusIsError = false
+            status = "Connected -- forwarding to \"$SERVICE\" on 127.0.0.1:${localPort}"
+        } catch (e: Exception) {
+            statusIsError = true
+            status = "$reason failed: ${e.message}"
+        } finally {
+            busy = false
+        }
+    }
+
+    // Auto-reconnect when the OS switches the default network out from under
+    // an active session (WiFi <-> cellular). The underlying QUIC connection
+    // does not survive that on its own: the local socket a session opened
+    // dies with the network it was on, and nothing today makes the session
+    // migrate -- so without this, the UI sits on a stale "Connected" long
+    // after the tunnel is dead, and the first sign anything is wrong is the
+    // next send failing with "Failed to connect to /127.0.0.1:<port>" (#211).
+    // Handled here rather than deeper in the Rust core because noticing a
+    // network change is Android's job to report and the app's to act on --
+    // and a plain redial is enough because pairing produced a standing
+    // grant, not a one-shot capability.
+    DisposableEffect(Unit) {
+        val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
+        // Plain var, not Compose state: this is bookkeeping the callback
+        // itself owns, and giving it to Compose would trigger a recomposition
+        // for every network blip whether or not a session cared.
+        var lastNetwork: Network? = null
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val previous = lastNetwork
+                lastNetwork = network
+                // The very first call just reports the network already in
+                // use when the callback registers -- nothing to recover from
+                // yet. Only a *change* from one already seen, with a session
+                // actually up, means the connection under it just went stale.
+                if (previous == null || previous == network || session == null) return
+                scope.launch {
+                    status = "Network changed -- reconnecting..."
+                    statusIsError = false
+                    val old = session
+                    session = null
+                    localPort = null
+                    // Best-effort: the old session's transport is almost
+                    // certainly already dead on the network that just went
+                    // away, so this is tidying up local state, not something
+                    // a failure here should block the reconnect on.
+                    if (old != null) {
+                        runCatching { withContext(Dispatchers.IO) { old.disconnect() } }
+                    }
+                    connectSession("Reconnect")
+                }
+            }
+        }
+        connectivityManager?.registerDefaultNetworkCallback(callback)
+        onDispose { connectivityManager?.unregisterNetworkCallback(callback) }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -319,38 +398,7 @@ fun PortalScreen(keyFile: File) {
             Button(
                 onClick = {
                     status = ""
-                    busy = true
-                    scope.launch {
-                        try {
-                            val token = currentAuth0Token()
-                            // Read fresh off the store, not the composable's
-                            // `authTokens` snapshot -- currentAuth0Token() may
-                            // have just refreshed it, and the manual-token
-                            // fallback path has no entry here at all, which is
-                            // exactly the `null` that keeps portal-core's
-                            // renewal off for that path (see connect()'s doc
-                            // comment on the Rust side).
-                            val stored = authStore.tokens.value
-                            val s = withContext(Dispatchers.IO) {
-                                portalConnect(
-                                    config = config.copy(auth0Token = token),
-                                    endpointKeyPem = endpointKeyPem,
-                                    refreshToken = stored?.refreshToken,
-                                    // Rust wants Unix seconds; Auth0Tokens.expiresAt is epoch millis.
-                                    accessTokenExpiresAtUnix = ((stored?.expiresAt ?: 0L) / 1000).toULong(),
-                                )
-                            }
-                            session = s
-                            localPort = s.localPort().toInt()
-                            statusIsError = false
-                            status = "Connected -- forwarding to \"$SERVICE\" on 127.0.0.1:${localPort}"
-                        } catch (e: Exception) {
-                            statusIsError = true
-                            status = "Connect failed: ${e.message}"
-                        } finally {
-                            busy = false
-                        }
-                    }
+                    scope.launch { connectSession("Connect") }
                 },
                 enabled = !busy && paired && session == null,
             ) { Text("Connect") }
