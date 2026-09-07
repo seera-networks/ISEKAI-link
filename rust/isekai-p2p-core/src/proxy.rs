@@ -1256,6 +1256,11 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// with `token-expired` a few minutes in, on a route whose retries look
     /// exactly like a relay being slow. Sharing means the renewal that replaces
     /// the token on the control-plane client replaces it here too.
+    /// This client's transport, for a caller that needs to ask it something.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
     pub fn with_transport<U: ControlPlaneTransport>(&self, transport: U) -> ProxyClient<U> {
         ProxyClient {
             transport,

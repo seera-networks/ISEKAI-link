@@ -65,6 +65,17 @@ impl MasqueH3Transport {
             .context("failed to build request")
     }
 
+    /// `scheme://authority` — where this transport sends, with no path.
+    ///
+    /// Lets a caller ask "am I already connected there?" before opening a
+    /// second connection to the same host.
+    pub fn origin(&self) -> String {
+        match (self.uri.scheme_str(), self.uri.authority()) {
+            (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
+            _ => self.uri.to_string(),
+        }
+    }
+
     /// Connect to the proxy at `target` (e.g. `https://link.isekai.tools:6443`).
     pub fn connect(target: &str) -> anyhow::Result<Self> {
         let uri: Uri = target.parse().context("invalid proxy target URI")?;

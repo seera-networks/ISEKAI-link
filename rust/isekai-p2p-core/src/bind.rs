@@ -323,6 +323,15 @@ pub async fn open_bind_session(
     opts: RelayOptions,
 ) -> anyhow::Result<BindSession> {
     let uri: Uri = target.parse().context("invalid proxy target URI")?;
+    // **Checked on this path too.** The connect leg validates inside
+    // `relay_target`; a bind leg took its target on trust, so a
+    // `relay_base_url` with no scheme — which `http::Uri` parses happily from
+    // `host:port` — got as far as the transport and failed per request. The
+    // lease loop would then retry that to the lapse, arriving at the same
+    // ten-minute death this route was fixed to avoid.
+    check_relay_uri(&uri)?;
+    // Taken before the URI is moved into the connector.
+    let dialled = origin_of(&uri);
     let pop = sign_connect_udp(key, CONNECT_UDP_BIND_PATH);
     let shutdown = CancellationToken::new();
     let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
@@ -393,7 +402,9 @@ pub async fn open_bind_session(
     match ready_rx.await {
         Ok(Ok(())) => Ok(BindSession {
             events: out_rx,
-            relay_origin: target.to_owned(),
+            // Normalized the same way the connect leg does, so the two report
+            // the same shape and `/renew` is appended to a base URL either way.
+            relay_origin: dialled,
             observed,
             inbound,
             shutdown,

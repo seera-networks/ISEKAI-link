@@ -174,6 +174,22 @@ fn lapsed(lapses_at: Option<tokio::time::Instant>) -> bool {
 /// clean exit.
 pub struct RelayLegLease(tokio::task::JoinHandle<()>);
 
+/// Hold a leg until its lease runs out, then tell the session the relay is done.
+///
+/// **For the cases where renewing has become impossible but the leg still
+/// works.** Cancelling at once throws away the time the current lease has left;
+/// never cancelling leaves the application holding a leg the relay has already
+/// dropped. Waiting is what the exhausted-retry path does, and these are the
+/// same situation reached sooner.
+async fn lapse_then_cancel(span: Option<Duration>, leg: CancellationToken) {
+    match span {
+        Some(span) => tokio::time::sleep(span).await,
+        // No ticket said how long, so there is no deadline to wait for.
+        None => return,
+    }
+    leg.cancel();
+}
+
 impl RelayLegLease {
     /// Start renewing the leg `connection_id` names.
     ///
@@ -210,26 +226,41 @@ impl RelayLegLease {
         leg: CancellationToken,
         ended: CancellationToken,
     ) -> Self {
-        // **Same Endpoint, same token, different host.** `with_transport`
-        // shares the token cell rather than copying it, so the renewal that
-        // replaces the Endpoint Token on `proxy` reaches this client too — a
-        // lease loop outlives a token by hours.
-        let relay = match MasqueH3Transport::connect(relay_origin) {
-            Ok(transport) => proxy.with_transport(transport),
-            Err(err) => {
-                // Nothing to renew against, so the leg keeps the lease its
-                // opening ticket wrote and then lapses — the same outcome as a
-                // relay that cannot be reached at all.
-                tracing::warn!(
-                    %err,
-                    relay_origin,
-                    connection_id,
-                    "cannot address the relay to renew this leg's lease"
-                );
-                return Self(tokio::spawn(std::future::ready(())));
+        let mut span = first.and_then(lease_span);
+        // Owned, because the loop below outlives this call and names the relay
+        // in what it logs — which is the whole point of logging it.
+        let relay_origin = relay_origin.to_owned();
+        // **Already connected there?** With no registered relay the leg is on
+        // the control plane's own data path, which is the connection this
+        // client is holding — opening a second one to the same host would cost
+        // a QUIC connection and two msquic `Configuration`s per leg, for a
+        // listener serving many.
+        let relay = if proxy.transport().origin() == relay_origin {
+            proxy.clone()
+        } else {
+            // **Same Endpoint, same token, different host.** `with_transport`
+            // shares the token cell rather than copying it, so the renewal that
+            // replaces the Endpoint Token on `proxy` reaches this client too —
+            // a lease loop outlives a token by hours.
+            match MasqueH3Transport::connect(&relay_origin) {
+                Ok(transport) => proxy.with_transport(transport),
+                Err(err) => {
+                    // **The leg still works; it just cannot be extended.** So
+                    // this waits the lease out and then cancels, which is what
+                    // the exhausted-retry path does. Returning here instead
+                    // left the proxy dropping the leg at the lease with the
+                    // session still holding a live relay and nothing to tell
+                    // it.
+                    tracing::warn!(
+                        %err,
+                        relay_origin,
+                        connection_id,
+                        "cannot address the relay to renew this leg's lease"
+                    );
+                    return Self(tokio::spawn(lapse_then_cancel(span, leg)));
+                }
             }
         };
-        let mut span = first.and_then(lease_span);
         let mut delay = renew_delay(span);
         Self(tokio::spawn(async move {
             // Monotonic, so this is the one deadline a disagreeing wall clock
@@ -311,13 +342,20 @@ impl RelayLegLease {
                         );
                     }
                     Err(e) => match verdict(&e) {
+                        // **The relay's answer, and it ends the relay only.**
+                        // Whether this Endpoint may hold the connection at all
+                        // was settled a moment ago by `/ticket`, which said
+                        // yes; spending it is bookkeeping. A `connection-closed`
+                        // from a relay that has lost its edge must not take the
+                        // application's session with it — the peers may be on a
+                        // direct path, and the connection's own lease is what
+                        // is entitled to decide otherwise.
                         Verdict::Refused => {
                             tracing::info!(
                                 connection_id = %connection_id,
-                                "this endpoint may no longer hold this connection: {e}",
+                                "the relay will not renew this leg: {e}",
                             );
                             leg.cancel();
-                            ended.cancel();
                             return;
                         }
                         // The proxy has no edge for this session. Nothing this
@@ -332,7 +370,25 @@ impl RelayLegLease {
                             leg.cancel();
                             return;
                         }
-                        Verdict::NotLeased => return,
+                        // **Not "this proxy does not lease legs".** That is
+                        // what a bare 404 meant when both calls went to the
+                        // control plane; here `/ticket` has just succeeded
+                        // against a control plane that plainly does lease, so a
+                        // 404 from the relay says the route is not there — an
+                        // older relay build, or a host that is not the relay.
+                        // Returning silently killed a healthy leg, and since
+                        // the proxy cuts an edge at the shorter of the two
+                        // parties' leases, it took the peer's with it.
+                        Verdict::NotLeased => {
+                            tracing::warn!(
+                                connection_id = %connection_id,
+                                relay = %relay_origin,
+                                "the relay has no lease route; holding this leg \
+                                 until its lease runs out: {e}",
+                            );
+                            lapse_then_cancel(span, leg).await;
+                            return;
+                        }
                         Verdict::Retry => {
                             if lapsed(lapses_at) {
                                 tracing::warn!(
@@ -450,6 +506,38 @@ mod tests {
             RETRY_IN * 4 < remaining,
             "a retry every {RETRY_IN:?} must fit several times into {remaining:?}",
         );
+    }
+
+    /// A leg that cannot be renewed still has the lease it was given, and the
+    /// session has to be told when *that* runs out — not before, and not never.
+    #[tokio::test(start_paused = true)]
+    async fn a_leg_that_cannot_be_renewed_is_held_until_its_lease_lapses() {
+        let leg = CancellationToken::new();
+        let span = Duration::from_secs(600);
+        let task = tokio::spawn(lapse_then_cancel(Some(span), leg.clone()));
+
+        // Still useful for the whole of the lease. Cancelling at once would
+        // throw away ten minutes of working relay.
+        tokio::time::sleep(span - Duration::from_secs(1)).await;
+        assert!(!leg.is_cancelled(), "cancelled before the lease ran out");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        task.await.unwrap();
+        // And it does end: leaving it uncancelled is how the application came
+        // to hold a leg the proxy had already dropped.
+        assert!(
+            leg.is_cancelled(),
+            "never cancelled after the lease ran out"
+        );
+    }
+
+    /// With no ticket there is no deadline, so there is nothing to wait for and
+    /// nothing to claim about when the leg dies.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_lease_to_wait_for_nothing_is_cancelled() {
+        let leg = CancellationToken::new();
+        lapse_then_cancel(None, leg.clone()).await;
+        assert!(!leg.is_cancelled());
     }
 
     fn problem(status: u16, kind: Option<&str>) -> ProxyError {
