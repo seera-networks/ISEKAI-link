@@ -8,7 +8,7 @@ package.edition = "2021"
 # single tag, so fourteen manifests each carrying their own number was an
 # invitation to bump thirteen of them. Members inherit with
 # `version.workspace = true`.
-package.version = "0.4.0"
+package.version = "0.4.1"
 
 [workspace.dependencies]
 anyhow = "1"
