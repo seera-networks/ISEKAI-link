@@ -271,6 +271,21 @@ impl PortalSession {
         self.local_port
     }
 
+    /// Whether the session has already ended on its own — a revoked Grant, or
+    /// the peer connection dying (idle timeout, a relay leg the proxy moved
+    /// elsewhere, a stalled direct path with no relay to fall back to; see
+    /// `connect`'s background task for the two ways this happens). `false`
+    /// right up until then, including for a session an explicit
+    /// [`Self::disconnect`] is in the middle of tearing down.
+    ///
+    /// A plain poll rather than something the app awaits: this crate has no
+    /// event-callback story to Kotlin yet, and a session dying is not urgent
+    /// enough to build one for when Android already has to poll the network
+    /// state through `ConnectivityManager` for the same "reconnect" decision.
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
     /// Tears the tunnel down and waits for that to actually finish — see
     /// `close_and_wait` for why. Safe to call more than once, and safe not to
     /// call at all (`Drop` runs the same wait as a safety net), but calling

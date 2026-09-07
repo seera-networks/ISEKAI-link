@@ -20,9 +20,11 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -57,6 +59,13 @@ private const val PROXY_URL = "https://link.isekai.tools:6443"
 private const val PROTOCOL = "isekai-validator-v1"
 private const val SERVICE = "ollama"
 private const val MODEL = "qwen3.5:4b"
+
+// How often the active session is asked whether it has closed on its own.
+// There is no push notification for this from the Rust side (PortalSession
+// exposes a plain poll, see its `isClosed` doc comment) -- short enough that
+// a dead session is noticed well inside a person's next "why isn't this
+// answering" moment, long enough not to matter next to an FFI call this cheap.
+private const val SESSION_HEALTH_POLL_MS = 4_000L
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -248,6 +257,36 @@ fun PortalScreen(keyFile: File) {
         }
         connectivityManager?.registerDefaultNetworkCallback(callback)
         onDispose { connectivityManager?.unregisterNetworkCallback(callback) }
+    }
+
+    // Auto-reconnect when the session dies for any *other* reason than a
+    // network change -- #211's fix above only fires on a
+    // ConnectivityManager callback, but a session can just as well die while
+    // the network never changed (#212: a relay leg the control plane moved
+    // elsewhere, or a direct path that stalls with no working relay behind
+    // it). Keyed on `session` itself: a new session restarts this loop for
+    // it, and setting `session = null` -- what both the Disconnect button and
+    // the network-change handler above do -- cancels it immediately, before
+    // its next poll, so a deliberate disconnect is never mistaken for a dead
+    // session and reconnected out from under the person who asked for it.
+    LaunchedEffect(session) {
+        val watched = session ?: return@LaunchedEffect
+        while (isActive) {
+            delay(SESSION_HEALTH_POLL_MS)
+            if (!watched.isClosed()) continue
+            // `busy` means something else (the network-change handler, a
+            // manual Connect) is already mid-reconnect for this same session
+            // going away -- that call already owns clearing `session` and
+            // redialing, so this loop only has to step aside.
+            if (!busy) {
+                status = "Session ended -- reconnecting..."
+                statusIsError = false
+                session = null
+                localPort = null
+                connectSession("Reconnect")
+            }
+            break
+        }
     }
 
     Column(
