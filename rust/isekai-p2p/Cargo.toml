@@ -55,3 +55,7 @@ openssl = { version = "0.10.66", features = ["vendored"] }
 [dev-dependencies]
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
 p256 = { workspace = true }
+# `test-util` for a paused clock: the lease timings this crate has to get right
+# are minutes and hours long, and a test that actually waits for one is a test
+# nobody runs. Not in tokio's `full`, hence the explicit feature.
+tokio = { workspace = true, features = ["test-util"] }

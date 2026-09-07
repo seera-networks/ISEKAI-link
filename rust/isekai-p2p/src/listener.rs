@@ -549,6 +549,10 @@ impl ListenerSession {
         )
         .await?;
         let inbound = session.inbound_activity();
+        // Taken before the session moves into the task below. **The leg's own
+        // answer to "where did this go"**, which is where its lease has to be
+        // renewed — see `RelayLegLease::spawn`.
+        let relay_origin = session.relay_origin().to_owned();
         // Own the session in a task that drains its notifications, so an unread
         // events channel can never stall the underlying MASQUE loop. Dropping
         // the task (on close) drops the session, whose Drop cancels the relay.
@@ -583,6 +587,7 @@ impl ListenerSession {
         let lease = renewable.then(|| {
             RelayLegLease::spawn(
                 self.proxy.clone(),
+                &relay_origin,
                 connection_id.to_owned(),
                 ticket.as_ref(),
                 CancellationToken::new(),

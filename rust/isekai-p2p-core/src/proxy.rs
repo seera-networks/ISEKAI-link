@@ -1243,6 +1243,32 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             .clone()
     }
 
+    /// The same Endpoint, over a transport to somewhere else.
+    ///
+    /// **For the routes that do not live at the control plane.** Since §8.14 a
+    /// relay leg's lease is replaced at the *data plane* — the relay's own host,
+    /// not the one that chose it — so renewing means addressing a different
+    /// origin with the same identity.
+    ///
+    /// **The token cell is shared, not copied.** Building a second client with
+    /// [`new`](Self::new) would give it a token frozen at that instant, and a
+    /// lease loop outlives an Endpoint Token by hours: it would start failing
+    /// with `token-expired` a few minutes in, on a route whose retries look
+    /// exactly like a relay being slow. Sharing means the renewal that replaces
+    /// the token on the control-plane client replaces it here too.
+    /// This client's transport, for a caller that needs to ask it something.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub fn with_transport<U: ControlPlaneTransport>(&self, transport: U) -> ProxyClient<U> {
+        ProxyClient {
+            transport,
+            key: self.key.clone(),
+            endpoint_token: Arc::clone(&self.endpoint_token),
+        }
+    }
+
     /// Use `endpoint_token` from now on, on this client and every clone of it.
     ///
     /// The next request carries it; requests already in flight carry the old one
