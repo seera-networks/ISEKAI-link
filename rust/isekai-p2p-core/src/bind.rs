@@ -103,6 +103,17 @@ fn relay_target(masque: &Uri, proxy_url: &str, dp_id: Option<&str>) -> anyhow::R
     Ok(uri)
 }
 
+/// `scheme://authority` — a leg's destination with the path dropped, which is
+/// the base URL every route on that host hangs off.
+fn origin_of(uri: &Uri) -> String {
+    match (uri.scheme_str(), uri.authority()) {
+        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
+        // `relay_target` has already refused anything without both, so this is
+        // unreachable in practice; returning the whole URI beats panicking.
+        _ => uri.to_string(),
+    }
+}
+
 /// A URL we are about to open a QUIC connection to.
 ///
 /// **Checked here rather than left to the transport.** `h3-util` unwraps the
@@ -193,6 +204,7 @@ pub struct BindSession {
     /// MASQUE client events (e.g. [`MasqueClientEvent::PublicAddresses`] carries
     /// this Endpoint's edge/relay addresses).
     pub events: mpsc::Receiver<MasqueClientEvent>,
+    relay_origin: String,
     observed: ObservedAddressWatch,
     inbound: InboundActivity,
     shutdown: CancellationToken,
@@ -200,6 +212,20 @@ pub struct BindSession {
 }
 
 impl BindSession {
+    /// The origin this leg was actually dialled at.
+    ///
+    /// **The leg reports it rather than the caller recomputing it**, because
+    /// the routes that act on a leg have to reach the same host it went to.
+    /// Since §8.14 `POST /v1/relay/sessions/{id}/renew` is served by the *data
+    /// plane* — the relay's own host — while the ticket it spends comes from
+    /// the control plane. Working the destination out a second time somewhere
+    /// else is how those two drift apart, and they fail quietly when they do:
+    /// the control plane answers `connection-not-found` for a leg it does not
+    /// hold, which reads as "the relay forgot us" rather than "you asked the
+    /// wrong host".
+    pub fn relay_origin(&self) -> &str {
+        &self.relay_origin
+    }
     /// How the proxy sees this leg — `None` until the first report arrives.
     ///
     /// The server advertises this pair to the video connection via
@@ -367,6 +393,7 @@ pub async fn open_bind_session(
     match ready_rx.await {
         Ok(Ok(())) => Ok(BindSession {
             events: out_rx,
+            relay_origin: target.to_owned(),
             observed,
             inbound,
             shutdown,
@@ -391,12 +418,27 @@ pub async fn open_bind_session(
 pub struct ConnectRelay {
     /// The local UDP address the application should send its traffic to.
     pub local_addr: SocketAddr,
+    relay_origin: String,
     observed: ObservedAddressWatch,
     shutdown: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
 
 impl ConnectRelay {
+    /// The origin this leg was actually dialled at.
+    ///
+    /// **The leg reports it rather than the caller recomputing it**, because
+    /// the routes that act on a leg have to reach the same host it went to.
+    /// Since §8.14 `POST /v1/relay/sessions/{id}/renew` is served by the *data
+    /// plane* — the relay's own host — while the ticket it spends comes from
+    /// the control plane. Working the destination out a second time somewhere
+    /// else is how those two drift apart, and they fail quietly when they do:
+    /// the control plane answers `connection-not-found` for a leg it does not
+    /// hold, which reads as "the relay forgot us" rather than "you asked the
+    /// wrong host".
+    pub fn relay_origin(&self) -> &str {
+        &self.relay_origin
+    }
     /// How the proxy sees this leg — `None` until the first report arrives.
     ///
     /// Note this is *not* [`local_addr`](ConnectRelay::local_addr), which is the
@@ -483,6 +525,9 @@ pub async fn open_connect_relay(
     // `proxy_url` remains the fallback for a `masque_uri` with no authority,
     // which is what a control plane that has no registered relay still returns.
     let uri = relay_target(&masque, proxy_url, dp_id)?;
+    // Kept as the leg's own answer to "where did this go", so nothing has to
+    // work it out again — see [`ConnectRelay::relay_origin`].
+    let dialled = origin_of(&uri);
     let shutdown = CancellationToken::new();
     let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
@@ -548,6 +593,7 @@ pub async fn open_connect_relay(
     match ready_rx.await {
         Ok(Ok(())) => Ok(ConnectRelay {
             local_addr,
+            relay_origin: dialled,
             observed,
             shutdown,
             task: Some(task),
@@ -567,6 +613,32 @@ pub async fn open_connect_relay(
 
 #[cfg(test)]
 mod tests {
+
+    /// **What the leg reports is a base URL, not the CONNECT-UDP path.**
+    ///
+    /// `relay_origin` is what the lease loop appends
+    /// `/v1/relay/sessions/{id}/renew` to, so carrying the leg's own long
+    /// `.well-known/masque/...` path through would address a route that does
+    /// not exist.
+    #[test]
+    fn the_origin_a_leg_reports_is_the_hosts_base_url() {
+        let masque: Uri = "https://dp1abc.relay.example:8443/.well-known/masque/udp/10.0.0.1/443/"
+            .parse()
+            .unwrap();
+        let dialled = relay_target(&masque, "https://cp.example:6443", Some("dp1abc")).unwrap();
+        assert_eq!(origin_of(&dialled), "https://dp1abc.relay.example:8443");
+    }
+
+    /// With no relay chosen the origin is the control plane's own, so the
+    /// renewal path needs no special case for the co-located data plane.
+    #[test]
+    fn with_no_relay_the_origin_is_the_control_plane() {
+        let masque: Uri = "https://ignored.example:8443/.well-known/masque/udp/10.0.0.1/443/"
+            .parse()
+            .unwrap();
+        let dialled = relay_target(&masque, "https://cp.example:6443", None).unwrap();
+        assert_eq!(origin_of(&dialled), "https://cp.example:6443");
+    }
 
     /// **Where a leg is dialled is what the control plane chose**, and the
     /// choice arrives as `dp_id`, not as the shape of the URI.
@@ -597,10 +669,9 @@ mod tests {
     /// Token and PoP to an origin nobody configured.
     #[test]
     fn no_chosen_relay_dials_the_configured_proxy_however_the_uri_looks() {
-        let masque: Uri =
-            "https://link.isekai.tools:6443/.well-known/masque/udp/127.0.0.1/30001/"
-                .parse()
-                .unwrap();
+        let masque: Uri = "https://link.isekai.tools:6443/.well-known/masque/udp/127.0.0.1/30001/"
+            .parse()
+            .unwrap();
         let dialled = relay_target(&masque, "https://localhost:8443", None).unwrap();
         assert_eq!(
             dialled.host(),

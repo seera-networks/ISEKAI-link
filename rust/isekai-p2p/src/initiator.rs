@@ -697,6 +697,9 @@ impl InitiatorSession {
         // which is what `ended` means to the application.
         let relay_lease = RelayLegLease::spawn(
             proxy.clone(),
+            // **From the leg itself**, so the renewal cannot address a
+            // different host than the one it is renewing on.
+            handle.relay_origin(),
             connection.connection_id.clone(),
             ticket.as_ref(),
             handle.shutdown_token(),

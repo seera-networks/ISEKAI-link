@@ -188,13 +188,47 @@ impl RelayLegLease {
     /// because the proxy forgot it cancels only the first: the peers may be on
     /// a direct path, where the relay was never going to be used again anyway.
     /// A leg refused because the grant was withdrawn cancels both.
+    /// `relay_origin` is where the leg was actually dialled — the value the
+    /// leg itself reports, so nothing recomputes it.
+    ///
+    /// **Two hosts, because the two calls belong to different planes.** Asking
+    /// for a ticket is asking the *control plane* to authorize this Endpoint
+    /// again; spending it replaces a lease held by the *data plane*, which
+    /// since §8.14 may be another machine entirely. Sending both to the control
+    /// plane worked only while the two were one process: it answers
+    /// `connection-not-found` for a leg it does not hold, which this loop reads
+    /// as "the relay forgot us" and so winds a perfectly healthy leg down at
+    /// its first renewal.
+    ///
+    /// A leg on the control plane's own data path passes that origin here, so
+    /// there is no special case.
     pub fn spawn(
         proxy: ProxyClient<MasqueH3Transport>,
+        relay_origin: &str,
         connection_id: String,
         first: Option<&RelayTicket>,
         leg: CancellationToken,
         ended: CancellationToken,
     ) -> Self {
+        // **Same Endpoint, same token, different host.** `with_transport`
+        // shares the token cell rather than copying it, so the renewal that
+        // replaces the Endpoint Token on `proxy` reaches this client too — a
+        // lease loop outlives a token by hours.
+        let relay = match MasqueH3Transport::connect(relay_origin) {
+            Ok(transport) => proxy.with_transport(transport),
+            Err(err) => {
+                // Nothing to renew against, so the leg keeps the lease its
+                // opening ticket wrote and then lapses — the same outcome as a
+                // relay that cannot be reached at all.
+                tracing::warn!(
+                    %err,
+                    relay_origin,
+                    connection_id,
+                    "cannot address the relay to renew this leg's lease"
+                );
+                return Self(tokio::spawn(std::future::ready(())));
+            }
+        };
         let mut span = first.and_then(lease_span);
         let mut delay = renew_delay(span);
         Self(tokio::spawn(async move {
@@ -256,7 +290,9 @@ impl RelayLegLease {
                     },
                 };
 
-                match proxy
+                // **To the relay, not to the control plane** — since §8.14
+                // this route is the data plane's own.
+                match relay
                     .renew_relay_lease(&connection_id, &ticket.ticket)
                     .await
                 {
