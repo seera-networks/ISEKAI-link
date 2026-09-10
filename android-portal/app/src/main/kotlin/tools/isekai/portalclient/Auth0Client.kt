@@ -188,6 +188,15 @@ class Auth0Client(private val context: Context) {
         withContext(Dispatchers.IO) {
             val connection = URL("https://${Auth0Config.DOMAIN}/oauth/token").openConnection() as HttpURLConnection
             try {
+                // Both default to 0 (wait forever) on HttpURLConnection. A
+                // token refresh triggered right as the network changes can
+                // land on a socket tied to the network that just went away --
+                // without these, that hangs the caller indefinitely instead
+                // of surfacing as the IOException connectSession() already
+                // knows how to turn into a normal "reconnect failed" status
+                // (isekai-link#215).
+                connection.connectTimeout = 10_000
+                connection.readTimeout = 10_000
                 connection.requestMethod = "POST"
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
