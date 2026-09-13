@@ -72,6 +72,22 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Catches a Custom Tab dismissed without ever producing a redirect (back
+     * button, swipe-away, or Auth0 itself showing an error page instead of
+     * redirecting) -- onNewIntent's handleRedirect() never runs in that case,
+     * so nothing would otherwise complete Auth0CallbackBroker's deferred and
+     * AuthStore.signIn() would suspend forever (isekai-link#178). Android
+     * always delivers a redirect's onNewIntent before this onResume for the
+     * same foreground transition, so by the time this runs, a completed
+     * broker has already cleared `pending` and this is a no-op; only a
+     * still-pending one -- meaning no redirect arrived -- gets cancelled.
+     */
+    override fun onResume() {
+        super.onResume()
+        Auth0CallbackBroker.cancelPending()
+    }
+
+    /**
      * The Auth0 redirect lands here as a `VIEW` intent (see the intent-filter
      * in AndroidManifest.xml) because `singleTop` keeps this Activity from
      * being recreated -- Android delivers it to the already-running instance
