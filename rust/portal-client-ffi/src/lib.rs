@@ -96,6 +96,25 @@ fn build_p2p_config(
     }
 }
 
+/// How long [`pair_with_code`] waits for the whole redemption (an optional
+/// Endpoint registration, opening the proxy connection, then the pairing
+/// call itself) before giving up.
+///
+/// **No layer under this call has ever had a timeout** — confirmed by
+/// reading `issue_endpoint_token`, `PeerDirectory::open`/`pair`, and
+/// `isekai-p2p-core`'s `ProxyClient::request_json`/`send` all the way down;
+/// none of them race their network I/O against anything. A code that is
+/// merely expired fails fast with a clear rejection over a healthy proxy
+/// connection — the actual trigger is the *phone's* own connection to the
+/// proxy having gone stale (screen off, backgrounded, a network handoff)
+/// while nothing here notices a dead socket rather than a slow one. Same
+/// reasoning as `APP_CONNECT_DEADLINE`: this is one synchronous FFI call
+/// with no cancel path reachable during the wait, so an unbounded hang means
+/// `busy = true` forever with no way out but force-closing the app
+/// (isekai-link#184). Sized generously since this can include a full
+/// Endpoint registration round trip, not just the pairing call.
+const APP_PAIR_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Redeem a pairing code and return `config` updated with the resulting
 /// `expected_endpoint` (the server's Endpoint ID). Registers the Endpoint
 /// first if `config.register` is set, same ordering as before: registration
@@ -119,34 +138,42 @@ pub fn pair_with_code(
     let register = config.register;
 
     runtime.block_on(async {
-        let cfg = build_p2p_config(&config, key, register, None);
-        if register {
-            isekai_p2p::issue_endpoint_token(&cfg)
+        tokio::time::timeout(APP_PAIR_DEADLINE, async {
+            let cfg = build_p2p_config(&config, key, register, None);
+            if register {
+                isekai_p2p::issue_endpoint_token(&cfg)
+                    .await
+                    .map_err(|e| PortalError::Pair(format!("{e:#}")))?;
+            }
+            let cfg = P2pConfig {
+                credential: isekai_p2p::Credential::auth0(config.auth0_token.clone(), None, false),
+                ..cfg
+            };
+
+            // Accepts whatever the user scanned, pasted or typed: a pairing
+            // URI, or the eight characters with or without their dash —
+            // same normalization `portal-client --pair` applies.
+            let code = pairing_code_from_input(&code);
+
+            let pd = PeerDirectory::open(&cfg)
                 .await
                 .map_err(|e| PortalError::Pair(format!("{e:#}")))?;
-        }
-        let cfg = P2pConfig {
-            credential: isekai_p2p::Credential::auth0(config.auth0_token.clone(), None, false),
-            ..cfg
-        };
+            let grant = pd
+                .pair(&code, Some("portal-client-android"))
+                .await
+                .map_err(|e| PortalError::Pair(format!("{e:#}")))?;
 
-        // Accepts whatever the user scanned, pasted or typed: a pairing URI,
-        // or the eight characters with or without their dash — same
-        // normalization `portal-client --pair` applies.
-        let code = pairing_code_from_input(&code);
-
-        let pd = PeerDirectory::open(&cfg)
-            .await
-            .map_err(|e| PortalError::Pair(format!("{e:#}")))?;
-        let grant = pd
-            .pair(&code, Some("portal-client-android"))
-            .await
-            .map_err(|e| PortalError::Pair(format!("{e:#}")))?;
-
-        Ok(PortalConfig {
-            expected_endpoint: grant.owner_endpoint,
-            register: false,
-            ..config
+            Ok(PortalConfig {
+                expected_endpoint: grant.owner_endpoint,
+                register: false,
+                ..config
+            })
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(PortalError::Pair(format!(
+                "no response from the proxy within {APP_PAIR_DEADLINE:?}"
+            )))
         })
     })
 }
