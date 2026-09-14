@@ -1,5 +1,9 @@
 /rust/target
 /target
+# portal-client-ffi is a standalone workspace (like isekai-client-ffi and
+# portal-server/portal-client before it), not a member of rust/'s workspace,
+# so /rust/target above doesn't cover its build output.
+/rust/portal-client-ffi/target
 
 # Private keys any of these tools writes with `load_or_generate_key` or
 # `endpoint_cert::load_or_generate_cert_key`. Long-lived secrets — never commit.

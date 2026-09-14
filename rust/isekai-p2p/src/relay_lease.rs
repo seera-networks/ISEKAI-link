@@ -117,6 +117,18 @@ pub(crate) enum Verdict {
     LegGone,
     /// This proxy does not lease legs. Stop asking; nothing is wrong.
     NotLeased,
+    /// **This leg's relay is not the one the proxy now has an edge on.** The
+    /// control plane moved the session to a different data plane (a rebalance,
+    /// or the original one going away) and named where in `detail`. Nothing
+    /// here dials that host — this crate does not carry a way to re-home a
+    /// live `MasqueH3Transport` — so the fix is to stop quickly rather than
+    /// spend the rest of the lease retrying a leg the proxy has already
+    /// disowned: every renewal against the old relay was refused with this
+    /// same answer for as long as the connection lived (`conn_2KhH88xouKAK`,
+    /// six refusals over 2.5 minutes before the debug session moved on), and
+    /// `Verdict::Retry`'s 30s backoff just spent that whole window hammering a
+    /// relay that was never going to accept it again.
+    Elsewhere,
 }
 
 /// What a refusal means.
@@ -148,6 +160,10 @@ pub(crate) fn verdict(error: &ProxyError) -> Verdict {
         // row has its own lease, renewed by its own loop; that is what is
         // entitled to decide the connection is over.
         Some("connection-not-found") => Verdict::LegGone,
+        // The proxy answers 409 with the new host in `detail` ("renew this
+        // session at https://…"). Distinct from `LegGone`: there the edge is
+        // simply gone; here it exists, just not where this leg is asking.
+        Some("relay-elsewhere") => Verdict::Elsewhere,
         // No problem body on a 404: there is no such route here.
         None if *status == 404 => Verdict::NotLeased,
         // `token-expired` and `insufficient-permission` included: both are
@@ -294,6 +310,16 @@ impl RelayLegLease {
                             leg.cancel();
                             return;
                         }
+                        Verdict::Elsewhere => {
+                            tracing::warn!(
+                                connection_id = %connection_id,
+                                "this leg's relay is no longer the session's data plane; \
+                                 winding it down rather than retrying a relay that has \
+                                 disowned it: {e}",
+                            );
+                            leg.cancel();
+                            return;
+                        }
                         Verdict::NotLeased => {
                             tracing::debug!(
                                 connection_id = %connection_id,
@@ -366,6 +392,16 @@ impl RelayLegLease {
                             tracing::info!(
                                 connection_id = %connection_id,
                                 "the relay leg is no longer there to renew: {e}",
+                            );
+                            leg.cancel();
+                            return;
+                        }
+                        Verdict::Elsewhere => {
+                            tracing::warn!(
+                                connection_id = %connection_id,
+                                "this leg's relay is no longer the session's data plane; \
+                                 winding it down rather than retrying a relay that has \
+                                 disowned it: {e}",
                             );
                             leg.cancel();
                             return;
@@ -600,6 +636,21 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    /// **A relay migration is not a transient failure.** Retrying the same
+    /// host every 30s for the rest of the lease — what `Verdict::Retry` would
+    /// do — spends minutes hammering a relay the proxy has already moved the
+    /// session off of. This is the answer #212 found: a leg stuck on
+    /// `relay-elsewhere` for the whole lease before finally lapsing, on a
+    /// connection whose actual peer connection may already have died for want
+    /// of a working leg.
+    #[test]
+    fn a_relay_migration_winds_the_leg_down_rather_than_retrying_it() {
+        assert_eq!(
+            verdict(&problem(409, Some("relay-elsewhere"))),
+            Verdict::Elsewhere,
+        );
     }
 
     /// Everything else is worth another go. A token that lapsed is replaced by
