@@ -241,6 +241,19 @@ impl Table {
     /// `None` against a name means the leases set no limit. An Endpoint absent
     /// from the map has no policy here at all, which is a different answer
     /// again and the one that will be refused once enforcement exists.
+    ///
+    /// # Two things this is coarser than the table
+    ///
+    /// **Keyed on the Endpoint alone, though rows are per
+    /// `(endpoint, protocol)`.** A connection notification names the peer and
+    /// not the protocol, so that is all there is to match on — which means a
+    /// tight limit on one class caps another class's connections too. Erring
+    /// tight is the right direction while nothing is enforced, and the
+    /// enforcement phase will need the protocol carried through to do better.
+    ///
+    /// **And it counts rows that have lapsed but not yet been swept**, up to
+    /// the sweep interval. The same direction: a moment of saying "covered"
+    /// about something just expired, rather than of refusing something live.
     pub fn limits(&self) -> BTreeMap<String, Option<u32>> {
         let mut out: BTreeMap<String, Option<u32>> = BTreeMap::new();
         for entry in self.entries.values() {

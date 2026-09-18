@@ -470,6 +470,11 @@ async fn follow_policies(
                             let gone = table.expire_now();
                             if gone > 0 {
                                 tracing::info!(gone, held = table.len(), "policy: leases lapsed");
+                                // **Here too.** During an outage this is the
+                                // only sweep running, and a lapsed row still
+                                // reading as covered errs in the one direction
+                                // that matters.
+                                publish_limits(&limits, &table);
                             }
                         }
                     }
@@ -542,6 +547,13 @@ async fn follow_once(
                     // because the other way round leaves a grant live with no
                     // scope describing it.
                     settle_grants(&proxy, table, ledger, &mut said).await;
+                    // **The path that carries almost everything.** Without
+                    // this, a lease granted over the stream did not reach the
+                    // connection side until something else happened to expire
+                    // or the token ran out -- so an agent connecting a minute
+                    // later read as uncovered, which is the false count this
+                    // phase exists to avoid producing.
+                    publish_limits(limits, table);
                 }
                 // The stream is over. Identity closes it at the token's expiry,
                 // so this is the ordinary way round the loop.
@@ -559,7 +571,14 @@ async fn follow_once(
 /// **A copy rather than a lock.** The two sides run at different rates — the
 /// follower changes the table on policy events, the signaling loop reads on
 /// connections — and what the reader needs is a handful of names, not the rows.
-pub type PolicyLimits = std::sync::Arc<std::collections::BTreeMap<String, Option<u32>>>;
+/// `None` until the first successful read.
+///
+/// **Not an empty map.** Empty means the control plane covers nobody, which is
+/// a real answer; not having read it yet is not one, and logging every
+/// connection in that window as would-be-refused inflates the very count this
+/// phase exists to produce — indefinitely, if the first reconcile keeps
+/// failing.
+pub type PolicyLimits = Option<std::sync::Arc<std::collections::BTreeMap<String, Option<u32>>>>;
 
 /// Say what enforcement *would* have done to this connection.
 ///
@@ -611,15 +630,30 @@ fn check_against_policy(
     // per-policy limit on one agent, and the listener's own `MAX_CONCURRENT_PEERS`
     // is a different cap on everyone at once; reading that number would answer
     // the wrong question.
-    let held = live.entry(peer.clone()).or_default();
-    // Only a bound connection is held. Counting the ones still waiting would
-    // inflate what enforcement is about to refuse.
-    if let Ev::Bound { .. } = event {
-        held.insert(connection_id.clone());
-    }
-    let open = held.len();
+    // **Only a bound connection is held**, and only that inserts — the other
+    // two would otherwise leave empty sets behind that nothing sweeps.
+    let open = match event {
+        Ev::Bound { .. } => {
+            let held = live.entry(peer.clone()).or_default();
+            held.insert(connection_id.clone());
+            held.len()
+        }
+        // **Plus this one.** A connection still waiting is not held yet, so the
+        // question is what the count *would become* if it were — otherwise one
+        // arriving exactly at the limit reads as covered when enforcement would
+        // refuse it.
+        _ => live.get(peer.as_str()).map_or(0, BTreeSet::len) + 1,
+    };
 
     let limits = limits.borrow();
+    let Some(limits) = limits.as_ref() else {
+        tracing::info!(
+            connection_id,
+            peer,
+            "policy: not read yet; nothing can be said about this connection",
+        );
+        return;
+    };
     match limits.get(peer.as_str()) {
         Some(Some(max)) if open > *max as usize => tracing::warn!(
             connection_id,
@@ -661,7 +695,7 @@ fn publish_limits(
 ) {
     // A failed send means nobody is listening, which is the case when no
     // gateway policy was given at all.
-    let _ = limits.send(std::sync::Arc::new(table.limits()));
+    let _ = limits.send(Some(std::sync::Arc::new(table.limits())));
 }
 
 /// Bring the proxy's grants into line with the table.
@@ -1599,7 +1633,13 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
                 }
                 // Lagged only loses log lines; the session is unaffected.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("missed {n} signaling events");
+                    // **The count cannot survive a gap.** A missed `Unbound`
+                    // leaves a connection id held forever, and every later
+                    // arrival then reads as over the limit — a false warning
+                    // that never heals. Starting again understates it for a
+                    // moment, which is the recoverable direction.
+                    tracing::warn!(missed = n, "missed signaling events; restarting the count");
+                    live.clear();
                 }
                 Err(_) => break,
             },
