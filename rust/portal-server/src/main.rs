@@ -33,8 +33,10 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use argh::FromArgs;
 use isekai_p2p::agent::{BindingView, ProvisioningBinding};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
+use isekai_p2p::agent::{MasqueH3Transport, ProxyClient};
 use isekai_p2p::{load_or_generate_key, AcceptPolicy, P2pConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -491,7 +493,18 @@ async fn follow_once(
 ) -> anyhow::Result<()> {
     let cursor = reconcile_policies(cfg, policy, table).await?;
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
-    settle_grants(cfg, &token, table, ledger).await;
+
+    // **One client for the pass.** `proxy_client`'s own documentation says it
+    // is handed out rather than built per call so that a caller making several
+    // requests does not open a connection for each -- and settling runs on
+    // every policy event.
+    let proxy = isekai_p2p::proxy_client(cfg, &token)?;
+    // Learnt before the first create, because creating a grant for a pair that
+    // already has one is an update that answers with the operator's grant id.
+    note_existing_grants(&proxy, ledger).await;
+
+    let mut said = BTreeSet::new();
+    settle_grants(&proxy, table, ledger, &mut said).await;
     let mut stream = isekai_p2p::policy_stream(cfg, &token, Some(cursor)).await?;
 
     // **Its own clock, because expiry is never streamed.** A lease that simply
@@ -510,6 +523,11 @@ async fn follow_once(
                 let gone = table.expire_now();
                 if gone > 0 {
                     tracing::info!(gone, held = table.len(), "policy: leases lapsed");
+                    // **And the grants go with them.** Expiry is the only way a
+                    // lapsed lease is ever noticed, so leaving the grant to the
+                    // next stream event would let it stand for up to a token
+                    // lifetime with nothing behind it.
+                    settle_grants(&proxy, table, ledger, &mut said).await;
                 }
             }
             event = stream.recv() => match event {
@@ -519,7 +537,7 @@ async fn follow_once(
                     // order -- validate, write the table, then the grant --
                     // because the other way round leaves a grant live with no
                     // scope describing it.
-                    settle_grants(cfg, &token, table, ledger).await;
+                    settle_grants(&proxy, table, ledger, &mut said).await;
                 }
                 // The stream is over. Identity closes it at the token's expiry,
                 // so this is the ordinary way round the loop.
@@ -539,30 +557,56 @@ async fn follow_once(
 /// stays in the ledger so that it *is* tried again. Reporting either as done
 /// would leave the ledger describing a proxy that does not exist.
 async fn settle_grants(
-    cfg: &P2pConfig,
-    endpoint_token: &str,
+    proxy: &ProxyClient<MasqueH3Transport>,
     table: &portal_core::gateway::Table,
     ledger: &mut portal_core::gateway::Ledger,
+    said: &mut BTreeSet<String>,
 ) {
-    let changes = ledger.plan(table);
-    if changes.create.is_empty() && changes.remove.is_empty() && changes.refused.is_empty() {
-        return;
-    }
-    let proxy = match isekai_p2p::proxy_client(cfg, endpoint_token) {
-        Ok(proxy) => proxy,
-        Err(e) => {
-            tracing::warn!("policy: cannot reach the proxy to settle grants: {e:#}");
-            return;
-        }
-    };
+    let changes = ledger.plan_now(table);
 
-    for (lease, why) in &changes.refused {
-        // **Said, not skipped.** Making no grant looks exactly like making one
-        // from the outside, so a row that cannot be served has to be audible.
-        tracing::warn!(lease, "policy: no grant made: {why}");
+    // **Before anything else, and before any chance of returning early.** A row
+    // that can never be served is the one thing that must not go unsaid, and
+    // making no grant looks exactly like making one from the outside.
+    //
+    // Only when the set changes, though: re-stating it on every pass turns one
+    // unservable row into a warning per policy event, which teaches whoever
+    // reads the log to skip the line.
+    let refused: BTreeSet<String> = changes.refused.iter().map(|(id, _)| id.clone()).collect();
+    if refused != *said {
+        for (lease, why) in &changes.refused {
+            if !said.contains(lease) {
+                tracing::warn!(lease, "policy: no grant made: {why}");
+            }
+        }
+        *said = refused;
+    }
+
+    // **Removals first.** At the per-Endpoint quota a pass that drops one pair
+    // and adds another would take `429` on the create although the delete right
+    // behind it frees the slot.
+    for (key, grant_id) in &changes.remove {
+        match proxy.revoke_grant(grant_id).await {
+            Ok(()) => {
+                tracing::info!(grant = %grant_id, allowed = %key.0, protocol = %key.1, "policy: grant removed");
+                ledger.removed(key);
+            }
+            // **Already gone counts as removed.** A grant that lapsed on its
+            // own TTL answers `404`, and keeping the key would retry the same
+            // doomed delete — and log the same warning — for the life of the
+            // process.
+            Err(e) if is_already_gone(&e) => {
+                tracing::debug!(grant = %grant_id, "policy: the grant had already gone");
+                ledger.removed(key);
+            }
+            // Kept in the ledger deliberately: forgetting it means never trying
+            // again, and the grant would stand until its own TTL with nothing
+            // tracking it.
+            Err(e) => tracing::warn!(grant = %grant_id, "policy: could not remove a grant: {e}"),
+        }
     }
 
     for wanted in &changes.create {
+        let key = wanted.key();
         let label = wanted.label();
         match proxy
             .create_grant(
@@ -582,7 +626,7 @@ async fn settle_grants(
                     leases = wanted.leases.len(),
                     "policy: granted",
                 );
-                ledger.made(wanted.key(), grant.grant_id);
+                ledger.made(key, grant.grant_id);
             }
             // **A quota refusal is not a grant.** The proxy caps grants per
             // Endpoint and answers `429` per row with the others untouched, so
@@ -596,18 +640,55 @@ async fn settle_grants(
             ),
         }
     }
+}
 
-    for (key, grant_id) in &changes.remove {
-        match proxy.revoke_grant(grant_id).await {
-            Ok(()) => {
-                tracing::info!(grant = %grant_id, allowed = %key.0, protocol = %key.1, "policy: grant removed");
-                ledger.removed(key);
-            }
-            // Kept in the ledger deliberately: forgetting it means never trying
-            // again, and the grant would stand until its own TTL with nothing
-            // tracking it.
-            Err(e) => tracing::warn!(grant = %grant_id, "policy: could not remove a grant: {e}"),
+/// Whether a failed delete means the grant had already gone.
+///
+/// A grant that lapsed on its own TTL is not there to delete, and retrying that
+/// forever would log the same warning for the life of the process.
+fn is_already_gone(e: &isekai_p2p::agent::ProxyError) -> bool {
+    matches!(e.kind(), Some("grant-not-found") | Some("not-found"))
+}
+
+/// Note which pairs already carry a grant this process did not make.
+///
+/// **Creating one for such a pair is an update, not a refusal**: the proxy
+/// answers `200` with the operator's own grant id and overwrites its label. So
+/// the pairs have to be learnt before the first create, or the ledger adopts a
+/// grant it did not make and revokes it when the last lease ends — the accident
+/// plan §3.1 names, which counting leases alone does not prevent.
+async fn note_existing_grants(
+    proxy: &ProxyClient<MasqueH3Transport>,
+    ledger: &mut portal_core::gateway::Ledger,
+) {
+    let grants = match proxy.list_grants().await {
+        Ok(grants) => grants,
+        // **Nothing is adopted on a failed read.** Not knowing is not the same
+        // as there being none, and guessing "none" here is what would take an
+        // operator's grant away.
+        Err(e) => {
+            tracing::warn!("policy: could not read the existing grants: {e}");
+            return;
         }
+    };
+    for grant in grants {
+        // **Both optional on the wire**, and a grant that names neither cannot
+        // collide with a pair this Gateway would serve -- there is nothing to
+        // compare it against.
+        let (Some(endpoint), Some(protocol)) = (&grant.allowed_endpoint, &grant.protocol) else {
+            continue;
+        };
+        let key = (endpoint.clone(), protocol.clone());
+        if ledger.is_operators(&key) {
+            continue;
+        }
+        tracing::debug!(
+            grant = %grant.grant_id,
+            allowed = %endpoint,
+            protocol = %protocol,
+            "policy: a grant that was here first; it will be served but never removed",
+        );
+        ledger.adopted_from_operator(key);
     }
 }
 

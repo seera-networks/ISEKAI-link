@@ -83,12 +83,16 @@ impl Entry {
     /// **Never `None`.** `create_grant` reads that as "until revoked", and a
     /// policy-driven grant that outlives every trace of its policy is the one
     /// thing this must not produce.
-    pub fn grant_ttl(&self) -> Result<u64, Refusal> {
-        let Some(lease) = self.ttl else {
-            // No lease length means no bound to stay under. Identity sends one
-            // on every `policy.granted`, so this is a row that does not fit the
-            // shape rather than a case to guess at.
-            return Err(Refusal::LeaseTooShort { ttl: 0 });
+    pub fn grant_ttl(&self, now: OffsetDateTime) -> Result<u64, Refusal> {
+        // **From the deadline, not from `ttl`.** `ttl` is what the lease had
+        // left *when the row was issued*, and a grant is re-created on every
+        // settle pass — which the proxy treats as an update, pushing the
+        // deadline out by that stale figure each time. A grant so refreshed
+        // walks past the lease it was derived from, which is the inversion this
+        // whole rule exists to prevent.
+        let lease = match self.remaining(now) {
+            Some(left) => left,
+            None => return Err(Refusal::NoDeadline),
         };
         if lease < MIN_LEASE_SECS {
             return Err(Refusal::LeaseTooShort { ttl: lease });
@@ -99,6 +103,16 @@ impl Entry {
             None => under_lease,
         };
         Ok(capped.max(GRANT_TTL_FLOOR))
+    }
+
+    /// Seconds of lease left at `now`, from the deadline the centre stated.
+    ///
+    /// `None` when there is no deadline to work from — `ttl` alone cannot say,
+    /// because it was measured at some earlier instant nobody recorded.
+    pub fn remaining(&self, now: OffsetDateTime) -> Option<i64> {
+        let text = self.expires_at.as_deref()?;
+        let at = OffsetDateTime::parse(text, &Rfc3339).ok()?;
+        Some((at - now).whole_seconds())
     }
 
     /// What a grant for this row is keyed by, at the proxy.
@@ -130,6 +144,13 @@ pub enum Refusal {
     UnknownWindow { window: String },
     /// An attribute is missing, undeclared, or outside its range.
     Attribute(AttributeRefusal),
+    /// There is no deadline to bound a grant by.
+    ///
+    /// **Not "too short".** `ttl` alone was measured at an instant nobody
+    /// recorded, so it cannot say how long is left; saying "a lease of 0s"
+    /// would name an invented cause for a row that may carry a perfectly good
+    /// `expires_at` this could not read.
+    NoDeadline,
     /// The lease is too short for a grant to be made that outlives it.
     ///
     /// The proxy clamps a grant's TTL to at least 60 seconds, so a lease
@@ -155,6 +176,11 @@ impl std::fmt::Display for Refusal {
                 write!(f, "window `{window}` is not one this gateway understands")
             }
             Self::Attribute(inner) => write!(f, "{inner}"),
+            Self::NoDeadline => write!(
+                f,
+                "no `expires_at` to bound a grant by; `ttl` alone cannot say how \
+                 much is left",
+            ),
             Self::LeaseTooShort { ttl } => write!(
                 f,
                 "a lease of {ttl}s is too short: a grant cannot be clamped below \
@@ -411,6 +437,13 @@ pub(crate) mod tests_support {
             event.allowed_endpoint = (*endpoint).to_owned();
             event.protocol = (*protocol).to_owned();
             event.ttl = Some(*ttl);
+            // A deadline that matches the lease, since `grant_ttl` reads the
+            // deadline rather than the seconds-at-issue.
+            event.expires_at = Some(
+                (OffsetDateTime::now_utc() + time::Duration::seconds(*ttl))
+                    .format(&Rfc3339)
+                    .expect("formats"),
+            );
             // The fixtures ask for a grant longer than the lease on purpose, so
             // that the lease is what bounds it.
             event.constraints.as_mut().unwrap().grant_ttl = Some(86_400);
@@ -651,6 +684,11 @@ mod tests {
     fn entry(ttl: Option<i64>, grant_ttl: Option<u32>) -> Entry {
         let mut event = granted("al_1", 1);
         event.ttl = ttl;
+        event.expires_at = ttl.map(|t| {
+            (OffsetDateTime::now_utc() + time::Duration::seconds(t))
+                .format(&Rfc3339)
+                .expect("formats")
+        });
         event.constraints.as_mut().unwrap().grant_ttl = grant_ttl;
         let mut table = Table::new();
         table.apply(&event, &policy()).expect("inside the envelope");
@@ -663,20 +701,26 @@ mod tests {
         // The direction the whole design leans: the grant goes first, so a
         // window where it is live and no policy describes it cannot open.
         let e = entry(Some(1800), None);
-        let ttl = e.grant_ttl().unwrap();
-        assert!(
-            ttl < 1800,
-            "grant {ttl}s does not expire before a 1800s lease"
-        );
-        assert_eq!(ttl, 1800 - GRANT_TTL_MARGIN as u64);
+        let ttl = e.grant_ttl(OffsetDateTime::now_utc()).unwrap();
+        // The property, not the arithmetic: the grant goes first, by at least
+        // the margin. An exact number would pin the second the test ran in.
+        assert!(ttl <= 1800 - GRANT_TTL_MARGIN as u64, "grant {ttl}s");
+        assert!(ttl > 1800 - 2 * GRANT_TTL_MARGIN as u64, "grant {ttl}s");
     }
 
     #[test]
     fn the_centres_cap_is_an_upper_bound_and_not_a_licence() {
         // A shorter `grant_ttl` is honoured...
-        assert_eq!(entry(Some(1800), Some(300)).grant_ttl().unwrap(), 300);
+        assert_eq!(
+            entry(Some(1800), Some(300))
+                .grant_ttl(OffsetDateTime::now_utc())
+                .unwrap(),
+            300
+        );
         // ...and a longer one does not let the grant outlive the lease.
-        let ttl = entry(Some(1800), Some(86_400)).grant_ttl().unwrap();
+        let ttl = entry(Some(1800), Some(86_400))
+            .grant_ttl(OffsetDateTime::now_utc())
+            .unwrap();
         assert!(
             ttl < 1800,
             "the centre talked the grant past its lease: {ttl}s"
@@ -692,24 +736,53 @@ mod tests {
         for lease in [1, 59, 60, MIN_LEASE_SECS - 1] {
             assert!(
                 matches!(
-                    entry(Some(lease), None).grant_ttl(),
+                    entry(Some(lease), None).grant_ttl(OffsetDateTime::now_utc()),
                     Err(Refusal::LeaseTooShort { .. })
                 ),
                 "a {lease}s lease was served"
             );
         }
-        assert!(entry(Some(MIN_LEASE_SECS), None).grant_ttl().is_ok());
+        assert!(entry(Some(MIN_LEASE_SECS + 1), None)
+            .grant_ttl(OffsetDateTime::now_utc())
+            .is_ok());
     }
 
     #[test]
-    fn a_row_with_no_lease_length_gets_no_grant() {
+    fn a_row_with_no_deadline_gets_no_grant() {
         // `None` on `create_grant` means "until revoked". A policy-driven grant
         // that outlives every trace of its policy is the one thing this must
         // not make.
         assert!(matches!(
-            entry(None, Some(3600)).grant_ttl(),
-            Err(Refusal::LeaseTooShort { .. })
+            entry(None, Some(3600)).grant_ttl(OffsetDateTime::now_utc()),
+            Err(Refusal::NoDeadline)
         ));
+    }
+
+    #[test]
+    fn a_refreshed_grant_cannot_walk_past_its_lease() {
+        // **The regression.** A grant is re-created on every settle pass, which
+        // the proxy treats as an update -- so a TTL taken from `ttl`, the
+        // seconds left *when the row was issued*, pushed the deadline out again
+        // each time until the grant outlived the lease it came from.
+        let mut event = granted("al_1", 1);
+        event.ttl = Some(1800);
+        let deadline = OffsetDateTime::now_utc() + time::Duration::seconds(1800);
+        event.expires_at = Some(deadline.format(&Rfc3339).expect("formats"));
+        event.constraints.as_mut().unwrap().grant_ttl = None;
+
+        let mut table = Table::new();
+        table.apply(&event, &policy()).unwrap();
+        let e = table.entries().next().unwrap();
+
+        // Later in the lease, the same row asks for a proportionally shorter
+        // grant rather than the full span over again.
+        // 200s left: under the old rule this asked for 1740 all over again.
+        let late = deadline - time::Duration::seconds(200);
+        let ttl = e.grant_ttl(late).unwrap();
+        assert!(
+            ttl <= 200 - GRANT_TTL_MARGIN as u64,
+            "with 200s of lease left the grant asked for {ttl}s",
+        );
     }
 
     #[test]
