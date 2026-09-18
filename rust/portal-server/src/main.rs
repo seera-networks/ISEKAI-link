@@ -622,7 +622,12 @@ async fn settle_grants(
                 // Creating over a pair the operator already had succeeds and
                 // answers with *their* id, so recording the result blindly is
                 // how their grant ends up in a later removal.
-                let ours = ledger.made(key, grant.grant_id.clone());
+                // **Decided from what came back, not from a listing that may
+                // be a quarter of an hour old.** A grant the operator created
+                // since that read is invisible to `note_existing`, and the
+                // proxy leaves `created_at` untouched on an update -- so an
+                // answer reporting an age is one that was already there.
+                let ours = ledger.record(key, grant.grant_id.clone(), grant.created_at.as_deref());
                 tracing::info!(
                     grant = %grant.grant_id,
                     allowed = %wanted.allowed_endpoint,
@@ -676,6 +681,7 @@ async fn note_existing_grants(
             return;
         }
     };
+    let mut present = BTreeSet::new();
     for grant in grants {
         // **Both optional on the wire**, and a grant that names neither cannot
         // collide with a pair this Gateway would serve -- there is nothing to
@@ -684,6 +690,7 @@ async fn note_existing_grants(
             continue;
         };
         let key = (endpoint.clone(), protocol.clone());
+        present.insert(key.clone());
         if ledger.note_existing(key) {
             tracing::debug!(
                 grant = %grant.grant_id,
@@ -692,6 +699,14 @@ async fn note_existing_grants(
                 "policy: a grant that was here first; it will be served but never removed",
             );
         }
+    }
+    // **Only from a listing that succeeded.** A mark that outlived the grant it
+    // described would refuse to record a later grant of ours for that pair --
+    // which `plan` could then never remove, leaving it untracked with nothing
+    // able to revoke it.
+    let forgotten = ledger.prune_theirs(&present);
+    if forgotten > 0 {
+        tracing::debug!(forgotten, "policy: grants that were here first have gone");
     }
 }
 
