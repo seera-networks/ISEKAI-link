@@ -32,6 +32,8 @@ pub mod client;
 pub mod config;
 pub mod datagram;
 pub mod frame;
+/// What a Gateway is willing to be told (`docs/portal_gateway_plan.md` P0).
+pub mod gateway;
 /// Keeping a Provisioning Key's Grant alive while the work runs.
 pub mod grant;
 pub mod login;

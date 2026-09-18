@@ -57,6 +57,9 @@ rustls-pemfile = "2"
 schannel = "0.1.27"
 serde = { version = "1.0.164", features = ["derive", "rc" ] }
 serde_json = "1"
+# Gateway policy parameter patterns (`portal-core::gateway`), compiled when the
+# file is read so a bad one is a startup failure rather than a runtime one.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 sha2 = "0.10"
 thiserror = "2.0.16"
 time = { version = "0.3", features = ["parsing", "formatting"] }
