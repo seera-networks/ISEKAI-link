@@ -817,6 +817,33 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         return Ok(());
     }
 
+    // **Before every way out of this function, not beside the catalogue.**
+    // `--login` and the grant administration below both return early, so a
+    // policy read further down would be accepted and silently ignored on those
+    // runs -- `--pair --gateway-config typo.toml` exiting happily without ever
+    // opening the file. This file refuses flags it will not act on in three
+    // other places for exactly that reason; the sixth recurrence of that shape
+    // in this work is not the one to leave.
+    //
+    // Nothing consults the policy yet -- the policy source and the PEP are
+    // later phases (`docs/portal_gateway_plan.md`). What reading it buys today
+    // is that a statement with three placeholders and two bindings, or a
+    // pattern that does not compile, is refused *here* rather than the first
+    // time an operation runs, which with the PEP deferred is not in this
+    // release at all.
+    if let Some(path) = &args.gateway_config {
+        let policy = portal_core::gateway::load(path)?;
+        for protocol in policy.protocols() {
+            let class = policy.protocol(protocol).expect("just listed");
+            tracing::info!(
+                protocol,
+                operations = class.operations().count(),
+                windows = class.windows().count(),
+                "gateway policy: serving a protocol class"
+            );
+        }
+    }
+
     // **Before the catalogue and before any listener**, because neither is
     // needed to answer them: grants belong to this Endpoint rather than to a
     // listener (spec §8.8), so listing and revoking are Endpoint-token calls on
@@ -896,27 +923,6 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // should cost a message, not a registered Endpoint and a listener nobody
     // can use.
     let catalogue = portal_core::config::load(&args.config)?;
-    // **Read before the network, like the catalogue.** A policy file that does
-    // not parse is a fact about the arguments; found later it hides behind
-    // whatever fails first, and the operator fixes the wrong thing.
-    //
-    // Nothing consults this yet -- the policy source and the PEP are later
-    // phases (`docs/portal_gateway_plan.md`). What it buys today is that a
-    // statement with three placeholders and two bindings, or a pattern that
-    // does not compile, is refused *here* rather than the first time an
-    // operation runs, which with the PEP deferred is not in this release at all.
-    if let Some(path) = &args.gateway_config {
-        let policy = portal_core::gateway::load(path)?;
-        for protocol in policy.protocols() {
-            let class = policy.protocol(protocol).expect("just listed");
-            tracing::info!(
-                protocol,
-                operations = class.operations().count(),
-                windows = class.windows().count(),
-                "gateway policy: serving a protocol class"
-            );
-        }
-    }
 
     let cert_key = args.cert_key.clone().unwrap_or_else(|| {
         let mut path = args.key.clone();

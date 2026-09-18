@@ -20,7 +20,7 @@
 //! max_rows = 1000
 //!
 //! [protocols."pg-sales-ro-v1".operations.params]
-//! month = { type = "string", pattern = '^\d{4}-\d{2}$' }
+//! month = { type = "string", pattern = '^[0-9]{4}-[0-9]{2}$' }
 //! ```
 //!
 //! # Why this file is what makes stage 2 worth shipping
@@ -83,7 +83,10 @@ bind     = ["{{region}}", "$month"]
 max_rows = 1000
 
 [protocols."pg-sales-ro-v1".operations.params]
-month = { type = "string", pattern = '^\d{4}-\d{2}$' }
+# `[0-9]` and not `\d`: patterns are Unicode-aware, so `\d` also accepts Arabic
+# and mathematical digits -- `٢٠٢٦-٠٨` would pass a month check written that
+# way. Write the range you mean.
+month = { type = "string", pattern = '^[0-9]{4}-[0-9]{2}$' }
 "#;
 
 /// The whole file: what each protocol class permits.
@@ -237,6 +240,11 @@ impl ValueSchema {
             // **Anchored by the operator, not by us.** Adding `^...$` here
             // would make a pattern mean something other than what it says, and
             // an operator who reads their own file would be wrong about it.
+            //
+            // For the same reason patterns stay Unicode-aware rather than being
+            // forced to ASCII — but note that makes `\d` match Arabic and
+            // mathematical digits too. An operator who means ten characters
+            // should write `[0-9]`, which is what [`EXAMPLE`] does.
             Self::Pattern { regex, .. } => regex.is_match(text),
         }
     }
@@ -304,6 +312,10 @@ pub fn parse(text: &str) -> anyhow::Result<GatewayPolicy> {
 
     let mut protocols = BTreeMap::new();
     for (name, entry) in file.protocols {
+        anyhow::ensure!(
+            !name.trim().is_empty(),
+            "a protocol class needs a name; `[protocols.\"\"]` names nothing a policy row could match",
+        );
         let policy = protocol(&entry).with_context(|| format!("protocol `{name}`"))?;
         protocols.insert(name, policy);
     }
@@ -342,6 +354,15 @@ fn protocol(entry: &ProtocolEntry) -> anyhow::Result<ProtocolPolicy> {
         operations.insert(op.name.clone(), op);
     }
 
+    // **A class with no operation is the same silent nothing an empty enum is**,
+    // reached by deleting an `[[operations]]` block rather than by emptying a
+    // list. Once the PEP exists it would grant reachability to a protocol that
+    // permits no call.
+    anyhow::ensure!(
+        !operations.is_empty(),
+        "this protocol permits no operation; add an [[operations]] entry or remove the class",
+    );
+
     Ok(ProtocolPolicy {
         windows,
         attributes,
@@ -366,6 +387,17 @@ fn operation(
     let mut bind = Vec::with_capacity(entry.bind.len());
     for text in &entry.bind {
         bind.push(binding(text, attributes, &params)?);
+    }
+
+    // **Both directions, as the attribute side has.** A param declared and
+    // never bound is a filter the operator believes is applied: the PEP would
+    // validate `month` and then drop it, and the query runs unfiltered while
+    // the file says otherwise.
+    for name in params.keys() {
+        anyhow::ensure!(
+            bind.iter().any(|b| b == &Bind::Param(name.clone())),
+            "param `{name}` is declared but nothing binds `${name}`",
+        );
     }
 
     check_placeholders(&entry.sql, bind.len())?;
@@ -418,30 +450,7 @@ fn binding(
 /// otherwise surface the first time the operation ran — which, with the PEP
 /// deferred, is not in this release at all.
 fn check_placeholders(sql: &str, binds: usize) -> anyhow::Result<()> {
-    let mut seen = BTreeSet::new();
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'$' {
-            i += 1;
-            continue;
-        }
-        let start = i + 1;
-        let mut end = start;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-        if end > start {
-            // `$0` is not a placeholder in any dialect that numbers from one,
-            // and treating it as one would invent an index nothing can bind.
-            if let Ok(n) = sql[start..end].parse::<usize>() {
-                if n >= 1 {
-                    seen.insert(n);
-                }
-            }
-        }
-        i = end.max(start);
-    }
+    let seen = placeholders(sql)?;
 
     for n in &seen {
         anyhow::ensure!(
@@ -456,6 +465,122 @@ fn check_placeholders(sql: &str, binds: usize) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The placeholder indexes a statement actually uses.
+///
+/// **Quoting is honoured, which is the point.** Counting `$` wherever it
+/// appears gets the check wrong in both directions, and the quiet direction is
+/// the bad one: `LIKE '%$1%'` would satisfy "binding 1 is used" while the
+/// statement takes no parameter at all, so the PEP would hand a driver a value
+/// for a placeholder that is not there and the filter everyone believed was
+/// applied would be the literal text `%$1%`. The loud direction merely makes a
+/// statement impossible to write — `SELECT 'costs $5'` refused for using `$5`.
+///
+/// What is skipped: `'...'` strings (with `''` inside), `"..."` identifiers,
+/// `--` to end of line, `/* ... */` (nested, as PostgreSQL has them), and
+/// `$tag$ ... $tag$` dollar-quoted bodies.
+fn placeholders(sql: &str) -> anyhow::Result<BTreeSet<usize>> {
+    let b = sql.as_bytes();
+    let mut seen = BTreeSet::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let quote = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == quote {
+                        // Doubled means an escaped quote, not the end.
+                        if i + 1 < b.len() && b[i + 1] == quote {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => {
+                if let Some(end) = dollar_quote(b, i) {
+                    i = end;
+                    continue;
+                }
+                let start = i + 1;
+                let mut end = start;
+                while end < b.len() && b[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > start {
+                    // **Refused rather than skipped.** In a function whose job
+                    // is that every `$n` has a binding, the one index too large
+                    // to parse must not be the one that is waved through.
+                    let n: usize = sql[start..end].parse().with_context(|| {
+                        format!(
+                            "the statement uses ${}, which is not an index",
+                            &sql[start..end]
+                        )
+                    })?;
+                    anyhow::ensure!(n >= 1, "the statement uses $0; placeholders start at $1");
+                    seen.insert(n);
+                }
+                i = end.max(start);
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(seen)
+}
+
+/// If a `$tag$` dollar quote opens at `at`, the offset just past its close.
+///
+/// The tag is `$`, an optional identifier, `$` — and the body ends at the same
+/// sequence. An opening with no matching close runs to the end, which the
+/// caller treats as "nothing after this is a placeholder"; that is the
+/// fail-closed reading, since the statement is malformed either way.
+fn dollar_quote(b: &[u8], at: usize) -> Option<usize> {
+    let mut end = at + 1;
+    while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+        end += 1;
+    }
+    if end >= b.len() || b[end] != b'$' {
+        return None;
+    }
+    // A leading digit would make `$1$` a tag rather than a placeholder, and
+    // `$1` is by far the likelier intent.
+    if end > at + 1 && b[at + 1].is_ascii_digit() {
+        return None;
+    }
+    let tag = &b[at..=end];
+    let mut i = end + 1;
+    while i + tag.len() <= b.len() {
+        if &b[i..i + tag.len()] == tag {
+            return Some(i + tag.len());
+        }
+        i += 1;
+    }
+    Some(b.len())
 }
 
 fn value_schema(entry: &SchemaEntry) -> anyhow::Result<ValueSchema> {
@@ -692,6 +817,113 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("never uses"), "{err:#}");
+    }
+
+    #[test]
+    fn a_placeholder_inside_a_string_literal_does_not_count() {
+        // **The quiet direction of the scan being naive.** `'%$1%'` would
+        // satisfy "binding 1 is used" while the statement takes no parameter,
+        // so the PEP would hand a driver a value for a placeholder that is not
+        // there and the filter would be the literal text `%$1%`.
+        let err = parse(
+            r#"
+            [protocols."x"]
+            [[protocols."x".operations]]
+            name = "q"
+            sql  = "SELECT * FROM t WHERE note LIKE '%$1%'"
+            bind = ["$a"]
+            max_rows = 1
+            [protocols."x".operations.params]
+            a = { type = "string", pattern = "." }
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("never uses"), "{err:#}");
+    }
+
+    #[test]
+    fn a_dollar_in_ordinary_text_is_not_a_placeholder() {
+        // The loud direction: a statement that simply mentions money, or uses
+        // PostgreSQL's dollar quoting, has to be expressible.
+        for sql in [
+            "SELECT 'costs $5 today'",
+            "SELECT $$a body with $7 in it$$",
+            "SELECT $tag$ $9 $tag$",
+            "SELECT 1 -- $3 in a comment",
+            "SELECT 1 /* $3 /* nested */ still */",
+            r#"SELECT "a $2 column""#,
+        ] {
+            assert_eq!(
+                placeholders(sql).unwrap(),
+                BTreeSet::new(),
+                "found a placeholder in {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_placeholders_are_still_found_beside_quoted_text() {
+        let seen = placeholders("SELECT $1 FROM t WHERE a = 'lit $9' AND b = $2").unwrap();
+        assert_eq!(seen, BTreeSet::from([1, 2]));
+    }
+
+    #[test]
+    fn an_index_too_large_to_parse_is_refused_rather_than_skipped() {
+        // In a function whose job is that every `$n` has a binding, the one
+        // index that cannot be parsed must not be the one waved through.
+        let err = placeholders("SELECT $99999999999999999999999").unwrap_err();
+        assert!(format!("{err:#}").contains("not an index"), "{err:#}");
+    }
+
+    #[test]
+    fn a_param_nothing_binds_is_refused() {
+        // The mirror of `a_binding_the_statement_never_uses_is_refused`. An
+        // operator who declares `month` and forgets the bind gets a query that
+        // runs unfiltered while the file says it is filtered.
+        let err = parse(
+            r#"
+            [protocols."x"]
+            [[protocols."x".operations]]
+            name = "q"
+            sql  = "SELECT 1"
+            max_rows = 1
+            [protocols."x".operations.params]
+            month = { type = "string", pattern = "." }
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("nothing binds"), "{err:#}");
+    }
+
+    #[test]
+    fn a_class_that_permits_no_operation_is_refused() {
+        // The same argument as the empty enum: a policy that silently does
+        // nothing is worse than one that will not load.
+        let err = parse(
+            r#"
+            [protocols."x"]
+            windows = ["business_hours"]
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no operation"), "{err:#}");
+    }
+
+    #[test]
+    fn the_examples_month_pattern_means_ten_characters() {
+        // `\d` is Unicode-aware here, so a month written in Arabic digits would
+        // pass a pattern that looks like it means ASCII. The shipped example
+        // says `[0-9]`; this pins that it stays that way.
+        let p = policy(EXAMPLE);
+        let month = p
+            .protocol("pg-sales-ro-v1")
+            .unwrap()
+            .operation("query_sales")
+            .unwrap()
+            .params()["month"]
+            .clone();
+        assert!(month.accepts(&serde_json::json!("2026-08")));
+        assert!(!month.accepts(&serde_json::json!("٢٠٢٦-٠٨")));
     }
 
     #[test]
