@@ -568,6 +568,15 @@ const RENEW_MIN: Duration = Duration::from_secs(30);
 /// no reason.
 const RENEW_UNKNOWN: Duration = Duration::from_secs(240);
 
+/// How often to re-ask after a refusal that only a person can lift.
+///
+/// **Slow because nothing here changes it, and finite because somebody else
+/// might.** An entitlement added while this process runs should reach it
+/// without a restart, and five minutes is short against how long it takes to
+/// notice an error and act on it, long against the transient retries this must
+/// not be confused with.
+const REFUSED_RETRY: Duration = Duration::from_secs(300);
+
 /// When to renew, given what the Identity API said the token's lifetime is.
 ///
 /// `None` — the caller supplied a token rather than issuing one, so its lifetime
@@ -627,6 +636,9 @@ pub fn spawn_token_renewal(
 ) -> TokenRenewal {
     let mut delay = renew_delay(expires_in);
     let mut failures = 0u32;
+    // Whether the refusal has already been reported, so it is said once rather
+    // than every time the slow retry comes round.
+    let mut refused = false;
     TokenRenewal(tokio::spawn(async move {
         loop {
             tokio::time::sleep(delay).await;
@@ -634,6 +646,9 @@ pub fn spawn_token_renewal(
                 Ok(token) => {
                     proxy.set_endpoint_token(&token.endpoint_token);
                     failures = 0;
+                    // Whoever was going to act has acted; if it is ever refused
+                    // again, that is news.
+                    refused = false;
                     delay = renew_delay(Some(token.expires_in));
                     tracing::debug!(
                         expires_in = token.expires_in,
@@ -642,26 +657,40 @@ pub fn spawn_token_renewal(
                     );
                 }
                 Err(e) if is_permanent(&e) => {
-                    // **Said once, loudly, and then not again.** A `403` is an
-                    // authorization decision, and asking again does not change
-                    // one: the ceiling has to gain the protocol, or the
-                    // Endpoint has to stop being revoked. Backing off from
-                    // thirty seconds to five minutes and carrying on is a
-                    // request the Identity API can never satisfy, repeated for
-                    // as long as the process runs — and at `warn`, among the
-                    // transient failures that look identical.
+                    // **Said once, loudly, and then asked for rarely.** A `403`
+                    // is an authorization decision: the ceiling has to gain the
+                    // protocol, or the Endpoint has to stop being revoked, and
+                    // nothing this loop does brings either about. Retrying it
+                    // every thirty seconds at `warn`, among the transient
+                    // failures that look identical, is how the one failure
+                    // somebody must act on becomes invisible.
                     //
-                    // The session is left alone. The token in force keeps
-                    // working until it expires, and ending a session that is
-                    // forwarding fine is the worse of the two answers; what
-                    // ends here is the asking.
-                    tracing::error!(
-                        "the Endpoint Token cannot be renewed and retrying will not help: \
-                         {e:#}. The session keeps working until the current token expires. \
-                         A narrowed run asks for one protocol, so the usual cause is that \
-                         this account is not entitled to it",
-                    );
-                    return;
+                    // **But it is not asked for never.** Somebody reads that
+                    // error and adds the entitlement a minute later, and a loop
+                    // that had given up would let this process's token lapse
+                    // anyway — every proxy call failing, nothing further
+                    // logged, and a restart the only way back. So the asking
+                    // slows to [`REFUSED_RETRY`] rather than stopping, and says
+                    // nothing more unless the answer changes.
+                    //
+                    // The session is left alone either way: the token in force
+                    // keeps working until it expires, and ending one that is
+                    // forwarding fine is the worse of the two answers.
+                    if !refused {
+                        refused = true;
+                        tracing::error!(
+                            "the Endpoint Token cannot be renewed, and retrying will not \
+                             change that: {e:#}. Somebody has to grant it — a narrowed run \
+                             asks for one protocol, so the usual cause is an account not \
+                             entitled to it. This keeps asking every {}s in case that \
+                             happens; the session works until the current token expires",
+                            REFUSED_RETRY.as_secs(),
+                        );
+                    } else {
+                        tracing::debug!("still refused: {e:#}");
+                    }
+                    failures = 0;
+                    delay = REFUSED_RETRY;
                 }
                 Err(e) => {
                     failures += 1;

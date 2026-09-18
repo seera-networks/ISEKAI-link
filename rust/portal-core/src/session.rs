@@ -483,6 +483,12 @@ async fn wait_for_a_grant(
         return Ok(reachable);
     }
     let started = Instant::now();
+    // **The last polling failure, held rather than raised.** A wait of thirty
+    // seconds makes about eighteen calls, and one `429`, one `503` or one
+    // control-plane hiccup among them is not an answer about the Grant. Raising
+    // it would end the wait the moment it was granted — the failure this
+    // function exists to prevent, arriving by a different door.
+    let mut last_error: Option<anyhow::Error> = None;
     // Short at first, because the usual answer arrives in seconds and a run
     // that sat out a fixed interval would spend most of its wait after the
     // Grant already existed. Then longer, because if it did not arrive quickly
@@ -496,22 +502,46 @@ async fn wait_for_a_grant(
     );
     loop {
         if started.elapsed() >= wait {
-            // **What to look at, because the three causes are one answer from
-            // here.** "The Gateway never got the event", "it got it and refused
-            // the attributes", and "nobody entitled this Endpoint" all look
-            // exactly like an empty list, and only the Gateway's log tells them
-            // apart.
+            // **A failed poll is reported as itself.** If the list never came
+            // back, saying "no Grant appeared" would blame the Gateway for the
+            // proxy being unreachable.
+            if let Some(e) = last_error {
+                return Err(e.context(format!(
+                    "could not tell whether a Grant exists: the reachable-listener list \
+                     kept failing for {wait:?}",
+                )));
+            }
+            // **What to look at, because several causes are one answer from
+            // here.** An empty list is what the Gateway not having made a Grant
+            // looks like — it never received the event, it refused the
+            // attributes, nothing entitles this Endpoint — and equally what a
+            // server that is not running looks like. Only the Gateway's log
+            // separates the first three, and only the peer separates them from
+            // the fourth.
             anyhow::bail!(
-                "no Grant appeared within {wait:?}. Issuing the token starts a lease at the \
-                 Gateway and the Grant follows over its event stream, so this means the \
+                "nothing reachable after {wait:?}. Issuing the token starts a lease at the \
+                 Gateway and the Grant follows over its event stream, so either the \
                  Gateway has not made one -- it never received the event, it refused the \
-                 attributes, or there is no entitlement for this Endpoint. Which of those \
-                 it is shows in the Gateway's log, not here",
+                 attributes, or nothing entitles this Endpoint, which its log will say and \
+                 this cannot -- or there is nothing to reach: check that the peer is \
+                 running, that it serves `{}`, and that {} is the Endpoint you meant",
+                cfg.protocol,
+                peer.unwrap_or("the peer"),
             );
         }
         tokio::time::sleep(interval).await;
         interval = (interval * 2).min(Duration::from_secs(2));
-        let reachable = directory.reachable().await?;
+        let reachable = match directory.reachable().await {
+            Ok(reachable) => {
+                last_error = None;
+                reachable
+            }
+            Err(e) => {
+                tracing::debug!("could not list reachable listeners while waiting: {e:#}");
+                last_error = Some(e);
+                continue;
+            }
+        };
         if matches(&reachable, &cfg.protocol, peer) {
             // **The number §6.3 asked for.** How long a Grant takes to arrive
             // was a guess from the design and had never been measured.
