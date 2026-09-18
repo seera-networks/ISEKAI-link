@@ -429,6 +429,58 @@ async fn renewing_on_auth0_still_uses_the_header() {
 
 // ---- §8.7 ----
 
+/// **The Auth0 route names its own reason, and for a task it is not an
+/// exception.**
+///
+/// The four words the vocabulary used to hold — lost, deleted, revoked by an
+/// admin, compromised — are all exceptions. A task-scoped Endpoint revokes
+/// itself on every successful run, hundreds of times a day, and putting those
+/// under `endpoint_deleted` would bury an operator's own deletions among them
+/// (ISEKAI-identity#44, answered in #45).
+#[tokio::test]
+async fn a_finished_task_says_so() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/endpoints/{endpoint_id}/revoke",
+            post(
+                |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
+                    record(&s, "/revoke", h, b).await;
+                    Json(json!({
+                        "endpoint_id": "ep:A7-task1",
+                        "status": "revoked",
+                        "reason": "task_finished",
+                        "revoked_at": "2026-09-18T01:00:00Z",
+                        "proxy_notification": "delivered",
+                    }))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+
+    let client = serve(app).await;
+    let revoked = client
+        .revoke_endpoint(
+            RevokeAuth::Auth0 {
+                token: "AUTH0_AT",
+                endpoint_id: "ep:A7-task1",
+                reason: RevokeReason::TaskFinished,
+            },
+            None,
+        )
+        .await
+        .expect("revoke");
+    assert_eq!(revoked.reason.as_deref(), Some("task_finished"));
+
+    let reqs = captured.take();
+    let (_p, headers, body) = &reqs[0];
+    assert_eq!(headers.get("authorization").unwrap(), "Bearer AUTH0_AT");
+    assert_eq!(body["reason"], "task_finished");
+    // The key route's field, which this route does not use: it authenticates
+    // as the person, and there is no Enrollment Key in an agent run.
+    assert!(body["enrollment_key"].is_null());
+}
+
 #[tokio::test]
 async fn self_revocation_sends_no_assertion_and_no_reason() {
     let captured = Captured::default();

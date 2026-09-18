@@ -143,6 +143,45 @@ impl Credential {
     }
 }
 
+impl Credential {
+    /// Which Endpoint this credential registered on the Auth0 route, if it has.
+    ///
+    /// **The question is "is there something to revoke", and nothing else
+    /// answers it.** A run that failed before its first token — an unreachable
+    /// Identity, a refused narrowing — registered nothing, and revoking would
+    /// buy a round trip to be told so.
+    ///
+    /// A `409` settles this cell too, and for agent mode that is still "ours":
+    /// the key was generated moments earlier, so the only way it can already be
+    /// registered is that our own attempt reached the server and the answer did
+    /// not come back. (The enrolment route cannot assume that, which is why it
+    /// tracks `by_us` separately — one Enrollment Key grows many Endpoints, and
+    /// a `409` there is usually somebody else's.)
+    pub fn registered_endpoint(&self) -> Option<&str> {
+        match self {
+            Credential::Auth0 { registered, .. } => registered.get().map(String::as_str),
+            // Its own route out is `release_enrollment`, which gives the slot
+            // back rather than revoking, and which tracks whose slot it is.
+            Credential::Enrollment(_) => None,
+        }
+    }
+
+    /// A current Auth0 access token, from the source when there is one.
+    ///
+    /// **The end of a task is the worst moment to be holding the token the
+    /// task started with.** Revocation happens last, and on a run of any length
+    /// the token captured at the beginning has expired by then.
+    pub async fn current_auth0_token(&self) -> anyhow::Result<Option<String>> {
+        let Credential::Auth0 { token, source, .. } = self else {
+            return Ok(None);
+        };
+        match source {
+            Some(source) => source.auth0_token().await.map(Some),
+            None => Ok(Some(token.clone())),
+        }
+    }
+}
+
 impl From<Enrollment> for Credential {
     fn from(enrollment: Enrollment) -> Self {
         Credential::Enrollment(enrollment)

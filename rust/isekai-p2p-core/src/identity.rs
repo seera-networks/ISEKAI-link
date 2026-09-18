@@ -186,6 +186,19 @@ pub enum RevokeReason {
     EndpointDeleted,
     AdminRevoke,
     SecurityIncident,
+    /// **The Endpoint's task is over. Nothing went wrong.**
+    ///
+    /// The other four are all exceptions — something was lost, deleted,
+    /// compromised, or overruled. A task-scoped Endpoint's revocation is none
+    /// of those: it is the ordinary way every successful run ends, hundreds of
+    /// times a day, and reusing `endpoint_deleted` for it would bury the
+    /// operator's own deletions under them in the audit log.
+    ///
+    /// This is the Auth0 route's counterpart to the key route's
+    /// `enrollment_released`, with one difference: **a request names this
+    /// one.** Identity can see a slot being given back; it cannot see that a
+    /// task finished.
+    TaskFinished,
 }
 
 impl RevokeReason {
@@ -195,6 +208,7 @@ impl RevokeReason {
             RevokeReason::EndpointDeleted => "endpoint_deleted",
             RevokeReason::AdminRevoke => "admin_revoke",
             RevokeReason::SecurityIncident => "security_incident",
+            RevokeReason::TaskFinished => "task_finished",
         }
     }
 }
