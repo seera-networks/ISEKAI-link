@@ -33,7 +33,9 @@ pub mod relay_lease;
 pub mod secret;
 
 pub use auth::{AssertionSource, Auth0TokenSource, Credential, Enrollment, StaticAuth0Token};
-pub use config::{issue_endpoint_token, load_or_generate_key, proxy_client, P2pConfig};
+pub use config::{
+    issue_endpoint_token, list_policies, load_or_generate_key, proxy_client, P2pConfig,
+};
 pub use initiator::{InitiatorSession, PeerDirectory};
 pub use listener::{
     AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,
@@ -60,6 +62,7 @@ pub mod agent {
         EnrollmentKeyRecord, EnrollmentRecord, IdentityAuth, IdentityError, IssuedEnrollmentKey,
         NewEnrollmentKey, RevokeAuth, RevokeEffects, RevokeReason, Revoked, RevokedEnrollmentKey,
     };
+    pub use isekai_p2p_core::identity::{PolicyConstraints, PolicyEvent, PolicySnapshot};
     pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::proxy::{
         pairing_code_from_input, pairing_code_in_uri, pairing_uri, proxy_authority, redact_secrets,

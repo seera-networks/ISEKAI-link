@@ -86,6 +86,26 @@ pub async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<EndpointTok
     }
 }
 
+/// Read the policies in force for this Endpoint as a Gateway (identity §8.10.2).
+///
+/// **Branches on the transport like [`issue_endpoint_token`] does**, and for the
+/// same reason: which one Identity is reached over is a deployment's choice, and
+/// both can answer a plain GET. (The *stream* is a different matter — only the
+/// H3 transport implements `EventStreamTransport` today, which is a later
+/// phase's problem.)
+pub async fn list_policies(
+    cfg: &P2pConfig,
+    endpoint_token: &str,
+) -> anyhow::Result<isekai_p2p_core::identity::PolicySnapshot> {
+    if cfg.identity_http3 {
+        let client = IdentityClient::new(MasqueH3Transport::connect(&cfg.identity_url)?);
+        Ok(client.list_policies(endpoint_token, &cfg.key).await?)
+    } else {
+        let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
+        Ok(client.list_policies(endpoint_token, &cfg.key).await?)
+    }
+}
+
 /// Give an unattended Endpoint's slot back (§8.7 with an Enrollment Key).
 ///
 /// **Only meaningful on [`Credential::Enrollment`]**, and an error on anything

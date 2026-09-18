@@ -319,6 +319,50 @@ struct Args {
 /// Endpoint, and the answer lives on the proxy — a Peer Listener is what a peer
 /// connects *through*, and standing one up to ask would put a second row under
 /// this Endpoint for every client that then looks one up.
+/// Read what the control plane says is in force, and build the table from it.
+///
+/// **P1 of `docs/portal_gateway_plan.md`: this makes no grant.** It reads,
+/// checks every row against the operator's envelope, and says what it found —
+/// so that a deployment can see what is being handed out before anything acts
+/// on it. Holding the table without enforcing it is the point of the phase.
+///
+/// Reconciling is also the correctness guarantee rather than the stream, which
+/// is why this runs at startup and (in a later phase) once per token lifetime.
+async fn reconcile_policies(
+    cfg: &P2pConfig,
+    policy: &portal_core::gateway::GatewayPolicy,
+) -> anyhow::Result<()> {
+    let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
+
+    // **Propagated, never rendered as an empty snapshot.** An empty list is an
+    // instruction to drop every row, so turning a failed read into one would
+    // delete a live policy over one bad moment -- which is the failure
+    // Identity's own spec warns about by name.
+    let snapshot = isekai_p2p::list_policies(cfg, &token)
+        .await
+        .context("read the policies in force")?;
+
+    let mut table = portal_core::gateway::Table::new();
+    let outcome = table.reconcile(&snapshot, policy);
+
+    tracing::info!(
+        gateway = %snapshot.gateway,
+        cursor = snapshot.cursor,
+        offered = snapshot.items.len(),
+        applied = outcome.applied,
+        refused = outcome.refused.len(),
+        "policy: reconciled with the control plane"
+    );
+    // **Each refusal named, not just counted.** A row the centre believes is in
+    // force and this Gateway will not apply is a disagreement between two
+    // configurations, and it is the number worth knowing before enforcement is
+    // switched on.
+    for (lease, why) in &outcome.refused {
+        tracing::warn!(lease, "policy: not applied: {why}");
+    }
+    Ok(())
+}
+
 async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Result<()> {
     // **Settled on the arguments, before anything authenticates.** A half-given
     // binding is a typo, and finding it out after a sign-in and an Identity
@@ -831,18 +875,22 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // pattern that does not compile, is refused *here* rather than the first
     // time an operation runs, which with the PEP deferred is not in this
     // release at all.
-    if let Some(path) = &args.gateway_config {
-        let policy = portal_core::gateway::load(path)?;
-        for protocol in policy.protocols() {
-            let class = policy.protocol(protocol).expect("just listed");
-            tracing::info!(
-                protocol,
-                operations = class.operations().count(),
-                windows = class.windows().count(),
-                "gateway policy: serving a protocol class"
-            );
+    let gateway_policy = match &args.gateway_config {
+        Some(path) => {
+            let policy = portal_core::gateway::load(path)?;
+            for protocol in policy.protocols() {
+                let class = policy.protocol(protocol).expect("just listed");
+                tracing::info!(
+                    protocol,
+                    operations = class.operations().count(),
+                    windows = class.windows().count(),
+                    "gateway policy: serving a protocol class"
+                );
+            }
+            Some(policy)
         }
-    }
+        None => None,
+    };
 
     // **Before the catalogue and before any listener**, because neither is
     // needed to answer them: grants belong to this Endpoint rather than to a
@@ -947,6 +995,10 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // From here on this Endpoint may exist, so every way out owes a slot back.
     if args.enroll {
         *enrolled = Some(cfg.clone());
+    }
+
+    if let Some(policy) = &gateway_policy {
+        reconcile_policies(&cfg, policy).await?;
     }
 
     let shutdown = CancellationToken::new();

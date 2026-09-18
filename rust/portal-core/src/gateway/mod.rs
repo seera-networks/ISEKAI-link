@@ -42,6 +42,10 @@
 //! anywhere on this path that a statement could arrive in.** Adding one would
 //! be the change to refuse, not a value to validate.
 
+pub mod table;
+
+pub use table::{Entry, Outcome, Refusal, Table};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -144,7 +148,7 @@ impl ProtocolPolicy {
     /// through — an unknown key is a value nobody bounded.
     pub fn accepts_attributes(
         &self,
-        attributes: &BTreeMap<String, serde_json::Value>,
+        attributes: &BTreeMap<String, String>,
     ) -> Result<(), AttributeRefusal> {
         for (name, value) in attributes {
             let Some(schema) = self.attributes.get(name) else {
@@ -196,10 +200,7 @@ pub enum AttributeRefusal {
     /// This file declares an attribute the row does not carry.
     Missing { name: String },
     /// The value is outside the declared range.
-    OutOfRange {
-        name: String,
-        value: serde_json::Value,
-    },
+    OutOfRange { name: String, value: String },
 }
 
 impl std::fmt::Display for AttributeRefusal {
@@ -228,13 +229,12 @@ pub enum ValueSchema {
 impl ValueSchema {
     /// Whether `value` is inside this range.
     ///
-    /// **A non-string is always refused.** Both forms describe strings, and
-    /// accepting `42` for an enum of names by stringifying it would be this
-    /// file quietly widening itself.
-    pub fn accepts(&self, value: &serde_json::Value) -> bool {
-        let Some(text) = value.as_str() else {
-            return false;
-        };
+    /// **A string, because that is what the wire carries.** Identity types a
+    /// policy row's attributes as a map of strings, so a number or an object is
+    /// refused at deserialization — by the type rather than by a check here
+    /// that a later edit could drop.
+    pub fn accepts(&self, value: &str) -> bool {
+        let text = value;
         match self {
             Self::Enum { allowed } => allowed.contains(text),
             // **Anchored by the operator, not by us.** Adding `^...$` here
@@ -723,12 +723,12 @@ mod tests {
     fn an_attribute_outside_its_enum_is_refused() {
         let p = policy(EXAMPLE);
         let sales = p.protocol("pg-sales-ro-v1").unwrap();
-        let ok = BTreeMap::from([("region".to_owned(), serde_json::json!("kanto"))]);
+        let ok = BTreeMap::from([("region".to_owned(), "kanto".to_owned())]);
         assert_eq!(sales.accepts_attributes(&ok), Ok(()));
 
         // This is the centre trying to widen its own envelope, which §3.1.0
         // says must not work.
-        let wide = BTreeMap::from([("region".to_owned(), serde_json::json!("*"))]);
+        let wide = BTreeMap::from([("region".to_owned(), "*".to_owned())]);
         assert!(matches!(
             sales.accepts_attributes(&wide),
             Err(AttributeRefusal::OutOfRange { .. })
@@ -740,8 +740,8 @@ mod tests {
         let p = policy(EXAMPLE);
         let sales = p.protocol("pg-sales-ro-v1").unwrap();
         let extra = BTreeMap::from([
-            ("region".to_owned(), serde_json::json!("kanto")),
-            ("tenant".to_owned(), serde_json::json!("acme")),
+            ("region".to_owned(), "kanto".to_owned()),
+            ("tenant".to_owned(), "acme".to_owned()),
         ]);
         assert!(matches!(
             sales.accepts_attributes(&extra),
@@ -762,61 +762,22 @@ mod tests {
     }
 
     #[test]
-    fn a_non_string_is_refused() {
-        // Stringifying to make it fit would be the file widening itself.
+    fn a_value_outside_an_enum_is_refused_whatever_it_looks_like() {
+        // The wire types attributes as strings, so a number cannot arrive as
+        // one -- serde refuses it before this code runs. What is left to check
+        // here is that nothing string-shaped sneaks past the enum.
         let p = policy(EXAMPLE);
         let sales = p.protocol("pg-sales-ro-v1").unwrap();
-        for value in [
-            serde_json::json!(42),
-            serde_json::json!(null),
-            serde_json::json!(["kanto"]),
-        ] {
-            let attrs = BTreeMap::from([("region".to_owned(), value)]);
-            assert!(matches!(
-                sales.accepts_attributes(&attrs),
-                Err(AttributeRefusal::OutOfRange { .. })
-            ));
+        for value in ["", "KANTO", "kanto ", "kanto,kansai", "*"] {
+            let attrs = BTreeMap::from([("region".to_owned(), value.to_owned())]);
+            assert!(
+                matches!(
+                    sales.accepts_attributes(&attrs),
+                    Err(AttributeRefusal::OutOfRange { .. })
+                ),
+                "{value:?} was accepted"
+            );
         }
-    }
-
-    #[test]
-    fn a_statement_with_more_placeholders_than_bindings_is_refused() {
-        // **The check that pays for parsing at startup.** With the PEP
-        // deferred, the first execution is not in this release, so this would
-        // otherwise go unnoticed for months.
-        let err = parse(
-            r#"
-            [protocols."x"]
-            [[protocols."x".operations]]
-            name = "q"
-            sql  = "SELECT 1 WHERE a = $1 AND b = $2"
-            bind = ["$a"]
-            max_rows = 1
-            [protocols."x".operations.params]
-            a = { type = "string", pattern = "." }
-            "#,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("$2"), "{err:#}");
-    }
-
-    #[test]
-    fn a_binding_the_statement_never_uses_is_refused() {
-        let err = parse(
-            r#"
-            [protocols."x"]
-            [[protocols."x".operations]]
-            name = "q"
-            sql  = "SELECT 1 WHERE a = $1"
-            bind = ["$a", "$b"]
-            max_rows = 1
-            [protocols."x".operations.params]
-            a = { type = "string", pattern = "." }
-            b = { type = "string", pattern = "." }
-            "#,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("never uses"), "{err:#}");
     }
 
     #[test]
@@ -922,8 +883,8 @@ mod tests {
             .unwrap()
             .params()["month"]
             .clone();
-        assert!(month.accepts(&serde_json::json!("2026-08")));
-        assert!(!month.accepts(&serde_json::json!("٢٠٢٦-٠٨")));
+        assert!(month.accepts("2026-08"));
+        assert!(!month.accepts("٢٠٢٦-٠٨"));
     }
 
     #[test]

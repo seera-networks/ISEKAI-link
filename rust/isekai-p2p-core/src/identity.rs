@@ -23,6 +23,7 @@
 //! authentication state plus possession of the Endpoint private key" and
 //! nothing else — every route that wanted a PoP still wants one.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -703,6 +704,80 @@ pub struct IdentityClient<T> {
     transport: T,
 }
 
+/// What a Gateway is told about one access lease
+/// (`docs/portal_gateway_plan.md` §1.2).
+///
+/// **`scope` is not here, and that is the design.** The centre holds a class
+/// name and attribute values; the rules that turn them into permission live at
+/// the enforcement point. A centre that never carries scope cannot invent a new
+/// rule shape, whatever else it is talked into.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PolicyEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub access_lease_id: String,
+    pub decision_id: String,
+    pub version: i64,
+    pub allowed_endpoint: String,
+    pub protocol: String,
+    /// Seconds left on the lease. `policy.granted` only.
+    #[serde(default)]
+    pub ttl: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// **Strings, because that is what the wire carries.** Identity types this
+    /// as a map of strings, so a number or an object is refused before this
+    /// code sees it rather than by a check of ours that could be forgotten.
+    #[serde(default)]
+    pub attributes: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub constraints: Option<PolicyConstraints>,
+    /// `policy.revoked` only, and always present on one: `lease-expired`,
+    /// `entitlement-removed` or `endpoint-revoked`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl PolicyEvent {
+    /// Whether this row grants rather than withdraws.
+    pub fn is_granted(&self) -> bool {
+        self.kind == "policy.granted"
+    }
+}
+
+/// What the centre asks the enforcement point to hold to.
+///
+/// **`window` is a label, not an expression.** What hours it means, in which
+/// zone, around which holidays, is the Gateway's configuration — putting the
+/// calendar in the centre is exactly the split this design avoids.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PolicyConstraints {
+    #[serde(default)]
+    pub grant_ttl: Option<u32>,
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+    #[serde(default)]
+    pub window: Option<String>,
+}
+
+/// Everything in force for this Gateway right now, and where the stream should
+/// pick up.
+///
+/// **This is the correctness guarantee, not the stream.** The table is rebuilt
+/// from here on the rule "anything not in this list is dropped", which is why
+/// the distinction between an empty list and a failed read matters so much: the
+/// first is an instruction and the second is not an answer at all.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicySnapshot {
+    /// The Gateway this is for. There is no way to ask for someone else's, so
+    /// this comes back as confirmation rather than as a choice that was made.
+    pub gateway: String,
+    /// Hand to `GET /v1/policies/stream?after=<cursor>`.
+    pub cursor: i64,
+    #[serde(default)]
+    pub items: Vec<PolicyEvent>,
+}
+
 impl<T: ControlPlaneTransport> IdentityClient<T> {
     /// Create a client that speaks to the Identity API over `transport`.
     pub fn new(transport: T) -> Self {
@@ -932,6 +1007,23 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     /// **Revoked rows are hidden unless asked for**, which is why
     /// [`EndpointList::revoked_count`] exists and why anything showing this
     /// should show that too.
+    /// `GET /v1/policies` — everything in force for this Gateway
+    /// (identity spec §8.10.2).
+    ///
+    /// Series B: an Endpoint Token and a PoP, and **no permission** — the
+    /// distribution is scoped to whoever is named by the token, so there is
+    /// nothing else to authorize and no way to ask for another Gateway's rows.
+    pub async fn list_policies(
+        &self,
+        endpoint_token: &str,
+        key: &EndpointKey,
+    ) -> Result<PolicySnapshot, IdentityError> {
+        let path = "/v1/policies";
+        let pop = pop::sign_request(key, "GET", path, &[]);
+        self.request_raw("GET", path, Some(endpoint_token), Some(&pop), Vec::new())
+            .await
+    }
+
     pub async fn list_endpoints(
         &self,
         auth0_token: &str,
