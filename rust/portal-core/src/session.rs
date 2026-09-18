@@ -30,6 +30,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use isekai_p2p::agent::ReachableListener;
@@ -371,7 +372,16 @@ pub enum Reach<'a> {
     /// `peer` narrows the search to one server's Endpoint ID, which is what a
     /// client paired with more than one needs. `None` is right when there is
     /// only one, and says so if there is not.
-    Grant { peer: Option<&'a str> },
+    Grant {
+        peer: Option<&'a str>,
+        /// How long to wait for a Grant to appear before giving up.
+        ///
+        /// **`None` asks once**, which is right when the Grant has stood since
+        /// pairing. A task-scoped Endpoint's Grant is made moments after its
+        /// token is issued and over an event stream, so for that one an empty
+        /// answer means *not yet* rather than *no*.
+        wait: Option<Duration>,
+    },
     /// A capability the operator issued and handed over. **One-shot, and 30
     /// seconds by default** — right for letting a guest in once, wrong for
     /// anything that reconnects. It names its listener, so nothing is
@@ -398,7 +408,7 @@ pub async fn connect(
     // `serve` does the same thing from the other end.
     let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default())?);
     let session = match reach {
-        Reach::Grant { peer } => connect_on_a_grant(cfg, peer, reg.clone()).await?,
+        Reach::Grant { peer, wait } => connect_on_a_grant(cfg, peer, wait, reg.clone()).await?,
         Reach::Capability {
             capability,
             listener_id,
@@ -418,12 +428,13 @@ pub async fn connect(
 async fn connect_on_a_grant(
     cfg: &P2pConfig,
     peer: Option<&str>,
+    wait: Option<Duration>,
     reg: Arc<Registration>,
 ) -> anyhow::Result<InitiatorSession> {
     let directory = PeerDirectory::open(cfg)
         .await
         .context("open the proxy control plane")?;
-    let reachable = directory.reachable().await?;
+    let reachable = wait_for_a_grant(&directory, cfg, peer, wait).await?;
     let listener = choose_listener(&reachable, &cfg.protocol, peer)?;
     tracing::info!(
         listener = %listener.listener_id,
@@ -443,6 +454,85 @@ async fn connect_on_a_grant(
         )
         .await
         .context("peer connect")
+}
+
+/// List the listeners this Endpoint can reach, waiting for one to appear.
+///
+/// **A token and a Grant do not arrive together.** Issuing the token is what
+/// starts a lease at the Gateway (draft §6.2.1), and from there the path is
+/// asynchronous — Identity streams `policy.granted`, the Gateway validates the
+/// attributes, writes its table and creates the Grant — so a `connect` made
+/// immediately after the issue finds nothing reachable. That is not a refusal;
+/// it is **early**, and a run that treats it as a refusal fails at the one
+/// moment it was always going to.
+///
+/// `wait` of `None` is what every caller before agent mode did: ask once, and
+/// let an empty answer be an answer. A task-scoped Endpoint registered seconds
+/// ago is the case that needs the other behaviour.
+async fn wait_for_a_grant(
+    directory: &PeerDirectory,
+    cfg: &P2pConfig,
+    peer: Option<&str>,
+    wait: Option<Duration>,
+) -> anyhow::Result<Vec<ReachableListener>> {
+    let reachable = directory.reachable().await?;
+    let Some(wait) = wait else {
+        return Ok(reachable);
+    };
+    if matches(&reachable, &cfg.protocol, peer) {
+        return Ok(reachable);
+    }
+    let started = Instant::now();
+    // Short at first, because the usual answer arrives in seconds and a run
+    // that sat out a fixed interval would spend most of its wait after the
+    // Grant already existed. Then longer, because if it did not arrive quickly
+    // it is not arriving quickly.
+    let mut interval = Duration::from_millis(250);
+    tracing::info!(
+        protocol = %cfg.protocol,
+        peer = peer.unwrap_or("-"),
+        ?wait,
+        "no Grant yet; waiting for the Gateway to make one",
+    );
+    loop {
+        if started.elapsed() >= wait {
+            // **What to look at, because the three causes are one answer from
+            // here.** "The Gateway never got the event", "it got it and refused
+            // the attributes", and "nobody entitled this Endpoint" all look
+            // exactly like an empty list, and only the Gateway's log tells them
+            // apart.
+            anyhow::bail!(
+                "no Grant appeared within {wait:?}. Issuing the token starts a lease at the \
+                 Gateway and the Grant follows over its event stream, so this means the \
+                 Gateway has not made one -- it never received the event, it refused the \
+                 attributes, or there is no entitlement for this Endpoint. Which of those \
+                 it is shows in the Gateway's log, not here",
+            );
+        }
+        tokio::time::sleep(interval).await;
+        interval = (interval * 2).min(Duration::from_secs(2));
+        let reachable = directory.reachable().await?;
+        if matches(&reachable, &cfg.protocol, peer) {
+            // **The number §6.3 asked for.** How long a Grant takes to arrive
+            // was a guess from the design and had never been measured.
+            tracing::info!(
+                waited = ?started.elapsed(),
+                "the Grant arrived",
+            );
+            return Ok(reachable);
+        }
+    }
+}
+
+/// Whether anything in `reachable` is what this run is looking for.
+///
+/// **Only emptiness is worth waiting on.** `choose_listener`'s other refusals —
+/// two servers and no `--peer`, a peer with several live listeners — are
+/// decisions the operator has to make, and no amount of waiting makes them.
+fn matches(reachable: &[ReachableListener], protocol: &str, peer: Option<&str>) -> bool {
+    reachable
+        .iter()
+        .any(|l| l.protocol == protocol && peer.is_none_or(|want| l.owner_endpoint == want))
 }
 
 /// The one listener `peer` names, or the only one there is.
@@ -700,6 +790,34 @@ mod tests {
             found.listener_id, "pl_running",
             "the newest lease is the one still being renewed",
         );
+    }
+
+    /// **Only an empty answer is worth waiting on.** The Grant travels over
+    /// the Gateway's event stream and arrives after the token that started its
+    /// lease, so "nothing here yet" is a moment in a sequence.
+    #[test]
+    fn nothing_reachable_is_what_waiting_is_for() {
+        let none: [ReachableListener; 0] = [];
+        assert!(!matches(&none, "isekai-portal-v1", None));
+        assert!(!matches(&none, "isekai-portal-v1", Some("ep:R1")));
+    }
+
+    /// The other refusals are decisions, and waiting makes none of them: a
+    /// listener on another protocol will not become this one, and a peer this
+    /// run did not name will not stop being there.
+    #[test]
+    fn a_listener_that_does_not_answer_the_question_is_not_one() {
+        let reachable = [listener("ep:aaa", "sample", "pl_camera")];
+        assert!(
+            !matches(&reachable, "isekai-portal-v1", None),
+            "a camera is not a portal, however long we wait",
+        );
+        assert!(
+            !matches(&reachable, "sample", Some("ep:bbb")),
+            "the protocol is right and the peer is not",
+        );
+        assert!(matches(&reachable, "sample", Some("ep:aaa")));
+        assert!(matches(&reachable, "sample", None));
     }
 
     /// **The awkward cases are the whole reason this is a function.** Each one

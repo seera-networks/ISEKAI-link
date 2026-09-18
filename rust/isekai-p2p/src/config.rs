@@ -596,6 +596,22 @@ fn retry_delay(failures: u32) -> Duration {
     (RENEW_MIN * 2u32.saturating_pow(doublings)).min(RENEW_UNKNOWN)
 }
 
+/// Whether retrying this failure could ever produce a different answer.
+///
+/// **`403` is the line.** The Identity API answers `403` when a rule refused
+/// the request — `protocol-not-allowed` when the ceiling does not hold the
+/// protocol asked for, `insufficient-permission`, `endpoint-revoked` — and none
+/// of those turns on anything the caller can do from here. Everything else is
+/// left retryable on purpose: `429` and `503` say when to come back, a `401`
+/// is usually an Auth0 token the source is about to replace, and a transport
+/// error is the network.
+fn is_permanent(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|e| e.downcast_ref::<isekai_p2p_core::identity::IdentityError>())
+        .any(|e| e.status() == Some(403))
+}
+
 /// Keep `proxy`'s Endpoint Token current for as long as the returned guard
 /// lives.
 ///
@@ -624,6 +640,28 @@ pub fn spawn_token_renewal(
                         next = ?delay,
                         "endpoint token renewed",
                     );
+                }
+                Err(e) if is_permanent(&e) => {
+                    // **Said once, loudly, and then not again.** A `403` is an
+                    // authorization decision, and asking again does not change
+                    // one: the ceiling has to gain the protocol, or the
+                    // Endpoint has to stop being revoked. Backing off from
+                    // thirty seconds to five minutes and carrying on is a
+                    // request the Identity API can never satisfy, repeated for
+                    // as long as the process runs — and at `warn`, among the
+                    // transient failures that look identical.
+                    //
+                    // The session is left alone. The token in force keeps
+                    // working until it expires, and ending a session that is
+                    // forwarding fine is the worse of the two answers; what
+                    // ends here is the asking.
+                    tracing::error!(
+                        "the Endpoint Token cannot be renewed and retrying will not help: \
+                         {e:#}. The session keeps working until the current token expires. \
+                         A narrowed run asks for one protocol, so the usual cause is that \
+                         this account is not entitled to it",
+                    );
+                    return;
                 }
                 Err(e) => {
                     failures += 1;
@@ -669,6 +707,42 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+
+    fn api_error(status: u16) -> anyhow::Error {
+        anyhow::Error::from(isekai_p2p_core::identity::IdentityError::Api {
+            status,
+            body: String::new(),
+            retry_after: None,
+        })
+        .context("could not renew the endpoint token")
+    }
+
+    /// **A rule refused, and asking again asks the same rule.** `403` is the
+    /// only status the renewal loop stops on, because it is the only one whose
+    /// answer is settled somewhere the caller cannot reach.
+    #[test]
+    fn a_refusal_is_permanent_and_the_rest_are_not() {
+        assert!(is_permanent(&api_error(403)));
+        for retryable in [401, 429, 500, 503] {
+            assert!(
+                !is_permanent(&api_error(retryable)),
+                "{retryable} may well succeed next time",
+            );
+        }
+    }
+
+    /// The loop's errors arrive wrapped in context, so a check that only looked
+    /// at the outermost error would find an `anyhow` string and retry forever.
+    #[test]
+    fn the_status_is_found_under_the_context() {
+        let wrapped = api_error(403).context("issue the endpoint token");
+        assert!(is_permanent(&wrapped));
+    }
+
+    #[test]
+    fn a_transport_failure_is_not_permanent() {
+        assert!(!is_permanent(&anyhow::anyhow!("connection reset")));
+    }
     /// A token is replaced a margin before it lapses, not as it lapses: the
     /// renewal is a round-trip that can fail, and there has to be room to try
     /// again while the current token still works.

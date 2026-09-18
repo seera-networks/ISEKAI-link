@@ -293,6 +293,14 @@ struct Args {
 /// this constant supplied is not.
 const DEFAULT_KEY: &str = "portal-client.pem";
 
+/// How long an agent run waits for its Grant to be made.
+///
+/// **Tens of seconds, not minutes.** The Gateway's stream delivers in seconds
+/// when it is connected; when it is not, what is being waited on is its
+/// reconnect and the reconciliation that follows (identity §8.10.2), and a task
+/// that sat through that would be a task nobody could tell from a hung one.
+const GRANT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The audience the **proxy** checks a binding assertion against (§8.13.4).
 const PROXY_AUDIENCE: &str = "isekai-proxy";
 
@@ -658,7 +666,14 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
             "--listener is only for the --capability path. On a grant the current listener \
              is found for you -- drop it, or add --capability"
         ),
-        (None, None) => portal_core::session::Reach::Grant { peer },
+        (None, None) => portal_core::session::Reach::Grant {
+            peer,
+            // **Only agent mode waits.** Its Endpoint was registered seconds
+            // ago, so its Grant is still travelling; every other client's has
+            // stood since it paired, and for those an empty answer means the
+            // server is not running — which waiting does not change.
+            wait: args.agent.then_some(GRANT_WAIT),
+        },
     };
 
     // **Installed before the connect, and the hatch armed with it.**
