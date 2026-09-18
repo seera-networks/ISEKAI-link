@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use argh::FromArgs;
 use isekai_p2p::agent::{BindingView, ProvisioningBinding};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use isekai_p2p::agent::{MasqueH3Transport, ProxyClient};
@@ -423,6 +423,7 @@ async fn reconcile_policies(
 async fn follow_policies(
     cfg: P2pConfig,
     policy: portal_core::gateway::GatewayPolicy,
+    limits: tokio::sync::watch::Sender<PolicyLimits>,
     shutdown: CancellationToken,
 ) {
     let mut table = portal_core::gateway::Table::new();
@@ -430,7 +431,7 @@ async fn follow_policies(
     let mut backoff = POLICY_RETRY_MIN;
     loop {
         let began = tokio::time::Instant::now();
-        match follow_once(&cfg, &policy, &mut table, &mut ledger, &shutdown).await {
+        match follow_once(&cfg, &policy, &mut table, &mut ledger, &limits, &shutdown).await {
             Ok(()) => {
                 backoff = POLICY_RETRY_MIN;
                 // **A floor even on success.** The reader turns a mid-stream
@@ -489,6 +490,7 @@ async fn follow_once(
     policy: &portal_core::gateway::GatewayPolicy,
     table: &mut portal_core::gateway::Table,
     ledger: &mut portal_core::gateway::Ledger,
+    limits: &tokio::sync::watch::Sender<PolicyLimits>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
     let cursor = reconcile_policies(cfg, policy, table).await?;
@@ -505,6 +507,7 @@ async fn follow_once(
 
     let mut said = BTreeSet::new();
     settle_grants(&proxy, table, ledger, &mut said).await;
+    publish_limits(limits, table);
     let mut stream = isekai_p2p::policy_stream(cfg, &token, Some(cursor)).await?;
 
     // **Its own clock, because expiry is never streamed.** A lease that simply
@@ -528,6 +531,7 @@ async fn follow_once(
                     // next stream event would let it stand for up to a token
                     // lifetime with nothing behind it.
                     settle_grants(&proxy, table, ledger, &mut said).await;
+                    publish_limits(limits, table);
                 }
             }
             event = stream.recv() => match event {
@@ -548,6 +552,116 @@ async fn follow_once(
             },
         }
     }
+}
+
+/// What the connection side needs to know, kept apart from the table itself.
+///
+/// **A copy rather than a lock.** The two sides run at different rates — the
+/// follower changes the table on policy events, the signaling loop reads on
+/// connections — and what the reader needs is a handful of names, not the rows.
+pub type PolicyLimits = std::sync::Arc<std::collections::BTreeMap<String, Option<u32>>>;
+
+/// Say what enforcement *would* have done to this connection.
+///
+/// **Nothing is refused.** The PEP is a later phase; the point of doing the
+/// matching now is that a deployment can see how many connections would be
+/// turned away before that is switched on — which is not a number anyone can
+/// guess, and the wrong moment to find it out is after enforcement is live.
+///
+/// The peer comes from the connection listing rather than from the event
+/// stream, so it is what the control plane says rather than a best-effort
+/// notification — and it is a name rather than an `Option`, with one exception
+/// handled below.
+fn check_against_policy(
+    limits: &tokio::sync::watch::Receiver<PolicyLimits>,
+    event: &isekai_p2p::SignalingEvent,
+    live: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    use isekai_p2p::SignalingEvent as Ev;
+    let (connection_id, peer) = match event {
+        Ev::Bound {
+            connection_id,
+            peer_endpoint,
+        }
+        | Ev::AtCapacity {
+            connection_id,
+            peer_endpoint,
+        }
+        | Ev::Waiting {
+            connection_id,
+            peer_endpoint,
+        } => (connection_id, peer_endpoint),
+        _ => return,
+    };
+
+    // **A third answer, counted apart.** The listing names both parties, but a
+    // row that names neither leaves this as the literal `unknown`. Folding it
+    // into "no policy" would inflate what enforcement is about to refuse;
+    // folding it into "allowed" would understate it. When the PEP lands this is
+    // the case that must fail closed.
+    if peer == "unknown" {
+        tracing::warn!(
+            connection_id,
+            "policy: the connection names no peer; enforcement would have to refuse it",
+        );
+        return;
+    }
+
+    // **Counted here rather than asked of the session.** `max_concurrent` is a
+    // per-policy limit on one agent, and the listener's own `MAX_CONCURRENT_PEERS`
+    // is a different cap on everyone at once; reading that number would answer
+    // the wrong question.
+    let held = live.entry(peer.clone()).or_default();
+    // Only a bound connection is held. Counting the ones still waiting would
+    // inflate what enforcement is about to refuse.
+    if let Ev::Bound { .. } = event {
+        held.insert(connection_id.clone());
+    }
+    let open = held.len();
+
+    let limits = limits.borrow();
+    match limits.get(peer.as_str()) {
+        Some(Some(max)) if open > *max as usize => tracing::warn!(
+            connection_id,
+            peer,
+            open,
+            max_concurrent = max,
+            "policy: over the concurrent limit; enforcement would refuse it",
+        ),
+        Some(max) => tracing::info!(
+            connection_id,
+            peer,
+            open,
+            max_concurrent = ?max,
+            "policy: a connection the policy covers",
+        ),
+        // The count worth having before enforcement exists.
+        None => tracing::warn!(
+            connection_id,
+            peer,
+            covered = limits.len(),
+            "policy: no policy covers this peer; enforcement would refuse it",
+        ),
+    }
+}
+
+/// Forget a connection that has ended, so the concurrent count is of what is
+/// actually open.
+fn forget_connection(live: &mut BTreeMap<String, BTreeSet<String>>, connection_id: &str) {
+    live.retain(|_, held| {
+        held.remove(connection_id);
+        !held.is_empty()
+    });
+}
+
+/// Publish what the table now allows, for the signaling loop to match against.
+fn publish_limits(
+    limits: &tokio::sync::watch::Sender<PolicyLimits>,
+    table: &portal_core::gateway::Table,
+) {
+    // A failed send means nobody is listening, which is the case when no
+    // gateway policy was given at all.
+    let _ = limits.send(std::sync::Arc::new(table.limits()));
 }
 
 /// Bring the proxy's grants into line with the table.
@@ -1390,8 +1504,19 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // standing task for the life of the server; doing it inline would hold the
     // listener up, and the forwarding this server exists for does not depend on
     // it. It takes the same token, so stopping the server stops this too.
-    let _policy_task = gateway_policy
-        .map(|policy| tokio::spawn(follow_policies(cfg.clone(), policy, shutdown.clone())));
+    // **A watch, because the reader wants the latest and not the history.** A
+    // connection is matched against what policy says now; an older set would be
+    // a worse answer than waiting, and there is nothing to wait for.
+    let (limits_tx, limits_rx) = tokio::sync::watch::channel(PolicyLimits::default());
+    let gateway_mode = gateway_policy.is_some();
+    let _policy_task = gateway_policy.map(|policy| {
+        tokio::spawn(follow_policies(
+            cfg.clone(),
+            policy,
+            limits_tx,
+            shutdown.clone(),
+        ))
+    });
 
     // `AutoNotify` rather than `Manual`: there is no operator watching a window
     // here, and the Grant the proxy checked is the authorization. It still says
@@ -1432,6 +1557,8 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     println!("ready");
 
     let mut events = server.signaling.subscribe();
+    // What each peer currently holds, for the `max_concurrent` count.
+    let mut live: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // **Made once, outside the loop.** `ctrl_c()` builds a future over signals
     // that arrive *after* it is created, so calling it inside the select meant
     // a fresh one every time a signaling event woke this loop — and a Ctrl+C
@@ -1457,7 +1584,19 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
             _ = &mut signalled => { interrupted = true; break }
             _ = &mut terminate => { interrupted = true; break }
             event = events.recv() => match event {
-                Ok(event) => tracing::info!("signaling: {event:?}"),
+                Ok(event) => {
+                    tracing::info!("signaling: {event:?}");
+                    // **Recorded, never refused.** Enforcement is a later
+                    // phase; what this buys now is that a deployment can see
+                    // how many connections *would* be turned away before that
+                    // is switched on, which is not a number anyone can guess.
+                    if gateway_mode {
+                        if let isekai_p2p::SignalingEvent::Unbound { connection_id } = &event {
+                            forget_connection(&mut live, connection_id);
+                        }
+                        check_against_policy(&limits_rx, &event, &mut live);
+                    }
+                }
                 // Lagged only loses log lines; the session is unaffected.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!("missed {n} signaling events");
