@@ -781,25 +781,22 @@ async fn run(
             tracing::warn!("the peer connection closed; the forwards are going with it");
         }
     }
-    // **Before the connection is folded, and before the hatch is armed.**
-    // `hard_exit_on_second_signal` installs a handler that calls `_exit`, and
-    // the close below is exactly what a second Ctrl+C is there to escape — so
-    // revoking after either of them would skip the revocation in the very case
-    // that most wants one, a run being forced to stop. It is bounded, so it
-    // cannot become the hang the hatch exists for.
-    if let Some(cfg) = task.take() {
-        if let Err(e) = portal_core::agent::revoke_the_task_endpoint(&cfg).await {
-            // **Put back rather than reported here**, so the way out tries
-            // once more — after the connection is closed, which is seconds
-            // later and past whatever was in the way — and reports it if that
-            // fails too. Two bounded attempts is cheap against an Endpoint
-            // that stays registered for good.
-            *task = Some(cfg);
-            tracing::debug!("revoking the task Endpoint failed: {e:#}");
-        }
-    }
     if interrupted {
+        // **Armed before the revocation, not after.** Nothing polls the signal
+        // handlers once the `select!` has returned, so a revocation placed
+        // ahead of this would make the process deaf for the whole of its
+        // window — a second Ctrl+C doing nothing, and a CI runner's SIGTERM
+        // grace period running out into a SIGKILL. A second press means "stop
+        // now", and that answer has to keep working.
         portal_core::shutdown::hard_exit_on_second_signal();
+        // **Before the close, and only here.** `connected.close()` reports the
+        // connection closed and can wait out its timeout, which is exactly
+        // what the hatch above exists to escape — so on a forced stop the
+        // revocation has to come first or it does not come at all (plan §2.6).
+        // The cost is that the close then reports under a revoked Endpoint and
+        // warns about the listener's leg, which the proxy expires on its own;
+        // an Endpoint nothing sweeps is the more expensive of the two.
+        revoke_if_pending(task).await;
     }
     // **Told to stop before it is dropped.** Dropping the keeper aborts it,
     // which can cut a redemption mid-request and leave msquic a handle the
@@ -807,7 +804,32 @@ async fn run(
     // and return.
     shutdown.cancel();
     connected.close().await;
+    if !interrupted {
+        // **After the close on an ordinary ending**, because revoking first
+        // would make `report_state` fail on every successful run: it goes
+        // through the auth layer that just stopped honouring this Endpoint, so
+        // the close would wait out its timeout and warn that the listener's leg
+        // stays reserved -- every time, for nothing. Nothing is racing the
+        // wind-down here, so the ordering §2.6 asks for costs nothing to give
+        // up.
+        revoke_if_pending(task).await;
+    }
     Ok(())
+}
+
+/// Revoke the task's Endpoint if there is one, leaving it for the way out if
+/// that fails.
+///
+/// **Failing does not report here.** `main` tries once more — after the
+/// connection is closed, seconds later and past whatever was in the way — and
+/// says so then. Two bounded attempts are cheap against an Endpoint that stays
+/// registered for good.
+async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
+    let Some(cfg) = task.take() else { return };
+    if let Err(e) = portal_core::agent::revoke_the_task_endpoint(&cfg).await {
+        tracing::debug!("revoking the task Endpoint failed, will try once more: {e:#}");
+        *task = Some(cfg);
+    }
 }
 
 /// `--relays` — measure this Endpoint's relay candidates and print them.

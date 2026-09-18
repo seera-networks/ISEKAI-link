@@ -34,7 +34,7 @@ pub mod secret;
 
 pub use auth::{AssertionSource, Auth0TokenSource, Credential, Enrollment, StaticAuth0Token};
 pub use config::{
-    issue_endpoint_token, list_policies, load_or_generate_key, policy_stream, proxy_client, revoke,
+    issue_endpoint_token, list_policies, load_or_generate_key, policy_stream, proxy_client,
     P2pConfig, PolicyStream,
 };
 // **A field of `P2pConfig` has to be nameable.** `portal-client` depends on

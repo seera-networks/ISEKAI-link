@@ -215,23 +215,6 @@ pub async fn release_enrollment(cfg: &P2pConfig) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Revoke an Endpoint, over whichever transport `cfg` says to use.
-///
-/// **The transport branch is the whole of what this adds.** `revoke_endpoint`
-/// takes the authority and the reason; this picks between H3 and h1/h2 the way
-/// every other call in this module does, so a caller does not have to know
-/// which one a config asked for in order to stop an Endpoint.
-pub async fn revoke(cfg: &P2pConfig, auth: RevokeAuth<'_>) -> anyhow::Result<()> {
-    if cfg.identity_http3 {
-        let client = IdentityClient::new(MasqueH3Transport::connect(&cfg.identity_url)?);
-        client.revoke_endpoint(auth, None).await?;
-    } else {
-        let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
-        client.revoke_endpoint(auth, None).await?;
-    }
-    Ok(())
-}
-
 /// A control-plane client for `cfg`'s proxy, authenticated with `endpoint_token`.
 ///
 /// Handed out rather than built per call, so
