@@ -424,10 +424,11 @@ async fn follow_policies(
     shutdown: CancellationToken,
 ) {
     let mut table = portal_core::gateway::Table::new();
+    let mut ledger = portal_core::gateway::Ledger::new();
     let mut backoff = POLICY_RETRY_MIN;
     loop {
         let began = tokio::time::Instant::now();
-        match follow_once(&cfg, &policy, &mut table, &shutdown).await {
+        match follow_once(&cfg, &policy, &mut table, &mut ledger, &shutdown).await {
             Ok(()) => {
                 backoff = POLICY_RETRY_MIN;
                 // **A floor even on success.** The reader turns a mid-stream
@@ -485,10 +486,12 @@ async fn follow_once(
     cfg: &P2pConfig,
     policy: &portal_core::gateway::GatewayPolicy,
     table: &mut portal_core::gateway::Table,
+    ledger: &mut portal_core::gateway::Ledger,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
     let cursor = reconcile_policies(cfg, policy, table).await?;
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
+    settle_grants(cfg, &token, table, ledger).await;
     let mut stream = isekai_p2p::policy_stream(cfg, &token, Some(cursor)).await?;
 
     // **Its own clock, because expiry is never streamed.** A lease that simply
@@ -510,7 +513,14 @@ async fn follow_once(
                 }
             }
             event = stream.recv() => match event {
-                Some(event) => apply_policy_event(table, policy, &event),
+                Some(event) => {
+                    apply_policy_event(table, policy, &event);
+                    // **After the table, never before it.** Identity fixes the
+                    // order -- validate, write the table, then the grant --
+                    // because the other way round leaves a grant live with no
+                    // scope describing it.
+                    settle_grants(cfg, &token, table, ledger).await;
+                }
                 // The stream is over. Identity closes it at the token's expiry,
                 // so this is the ordinary way round the loop.
                 None => {
@@ -518,6 +528,85 @@ async fn follow_once(
                     return Ok(());
                 }
             },
+        }
+    }
+}
+
+/// Bring the proxy's grants into line with the table.
+///
+/// **Never fatal, and never optimistic.** A grant that could not be made is
+/// reported and tried again on the next pass; one that could not be removed
+/// stays in the ledger so that it *is* tried again. Reporting either as done
+/// would leave the ledger describing a proxy that does not exist.
+async fn settle_grants(
+    cfg: &P2pConfig,
+    endpoint_token: &str,
+    table: &portal_core::gateway::Table,
+    ledger: &mut portal_core::gateway::Ledger,
+) {
+    let changes = ledger.plan(table);
+    if changes.create.is_empty() && changes.remove.is_empty() && changes.refused.is_empty() {
+        return;
+    }
+    let proxy = match isekai_p2p::proxy_client(cfg, endpoint_token) {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            tracing::warn!("policy: cannot reach the proxy to settle grants: {e:#}");
+            return;
+        }
+    };
+
+    for (lease, why) in &changes.refused {
+        // **Said, not skipped.** Making no grant looks exactly like making one
+        // from the outside, so a row that cannot be served has to be audible.
+        tracing::warn!(lease, "policy: no grant made: {why}");
+    }
+
+    for wanted in &changes.create {
+        let label = wanted.label();
+        match proxy
+            .create_grant(
+                &wanted.allowed_endpoint,
+                &wanted.protocol,
+                Some(wanted.ttl),
+                Some(&label),
+            )
+            .await
+        {
+            Ok(grant) => {
+                tracing::info!(
+                    grant = %grant.grant_id,
+                    allowed = %wanted.allowed_endpoint,
+                    protocol = %wanted.protocol,
+                    ttl = wanted.ttl,
+                    leases = wanted.leases.len(),
+                    "policy: granted",
+                );
+                ledger.made(wanted.key(), grant.grant_id);
+            }
+            // **A quota refusal is not a grant.** The proxy caps grants per
+            // Endpoint and answers `429` per row with the others untouched, so
+            // treating it as success would record a grant nobody has and leave
+            // the policy half applied without saying so.
+            Err(e) => tracing::warn!(
+                allowed = %wanted.allowed_endpoint,
+                protocol = %wanted.protocol,
+                kind = e.kind().unwrap_or("unknown"),
+                "policy: could not grant: {e}",
+            ),
+        }
+    }
+
+    for (key, grant_id) in &changes.remove {
+        match proxy.revoke_grant(grant_id).await {
+            Ok(()) => {
+                tracing::info!(grant = %grant_id, allowed = %key.0, protocol = %key.1, "policy: grant removed");
+                ledger.removed(key);
+            }
+            // Kept in the ledger deliberately: forgetting it means never trying
+            // again, and the grant would stand until its own TTL with nothing
+            // tracking it.
+            Err(e) => tracing::warn!(grant = %grant_id, "policy: could not remove a grant: {e}"),
         }
     }
 }

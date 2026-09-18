@@ -42,8 +42,10 @@
 //! anywhere on this path that a statement could arrive in.** Adding one would
 //! be the change to refuse, not a value to validate.
 
+pub mod grants;
 pub mod table;
 
+pub use grants::{Changes, Ledger, Wanted};
 pub use table::{Entry, Outcome, Refusal, Table};
 
 use std::collections::{BTreeMap, BTreeSet};
