@@ -280,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
         device_name: Some("synthetic-server".to_owned()),
         token_ttl: None,
         key: load_or_generate_key(key_path)?,
+        narrowing: Default::default(),
     };
 
     let shutdown = CancellationToken::new();

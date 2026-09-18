@@ -145,6 +145,7 @@ fn config(identity_url: String, credential: Credential) -> P2pConfig {
         device_name: Some("gha-4821".into()),
         token_ttl: Some(900),
         key: EndpointKey::generate(),
+        narrowing: Default::default(),
     }
 }
 

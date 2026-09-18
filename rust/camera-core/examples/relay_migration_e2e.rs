@@ -79,6 +79,7 @@ fn config(auth0: &str, identity: &str, proxy: &str, protocol: &str, key_path: &s
         device_name: Some("relay-migration-e2e".to_owned()),
         token_ttl: None,
         key: load_or_generate_key(key_path).expect("load/generate key"),
+        narrowing: Default::default(),
     }
 }
 

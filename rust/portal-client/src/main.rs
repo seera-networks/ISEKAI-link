@@ -96,10 +96,7 @@ struct Args {
     #[argh(switch)]
     identity_http3: bool,
     /// proxy base URL. Defaults to the deployment the camera apps use
-    #[argh(
-        option,
-        default = "String::from(\"https://link.isekai.tools:6443\")"
-    )]
+    #[argh(option, default = "String::from(\"https://link.isekai.tools:6443\")")]
     proxy_url: String,
     /// auth0 access token, used only to obtain the Endpoint Token. Cannot be
     /// refreshed -- `--login` is the way to stay signed in. Not needed with
@@ -995,6 +992,9 @@ async fn config(
         isekai_p2p::Credential::auth0(auth.token, auth.source, args.register)
     };
     Ok(P2pConfig {
+        // Default: the ceiling. Agent mode is what asks for less
+        // (`docs/portal_agent_plan.md`).
+        narrowing: Default::default(),
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),

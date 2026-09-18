@@ -253,6 +253,48 @@ pub struct Registration {
     pub registered_at: String,
 }
 
+/// What a token is asked to be narrowed to, at issue.
+///
+/// **Absent is not the same as empty.** `None` asks for nothing in particular
+/// and gets the ceiling; `Some(vec![])` asks for none of that axis, which is a
+/// different request and one the server is entitled to refuse.
+///
+/// Narrowing never widens: what is asked for is intersected with the ceiling
+/// the user's entitlements set, so this cannot reach past them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Narrowing {
+    /// The permissions this token should carry.
+    pub permissions: Option<Vec<String>>,
+    /// The protocol classes this token should carry.
+    pub protocols: Option<Vec<String>>,
+    /// **Not a claim.** Which entitlements' leases to start — the selector the
+    /// distribution uses to decide which Gateways hear about this Endpoint.
+    ///
+    /// Omitting it starts a lease at *every* Gateway offering the class, which
+    /// is how grants spread further than a task needs. Naming them is the
+    /// intended operation.
+    pub gateways: Option<Vec<String>>,
+}
+
+impl Narrowing {
+    /// Whether this asks for anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.permissions.is_none() && self.protocols.is_none() && self.gateways.is_none()
+    }
+
+    fn apply_to(&self, body: &mut Value) {
+        if let Some(p) = &self.permissions {
+            body["requested_permissions"] = json!(p);
+        }
+        if let Some(p) = &self.protocols {
+            body["requested_protocols"] = json!(p);
+        }
+        if let Some(g) = &self.gateways {
+            body["requested_gateways"] = json!(g);
+        }
+    }
+}
+
 /// Response of `POST /v1/tokens/endpoint` (§8.2.1).
 #[derive(Debug, Clone, Deserialize)]
 pub struct EndpointToken {
@@ -837,21 +879,19 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     }
 
     /// §8.2.1 — obtain an Endpoint Token (Auth0 AT + PoP over this request).
+    ///
+    /// **Issuing is where a narrowing is asked for.** Renewal cannot widen and
+    /// therefore carries none ([`refresh_token`](Self::refresh_token)); asking
+    /// for the ceiling back is what calling this again is for.
     pub async fn issue_token(
         &self,
         auth0_token: &str,
         key: &EndpointKey,
-        requested_permissions: Option<&[String]>,
-        requested_protocols: Option<&[String]>,
+        narrowing: &Narrowing,
         ttl: Option<i64>,
     ) -> Result<EndpointToken, IdentityError> {
         let mut body = json!({ "endpoint_id": key.endpoint_id() });
-        if let Some(p) = requested_permissions {
-            body["requested_permissions"] = json!(p);
-        }
-        if let Some(p) = requested_protocols {
-            body["requested_protocols"] = json!(p);
-        }
+        narrowing.apply_to(&mut body);
         if let Some(t) = ttl {
             body["ttl"] = json!(t);
         }
@@ -864,17 +904,23 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     }
 
     /// Convenience: challenge → register → issue a token in one call.
+    ///
+    /// **The narrowing reaches the issue at the end.** It used to pass `None`
+    /// there, which meant a caller registering a fresh key — every task of an
+    /// agent runtime does — got its first token at the full ceiling however
+    /// carefully it had asked otherwise.
     pub async fn register_and_issue(
         &self,
         auth0_token: &str,
         key: &EndpointKey,
         device_name: Option<&str>,
+        narrowing: &Narrowing,
         ttl: Option<i64>,
     ) -> Result<EndpointToken, IdentityError> {
         let challenge = self.register_challenge(auth0_token, key).await?;
         self.register(auth0_token, key, &challenge, device_name)
             .await?;
-        self.issue_token(auth0_token, key, None, None, ttl).await
+        self.issue_token(auth0_token, key, narrowing, ttl).await
     }
 
     // ---- §8.2.2 / §8.2.3: renewal ----

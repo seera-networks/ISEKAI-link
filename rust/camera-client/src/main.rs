@@ -536,6 +536,7 @@ impl MyApp {
     fn p2p_config(&self) -> anyhow::Result<P2pConfig> {
         let key = camera_core::load_or_generate_key(std::path::Path::new(&self.key_path))?;
         Ok(P2pConfig {
+            narrowing: Default::default(),
             identity_url: self.identity_url.clone(),
             identity_http3: false,
             proxy_url: self.proxy_url.clone(),

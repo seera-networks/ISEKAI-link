@@ -581,6 +581,7 @@ fn directory_config(
         token_ttl: None,
         key: EndpointKey::from_pkcs8_pem(endpoint_key_pem)
             .map_err(|e| ClientError::InvalidKey(e.to_string()))?,
+        narrowing: Default::default(),
     })
 }
 
@@ -780,6 +781,7 @@ pub fn connect(
     sink.on_state(ConnectionState::Connecting, String::new());
 
     let cfg = P2pConfig {
+        narrowing: Default::default(),
         identity_url: config.identity_url,
         identity_http3: false,
         proxy_url: config.proxy_url,

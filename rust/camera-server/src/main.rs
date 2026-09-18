@@ -576,6 +576,7 @@ impl MyApp {
                 }
             };
             let cfg = P2pConfig {
+                narrowing: Default::default(),
                 identity_url,
                 identity_http3: false,
                 proxy_url,

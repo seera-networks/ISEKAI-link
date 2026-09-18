@@ -363,6 +363,7 @@ async fn token(a: Token) -> anyhow::Result<()> {
         device_name: a.device_name,
         token_ttl: a.ttl,
         key: load_key(&a.key)?,
+        narrowing: Default::default(),
     };
     let token = issue_endpoint_token(&cfg).await?;
     print_json(&serde_json::json!({
@@ -403,6 +404,7 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
         device_name: None,
         token_ttl: None,
         key: load_key(&a.key)?,
+        narrowing: Default::default(),
     };
     let candidates = parse_candidates(&a.candidate)?;
     let session = InitiatorSession::connect_with_token(

@@ -949,6 +949,7 @@ async fn config(args: &Args, tokens: &std::path::Path) -> anyhow::Result<P2pConf
     };
     let key = load_or_generate_key(&args.key)?;
     Ok(P2pConfig {
+        narrowing: Default::default(),
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
