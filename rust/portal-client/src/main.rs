@@ -276,7 +276,6 @@ struct Args {
     note: Option<String>,
 }
 
-/// The audience the **proxy** checks a binding assertion against (§8.13.4).
 /// Where a stored key lives when `--key` said nothing.
 ///
 /// **The default moved off the argument on purpose.** As an argh default,
@@ -285,6 +284,7 @@ struct Args {
 /// this constant supplied is not.
 const DEFAULT_KEY: &str = "portal-client.pem";
 
+/// The audience the **proxy** checks a binding assertion against (§8.13.4).
 const PROXY_AUDIENCE: &str = "isekai-proxy";
 
 #[tokio::main]
@@ -358,6 +358,20 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         args.auth0_token.is_some(),
         args.enroll,
     )?;
+    // **Stops here until P2, and here rather than beside the key it is about.**
+    // Several modes return before the key is ever loaded — signing in, and the
+    // whole account-admin path — so a refusal further down would let
+    // `--agent --endpoints` run the admin command and exit 0, having accepted
+    // the flag and dropped it. `--agent` is the one flag whose entire subject
+    // is how long this Endpoint lives, and silently ignoring it is the same
+    // confusion `check_args` is here to prevent. It also keeps the "generating
+    // a new Endpoint key" notice from naming a file agent mode never makes.
+    if args.agent {
+        anyhow::bail!(
+            "--agent is accepted but not connected yet: the task key and its revocation \
+             are the next step (docs/portal_agent_plan.md P2)"
+        );
+    }
     let key_path = args.key.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
         .auth0_tokens
@@ -447,17 +461,6 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // later, naming nothing that points back here.
     if !key_path.exists() {
         tracing::info!(path = %key_path.display(), "generating a new Endpoint key");
-    }
-    // **Stops here until P2.** Agent mode's whole difference starts at this
-    // line — a key that is generated and never written — and everything after
-    // it assumes a stored Endpoint that outlives the run. Falling through
-    // would hand the operator the stored-key behaviour their flag asked not to
-    // have, which is the confusion `check_args` exists to prevent.
-    if args.agent {
-        anyhow::bail!(
-            "--agent is accepted but not connected yet: the task key and its revocation \
-             are the next step (docs/portal_agent_plan.md P2)"
-        );
     }
     let key = load_or_generate_key(&key_path)?;
     if args.whoami {
