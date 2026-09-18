@@ -242,28 +242,38 @@ POST /v1/tokens/endpoint
 > リースが起き、Grant が不要に広がる。**指定を必須**にはしないが、省略したときは
 > 何が起きるかをログに出す。
 
-### 3.2 足すのは 3 箇所で、`refresh_token` は含まない
+### 3.2 足すのは 4 箇所で、`refresh_token` も含む
 
 - `IdentityClient::issue_token` に `requested_gateways` を足す
 - `register_and_issue` に絞りを通す（いま `None, None` で終わっている）
 - `P2pConfig` → `isekai_p2p::config::issue()` の Auth0 分岐に通す（§0.4）
+- **`refresh_token` に `requested_gateways` を足す**。理由は §3.3
 
-**`refresh_token` には足さない**。理由は §3.3。
+> **本書は 2 度、ここを取り違えた。** 初版は「更新で送らなければ天井に戻る」と書き、
+> 第 2 版はそれを正して「`refresh_token` には足さない」とした。**どちらも 3 つの軸を
+> 1 つの規則で括っていた点が同じ**で、P0 の実装中にサーバの記述を読んで判明した。
 
-### 3.3 更新では、送らないことが絞りを保つ
+### 3.3 記憶される 2 軸と、記憶されない 1 軸
 
-**初版はここを逆に書いていた。** `refresh_token` の契約はこうである。
+`refresh_token` の契約は `permissions` と `protocols` についてはこうである。
 
 > **Renewal never widens.** The result is `current ceiling ∩ the token being
 > refreshed`, monotonically, so `requested_*` is not sent: it exists only to
 > narrow further, and asking for the ceiling back is what re-issuing is for.
 
-つまり**更新は「いまの天井 ∩ いま持っているトークン」**で、送らないことが絞りを
-保つ。送る必要があるのは**さらに狭めたいとき**だけである。
+つまりこの 2 つは**「いまの天井 ∩ いま持っているトークン」**で、送らないことが
+絞りを保つ。送る必要があるのは**さらに狭めたいとき**だけである。
 
-初版は「送らなければ天井いっぱいに戻る」と書いたが、それは**再発行**の話であって
-更新の話ではない。agent モードにとって重要なのは §0.4 のほう — **初回の発行で
-絞りが渡っていない**ことである。
+**`requested_gateways` はこの規則の外にある。** サーバの `RefreshRequest` が明記して
+いる — 「更新のたびに指定すること。省略するとそのクラスの全 Gateway のリースが
+延びる。絞りの記憶（0-b）はトークンの permissions / protocols についてのもので、
+こちらは記憶しない」。実装も `gateways.is_none_or(|list| list.contains(..))` で、
+**省略は「全部」を意味する**。
+
+これは claim ではなく selector（§3.1）だからで、記憶の対象ではない。したがって
+**issue で 1 つの Gateway に絞っても、最初の更新で全 Gateway に広がる** — 15 分の
+トークンなら 12 分後である。agent モードは寿命がトークンより長いタスクを走らせる
+のだから、これは例外ではなく通常の経路に当たる。
 
 ### 3.4 `register` が更新のたびに再登録する
 
@@ -326,8 +336,8 @@ draft §6.2.1 の経路は **Identity → Gateway → Proxy** で、非同期で
 
 | # | やること | 出口 |
 | --- | --- | --- |
-| **P0** | 絞りを `P2pConfig` → `issue()` → `issue_token` / `register_and_issue` に通す。`requested_gateways` を足す（§0.4、§3.2） | **発行したトークンが実際に絞られる** |
-| **P1** | `--key` を `Option<PathBuf>` にし、`--agent` との併用を拒否。`--auth0-tokens` を必須に（§2.1、§2.2） | 「渡されたか」が判定できる |
+| **P0** ✅ | 絞りを `P2pConfig` → `issue()` → `issue_token` / `register_and_issue` に通す。`requested_gateways` を足す（§0.4、§3.2）。**更新でも selector を送り直す**（§3.3） | **発行したトークンが実際に絞られ、更新で広がらない** |
+| **P1** ✅ | `--key` を `Option<PathBuf>` にし、`--agent` との併用を拒否。`--auth0-tokens` を必須に（§2.1、§2.2） | 「渡されたか」が判定できる |
 | **P2** | メモリだけの鍵と登録。**初回成功後に `register` を下ろす**（§3.4） | タスク単位の Endpoint が、更新をまたいで生き続ける |
 | **P3** | Grant を待つ（§4.1）。**天井の拒否を更新ループの再試行から外す**（§4.2） | 早すぎる接続で失敗せず、直らない失敗を回し続けない |
 | **P4** | Auth0 経路の自己失効。**接続を畳む前に**（§2.6）。`reason` は §2.3 の決着後 | タスクの到達性が残らない |

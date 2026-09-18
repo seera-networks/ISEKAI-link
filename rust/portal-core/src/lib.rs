@@ -26,6 +26,8 @@
 //! stream would add reliability and ordering the application did not ask for
 //! and head-of-line blocking it does not expect.
 
+/// What agent mode refuses before it starts (`docs/portal_agent_plan.md` P1).
+pub mod agent;
 /// Credentials for a run with nobody at the keyboard.
 pub mod ci;
 pub mod client;
