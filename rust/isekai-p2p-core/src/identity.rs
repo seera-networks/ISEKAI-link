@@ -939,25 +939,19 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
             .await
     }
 
-    /// Convenience: challenge → register → issue a token in one call.
-    ///
-    /// **The narrowing reaches the issue at the end.** It used to pass `None`
-    /// there, which meant a caller registering a fresh key — every task of an
-    /// agent runtime does — got its first token at the full ceiling however
-    /// carefully it had asked otherwise.
-    pub async fn register_and_issue(
-        &self,
-        auth0_token: &str,
-        key: &EndpointKey,
-        device_name: Option<&str>,
-        narrowing: &Narrowing,
-        ttl: Option<i64>,
-    ) -> Result<EndpointToken, IdentityError> {
-        let challenge = self.register_challenge(auth0_token, key).await?;
-        self.register(auth0_token, key, &challenge, device_name)
-            .await?;
-        self.issue_token(auth0_token, key, narrowing, ttl).await
-    }
+    // **There was a `register_and_issue` here, and it is gone on purpose.**
+    //
+    // Folding challenge → register → issue into one call put two server-side
+    // writes behind one `Result`, so an issue refused after a registration the
+    // server had accepted came back as a single failure. A caller could not
+    // tell that an Endpoint now existed — and for a task-scoped one, nothing
+    // revokes it and no sweep reaches it, so it stayed registered for good. A
+    // narrowing the server refuses is refused at the issue, one call after the
+    // registration, which made that the ordinary path rather than the rare one.
+    //
+    // Call the three in order and keep the registration's outcome. The count of
+    // round trips is the same; what differs is that the middle one's success is
+    // something the caller is told.
 
     // ---- §8.2.2 / §8.2.3: renewal ----
 

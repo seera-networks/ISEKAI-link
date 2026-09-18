@@ -191,12 +191,15 @@ pub async fn revoke_the_task_endpoint(cfg: &isekai_p2p::P2pConfig) -> anyhow::Re
 async fn revoke_now(cfg: &isekai_p2p::P2pConfig) -> anyhow::Result<()> {
     use isekai_p2p::agent::RevokeReason;
 
-    // Only what this run actually registered. A task that failed before its
-    // first token has nothing to revoke, and asking anyway buys a round trip
-    // to be told so.
-    let Some(endpoint_id) = cfg.credential.registered_endpoint() else {
+    // Only a run that may have registered. One that failed before reaching
+    // that call created nothing, and asking anyway buys a round trip to be told
+    // so — on a path reached when Identity is already the thing that was not
+    // working.
+    if !cfg.credential.may_have_registered() {
         return Ok(());
-    };
+    }
+    let endpoint_id = cfg.key.endpoint_id();
+    let endpoint_id = endpoint_id.as_str();
     let token = cfg
         .credential
         .current_auth0_token()
@@ -204,7 +207,7 @@ async fn revoke_now(cfg: &isekai_p2p::P2pConfig) -> anyhow::Result<()> {
         .context("could not obtain an Auth0 token to revoke with")?
         .context("agent mode revokes as the signed-in person, and this run has no Auth0 token")?;
     let identity = isekai_p2p::enrollment::Identity::new(&cfg.identity_url, cfg.identity_http3);
-    let revoked = isekai_p2p::endpoints::revoke(
+    let revoked = match isekai_p2p::endpoints::revoke(
         &identity,
         &token,
         endpoint_id,
@@ -217,7 +220,22 @@ async fn revoke_now(cfg: &isekai_p2p::P2pConfig) -> anyhow::Result<()> {
         None,
     )
     .await
-    .with_context(|| format!("revoke {endpoint_id}"))?;
+    {
+        Ok(revoked) => revoked,
+        // **The attempt that never landed.** `may_have_registered` answers
+        // pessimistically because a registration whose answer was lost is
+        // indistinguishable from one that never arrived — and this is the
+        // server saying which it was. Reporting it would send an operator
+        // looking for an Endpoint that was never made.
+        Err(e) if not_found(&e) => {
+            tracing::debug!(
+                endpoint = %endpoint_id,
+                "nothing to revoke: the registration never landed",
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("revoke {endpoint_id}")),
+    };
 
     // **A `200` does not mean the Endpoint stopped** (§8.7). Identity's own
     // record is settled either way; whether the proxy heard is a separate fact,
@@ -254,6 +272,14 @@ async fn revoke_now(cfg: &isekai_p2p::P2pConfig) -> anyhow::Result<()> {
             other.unwrap_or("not reported"),
         ),
     }
+}
+
+/// Whether Identity answered that there is no such Endpoint.
+fn not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|e| e.downcast_ref::<isekai_p2p::agent::IdentityError>())
+        .any(|e| e.status() == Some(404))
 }
 
 /// How long to wait for the revocation before calling it failed.
@@ -436,7 +462,7 @@ mod tests {
             key: isekai_p2p::agent::EndpointKey::generate(),
             narrowing: Default::default(),
         };
-        assert!(cfg.credential.registered_endpoint().is_none());
+        assert!(!cfg.credential.may_have_registered());
         revoke_the_task_endpoint(&cfg)
             .await
             .expect("nothing to do, and no attempt to make");

@@ -84,16 +84,18 @@ async fn register_and_issue_sends_correct_requests() {
     let client = IdentityClient::new(
         HttpsTransport::connect(&format!("http://{addr}")).expect("transport builds"),
     );
-    let token = client
-        .register_and_issue(
-            "AUTH0_AT",
-            &key,
-            Some("test-device"),
-            &Narrowing::default(),
-            Some(900),
-        )
+    let challenge = client
+        .register_challenge("AUTH0_AT", &key)
         .await
-        .expect("flow succeeds");
+        .expect("a challenge");
+    client
+        .register("AUTH0_AT", &key, &challenge, Some("test-device"))
+        .await
+        .expect("registered");
+    let token = client
+        .issue_token("AUTH0_AT", &key, &Narrowing::default(), Some(900))
+        .await
+        .expect("a token");
     assert_eq!(token.endpoint_token, "TOKEN.JWT.VALUE");
     assert_eq!(token.expires_in, 900);
 
@@ -132,13 +134,15 @@ async fn register_and_issue_sends_correct_requests() {
     assert_eq!(body["endpoint_id"], key.endpoint_id());
 }
 
-/// **The narrowing has to survive the convenience call.**
+/// **The narrowing has to reach the issue that follows a registration.**
 ///
-/// `register_and_issue` used to end in `issue_token(.., None, None, ..)`, so a
-/// caller registering a fresh key — which an agent runtime does for every task —
-/// got its first token at the full ceiling however carefully it had asked. That
-/// is the one path agent mode always takes, so it was the one where the request
-/// was furthest from reaching the wire.
+/// The convenience call this used to go through ended in
+/// `issue_token(.., None, None, ..)`, so a caller registering a fresh key —
+/// which an agent runtime does for every task — got its first token at the full
+/// ceiling however carefully it had asked. That is the one path agent mode
+/// always takes, so it was the one where the request was furthest from reaching
+/// the wire. (The call itself is gone now: it hid a registration's outcome
+/// behind the issue's.)
 #[tokio::test]
 async fn registering_carries_the_narrowing_to_the_issue() {
     let captured = Captured::default();
@@ -163,8 +167,16 @@ async fn registering_carries_the_narrowing_to_the_issue() {
         gateways: Some(vec!["ep:r1".to_owned()]),
         ..Default::default()
     };
+    let challenge = client
+        .register_challenge("AUTH0_AT", &key)
+        .await
+        .expect("a challenge");
     client
-        .register_and_issue("AUTH0_AT", &key, Some("test-device"), &narrowing, Some(900))
+        .register("AUTH0_AT", &key, &challenge, Some("test-device"))
+        .await
+        .expect("registered");
+    client
+        .issue_token("AUTH0_AT", &key, &narrowing, Some(900))
         .await
         .expect("a token");
 

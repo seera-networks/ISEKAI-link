@@ -105,6 +105,20 @@ pub enum Credential {
         /// this path on every run, where an attended client with a stored key
         /// passes `--register` once and never again.
         registered: Arc<OnceCell<String>>,
+        /// Whether this credential has ever tried to register.
+        ///
+        /// **What tells "never registered" from "registered, answer lost".**
+        /// `registered` only settles when the response came back; a
+        /// registration the server accepted whose reply was dropped — or whose
+        /// body would not parse — leaves it empty and the Endpoint in
+        /// existence. That is the same Endpoint nothing revokes and no sweep
+        /// reaches, arrived at by a different road.
+        ///
+        /// The enrolment route keeps this for the same reason, and has to work
+        /// harder with it: one Enrollment Key grows many Endpoints, so a `409`
+        /// there may be somebody else's. Agent mode's keypair is seconds old,
+        /// so any registration that landed is provably its own.
+        attempted: Arc<std::sync::atomic::AtomicBool>,
     },
     /// §8.8: an Enrollment Key, for a job with nobody at the keyboard.
     Enrollment(Enrollment),
@@ -122,6 +136,7 @@ impl Credential {
             source,
             register,
             registered: Arc::new(OnceCell::new()),
+            attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -144,25 +159,50 @@ impl Credential {
 }
 
 impl Credential {
-    /// Which Endpoint this credential registered on the Auth0 route, if it has.
+    /// Whether this credential may have brought an Endpoint into existence.
     ///
-    /// **The question is "is there something to revoke", and nothing else
-    /// answers it.** A run that failed before its first token — an unreachable
-    /// Identity, a refused narrowing — registered nothing, and revoking would
-    /// buy a round trip to be told so.
+    /// **The question is "could there be something to revoke", and the
+    /// pessimistic answer is the safe one.** A run that never reached its
+    /// registration created nothing, and revoking would buy a round trip to be
+    /// told so; a run whose registration was accepted and whose *answer* was
+    /// lost created an Endpoint that nothing else will ever clean up. Those two
+    /// are not distinguishable from here, so an attempt counts — and the
+    /// revocation reads `404` as the first case.
     ///
-    /// A `409` settles this cell too, and for agent mode that is still "ours":
+    /// A `409` settles the cell too, and for agent mode that is still "ours":
     /// the key was generated moments earlier, so the only way it can already be
-    /// registered is that our own attempt reached the server and the answer did
-    /// not come back. (The enrolment route cannot assume that, which is why it
-    /// tracks `by_us` separately — one Enrollment Key grows many Endpoints, and
-    /// a `409` there is usually somebody else's.)
-    pub fn registered_endpoint(&self) -> Option<&str> {
+    /// registered is that an attempt of our own reached the server. (The
+    /// enrolment route cannot assume that, which is why it tracks `by_us`
+    /// separately — one Enrollment Key grows many Endpoints, and a `409` there
+    /// is usually somebody else's.)
+    /// **A `bool`, because the identity is not this type's to give.** An
+    /// Endpoint ID is derived from the keypair, which lives in the config
+    /// beside this credential; returning one from here would mean inventing a
+    /// value for the attempted case, and an empty string reaching a URL is a
+    /// worse failure than the one being fixed.
+    pub fn may_have_registered(&self) -> bool {
         match self {
-            Credential::Auth0 { registered, .. } => registered.get().map(String::as_str),
+            Credential::Auth0 {
+                registered,
+                attempted,
+                ..
+            } => {
+                registered.get().is_some()
+                    || attempted.load(std::sync::atomic::Ordering::Relaxed)
+            }
             // Its own route out is `release_enrollment`, which gives the slot
             // back rather than revoking, and which tracks whose slot it is.
-            Credential::Enrollment(_) => None,
+            Credential::Enrollment(_) => false,
+        }
+    }
+
+    /// Record that a registration is about to be attempted.
+    ///
+    /// **Taken before the request, not after**, which is the whole point: what
+    /// is being guarded against is never learning the outcome.
+    pub(crate) fn mark_registration_attempt(&self) {
+        if let Credential::Auth0 { attempted, .. } = self {
+            attempted.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

@@ -241,6 +241,9 @@ async fn issue<T: ControlPlaneTransport>(
             source,
             register,
             registered,
+            // Set through `mark_registration_attempt` below, which takes it on
+            // the credential rather than from here.
+            attempted: _,
         } => {
             // The source when there is one, and only then the starting token:
             // this runs again every few minutes for the life of the session, so
@@ -284,6 +287,15 @@ async fn issue<T: ControlPlaneTransport>(
                     let challenge = client.register_challenge(&auth0, &cfg.key).await;
                     let registered = match challenge {
                         Ok(challenge) => {
+                            // **Here, and not one call earlier.** What this
+                            // guards against is never learning the outcome: a
+                            // registration the server accepts whose answer is
+                            // lost leaves the cell empty and the Endpoint in
+                            // existence. Marking before the *challenge* would
+                            // claim an Endpoint for every run that could not
+                            // reach Identity at all, and send its operator
+                            // hunting one that was never made.
+                            cfg.credential.mark_registration_attempt();
                             client
                                 .register(
                                     &auth0,

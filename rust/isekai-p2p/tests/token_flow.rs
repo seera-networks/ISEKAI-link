@@ -236,9 +236,8 @@ async fn a_registration_counts_even_when_the_issue_is_refused() {
         .await
         .expect_err("the issue is refused");
 
-    assert_eq!(
-        cfg.credential.registered_endpoint(),
-        Some(cfg.key.endpoint_id().as_str()),
+    assert!(
+        cfg.credential.may_have_registered(),
         "the Endpoint exists, so whatever cleans up has to be able to find it",
     );
     assert_eq!(
@@ -277,5 +276,59 @@ async fn retrying_after_a_refused_issue_does_not_register_again() {
     assert_eq!(
         *hits.0.lock().unwrap(),
         vec!["challenge", "register", "token", "token"],
+    );
+}
+
+/// **A registration whose answer is lost still made an Endpoint.**
+///
+/// `registered` only settles when the response comes back, so a dropped
+/// connection or a body that will not parse leaves it empty — and the Endpoint
+/// exists all the same. That is the leak this file's other test closes,
+/// arrived at by a different road: nothing revokes it and no sweep reaches it.
+/// The attempt is taken *before* the request for exactly this reason.
+#[tokio::test]
+async fn a_registration_whose_answer_is_lost_still_counts() {
+    let hits = Hits::default();
+    let app = Router::new()
+        .route("/v1/endpoints/register/challenge", post(challenge))
+        .route(
+            "/v1/endpoints/register",
+            // Accepted by the server, and the caller never finds out: a `200`
+            // whose body is not what `Registered` parses.
+            post(|State(s): State<Hits>| async move {
+                s.0.lock().unwrap().push("register".into());
+                Json(json!({ "unexpected": "shape" }))
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = config(format!("http://{addr}"), true);
+
+    issue_endpoint_token(&cfg)
+        .await
+        .expect_err("the registration's answer did not arrive");
+
+    assert!(
+        cfg.credential.may_have_registered(),
+        "an Endpoint may exist, and only whoever cleans up can find out",
+    );
+}
+
+/// **The other side of that pessimism, and the reason it is narrow.**
+///
+/// A run that could not reach Identity at all never asked for a registration —
+/// the challenge is its own call, and registering only follows one that
+/// succeeded. Claiming an Endpoint here would make every unreachable-Identity
+/// run end by telling its operator to go and revoke something that was never
+/// made.
+#[tokio::test]
+async fn a_run_that_never_asked_claims_nothing() {
+    let cfg = config("http://127.0.0.1:1".to_owned(), true);
+    issue_endpoint_token(&cfg).await.expect_err("nothing there");
+    assert!(
+        !cfg.credential.may_have_registered(),
+        "the challenge never came back, so no registration was ever attempted",
     );
 }
