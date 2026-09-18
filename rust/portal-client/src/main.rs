@@ -369,6 +369,22 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         whoami: args.whoami,
         pair: args.pair.is_some(),
         redeem: args.redeem.is_some(),
+        // **Named, not read.** Whether the key parses is a later question;
+        // this one is only whether the operator described a second authority,
+        // and the environment variable describes one as surely as the flag.
+        provisioning: args.provisioning_key_file.is_some()
+            || std::env::var_os(portal_core::ci::PROVISIONING_KEY_VAR).is_some(),
+        capability: args.capability.is_some() || args.listener.is_some(),
+        admin: args.issue_enrollment_key
+            || args.enrollment_keys
+            || args.enrollment_key_enrollments.is_some()
+            || args.revoke_enrollment_key.is_some()
+            || args.endpoints
+            || args.revoke_endpoint.is_some(),
+        login: args.login,
+        relays: args.relays,
+        gateway: !args.gateway.is_empty(),
+        task: args.task.is_some(),
     })?;
     let key_path = args.key.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
@@ -1066,7 +1082,8 @@ async fn config(
         protocol: args.protocol.clone(),
         // The task's name, so the audit log says which run made this Endpoint.
         // A device name would be a lie here: nothing about this key belongs to
-        // a device.
+        // a device. `--task` is refused without `--agent`, so this displaces
+        // nothing an attended run asked for.
         device_name: args.task.clone().or_else(|| args.device_name.clone()),
         token_ttl: None,
         key,
