@@ -215,8 +215,9 @@ impl Ledger {
     /// since `created_at` is the *original* creation and ours will look old
     /// from the second pass onwards.
     pub fn record(&mut self, key: GrantKey, grant_id: String, created_at: Option<&str>) -> bool {
-        if self.made.contains_key(&key) {
-            self.made.insert(key, grant_id);
+        if let std::collections::btree_map::Entry::Occupied(mut ours) = self.made.entry(key.clone())
+        {
+            ours.insert(grant_id);
             return true;
         }
         let existed_before = created_at
