@@ -70,9 +70,11 @@ pub enum Refusal {
     UnknownWindow { window: String },
     /// An attribute is missing, undeclared, or outside its range.
     Attribute(AttributeRefusal),
-    /// A `version` no newer than one already seen.
+    /// A `version` older than one already seen.
     ///
     /// Keyed on `access_lease_id`, because `version` is a per-lease sequence.
+    /// **Equal is not stale** — a snapshot repeats what is in force, so the same
+    /// row arriving again is the normal case rather than a replay.
     Stale { seen: i64 },
 }
 
@@ -86,7 +88,7 @@ impl std::fmt::Display for Refusal {
                 write!(f, "window `{window}` is not one this gateway understands")
             }
             Self::Attribute(inner) => write!(f, "{inner}"),
-            Self::Stale { seen } => write!(f, "version is no newer than {seen}"),
+            Self::Stale { seen } => write!(f, "version is older than {seen}"),
         }
     }
 }
@@ -187,8 +189,14 @@ impl Table {
     /// busier path; validating in one and not the other would let the common
     /// route be the unchecked one.
     pub fn check(&self, event: &PolicyEvent, policy: &GatewayPolicy) -> Result<Entry, Refusal> {
+        // **Strictly older, not "no newer".** Reconciling runs at startup and
+        // once per token lifetime against whatever is still in force, so the
+        // same row arrives again with the same version as a matter of course.
+        // Refusing an equal version made the second reconcile of an unchanged
+        // snapshot drop every policy it had just applied -- and at P3 that is a
+        // routine re-read revoking every live grant.
         if let Some(seen) = self.seen.get(&event.access_lease_id) {
-            if event.version <= *seen {
+            if event.version < *seen {
                 return Err(Refusal::Stale { seen: *seen });
             }
         }
@@ -225,6 +233,27 @@ impl Table {
             max_concurrent: constraints.and_then(|c| c.max_concurrent),
             grant_ttl: constraints.and_then(|c| c.grant_ttl),
         })
+    }
+
+    /// Apply one row, as the stream will.
+    ///
+    /// **The counterpart to [`check`](Self::check) being public.** Factoring the
+    /// validation out for P2 is pointless if the stream has no way to write the
+    /// result, and advancing the high-water mark is part of applying a row
+    /// rather than of checking it.
+    pub fn apply(&mut self, event: &PolicyEvent, policy: &GatewayPolicy) -> Result<(), Refusal> {
+        let entry = self.check(event, policy)?;
+        self.remember(event);
+        self.entries.insert(entry.access_lease_id.clone(), entry);
+        Ok(())
+    }
+
+    /// Drop one row, as a `policy.revoked` on the stream will.
+    ///
+    /// The mark is kept: the lease is gone, and an older grant for it must not
+    /// bring it back.
+    pub fn withdraw(&mut self, access_lease_id: &str) -> bool {
+        self.entries.remove(access_lease_id).is_some()
     }
 
     fn remember(&mut self, event: &PolicyEvent) {
@@ -357,17 +386,38 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_cannot_reinstate_a_dropped_lease() {
+    fn reconciling_an_unchanged_snapshot_changes_nothing() {
+        // **The regression.** Refusing an equal version made the second
+        // reconcile drop everything the first had applied -- and this runs at
+        // startup and once per token lifetime, so at P3 it would be a routine
+        // re-read revoking every live grant.
+        let mut table = Table::new();
+        let snap = snapshot(vec![granted("al_1", 1)]);
+        let first = table.reconcile(&snap, &policy());
+        let second = table.reconcile(&snap, &policy());
+        assert_eq!(first, second, "a second look changed the answer");
+        assert_eq!(second.applied, 1);
+        assert_eq!(second.dropped, 0);
+        assert!(second.refused.is_empty(), "{:?}", second.refused);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn an_older_version_cannot_reinstate_a_dropped_lease() {
         // The high-water mark outlives the entry on purpose: a lease that went
-        // away and whose old grant is replayed must not come back.
+        // away and whose *older* grant is replayed must not come back. The same
+        // version may -- a snapshot is authoritative about what is in force.
         let mut table = Table::new();
         table.reconcile(&snapshot(vec![granted("al_1", 5)]), &policy());
         table.reconcile(&snapshot(vec![]), &policy());
         assert!(table.is_empty());
 
-        let out = table.reconcile(&snapshot(vec![granted("al_1", 5)]), &policy());
+        let out = table.reconcile(&snapshot(vec![granted("al_1", 4)]), &policy());
         assert_eq!(out.applied, 0);
-        assert!(matches!(out.refused[0].1, Refusal::Stale { .. }));
+        assert!(matches!(out.refused[0].1, Refusal::Stale { seen: 5 }));
+
+        let back = table.reconcile(&snapshot(vec![granted("al_1", 5)]), &policy());
+        assert_eq!(back.applied, 1);
     }
 
     #[test]

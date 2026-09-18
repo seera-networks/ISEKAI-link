@@ -250,6 +250,23 @@ impl ValueSchema {
     }
 }
 
+impl ValueSchema {
+    /// Whether a JSON value is inside this range.
+    ///
+    /// **For the caller's parameters, which are not strings on the wire.** A
+    /// policy row's attributes are typed as strings by Identity, so
+    /// [`accepts`](Self::accepts) is enough for those; an operation's `params`
+    /// arrive from an agent as JSON once the PEP exists, and `202608` must not
+    /// become `"202608"` on its way to a schema that describes text. A
+    /// non-string is refused rather than stringified.
+    pub fn accepts_json(&self, value: &serde_json::Value) -> bool {
+        match value.as_str() {
+            Some(text) => self.accepts(text),
+            None => false,
+        }
+    }
+}
+
 /// One thing that may be done, with its statement and its bindings.
 #[derive(Debug, Clone)]
 pub struct Operation {
@@ -885,6 +902,68 @@ mod tests {
             .clone();
         assert!(month.accepts("2026-08"));
         assert!(!month.accepts("٢٠٢٦-٠٨"));
+    }
+
+    #[test]
+    fn a_statement_with_more_placeholders_than_bindings_is_refused() {
+        // **The check that pays for parsing at startup.** With the PEP
+        // deferred, the first execution is not in this release, so this would
+        // otherwise go unnoticed for months.
+        let err = parse(
+            r#"
+            [protocols."x"]
+            [[protocols."x".operations]]
+            name = "q"
+            sql  = "SELECT 1 WHERE a = $1 AND b = $2"
+            bind = ["$a"]
+            max_rows = 1
+            [protocols."x".operations.params]
+            a = { type = "string", pattern = "." }
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("$2"), "{err:#}");
+    }
+
+    #[test]
+    fn a_binding_the_statement_never_uses_is_refused() {
+        let err = parse(
+            r#"
+            [protocols."x"]
+            [[protocols."x".operations]]
+            name = "q"
+            sql  = "SELECT 1 WHERE a = $1"
+            bind = ["$a", "$b"]
+            max_rows = 1
+            [protocols."x".operations.params]
+            a = { type = "string", pattern = "." }
+            b = { type = "string", pattern = "." }
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("never uses"), "{err:#}");
+    }
+
+    #[test]
+    fn a_json_parameter_that_is_not_a_string_is_refused() {
+        // The param path takes JSON from the caller, so this is the check the
+        // attribute path gets from its wire type for free.
+        let p = policy(EXAMPLE);
+        let month = p
+            .protocol("pg-sales-ro-v1")
+            .unwrap()
+            .operation("query_sales")
+            .unwrap()
+            .params()["month"]
+            .clone();
+        assert!(month.accepts_json(&serde_json::json!("2026-08")));
+        for value in [
+            serde_json::json!(202608),
+            serde_json::json!(null),
+            serde_json::json!(["2026-08"]),
+        ] {
+            assert!(!month.accepts_json(&value), "{value} was accepted");
+        }
     }
 
     #[test]

@@ -774,7 +774,11 @@ pub struct PolicySnapshot {
     pub gateway: String,
     /// Hand to `GET /v1/policies/stream?after=<cursor>`.
     pub cursor: i64,
-    #[serde(default)]
+    /// **Required, deliberately.** An empty list is an instruction to drop
+    /// every row, so a `#[serde(default)]` here would turn a `200` whose body
+    /// has been renamed or reshaped into exactly that — the failure the rest of
+    /// this design goes out of its way to make impossible to write by accident.
+    /// Absent, the response fails to deserialize and the caller gets an error.
     pub items: Vec<PolicyEvent>,
 }
 
@@ -1007,23 +1011,6 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     /// **Revoked rows are hidden unless asked for**, which is why
     /// [`EndpointList::revoked_count`] exists and why anything showing this
     /// should show that too.
-    /// `GET /v1/policies` — everything in force for this Gateway
-    /// (identity spec §8.10.2).
-    ///
-    /// Series B: an Endpoint Token and a PoP, and **no permission** — the
-    /// distribution is scoped to whoever is named by the token, so there is
-    /// nothing else to authorize and no way to ask for another Gateway's rows.
-    pub async fn list_policies(
-        &self,
-        endpoint_token: &str,
-        key: &EndpointKey,
-    ) -> Result<PolicySnapshot, IdentityError> {
-        let path = "/v1/policies";
-        let pop = pop::sign_request(key, "GET", path, &[]);
-        self.request_raw("GET", path, Some(endpoint_token), Some(&pop), Vec::new())
-            .await
-    }
-
     pub async fn list_endpoints(
         &self,
         auth0_token: &str,
@@ -1084,6 +1071,23 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     /// **Best-effort at the end of a job.** The idle sweep is behind this, so a
     /// failure here costs a slot until then and nothing else; it is not a
     /// reason to fail work that otherwise succeeded.
+    /// `GET /v1/policies` — everything in force for this Gateway
+    /// (identity spec §8.10.2).
+    ///
+    /// Series B: an Endpoint Token and a PoP, and **no permission** — the
+    /// distribution is scoped to whoever is named by the token, so there is
+    /// nothing else to authorize and no way to ask for another Gateway's rows.
+    pub async fn list_policies(
+        &self,
+        endpoint_token: &str,
+        key: &EndpointKey,
+    ) -> Result<PolicySnapshot, IdentityError> {
+        let path = "/v1/policies";
+        let pop = pop::sign_request(key, "GET", path, &[]);
+        self.request_raw("GET", path, Some(endpoint_token), Some(&pop), Vec::new())
+            .await
+    }
+
     pub async fn revoke_endpoint(
         &self,
         auth: RevokeAuth<'_>,

@@ -319,6 +319,28 @@ struct Args {
 /// Endpoint, and the answer lives on the proxy — a Peer Listener is what a peer
 /// connects *through*, and standing one up to ask would put a second row under
 /// this Endpoint for every client that then looks one up.
+async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Result<()> {
+    // **Settled on the arguments, before anything authenticates.** A half-given
+    // binding is a typo, and finding it out after a sign-in and an Identity
+    // round trip tells the operator nothing extra. `portal-client` checks a
+    // ticket's authority the same way and for the same reason.
+    let binding = provisioning_binding(args)?;
+    let cfg = config(args, tokens).await?;
+    // **These enrol, and still must not give the slot back.** `grant_admin`
+    // issues an Endpoint Token, which on the unattended path is what registers,
+    // so it does spend a slot. But what these runs make — a Provisioning Key —
+    // **belongs to the Endpoint and outlives the process**: revoking on the way
+    // out makes the key invalid the moment it is handed over, because §8.13.6
+    // counts a revoked owner among the uniform refusals.
+    //
+    // So the slot stays taken, and it is not leaked: it is held by the Endpoint
+    // that owns the key. Retiring it means revoking the key and then the
+    // Endpoint, which is a decision rather than a process exiting.
+    grant_admin(args, &cfg, binding.as_ref()).await
+}
+
+/// The P2P configuration these arguments describe, authenticated however this
+/// installation is.
 /// Read what the control plane says is in force, and build the table from it.
 ///
 /// **P1 of `docs/portal_gateway_plan.md`: this makes no grant.** It reads,
@@ -342,6 +364,17 @@ async fn reconcile_policies(
         .await
         .context("read the policies in force")?;
 
+    // **The one field that is confirmation rather than content.** There is no
+    // way to ask for another Gateway's rows, so a mismatch is not a permission
+    // problem -- it means this is not the answer to the question that was
+    // asked, and applying it would hold to somebody else's policy.
+    let me = cfg.endpoint_id();
+    anyhow::ensure!(
+        snapshot.gateway == me,
+        "the control plane answered with policy for {}, not for this endpoint ({me})",
+        snapshot.gateway,
+    );
+
     let mut table = portal_core::gateway::Table::new();
     let outcome = table.reconcile(&snapshot, policy);
 
@@ -360,31 +393,12 @@ async fn reconcile_policies(
     for (lease, why) in &outcome.refused {
         tracing::warn!(lease, "policy: not applied: {why}");
     }
+    // **The table is dropped here on purpose.** Nothing consults it yet, and
+    // keeping one alive would invite something to start. It is held for the
+    // life of the process from P2, when the stream has somewhere to write.
     Ok(())
 }
 
-async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Result<()> {
-    // **Settled on the arguments, before anything authenticates.** A half-given
-    // binding is a typo, and finding it out after a sign-in and an Identity
-    // round trip tells the operator nothing extra. `portal-client` checks a
-    // ticket's authority the same way and for the same reason.
-    let binding = provisioning_binding(args)?;
-    let cfg = config(args, tokens).await?;
-    // **These enrol, and still must not give the slot back.** `grant_admin`
-    // issues an Endpoint Token, which on the unattended path is what registers,
-    // so it does spend a slot. But what these runs make — a Provisioning Key —
-    // **belongs to the Endpoint and outlives the process**: revoking on the way
-    // out makes the key invalid the moment it is handed over, because §8.13.6
-    // counts a revoked owner among the uniform refusals.
-    //
-    // So the slot stays taken, and it is not leaked: it is held by the Endpoint
-    // that owns the key. Retiring it means revoking the key and then the
-    // Endpoint, which is a decision rather than a process exiting.
-    grant_admin(args, &cfg, binding.as_ref()).await
-}
-
-/// The P2P configuration these arguments describe, authenticated however this
-/// installation is.
 async fn config(args: &Args, tokens: &std::path::Path) -> anyhow::Result<P2pConfig> {
     // **Authentication first, then the key.** The struct literal this replaced
     // evaluated the token before the key, so a run with neither a sign-in nor a
