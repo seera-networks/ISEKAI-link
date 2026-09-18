@@ -49,9 +49,12 @@ pub struct P2pConfig {
     /// What the Endpoint Token should be narrowed to, and which Gateways
     /// should hear about this Endpoint.
     ///
-    /// **Only asked for at issue.** A renewal cannot widen, so it carries none
-    /// — see `IdentityClient::refresh_token`. Leaving this at its default is
-    /// what every caller before agent mode did, and gets the ceiling.
+    /// **The two halves travel differently.** A renewal cannot widen, so the
+    /// remembered axes — permissions and protocols — are asked for once, at
+    /// issue. The selector is not remembered and goes out again at every
+    /// renewal; see `IdentityClient::refresh_token`. Leaving this at its
+    /// default is what every caller before agent mode did, and gets the
+    /// ceiling.
     pub narrowing: Narrowing,
 }
 
