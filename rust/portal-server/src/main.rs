@@ -426,8 +426,22 @@ async fn follow_policies(
     let mut table = portal_core::gateway::Table::new();
     let mut backoff = POLICY_RETRY_MIN;
     loop {
-        match follow_once(&cfg, &policy, &mut table).await {
-            Ok(()) => backoff = POLICY_RETRY_MIN,
+        let began = tokio::time::Instant::now();
+        match follow_once(&cfg, &policy, &mut table, &shutdown).await {
+            Ok(()) => {
+                backoff = POLICY_RETRY_MIN;
+                // **A floor even on success.** The reader turns a mid-stream
+                // transport error into a closed channel, which arrives here as
+                // an ordinary end -- so a stream that dies immediately would
+                // spin, and each turn costs two Endpoint Tokens.
+                let held_for = began.elapsed();
+                if held_for < POLICY_MIN_STREAM {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(POLICY_MIN_STREAM - held_for) => {}
+                    }
+                }
+            }
             Err(e) => {
                 // **The table is left alone.** A read that failed says nothing
                 // about what is in force, and an empty answer is what says
@@ -438,9 +452,23 @@ async fn follow_policies(
                     held = table.len(),
                     "policy: could not follow the control plane: {e:#}",
                 );
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = tokio::time::sleep(backoff) => {}
+                // **Swept while waiting, too.** The sweep used to live only
+                // inside the stream loop, so an outage -- exactly when the
+                // control plane cannot tell us anything -- was when lapsed
+                // leases were held longest. This is the only mechanism that
+                // ever notices expiry.
+                let deadline = tokio::time::Instant::now() + backoff;
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep_until(deadline) => break,
+                        _ = tokio::time::sleep(POLICY_EXPIRY_SWEEP) => {
+                            let gone = table.expire_now();
+                            if gone > 0 {
+                                tracing::info!(gone, held = table.len(), "policy: leases lapsed");
+                            }
+                        }
+                    }
                 }
                 backoff = policy_retry_after(backoff);
                 continue;
@@ -457,10 +485,11 @@ async fn follow_once(
     cfg: &P2pConfig,
     policy: &portal_core::gateway::GatewayPolicy,
     table: &mut portal_core::gateway::Table,
+    shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
     let cursor = reconcile_policies(cfg, policy, table).await?;
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
-    let mut events = isekai_p2p::policy_stream(cfg, &token, Some(cursor)).await?;
+    let mut stream = isekai_p2p::policy_stream(cfg, &token, Some(cursor)).await?;
 
     // **Its own clock, because expiry is never streamed.** A lease that simply
     // runs out writes no row at Identity, so nothing arrives to say so; waiting
@@ -469,13 +498,18 @@ async fn follow_once(
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            // **Answered here, not only between passes.** Without it, Ctrl+C
+            // left this holding the stream for up to a token lifetime -- and on
+            // H3 that keeps a QUIC connection alive for `drain_msquic` to time
+            // out on.
+            _ = shutdown.cancelled() => return Ok(()),
             _ = sweep.tick() => {
                 let gone = table.expire_now();
                 if gone > 0 {
                     tracing::info!(gone, held = table.len(), "policy: leases lapsed");
                 }
             }
-            event = events.recv() => match event {
+            event = stream.recv() => match event {
                 Some(event) => apply_policy_event(table, policy, &event),
                 // The stream is over. Identity closes it at the token's expiry,
                 // so this is the ordinary way round the loop.
@@ -504,10 +538,14 @@ fn apply_policy_event(
     // **A revocation is obeyed without being checked.** Validation decides
     // whether a row may be *applied*; refusing to withdraw one because its
     // attributes no longer parse would keep a policy the centre has withdrawn.
-    let held = table.withdraw(lease);
+    // `was_held` rather than `held`: the applied log reports a count, and the
+    // same name meaning a bool here reads as "held=false" for a lease that was
+    // never there.
+    let was_held = table.withdraw(lease, event.version);
     tracing::info!(
         lease,
-        held,
+        was_held,
+        held = table.len(),
         reason = event.reason.as_deref().unwrap_or("unstated"),
         "policy: withdrawn"
     );
@@ -525,6 +563,13 @@ const POLICY_EXPIRY_SWEEP: Duration = Duration::from_secs(60);
 /// Backed off rather than fixed for the reason the relay measurements are: a
 /// control plane that cannot be reached does not improve by being asked every
 /// few seconds, and the log fills with the same line.
+/// The shortest a pass may take before another is started.
+///
+/// A mid-stream transport error reaches the follower as an ordinary end, so
+/// without a floor a stream that dies at once would spin -- and each turn costs
+/// an `/v1/policies` read and an Endpoint Token.
+const POLICY_MIN_STREAM: Duration = Duration::from_secs(5);
+
 const POLICY_RETRY_MIN: Duration = Duration::from_secs(5);
 const POLICY_RETRY_MAX: Duration = Duration::from_secs(300);
 
@@ -1262,8 +1307,6 @@ mod tests {
             assert!(d <= POLICY_RETRY_MAX, "backed off to {d:?}");
         }
     }
-
-    use super::*;
 
     fn args_with(oidc: Option<&str>, subject: Option<&str>) -> Args {
         let mut args: Args = argh::FromArgs::from_args(&["portal-server"], &[]).expect("defaults");

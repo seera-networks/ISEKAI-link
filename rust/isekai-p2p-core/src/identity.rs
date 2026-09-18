@@ -1011,66 +1011,6 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     /// **Revoked rows are hidden unless asked for**, which is why
     /// [`EndpointList::revoked_count`] exists and why anything showing this
     /// should show that too.
-    pub async fn list_endpoints(
-        &self,
-        auth0_token: &str,
-        status: Option<&str>,
-        cursor: Option<&str>,
-    ) -> Result<EndpointList, IdentityError> {
-        // **Percent-encoded.** A cursor is the server's opaque value and may
-        // carry anything; splicing it in raw would let it end the query string
-        // or add a parameter, and the failure would look like the listing
-        // simply ignoring the page.
-        let mut query = Vec::new();
-        if let Some(status) = status {
-            query.push(format!("status={}", encode_query(status)));
-        }
-        if let Some(cursor) = cursor {
-            query.push(format!("cursor={}", encode_query(cursor)));
-        }
-        let path = if query.is_empty() {
-            "/v1/endpoints".to_owned()
-        } else {
-            format!("/v1/endpoints?{}", query.join("&"))
-        };
-        self.request(
-            "GET",
-            &path,
-            IdentityAuth::Auth0(auth0_token),
-            None,
-            Vec::new(),
-        )
-        .await
-    }
-
-    /// §8.1.4 — one Endpoint, and what else holds its key.
-    pub async fn get_endpoint(
-        &self,
-        auth0_token: &str,
-        endpoint_id: &str,
-    ) -> Result<EndpointDetail, IdentityError> {
-        self.request(
-            "GET",
-            &format!("/v1/endpoints/{endpoint_id}"),
-            IdentityAuth::Auth0(auth0_token),
-            None,
-            Vec::new(),
-        )
-        .await
-    }
-
-    // ---- §8.7: revocation ----
-
-    /// §8.7 — revoke an Endpoint, as its owner or as itself.
-    ///
-    /// [`RevokeAuth`] carries the asymmetry: the Auth0 route states a reason,
-    /// the key route states none and gets `enrollment_released`. The key route
-    /// signs a PoP, which is what confines it to **this** Endpoint — a leaked
-    /// key alone stops nothing, including the other Endpoints it grew.
-    ///
-    /// **Best-effort at the end of a job.** The idle sweep is behind this, so a
-    /// failure here costs a slot until then and nothing else; it is not a
-    /// reason to fail work that otherwise succeeded.
     /// `GET /v1/policies/stream` — the changes, as they happen
     /// (identity spec §8.10.3).
     ///
@@ -1135,8 +1075,12 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
             return Err(IdentityError::Api {
                 status,
                 body: String::from_utf8_lossy(&body).into_owned(),
-                // `503 policy-stream-capacity` is the one worth backing off
-                // for, and the header is where the server says how long.
+                // **None because this path cannot see headers**, not because
+                // there are none to read. `open_stream` returns a status and a
+                // body, so a `Retry-After` on `503 policy-stream-capacity` is
+                // not available here; the caller's own backoff is what paces a
+                // retry. Widening the trait to carry them is the fix if that
+                // stops being enough.
                 retry_after: None,
             });
         }
@@ -1152,14 +1096,19 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
                         break;
                     }
                 }
+                // **Drained first, then measured.** The cap is on one
+                // unterminated line, not on how much arrives at once: a full
+                // replay (`after = None`) can deliver far more than this in a
+                // single chunk, all of it complete lines, and checking first
+                // ended the stream on a buffer that was about to be emptied.
+                let mut ready = Vec::new();
+                drain_policy_lines(&mut buffer, &mut ready);
                 if buffer.len() > MAX_POLICY_LINE {
                     tracing::warn!(
                         "a policy line exceeded {MAX_POLICY_LINE} bytes; ending the stream"
                     );
                     break;
                 }
-                let mut ready = Vec::new();
-                drain_policy_lines(&mut buffer, &mut ready);
                 for event in ready {
                     if events.send(event).await.is_err() {
                         return;
@@ -1170,6 +1119,71 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
         Ok(receiver)
     }
 
+    /// §8.1.3 — the Endpoints this caller owns.
+    ///
+    /// **Revoked rows are hidden unless asked for**, which is why
+    /// [`EndpointList::revoked_count`] exists and why anything showing this
+    /// should show that too.
+    pub async fn list_endpoints(
+        &self,
+        auth0_token: &str,
+        status: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<EndpointList, IdentityError> {
+        // **Percent-encoded.** A cursor is the server's opaque value and may
+        // carry anything; splicing it in raw would let it end the query string
+        // or add a parameter, and the failure would look like the listing
+        // simply ignoring the page.
+        let mut query = Vec::new();
+        if let Some(status) = status {
+            query.push(format!("status={}", encode_query(status)));
+        }
+        if let Some(cursor) = cursor {
+            query.push(format!("cursor={}", encode_query(cursor)));
+        }
+        let path = if query.is_empty() {
+            "/v1/endpoints".to_owned()
+        } else {
+            format!("/v1/endpoints?{}", query.join("&"))
+        };
+        self.request(
+            "GET",
+            &path,
+            IdentityAuth::Auth0(auth0_token),
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// §8.1.4 — one Endpoint, and what else holds its key.
+    pub async fn get_endpoint(
+        &self,
+        auth0_token: &str,
+        endpoint_id: &str,
+    ) -> Result<EndpointDetail, IdentityError> {
+        self.request(
+            "GET",
+            &format!("/v1/endpoints/{endpoint_id}"),
+            IdentityAuth::Auth0(auth0_token),
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    // ---- §8.7: revocation ----
+
+    /// §8.7 — revoke an Endpoint, as its owner or as itself.
+    ///
+    /// [`RevokeAuth`] carries the asymmetry: the Auth0 route states a reason,
+    /// the key route states none and gets `enrollment_released`. The key route
+    /// signs a PoP, which is what confines it to **this** Endpoint — a leaked
+    /// key alone stops nothing, including the other Endpoints it grew.
+    ///
+    /// **Best-effort at the end of a job.** The idle sweep is behind this, so a
+    /// failure here costs a slot until then and nothing else; it is not a
+    /// reason to fail work that otherwise succeeded.
     /// `GET /v1/policies` — everything in force for this Gateway
     /// (identity spec §8.10.2).
     ///
@@ -1187,6 +1201,16 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
             .await
     }
 
+    /// §8.7 — revoke an Endpoint, as its owner or as itself.
+    ///
+    /// [`RevokeAuth`] carries the asymmetry: the Auth0 route states a reason,
+    /// the key route states none and gets `enrollment_released`. The key route
+    /// signs a PoP, which is what confines it to **this** Endpoint — a leaked
+    /// key alone stops nothing, including the other Endpoints it grew.
+    ///
+    /// **Best-effort at the end of a job.** The idle sweep is behind this, so a
+    /// failure here costs a slot until then and nothing else; it is not a
+    /// reason to fail work that otherwise succeeded.
     pub async fn revoke_endpoint(
         &self,
         auth: RevokeAuth<'_>,
@@ -1479,6 +1503,35 @@ fn now_rfc3339() -> Result<String, IdentityError> {
         .map_err(|_| IdentityError::Time)
 }
 
+/// The largest policy line worth buffering.
+///
+/// A line that never ends would grow the buffer without limit. Ending the
+/// stream is what every other failure here does, so the caller already knows
+/// how to recover — by reconciling and opening a new one.
+const MAX_POLICY_LINE: usize = 64 * 1024;
+
+/// Split what has arrived into whole lines, dropping `keepalive` and anything
+/// unreadable.
+///
+/// **One bad line does not end the stream.** The next may be fine, and the
+/// reconciliation is what this is checked against in any case.
+fn drain_policy_lines(buffer: &mut Vec<u8>, out: &mut Vec<PolicyEvent>) {
+    while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=end).collect();
+        let line = &line[..line.len() - 1];
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<PolicyEvent>(line) {
+            Ok(event) => out.push(event),
+            // `keepalive` has no lease and lands here. It carries nothing, and
+            // its only meaning is that the stream is still open — which is
+            // already said by the fact that a chunk arrived.
+            Err(e) => tracing::trace!("ignoring a policy line: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,34 +1573,5 @@ mod tests {
         assert_eq!(tok.endpoint_token, "eyJ...");
         assert_eq!(tok.expires_in, 900);
         assert_eq!(tok.permissions, vec!["peer-connect:initiate"]);
-    }
-}
-
-/// The largest policy line worth buffering.
-///
-/// A line that never ends would grow the buffer without limit. Ending the
-/// stream is what every other failure here does, so the caller already knows
-/// how to recover — by reconciling and opening a new one.
-const MAX_POLICY_LINE: usize = 64 * 1024;
-
-/// Split what has arrived into whole lines, dropping `keepalive` and anything
-/// unreadable.
-///
-/// **One bad line does not end the stream.** The next may be fine, and the
-/// reconciliation is what this is checked against in any case.
-fn drain_policy_lines(buffer: &mut Vec<u8>, out: &mut Vec<PolicyEvent>) {
-    while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
-        let line: Vec<u8> = buffer.drain(..=end).collect();
-        let line = &line[..line.len() - 1];
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_slice::<PolicyEvent>(line) {
-            Ok(event) => out.push(event),
-            // `keepalive` has no lease and lands here. It carries nothing, and
-            // its only meaning is that the stream is still open — which is
-            // already said by the fact that a chunk arrived.
-            Err(e) => tracing::trace!("ignoring a policy line: {e}"),
-        }
     }
 }

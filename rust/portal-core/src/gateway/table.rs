@@ -287,9 +287,14 @@ impl Table {
 
     /// Drop one row, as a `policy.revoked` on the stream will.
     ///
-    /// The mark is kept: the lease is gone, and an older grant for it must not
-    /// bring it back.
-    pub fn withdraw(&mut self, access_lease_id: &str) -> bool {
+    /// `version` is the revocation's own, and it **advances the high-water
+    /// mark**. Without that, a `policy.granted v4` re-delivered after a
+    /// `policy.revoked v5` is not older than anything remembered — the mark
+    /// still said 4 — so the row came back. Re-delivery is exactly what the
+    /// rollback rule is for.
+    pub fn withdraw(&mut self, access_lease_id: &str, version: i64) -> bool {
+        let seen = self.seen.entry(access_lease_id.to_owned()).or_default();
+        *seen = (*seen).max(version);
         self.entries.remove(access_lease_id).is_some()
     }
 
@@ -527,9 +532,26 @@ mod tests {
             Err(Refusal::Stale { seen: 1 })
         ));
 
-        assert!(table.withdraw("al_1"));
-        assert!(!table.withdraw("al_1"));
+        assert!(table.withdraw("al_1", 2));
+        assert!(!table.withdraw("al_1", 2));
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn a_grant_redelivered_after_a_revocation_does_not_come_back() {
+        // **Re-delivery is what the rollback rule is for.** The stream replays
+        // nothing, but a reconnect can carry a row the other path already
+        // withdrew, and the revocation's version is what makes the older grant
+        // older than something.
+        let mut table = Table::new();
+        table.apply(&granted("al_1", 4), &policy()).unwrap();
+        table.withdraw("al_1", 5);
+        assert!(table.is_empty());
+
+        assert!(matches!(
+            table.apply(&granted("al_1", 4), &policy()),
+            Err(Refusal::Stale { seen: 5 })
+        ));
     }
 
     #[test]
