@@ -37,6 +37,10 @@ pub use config::{
     issue_endpoint_token, list_policies, load_or_generate_key, policy_stream, proxy_client,
     P2pConfig, PolicyStream,
 };
+// **A field of `P2pConfig` has to be nameable.** `portal-client` depends on
+// this crate alone, so without the re-export agent mode could only ever write
+// `Default::default()` -- the ceiling, which is the thing it exists to avoid.
+pub use isekai_p2p_core::identity::Narrowing;
 pub use initiator::{InitiatorSession, PeerDirectory};
 pub use listener::{
     AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,

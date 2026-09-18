@@ -439,7 +439,18 @@ async fn refresh<T: ControlPlaneTransport>(
         .await
         .context("could not obtain a renewal challenge")?;
     client
-        .refresh_token(auth, &cfg.key, &challenge, cfg.token_ttl)
+        // **The selector is re-sent, unlike the other two axes.** The server
+        // remembers a narrowing of permissions and protocols and does not
+        // remember this one, so a renewal that stayed quiet about it would
+        // renew the lease at every Gateway offering the class — undoing at the
+        // first renewal what the issue had asked for.
+        .refresh_token(
+            auth,
+            &cfg.key,
+            &challenge,
+            cfg.narrowing.gateways.as_deref(),
+            cfg.token_ttl,
+        )
         .await
         .context("could not renew the endpoint token")
 }

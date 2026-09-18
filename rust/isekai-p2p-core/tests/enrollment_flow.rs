@@ -295,7 +295,7 @@ async fn renewing_mints_one_assertion_and_signs_a_pop() {
         .await
         .expect("refresh challenge");
     let token = client
-        .refresh_token(auth, &key, &challenge, None)
+        .refresh_token(auth, &key, &challenge, None, None)
         .await
         .expect("refresh");
     assert_eq!(token.endpoint_token, "TOKEN.2");
@@ -329,6 +329,71 @@ async fn renewing_mints_one_assertion_and_signs_a_pop() {
 
     // Renewal narrows monotonically; asking for the ceiling back is what
     // re-issuing is for, so nothing here requests permissions or protocols.
+    assert!(body["requested_permissions"].is_null());
+    assert!(body["requested_protocols"].is_null());
+    // And with no selector given, none is sent.
+    assert!(body["requested_gateways"].is_null());
+}
+
+/// **The lease selector is the one axis a renewal must repeat.**
+///
+/// The server remembers a narrowing of permissions and protocols and says
+/// outright that it does not remember this one: leaving it out renews the lease
+/// at every Gateway offering the class. A caller that narrowed at issue and then
+/// went quiet would spread its grants across all of them from the first renewal
+/// onwards — which is the opposite of what asking for one Gateway meant.
+#[tokio::test]
+async fn a_renewal_repeats_the_lease_selector() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/tokens/endpoint/refresh/challenge",
+            post(
+                |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
+                    record(&s, "/v1/tokens/endpoint/refresh/challenge", h, b).await;
+                    Json(challenge_body())
+                },
+            ),
+        )
+        .route(
+            "/v1/tokens/endpoint/refresh",
+            post(
+                |State(s): State<Captured>, h: HeaderMap, b: Bytes| async move {
+                    record(&s, "/v1/tokens/endpoint/refresh", h, b).await;
+                    Json(json!({
+                        "endpoint_token": "TOKEN.2",
+                        "token_type": "Bearer",
+                        "expires_in": 900,
+                        "endpoint_id": "ep:abc",
+                        "permissions": ["peer-connect:initiate"],
+                        "protocols": ["isekai-portal-v1"],
+                    }))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+
+    let client = serve(app).await;
+    let key = EndpointKey::generate();
+    let auth = enrolment("enr1_SECRET").with_assertion("OIDC.JWT");
+    let challenge = client
+        .refresh_challenge(auth, &key.endpoint_id())
+        .await
+        .expect("refresh challenge");
+    let gateways = vec!["ep:r1".to_owned()];
+    client
+        .refresh_token(auth, &key, &challenge, Some(&gateways), None)
+        .await
+        .expect("refresh");
+
+    let reqs = captured.0.lock().unwrap();
+    let (_, _, body) = reqs
+        .iter()
+        .find(|(path, _, _)| path == "/v1/tokens/endpoint/refresh")
+        .expect("the refresh was made");
+    assert_eq!(body["requested_gateways"], json!(["ep:r1"]));
+    // Still not these two: they are remembered, and re-sending them is how a
+    // caller would widen back towards the ceiling by accident.
     assert!(body["requested_permissions"].is_null());
     assert!(body["requested_protocols"].is_null());
 }

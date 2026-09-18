@@ -253,11 +253,31 @@ pub struct Registration {
     pub registered_at: String,
 }
 
-/// What a token is asked to be narrowed to, at issue.
+/// What a token is asked to be narrowed to.
 ///
-/// **Absent is not the same as empty.** `None` asks for nothing in particular
-/// and gets the ceiling; `Some(vec![])` asks for none of that axis, which is a
-/// different request and one the server is entitled to refuse.
+/// # The two halves obey different rules
+///
+/// **`permissions` and `protocols` are remembered; `gateways` is not.**
+///
+/// A renewal returns `the current ceiling ∩ the token being refreshed`, so a
+/// narrowing on those two axes survives *by not being re-sent* — which is why
+/// [`refresh_token`](IdentityClient::refresh_token) takes none of them.
+///
+/// `gateways` is not a claim on the token at all. It selects which
+/// entitlements' leases to start, and **the server states outright that it must
+/// be given on every renewal**: omitting it renews the lease at every Gateway
+/// offering the class. Treating the two halves alike is how a caller that named
+/// one Gateway ends up with grants at all of them from the first renewal
+/// onwards.
+///
+/// # Absent is not the same as empty
+///
+/// `None` asks for nothing in particular and gets the ceiling.
+/// `Some(vec![])` asks for *none* of that axis — and **the server takes it
+/// literally**: a token with no protocols is issued, starts no lease, and can
+/// never connect. It is not refused, so a caller building this list from a
+/// filter that matched nothing gets a `200` and a failure that surfaces much
+/// later as "the grant never arrived".
 ///
 /// Narrowing never widens: what is asked for is intersected with the ceiling
 /// the user's entitlements set, so this cannot reach past them.
@@ -267,12 +287,14 @@ pub struct Narrowing {
     pub permissions: Option<Vec<String>>,
     /// The protocol classes this token should carry.
     pub protocols: Option<Vec<String>>,
-    /// **Not a claim.** Which entitlements' leases to start — the selector the
-    /// distribution uses to decide which Gateways hear about this Endpoint.
+    /// **Not a claim, and not remembered.** Which entitlements' leases to start
+    /// — the selector the distribution uses to decide which Gateways hear about
+    /// this Endpoint.
     ///
     /// Omitting it starts a lease at *every* Gateway offering the class, which
     /// is how grants spread further than a task needs. Naming them is the
-    /// intended operation.
+    /// intended operation — **on every renewal as well as at issue**, because
+    /// unlike the other two axes the server does not carry this one forward.
     pub gateways: Option<Vec<String>>,
 }
 
@@ -951,8 +973,15 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
     ///
     /// **Renewal never widens.** The result is
     /// `current ceiling ∩ the token being refreshed`, monotonically, so
-    /// `requested_*` is not sent: it exists only to narrow further, and asking
-    /// for the ceiling back is what re-issuing (§8.2.1) is for.
+    /// `requested_permissions` and `requested_protocols` are not sent: they
+    /// exist only to narrow further, and asking for the ceiling back is what
+    /// re-issuing (§8.2.1) is for.
+    ///
+    /// **`gateways` is the exception, and not optional in practice.** It is a
+    /// lease selector rather than a claim, and the server does not carry it
+    /// forward — omitting it renews the lease at *every* Gateway offering the
+    /// class. A caller that narrowed at issue and then stopped saying so
+    /// spreads its grants across all of them from the first renewal onwards.
     ///
     /// PoP is required here whichever credential is used — §8.8.7 substitutes
     /// for the Auth0 half of §17's pair and leaves the key-possession half
@@ -962,6 +991,7 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
         auth: IdentityAuth<'_>,
         key: &EndpointKey,
         challenge: &Challenge,
+        gateways: Option<&[String]>,
         ttl: Option<i64>,
     ) -> Result<EndpointToken, IdentityError> {
         let endpoint_id = key.endpoint_id();
@@ -973,6 +1003,12 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
             "timestamp": timestamp,
             "signature": signature,
         });
+        // **Re-sent every time, unlike the other two axes.** The server does
+        // not remember this one: leaving it out renews the lease at every
+        // Gateway offering the class.
+        if let Some(g) = gateways {
+            body["requested_gateways"] = json!(g);
+        }
         if let Some(t) = ttl {
             body["ttl"] = json!(t);
         }
