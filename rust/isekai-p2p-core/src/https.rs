@@ -41,6 +41,59 @@ impl HttpsTransport {
     }
 }
 
+impl crate::proxy::EventStreamTransport for HttpsTransport {
+    /// **The other half of the pair, and it was missing.** Only the H3
+    /// transport implemented this, so a deployment reaching Identity over
+    /// TCP+TLS — which `P2pConfig::identity_http3` makes a runtime choice —
+    /// had no way to hold a stream open at all. Everything else on this
+    /// transport works; the absence showed up only when something tried to
+    /// subscribe.
+    async fn open_stream(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> anyhow::Result<(u16, tokio::sync::mpsc::Receiver<anyhow::Result<Vec<u8>>>)> {
+        let method: reqwest::Method = method.parse().context("invalid HTTP method")?;
+        let mut req = self
+            .http
+            .request(method, format!("{}{path}", self.base_url));
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        let resp = req.send().await.context("HTTPS request failed")?;
+        let status = resp.status().as_u16();
+
+        // One chunk at a time, matching the H3 transport. A depth of one is
+        // deliberate: the reader reacts to each event, and buffering ahead of
+        // it would hide that it had stopped keeping up — which is the one thing
+        // a policy subscriber must not do quietly.
+        let (chunks, receiver) = tokio::sync::mpsc::channel(1);
+        let mut resp = resp;
+        tokio::spawn(async move {
+            loop {
+                let chunk = match resp.chunk().await {
+                    Ok(Some(chunk)) => chunk,
+                    // The response ended. Dropping the sender is how the reader
+                    // finds out, and it means the same thing either way: the
+                    // stream is over and it is time to reconnect.
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = chunks.send(Err(anyhow::anyhow!("{e}"))).await;
+                        return;
+                    }
+                };
+                if chunks.send(Ok(chunk.to_vec())).await.is_err() {
+                    // Nobody is reading any more, so stop pulling the body,
+                    // which also ends the request.
+                    return;
+                }
+            }
+        });
+        Ok((status, receiver))
+    }
+}
+
 impl ControlPlaneTransport for HttpsTransport {
     async fn send(
         &self,

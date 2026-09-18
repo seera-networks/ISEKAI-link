@@ -33,6 +33,8 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use argh::FromArgs;
 use isekai_p2p::agent::{BindingView, ProvisioningBinding};
+use std::time::Duration;
+
 use isekai_p2p::{load_or_generate_key, AcceptPolicy, P2pConfig};
 use tokio_util::sync::CancellationToken;
 
@@ -353,7 +355,8 @@ async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Res
 async fn reconcile_policies(
     cfg: &P2pConfig,
     policy: &portal_core::gateway::GatewayPolicy,
-) -> anyhow::Result<()> {
+    table: &mut portal_core::gateway::Table,
+) -> anyhow::Result<i64> {
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
 
     // **Propagated, never rendered as an empty snapshot.** An empty list is an
@@ -375,7 +378,6 @@ async fn reconcile_policies(
         snapshot.gateway,
     );
 
-    let mut table = portal_core::gateway::Table::new();
     let outcome = table.reconcile(&snapshot, policy);
 
     tracing::info!(
@@ -393,10 +395,148 @@ async fn reconcile_policies(
     for (lease, why) in &outcome.refused {
         tracing::warn!(lease, "policy: not applied: {why}");
     }
-    // **The table is dropped here on purpose.** Nothing consults it yet, and
-    // keeping one alive would invite something to start. It is held for the
-    // life of the process from P2, when the stream has somewhere to write.
-    Ok(())
+    Ok(snapshot.cursor)
+}
+
+/// Keep the table in step with the control plane, for as long as the process
+/// runs.
+///
+/// ```text
+/// reconcile  ->  stream from its cursor  ->  the stream ends  ->  reconcile
+/// ```
+///
+/// **The stream ending is the normal case, not a fault.** Identity closes it at
+/// the expiry of the token that opened it, which is what forces the PoP to be
+/// checked again and bounds how much can be missed to one token lifetime. A
+/// loop that logged an error each time would print one every fifteen minutes
+/// and teach whoever reads it to ignore the line.
+///
+/// Reconciling is also what makes the table right: the stream is the fast path
+/// and replays nothing, so a dropped line is repaired by the next read rather
+/// than by anything in here.
+///
+/// **Nothing consults the table yet.** Grants are P3 and enforcement is later
+/// still; what this phase buys is that a deployment can watch what the control
+/// plane is handing out, and what this Gateway refuses, before either acts.
+async fn follow_policies(
+    cfg: P2pConfig,
+    policy: portal_core::gateway::GatewayPolicy,
+    shutdown: CancellationToken,
+) {
+    let mut table = portal_core::gateway::Table::new();
+    let mut backoff = POLICY_RETRY_MIN;
+    loop {
+        match follow_once(&cfg, &policy, &mut table).await {
+            Ok(()) => backoff = POLICY_RETRY_MIN,
+            Err(e) => {
+                // **The table is left alone.** A read that failed says nothing
+                // about what is in force, and an empty answer is what says
+                // "drop everything" -- so a failure must not be allowed to
+                // resemble one.
+                tracing::warn!(
+                    retry_in = ?backoff,
+                    held = table.len(),
+                    "policy: could not follow the control plane: {e:#}",
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = policy_retry_after(backoff);
+                continue;
+            }
+        }
+        if shutdown.is_cancelled() {
+            return;
+        }
+    }
+}
+
+/// One pass: reconcile, then read the stream until it ends.
+async fn follow_once(
+    cfg: &P2pConfig,
+    policy: &portal_core::gateway::GatewayPolicy,
+    table: &mut portal_core::gateway::Table,
+) -> anyhow::Result<()> {
+    let cursor = reconcile_policies(cfg, policy, table).await?;
+    let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
+    let mut events = isekai_p2p::policy_stream(cfg, &token, Some(cursor)).await?;
+
+    // **Its own clock, because expiry is never streamed.** A lease that simply
+    // runs out writes no row at Identity, so nothing arrives to say so; waiting
+    // to be told means holding a policy the centre stopped counting on.
+    let mut sweep = tokio::time::interval(POLICY_EXPIRY_SWEEP);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = sweep.tick() => {
+                let gone = table.expire_now();
+                if gone > 0 {
+                    tracing::info!(gone, held = table.len(), "policy: leases lapsed");
+                }
+            }
+            event = events.recv() => match event {
+                Some(event) => apply_policy_event(table, policy, &event),
+                // The stream is over. Identity closes it at the token's expiry,
+                // so this is the ordinary way round the loop.
+                None => {
+                    tracing::debug!("policy: the stream ended; reconciling again");
+                    return Ok(());
+                }
+            },
+        }
+    }
+}
+
+fn apply_policy_event(
+    table: &mut portal_core::gateway::Table,
+    policy: &portal_core::gateway::GatewayPolicy,
+    event: &isekai_p2p::agent::PolicyEvent,
+) {
+    let lease = event.access_lease_id.as_str();
+    if event.is_granted() {
+        match table.apply(event, policy) {
+            Ok(()) => tracing::info!(lease, held = table.len(), "policy: applied"),
+            Err(why) => tracing::warn!(lease, "policy: not applied: {why}"),
+        }
+        return;
+    }
+    // **A revocation is obeyed without being checked.** Validation decides
+    // whether a row may be *applied*; refusing to withdraw one because its
+    // attributes no longer parse would keep a policy the centre has withdrawn.
+    let held = table.withdraw(lease);
+    tracing::info!(
+        lease,
+        held,
+        reason = event.reason.as_deref().unwrap_or("unstated"),
+        "policy: withdrawn"
+    );
+}
+
+/// How often the table is swept for leases that have run out.
+///
+/// Expiry is never streamed, so this is the detection. A minute is far finer
+/// than the lease TTLs involved and costs a walk of a table with tens of rows.
+const POLICY_EXPIRY_SWEEP: Duration = Duration::from_secs(60);
+
+/// How soon to try the control plane again after a failure, doubling to
+/// [`POLICY_RETRY_MAX`].
+///
+/// Backed off rather than fixed for the reason the relay measurements are: a
+/// control plane that cannot be reached does not improve by being asked every
+/// few seconds, and the log fills with the same line.
+const POLICY_RETRY_MIN: Duration = Duration::from_secs(5);
+const POLICY_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// The next wait after one of `previous`.
+///
+/// Saturating rather than wrapping: doubling must never come back round to a
+/// short wait, which would turn a long outage into the tight loop the backoff
+/// exists to avoid.
+fn policy_retry_after(previous: Duration) -> Duration {
+    previous
+        .saturating_mul(2)
+        .clamp(POLICY_RETRY_MIN, POLICY_RETRY_MAX)
 }
 
 async fn config(args: &Args, tokens: &std::path::Path) -> anyhow::Result<P2pConfig> {
@@ -1011,11 +1151,15 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         *enrolled = Some(cfg.clone());
     }
 
-    if let Some(policy) = &gateway_policy {
-        reconcile_policies(&cfg, policy).await?;
-    }
-
     let shutdown = CancellationToken::new();
+
+    // **Spawned rather than awaited.** Following the control plane is a
+    // standing task for the life of the server; doing it inline would hold the
+    // listener up, and the forwarding this server exists for does not depend on
+    // it. It takes the same token, so stopping the server stops this too.
+    let _policy_task = gateway_policy
+        .map(|policy| tokio::spawn(follow_policies(cfg.clone(), policy, shutdown.clone())));
+
     // `AutoNotify` rather than `Manual`: there is no operator watching a window
     // here, and the Grant the proxy checked is the authorization. It still says
     // who arrived, which is the difference from plain `Auto`.
@@ -1101,6 +1245,24 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_policy_retry_backs_off_and_settles() {
+        // The first failure is probably a moment of trouble, so ask again soon.
+        assert_eq!(policy_retry_after(POLICY_RETRY_MIN), POLICY_RETRY_MIN * 2);
+        // A control plane that cannot be reached does not improve by being
+        // asked every few seconds, and the log fills with the same line.
+        assert_eq!(policy_retry_after(POLICY_RETRY_MAX), POLICY_RETRY_MAX);
+        // And doubling must never wrap round to a short wait.
+        let mut d = POLICY_RETRY_MIN;
+        for _ in 0..64 {
+            d = policy_retry_after(d);
+            assert!(d >= POLICY_RETRY_MIN, "backed off to {d:?}");
+            assert!(d <= POLICY_RETRY_MAX, "backed off to {d:?}");
+        }
+    }
+
     use super::*;
 
     fn args_with(oidc: Option<&str>, subject: Option<&str>) -> Args {

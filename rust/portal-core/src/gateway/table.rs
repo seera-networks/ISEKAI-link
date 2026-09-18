@@ -26,6 +26,9 @@
 
 use std::collections::BTreeMap;
 
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
 use isekai_p2p::agent::{PolicyEvent, PolicySnapshot};
 
 use super::{AttributeRefusal, GatewayPolicy};
@@ -248,6 +251,40 @@ impl Table {
         Ok(())
     }
 
+    /// Drop every row whose lease has run out, by this host's clock.
+    ///
+    /// **The only way expiry is ever detected.** Identity does not stream it —
+    /// a lease that simply runs out writes no row, so no `policy.revoked`
+    /// appears. A subscriber waiting to be told waits forever, and the rows it
+    /// is holding are ones the centre stopped counting on long ago.
+    ///
+    /// Rows with no `expires_at` are kept: the centre did not say when, and
+    /// inventing a deadline for it would drop a live policy on a guess. The
+    /// reconciliation is what catches those.
+    pub fn expire(&mut self, now: OffsetDateTime) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| match &entry.expires_at {
+            Some(text) => match OffsetDateTime::parse(text, &Rfc3339) {
+                Ok(at) => at > now,
+                // Unparseable is kept rather than dropped. It is the centre's
+                // field and this is not the place to decide a policy is over
+                // because a timestamp could not be read; reconciliation settles
+                // it within the token lifetime either way.
+                Err(_) => true,
+            },
+            None => true,
+        });
+        before - self.entries.len()
+    }
+
+    /// [`expire`](Self::expire) against the clock now.
+    ///
+    /// The deadline is a parameter on `expire` so tests need not wait; callers
+    /// want this one.
+    pub fn expire_now(&mut self) -> usize {
+        self.expire(OffsetDateTime::now_utc())
+    }
+
     /// Drop one row, as a `policy.revoked` on the stream will.
     ///
     /// The mark is kept: the lease is gone, and an older grant for it must not
@@ -434,6 +471,65 @@ mod tests {
         assert_eq!(out.applied, 0);
         assert_eq!(out.dropped, 1);
         assert!(out.refused.is_empty(), "{:?}", out.refused);
+    }
+
+    fn at(text: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(text, &Rfc3339).expect("a timestamp")
+    }
+
+    #[test]
+    fn a_lapsed_lease_is_dropped_by_our_own_clock() {
+        // **The only way expiry is ever noticed.** Identity streams nothing
+        // when a lease simply runs out, so a table that waited to be told would
+        // hold it forever.
+        let mut table = Table::new();
+        table.reconcile(&snapshot(vec![granted("al_1", 1)]), &policy());
+        assert_eq!(table.len(), 1);
+
+        assert_eq!(table.expire(at("2026-09-17T09:29:59Z")), 0, "dropped early");
+        assert_eq!(table.expire(at("2026-09-17T09:30:01Z")), 1);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn a_row_with_no_deadline_is_kept() {
+        // The centre did not say when, so there is nothing to have passed.
+        let mut event = granted("al_1", 1);
+        event.expires_at = None;
+        let mut table = Table::new();
+        table.reconcile(&snapshot(vec![event]), &policy());
+        assert_eq!(table.expire(at("2099-01-01T00:00:00Z")), 0);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn a_deadline_that_cannot_be_read_is_kept() {
+        // Dropping a live policy because a timestamp would not parse is a
+        // decision this is not the place to make; reconciliation settles it.
+        let mut event = granted("al_1", 1);
+        event.expires_at = Some("not a timestamp".into());
+        let mut table = Table::new();
+        table.reconcile(&snapshot(vec![event]), &policy());
+        assert_eq!(table.expire(at("2099-01-01T00:00:00Z")), 0);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn the_stream_can_apply_and_withdraw() {
+        // What `check` being public is for: P2 writes through these.
+        let mut table = Table::new();
+        assert!(table.apply(&granted("al_1", 1), &policy()).is_ok());
+        assert_eq!(table.len(), 1);
+
+        // And the mark still advances, so a later older row is refused.
+        assert!(matches!(
+            table.apply(&granted("al_1", 0), &policy()),
+            Err(Refusal::Stale { seen: 1 })
+        ));
+
+        assert!(table.withdraw("al_1"));
+        assert!(!table.withdraw("al_1"));
+        assert!(table.is_empty());
     }
 
     #[test]

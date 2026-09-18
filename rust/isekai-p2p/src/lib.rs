@@ -34,7 +34,8 @@ pub mod secret;
 
 pub use auth::{AssertionSource, Auth0TokenSource, Credential, Enrollment, StaticAuth0Token};
 pub use config::{
-    issue_endpoint_token, list_policies, load_or_generate_key, proxy_client, P2pConfig,
+    issue_endpoint_token, list_policies, load_or_generate_key, policy_stream, proxy_client,
+    P2pConfig,
 };
 pub use initiator::{InitiatorSession, PeerDirectory};
 pub use listener::{

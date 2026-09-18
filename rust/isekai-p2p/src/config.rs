@@ -106,6 +106,29 @@ pub async fn list_policies(
     }
 }
 
+/// Subscribe to the policy stream (identity §8.10.3).
+///
+/// **Only the H3 transport could do this until now.** `EventStreamTransport`
+/// is implemented for both since this phase, so the branch here is the same
+/// runtime choice every other Identity call makes rather than a limitation.
+pub async fn policy_stream(
+    cfg: &P2pConfig,
+    endpoint_token: &str,
+    after: Option<i64>,
+) -> anyhow::Result<tokio::sync::mpsc::Receiver<isekai_p2p_core::identity::PolicyEvent>> {
+    if cfg.identity_http3 {
+        let client = IdentityClient::new(MasqueH3Transport::connect(&cfg.identity_url)?);
+        Ok(client
+            .policy_stream(endpoint_token, &cfg.key, after)
+            .await?)
+    } else {
+        let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
+        Ok(client
+            .policy_stream(endpoint_token, &cfg.key, after)
+            .await?)
+    }
+}
+
 /// Give an unattended Endpoint's slot back (§8.7 with an Enrollment Key).
 ///
 /// **Only meaningful on [`Credential::Enrollment`]**, and an error on anything
