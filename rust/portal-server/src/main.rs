@@ -618,15 +618,20 @@ async fn settle_grants(
             .await
         {
             Ok(grant) => {
+                // **The ledger decides whether this is ours to remove later.**
+                // Creating over a pair the operator already had succeeds and
+                // answers with *their* id, so recording the result blindly is
+                // how their grant ends up in a later removal.
+                let ours = ledger.made(key, grant.grant_id.clone());
                 tracing::info!(
                     grant = %grant.grant_id,
                     allowed = %wanted.allowed_endpoint,
                     protocol = %wanted.protocol,
                     ttl = wanted.ttl,
                     leases = wanted.leases.len(),
+                    ours,
                     "policy: granted",
                 );
-                ledger.made(key, grant.grant_id);
             }
             // **A quota refusal is not a grant.** The proxy caps grants per
             // Endpoint and answers `429` per row with the others untouched, so
@@ -679,16 +684,14 @@ async fn note_existing_grants(
             continue;
         };
         let key = (endpoint.clone(), protocol.clone());
-        if ledger.is_operators(&key) {
-            continue;
+        if ledger.note_existing(key) {
+            tracing::debug!(
+                grant = %grant.grant_id,
+                allowed = %endpoint,
+                protocol = %protocol,
+                "policy: a grant that was here first; it will be served but never removed",
+            );
         }
-        tracing::debug!(
-            grant = %grant.grant_id,
-            allowed = %endpoint,
-            protocol = %protocol,
-            "policy: a grant that was here first; it will be served but never removed",
-        );
-        ledger.adopted_from_operator(key);
     }
 }
 
