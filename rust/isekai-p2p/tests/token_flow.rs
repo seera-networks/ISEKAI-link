@@ -114,3 +114,84 @@ async fn without_register_only_issues() {
         "register=false skips registration",
     );
 }
+
+/// **The second issue must not register again.**
+///
+/// `register` is a static argument and `issue()` re-reads it on every renewal,
+/// so a config that registered once would present the same keypair again and
+/// take `409 endpoint-already-registered`. Nothing in the Auth0 arm caught
+/// that, so every renewal from the second onwards failed — and a task outliving
+/// one token lost its Endpoint Token partway through. Agent mode meets this on
+/// every run, because a task-scoped key is freshly generated and so must
+/// register.
+#[tokio::test]
+async fn renewing_issues_rather_than_registering_again() {
+    let hits = Hits::default();
+    let url = serve(hits.clone()).await;
+    let cfg = config(url, true);
+
+    issue_endpoint_token(&cfg).await.expect("the first token");
+    issue_endpoint_token(&cfg).await.expect("the renewal");
+
+    assert_eq!(
+        *hits.0.lock().unwrap(),
+        vec!["challenge", "register", "token", "token"],
+        "the renewal issues against the Endpoint the first call registered",
+    );
+}
+
+/// The cell is shared across clones, because the renewal task holds one.
+#[tokio::test]
+async fn a_cloned_config_registers_no_second_time() {
+    let hits = Hits::default();
+    let url = serve(hits.clone()).await;
+    let cfg = config(url, true);
+    let renewal = cfg.clone();
+
+    issue_endpoint_token(&cfg).await.expect("the first token");
+    issue_endpoint_token(&renewal).await.expect("the renewal");
+
+    assert_eq!(
+        *hits.0.lock().unwrap(),
+        vec!["challenge", "register", "token", "token"],
+    );
+}
+
+/// **A `409` on the way in is not a failure.** The registration can reach the
+/// server and the answer not come back; `get_or_try_init` does not remember
+/// failures, so without an arm for it every renewal would register again, take
+/// `409` again, and keep doing that while a plain issue would have worked.
+#[tokio::test]
+async fn an_endpoint_already_registered_is_issued_against() {
+    let hits = Hits::default();
+    let app = Router::new()
+        .route(
+            "/v1/endpoints/register/challenge",
+            post(|State(s): State<Hits>| async move {
+                s.0.lock().unwrap().push("challenge".into());
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(json!({
+                        "type": "https://identity.isekai.tools/problems/endpoint-already-registered",
+                        "title": "Endpoint already registered",
+                        "status": 409,
+                    })),
+                )
+            }),
+        )
+        .route("/v1/tokens/endpoint", post(issue_token))
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = config(format!("http://{addr}"), true);
+
+    issue_endpoint_token(&cfg).await.expect("the first token");
+    issue_endpoint_token(&cfg).await.expect("the renewal");
+
+    assert_eq!(
+        *hits.0.lock().unwrap(),
+        vec!["challenge", "token", "token"],
+        "the 409 settles the cell, so the renewal does not try to register again",
+    );
+}

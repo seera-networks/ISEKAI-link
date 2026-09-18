@@ -132,6 +132,15 @@ struct Args {
     /// it. Needs --auth0-tokens, and refuses --key
     #[argh(switch)]
     agent: bool,
+    /// which Gateway should hear about this Endpoint (repeatable). Not a
+    /// permission -- it selects which entitlement raises a lease, and omitting
+    /// it raises one at every Gateway offering the protocol
+    #[argh(option)]
+    gateway: Vec<String>,
+    /// what this task is called, recorded at registration so the audit log
+    /// says which run made the Endpoint
+    #[argh(option)]
+    task: Option<String>,
     /// print this Endpoint's ID and exit -- what the server needs for --allow
     #[argh(switch)]
     whoami: bool,
@@ -351,27 +360,16 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // **First, because the rest of this function reads the key's path.** Agent
     // mode has none, and what the token store defaults to is the first thing
     // that would quietly paper over that.
-    portal_core::agent::check_args(
-        args.agent,
-        args.key.is_some(),
-        args.auth0_tokens.is_some(),
-        args.auth0_token.is_some(),
-        args.enroll,
-    )?;
-    // **Stops here until P2, and here rather than beside the key it is about.**
-    // Several modes return before the key is ever loaded — signing in, and the
-    // whole account-admin path — so a refusal further down would let
-    // `--agent --endpoints` run the admin command and exit 0, having accepted
-    // the flag and dropped it. `--agent` is the one flag whose entire subject
-    // is how long this Endpoint lives, and silently ignoring it is the same
-    // confusion `check_args` is here to prevent. It also keeps the "generating
-    // a new Endpoint key" notice from naming a file agent mode never makes.
-    if args.agent {
-        anyhow::bail!(
-            "--agent is accepted but not connected yet: the task key and its revocation \
-             are the next step (docs/portal_agent_plan.md P2)"
-        );
-    }
+    portal_core::agent::check_args(portal_core::agent::Given {
+        agent: args.agent,
+        key: args.key.is_some(),
+        auth0_tokens: args.auth0_tokens.is_some(),
+        auth0_token: args.auth0_token.is_some(),
+        enroll: args.enroll,
+        whoami: args.whoami,
+        pair: args.pair.is_some(),
+        redeem: args.redeem.is_some(),
+    })?;
     let key_path = args.key.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
         .auth0_tokens
@@ -454,15 +452,42 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         return enrollment_admin(&args, &tokens).await;
     }
 
-    // **Said out loud, because a generated key looks exactly like a loaded one
-    // until it fails.** `--key` has a default, so running from a different
-    // directory than last time silently makes a *second* Endpoint — and the
-    // failure is `capability-endpoint-mismatch` from the proxy, several steps
-    // later, naming nothing that points back here.
-    if !key_path.exists() {
-        tracing::info!(path = %key_path.display(), "generating a new Endpoint key");
-    }
-    let key = load_or_generate_key(&key_path)?;
+    // **Generated, never written.** A stored key would make the next run the
+    // same Endpoint, inheriting this task's Grants; and revoking it would still
+    // leave the file, so a revoked Endpoint's private key would sit on disk
+    // looking like a working one. `load_or_generate_key` writes, so agent mode
+    // does not call it.
+    let key = if args.agent {
+        let key = isekai_p2p::agent::EndpointKey::generate();
+        tracing::info!(
+            endpoint_id = %key.endpoint_id(),
+            task = args.task.as_deref().unwrap_or("-"),
+            "made a key for this task; it is not written anywhere",
+        );
+        // **Said every time, until P4 lands.** Revoking on the way out is what
+        // makes a task-scoped Endpoint disappear, and it is not written yet.
+        // Nor is there a sweep behind it: `endpoint_idle_ttl` belongs to
+        // Enrollment Keys, and this Endpoint has none — so it stays registered
+        // indefinitely. The Grants go within a lease TTL once this process
+        // stops renewing, so reachability does end; the registration does not.
+        tracing::warn!(
+            endpoint_id = %key.endpoint_id(),
+            "this Endpoint is not revoked when the task ends yet \
+             (docs/portal_agent_plan.md P4); its Grants lapse with the lease, \
+             but the registration stays",
+        );
+        key
+    } else {
+        // **Said out loud, because a generated key looks exactly like a loaded
+        // one until it fails.** `--key` defaults, so running from a different
+        // directory than last time silently makes a *second* Endpoint — and the
+        // failure is `capability-endpoint-mismatch` from the proxy, several
+        // steps later, naming nothing that points back here.
+        if !key_path.exists() {
+            tracing::info!(path = %key_path.display(), "generating a new Endpoint key");
+        }
+        load_or_generate_key(&key_path)?
+    };
     if args.whoami {
         // Before any network call: this is what the operator needs in order to
         // ask the other side for a capability, and it costs nothing to answer.
@@ -1027,21 +1052,59 @@ async fn config(
         // **The whole point of the source.** The Endpoint Token renewal runs
         // every few minutes for the life of the session and needs a current
         // Auth0 token each time; without one it reuses one that expires.
-        isekai_p2p::Credential::auth0(auth.token, auth.source, args.register)
+        // **Agent mode always registers**, because its key was made moments
+        // ago and no Endpoint exists for it yet. The operator does not have to
+        // say so, and `--register` on its own would be a way to get it wrong.
+        isekai_p2p::Credential::auth0(auth.token, auth.source, args.register || args.agent)
     };
     Ok(P2pConfig {
-        // Default: the ceiling. Agent mode is what asks for less
-        // (`docs/portal_agent_plan.md`).
-        narrowing: Default::default(),
+        narrowing: narrowing(args),
         identity_url: args.identity_url.clone(),
         identity_http3: args.identity_http3,
         proxy_url: args.proxy_url.clone(),
         credential,
         protocol: args.protocol.clone(),
-        device_name: args.device_name.clone(),
+        // The task's name, so the audit log says which run made this Endpoint.
+        // A device name would be a lie here: nothing about this key belongs to
+        // a device.
+        device_name: args.task.clone().or_else(|| args.device_name.clone()),
         token_ttl: None,
         key,
     })
+}
+
+/// What this run asks its Endpoint Token to be narrowed to.
+///
+/// **Empty outside agent mode**, which leaves every existing caller at the
+/// ceiling it has always had. Narrowing is the thing agent mode exists to do,
+/// and doing it to an attended client that never asked would take away
+/// protocols its operator is entitled to.
+fn narrowing(args: &Args) -> isekai_p2p::Narrowing {
+    if !args.agent {
+        return Default::default();
+    }
+    // **Said, because the quiet case is the expensive one.** A selector is not
+    // required (§3.1), but omitting it raises a lease at *every* Gateway
+    // offering the protocol, which spreads this task's Grants across all of
+    // them. That is a fine default for one Gateway and a surprise for ten, and
+    // the difference is invisible from here.
+    if args.gateway.is_empty() {
+        tracing::warn!(
+            protocol = %args.protocol,
+            "no --gateway given: every Gateway offering this protocol will start a lease \
+             for this Endpoint",
+        );
+    }
+    isekai_p2p::Narrowing {
+        // **One protocol, the one this task speaks.** The token's ceiling is
+        // every protocol the person is entitled to, and a task that forwards
+        // one service has no use for the rest.
+        protocols: Some(vec![args.protocol.clone()]),
+        gateways: (!args.gateway.is_empty()).then(|| args.gateway.clone()),
+        // Permissions are left alone: what a portal client needs is the same
+        // for every task, and narrowing them here would be guessing.
+        permissions: None,
+    }
 }
 
 /// Answer the Enrollment Key commands, which need no key of this Endpoint's own.

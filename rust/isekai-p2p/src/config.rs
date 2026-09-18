@@ -240,6 +240,7 @@ async fn issue<T: ControlPlaneTransport>(
             token,
             source,
             register,
+            registered,
         } => {
             // The source when there is one, and only then the starting token:
             // this runs again every few minutes for the life of the session, so
@@ -259,22 +260,80 @@ async fn issue<T: ControlPlaneTransport>(
             // user is entitled to. An agent runtime registers a fresh key for
             // every task, so it takes the `register` arm every time — the one
             // where the narrowing was furthest from reaching the wire.
-            let token = if *register {
-                client
-                    .register_and_issue(
-                        &auth0,
-                        &cfg.key,
-                        cfg.device_name.as_deref(),
-                        &cfg.narrowing,
-                        cfg.token_ttl,
-                    )
-                    .await?
-            } else {
-                client
+            if !*register {
+                return Ok(client
                     .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
-                    .await?
-            };
-            Ok(token)
+                    .await?);
+            }
+            // Set by whichever caller actually registers. §8.1 hands back the
+            // first Endpoint Token with the registration, so the caller that
+            // did the work already holds one and must not spend a second round
+            // trip issuing another.
+            let mut minted: Option<EndpointToken> = None;
+            // **Registration happens once; the renewals issue.** `register` is
+            // a static argument re-read on every renewal, so without this the
+            // second one would register the same keypair again and take `409`,
+            // and every renewal after it would too. A task outliving one token
+            // would lose its Endpoint Token partway through.
+            let registered_id = registered
+                .get_or_try_init(|| async {
+                    match client
+                        .register_and_issue(
+                            &auth0,
+                            &cfg.key,
+                            cfg.device_name.as_deref(),
+                            &cfg.narrowing,
+                            cfg.token_ttl,
+                        )
+                        .await
+                    {
+                        Ok(token) => {
+                            minted = Some(token);
+                            // **The keypair's id, not the one the response
+                            // echoed** — the same reasoning the enrolment cell
+                            // gives. What this records is which keypair this
+                            // credential spent its registration on, which is a
+                            // local fact.
+                            anyhow::Ok(cfg.key.endpoint_id())
+                        }
+                        // **`409` means it is already there, which is what
+                        // this cell wanted.** Registration can reach the server
+                        // and still fail here — a dropped response, a body that
+                        // will not parse — and `get_or_try_init` does not
+                        // remember failures, so without this arm every renewal
+                        // would register again, take `409` again, and keep
+                        // doing that while a plain issue would have worked.
+                        Err(e) if e.status() == Some(409) => {
+                            tracing::info!(
+                                "this Endpoint is already registered; issuing instead",
+                            );
+                            Ok(cfg.key.endpoint_id())
+                        }
+                        Err(e) => Err(e.into()),
+                    }
+                })
+                .await?;
+
+            // **The cell belongs to the credential; the registration belongs
+            // to the keypair.** Sharing one `Credential` between configs with
+            // different keys would let the second skip registration and issue
+            // for an Endpoint that was never registered — which fails at the
+            // proxy, naming nothing that points back here.
+            if registered_id != &cfg.key.endpoint_id() {
+                anyhow::bail!(
+                    "this credential already registered {registered_id}, but this config \
+                     carries {}. Give each keypair its own Credential.",
+                    cfg.key.endpoint_id(),
+                );
+            }
+            match minted {
+                Some(token) => Ok(token),
+                // Somebody else registered — an earlier call of ours, or the
+                // `409` above. The Endpoint exists now, so issue against it.
+                None => Ok(client
+                    .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
+                    .await?),
+            }
         }
         Credential::Enrollment(enrollment) => unattended(client, cfg, enrollment).await,
     }

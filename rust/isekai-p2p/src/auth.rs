@@ -82,7 +82,29 @@ pub enum Credential {
         /// Auth0 authentication state, so it is not a choice the unattended
         /// route has; leaving it at the top level would make a field that is
         /// silently ignored there — the same defect this enum removes.
+        ///
+        /// **What the caller asked for, not what is still outstanding.** This
+        /// field is read on every issue, including the renewals, so on its own
+        /// it would ask for registration again every few minutes;
+        /// [`registered`](Self::Auth0::registered) is what makes it happen
+        /// once.
         register: bool,
+        /// Which Endpoint this credential has already registered, if any.
+        ///
+        /// **Shared across clones, and it has to be** — the same reason
+        /// [`Enrollment::cell`](crate::Enrollment) gives. `P2pConfig` is
+        /// `Clone`, the renewal task holds one, and `register` is a static
+        /// argument that `issue` re-reads on every renewal. Without this, the
+        /// second issue would present an already-registered keypair and take
+        /// `409 endpoint-already-registered` — and since the Auth0 arm has no
+        /// arm for that, the renewals would fail from then on and the session
+        /// would lose its token mid-task.
+        ///
+        /// This matters to agent mode above all, because a task-scoped key is
+        /// freshly generated and so *must* register — meaning agent mode takes
+        /// this path on every run, where an attended client with a stored key
+        /// passes `--register` once and never again.
+        registered: Arc<OnceCell<String>>,
     },
     /// §8.8: an Enrollment Key, for a job with nobody at the keyboard.
     Enrollment(Enrollment),
@@ -99,6 +121,7 @@ impl Credential {
             token: token.into(),
             source,
             register,
+            registered: Arc::new(OnceCell::new()),
         }
     }
 
