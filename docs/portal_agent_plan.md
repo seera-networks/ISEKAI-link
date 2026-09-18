@@ -20,20 +20,23 @@ Agent Runtime に相当するのは `portal-client` である。本書はそこ�
 
 ## 0. 結論を先に
 
-### 0.1 上流も、こちらの片側も、既に揃っている
+### 0.1 上流は揃っている。こちら側は思ったより揃っていない
 
 | 要るもの | 状態 |
 | --- | --- |
 | `requested_protocols`（発行） | Identity 実装済み |
-| `requested_protocols`（更新でも絞りを保つ、段階 0-b） | **Identity 実装済み** — 更新は `Bound::Narrowed` |
-| `requested_gateways`（リースの selector） | Identity 実装済み |
-| 発行がリース配布の引き金になる（draft §6.2.1） | Identity 実装済み |
+| `requested_protocols`（更新） | **送らない設計**（§3.3） |
+| `requested_gateways` | Identity 実装済み／**クライアントに無い** |
+| 発行がリース配布の引き金（draft §6.2.1） | Identity 実装済み |
 | Gateway 側の受け取り（段階 2） | **`portal-server` 実装済み**（P0〜P5） |
-| クライアントの `refresh_token` に `requested_protocols` | **ある** |
-| クライアントの `requested_gateways` | **無い** |
-| **タスク単位の Endpoint** | **無い** |
+| クライアントが絞りを送る経路 | **無い**（§0.4） |
+| タスク単位の Endpoint | **無い** |
+| Auth0 経路での自己失効 | **無い**（§2.3） |
 
-**段階 3 で本当に無いのは 2 つだけである。** 残りは既にある部品を繋ぐ仕事になる。
+> **初版はこの表を誤っていた。** 「`refresh_token` に `requested_protocols` がある」
+> と書いたが、それは `issue_token` の引数を読み違えたものである。
+> `refresh_token` は `(auth, key, challenge, ttl)` しか取らない — 意図的にそうで、
+> 理由は §3.3 にある。
 
 ### 0.2 難しいのは絞りではなく、鍵の寿命
 
@@ -68,6 +71,23 @@ draft §3.4 の中心。**Proxy が区別できるのは
 本来の解（Grant のキーに `access_lease_id` を入れる）は Proxy の変更を要し、
 段階 6 である。
 
+### 0.4 絞りを送る経路が、そもそも繋がっていない
+
+`IdentityClient::issue_token` は `requested_protocols` を取る。**しかし
+`isekai-p2p` の Auth0 経路は、そこに必ず `None` を渡す。**
+
+```rust
+// config.rs の Auth0 分岐
+client.issue_token(&auth0, &cfg.key, None, None, cfg.token_ttl)
+//                                   ^^^^  ^^^^  permissions / protocols
+```
+
+`register_and_issue` も最後は同じ `issue_token(.., None, None, ..)` で終わる。
+**そして agent モードは毎タスク新しい鍵なので、必ず `register` 経路を通る。**
+
+つまり現状、**agent モードが得るトークンは初回から天井いっぱいになる。**
+P0 は `P2pConfig` → `issue()` → `issue_token` と `register_and_issue` の
+両方に絞りを通す仕事であり、「既存の呼び出し側は `None` を渡すだけ」では済まない。
 ---
 
 ## 1. agent モードとは何か
@@ -95,9 +115,21 @@ portal-client --agent --task <name> --protocol pg-sales-ro-v1 --gateway ep:R1 --
 | 認可の出どころ | Provisioning Key の引き換え | **エンタイトルメント → リース → Grant** |
 | 終了時 | 枠を返す（`release_enrollment`） | **Endpoint を失効させる** |
 
-**失効の仕組みは共有できる。** `--enroll` は既に「終了時に自分を失効させる」経路
-（`portal_core::ci::release_the_slot`、SIGTERM も含む）を持っている。agent モードは
-その理由が違うだけで、やることは同じである。
+**失効の呼び出しは共有できない。** `--enroll` の
+`portal_core::ci::release_the_slot` は `release_enrollment` を呼び、その先頭で
+
+```rust
+let Credential::Enrollment(enrollment) = &cfg.credential else {
+    anyhow::bail!("only an Endpoint enrolled with a key can return its own slot");
+};
+```
+
+と弾かれる。agent モードが持つのは `Credential::Auth0` なので、**そのまま流用すると
+「枠を返せなかった、掃引に任せる」と警告して何も失効させない** — 後片付けが走った
+ように見える無音の no-op である。
+
+共有できるのは `main` の「`run` の後で呼ぶ」配管とシグナルの配線だけで、
+**失効そのものは `RevokeAuth::Auth0` で作り直す**（§2.3）。
 
 ---
 
@@ -117,26 +149,75 @@ portal-client --agent --task <name> --protocol pg-sales-ro-v1 --gateway ep:R1 --
 > 両立しない要求であり、黙ってどちらかを選ぶと、選ばれなかったほうを期待していた
 > 運用者が**分離されているつもりで分離されていない**状態になる。
 
-### 2.2 失効は最後にやること、かつ必ずやること
+### 2.2 鍵をメモリだけに置くと、Auth0 のセッションの置き場が消える
 
-draft §4.3: **失効の単位が Endpoint である**ことがタスク単位に寄せる理由でもある。
-Grant の失効は「次の connect から」だが、Endpoint 失効は認証層で全要求を弾く。
+`run` は**鍵のパスからトークン置き場を導いている**。
 
-- 正常終了でも異常終了でも失効させる
-- **SIGTERM でも**。`--enroll` が同じ理由で `hard_exit_on_second_signal` と
-  組み合わせている
-- 失効に失敗しても**タスクの結果は失敗にしない**。§8.8.8 の掃引が後ろに居る
-  （`--enroll` の「Best-effort at the end of a job」と同じ判断）
+```rust
+args.auth0_tokens.clone().unwrap_or_else(|| portal_core::login::tokens_beside(&args.key))
+```
 
-> **ただし黙って諦めない。** 失効できなかったことは、掃引が来るまで Endpoint が
-> 生きているという意味であり、運用者が知るべき事実である。
+鍵ファイルが無く `--key` も拒否するなら、この既定は意味を持たない。
+**`--agent` は `--auth0-tokens` を必須にする。**
 
-### 2.3 リースは放っておけば切れる
+なお `--key` は `#[argh(option, default = ...)]` なので、**「渡されなかった」と
+「既定値が渡された」を区別できない。** §2.1 の拒否を実装するには
+`Option<PathBuf>` に変える必要があり、`tokens_beside` と
+「鍵が無ければ作ると言う」通知を含む既存の参照すべてに及ぶ。
+
+### 2.3 Auth0 経路での自己失効は、まだ無い
+
+`revoke_endpoint` の `RevokeAuth::Auth0` は `reason` を要求し、その語彙は
+`device_lost` / `endpoint_deleted` / `admin_revoke` / `security_incident` の
+4 つだけである。
+
+**「タスクが終わった」に当たる語が無い。** 鍵経路の `enrollment_released` は
+まさにそのために在る（「ジョブが片付けた」と「時間が片付けた」を区別するため）が、
+Enrollment Key が無いと使えない。
+
+取りうるのは 2 つで、**どちらも決めずに実装を始めてはいけない**。
+
+| 案 | 評価 |
+| --- | --- |
+| 上流に語を足す（`task_finished` 相当） | 正しい。監査ログで区別がつく。**上流の作業** |
+| `endpoint_deleted` を流用する | 動くが、**監査ログで運用者の削除と見分けがつかなくなる** |
+
+> **Auth0 アクセストークンが終了時にも有効でなければならない。** つまり agent
+> モードは `--login` の更新される経路を使い、**更新されない `--auth0-token` は
+> 使えない** — 長いタスクの失効が 401 で死ぬ。
+
+### 2.4 失効に失敗したときの後ろ盾は、実は無い
+
+初版は「§8.8.8 の掃引が後ろに居る」と書いた。**誤りである。**
+
+`endpoint_idle_ttl` は `NewEnrollmentKey` の項であり、`enrollment_idle` は
+**鍵経路の理由**である。Auth0 経路で登録された Endpoint に Enrollment Key は無く、
+したがって**その掃引は掛からない**。
+
+つまり失効に失敗すれば、Endpoint と Grant は**掃引までではなく、無期限に**残る。
+
+- リース切れは効く（§2.5）ので **Grant は 1 リース TTL 以内に消える**
+- **しかし Endpoint は残る。** 到達性そのものは Grant が消えれば無くなるが、
+  Endpoint の登録は残り続ける
+- したがって失効の失敗は**警告ではなく、はっきりした失敗として報告する**。
+  タスクの結果を失敗にするかは呼び出し側の判断だが、黙って済ませてはならない
+
+### 2.5 リースは放っておけば切れる
 
 draft §6.2.1: **「タスクが終わった」を誰かが伝える必要は無い。** トークンの更新が
 リースの時計なので、プロセスが消えれば 1 リース TTL 以内に Grant も消える。
 
-**失効はそれを待たないための手段**であって、代わりではない。両方ある。
+**失効はそれを待たないための手段**であって、代わりではない。
+
+### 2.6 2 度目のシグナルは失効を飛ばす
+
+`hard_exit_on_second_signal` は `_exit(128+sig)` を呼ぶ生のハンドラを入れる。
+**2 度目の Ctrl-C は失効を飛ばす。** そして `release_the_slot` が居る位置は
+`run` が返った後 — つまり `connected.close().await` の後ろで、その close が
+詰まることこそハッチが救おうとしている事態である。
+
+したがって**失効は接続を畳む前に行う**。順序を逆にすると、いちばん失効したい場面
+（畳むのに手間取っている）で、いちばん失効されなくなる。
 
 ---
 
@@ -161,17 +242,41 @@ POST /v1/tokens/endpoint
 > リースが起き、Grant が不要に広がる。**指定を必須**にはしないが、省略したときは
 > 何が起きるかをログに出す。
 
-### 3.2 クライアントに無いのは `requested_gateways` だけ
+### 3.2 足すのは 3 箇所で、`refresh_token` は含まない
 
-`IdentityClient::issue_token` / `refresh_token` は既に `requested_protocols` を
-送れる。**`requested_gateways` を足す。** 発行と更新の両方に要る — 更新もリースの
-引き金だからである（draft §6.2.1 の表）。
+- `IdentityClient::issue_token` に `requested_gateways` を足す
+- `register_and_issue` に絞りを通す（いま `None, None` で終わっている）
+- `P2pConfig` → `isekai_p2p::config::issue()` の Auth0 分岐に通す（§0.4）
 
-### 3.3 絞りは更新をまたいで保たれる
+**`refresh_token` には足さない**。理由は §3.3。
 
-Identity 側（段階 0-b）が `Bound::Narrowed` で実装済みなので、**クライアントは
-毎回同じ絞りを送るだけでよい**。送らなければ Endpoint レコードから再計算される
-——それが天井いっぱいに戻る経路なので、**更新でも必ず送る。**
+### 3.3 更新では、送らないことが絞りを保つ
+
+**初版はここを逆に書いていた。** `refresh_token` の契約はこうである。
+
+> **Renewal never widens.** The result is `current ceiling ∩ the token being
+> refreshed`, monotonically, so `requested_*` is not sent: it exists only to
+> narrow further, and asking for the ceiling back is what re-issuing is for.
+
+つまり**更新は「いまの天井 ∩ いま持っているトークン」**で、送らないことが絞りを
+保つ。送る必要があるのは**さらに狭めたいとき**だけである。
+
+初版は「送らなければ天井いっぱいに戻る」と書いたが、それは**再発行**の話であって
+更新の話ではない。agent モードにとって重要なのは §0.4 のほう — **初回の発行で
+絞りが渡っていない**ことである。
+
+### 3.4 `register` が更新のたびに再登録する
+
+`Credential::Auth0` の `register` は静的な引数から来て、`issue()` が**更新のたびに
+読み直す**。agent モードは毎タスク新しい鍵なので `register` を立てる必要があり、
+すると**2 回目以降の更新が、登録済みの鍵を登録し直す**。
+
+**Auth0 経路には `409 endpoint-already-registered` の受け皿が無い**（あるのは
+enrollment 経路だけ、`already_registered`）。このままだと初回以降の更新が毎回失敗し、
+後退し、**タスクの途中で Endpoint Token が切れる**。
+
+取るべきは「初回成功後に `register` を下ろす」— enrollment 経路に 409 の腕を足すのと
+どちらでもよいが、**片方は要る**。
 
 ---
 
@@ -199,13 +304,21 @@ draft §6.2.1 の経路は **Identity → Gateway → Proxy** で、非同期で
 > Gateway が落ちていれば再接続時の照合（identity §8.10.2）までかかる。
 > **数十秒で諦め、待ち続けない。**
 
-### 4.2 `protocol-not-allowed` は待っても直らない
+### 4.2 `protocol-not-allowed` を無限に再試行しているのは、既存のループである
 
-トークン発行の時点で天井を超えていれば、その場で拒否される。**これは再試行の
-対象ではない** — エンタイトルメントを足す以外に変わりようがない。
+初版は「2 つを同じ再試行に入れない」と書いたが、**両者はそもそも同じループに
+居ない**。`grant-invalid` は proxy の `connect` が返す `ProxyError`、
+`protocol-not-allowed` は **Identity のトークン発行**が返す `IdentityError` である。
 
-`grant-invalid`（まだ配られていない）と `protocol-not-allowed`（配られることが
-ない）を**同じ再試行に入れない**。
+本当の危険はその上流にある。**`spawn_token_renewal` は
+`issue_endpoint_token` のあらゆる失敗を、後退しながら永久に再試行し、
+`tracing::warn!` しか出さない。**
+
+つまり `protocol-not-allowed` — エンタイトルメントを足す以外に変わりようのない
+拒否 — が、**そこで無限に再試行される**。§4.2 が禁じたい形そのものが、既に在る。
+
+**P3 はこのループに触る必要がある。** 天井の拒否は後退の対象ではなく、
+**その場で言って終わる**ものである。
 
 ---
 
@@ -213,14 +326,19 @@ draft §6.2.1 の経路は **Identity → Gateway → Proxy** で、非同期で
 
 | # | やること | 出口 |
 | --- | --- | --- |
-| **P0** | `requested_gateways` をクライアントの発行・更新に足す | 上流の selector が使える |
-| **P1** | `--agent` の引数と、**メモリだけの鍵**。`--key` との併用を拒否 | タスク単位の Endpoint ができる |
-| **P2** | 絞ったトークンの発行と更新（毎回同じ絞りを送る） | リースが起き、延びる |
-| **P3** | Grant を待つ（§4）。`grant-invalid` と `protocol-not-allowed` を分ける | 早すぎる接続で失敗しない |
-| **P4** | 終了時の失効（正常・異常・SIGTERM）。失敗は報告するが致命にしない | タスクの到達性が残らない |
-| **P5** | 実配備で端から端まで — エンタイトルメントを 1 行入れ、agent が繋ぎ、終了で消える | **段階 2 と 3 が噛み合う** |
+| **P0** | 絞りを `P2pConfig` → `issue()` → `issue_token` / `register_and_issue` に通す。`requested_gateways` を足す（§0.4、§3.2） | **発行したトークンが実際に絞られる** |
+| **P1** | `--key` を `Option<PathBuf>` にし、`--agent` との併用を拒否。`--auth0-tokens` を必須に（§2.1、§2.2） | 「渡されたか」が判定できる |
+| **P2** | メモリだけの鍵と登録。**初回成功後に `register` を下ろす**（§3.4） | タスク単位の Endpoint が、更新をまたいで生き続ける |
+| **P3** | Grant を待つ（§4.1）。**天井の拒否を更新ループの再試行から外す**（§4.2） | 早すぎる接続で失敗せず、直らない失敗を回し続けない |
+| **P4** | Auth0 経路の自己失効。**接続を畳む前に**（§2.6）。`reason` は §2.3 の決着後 | タスクの到達性が残らない |
+| **P5** | 実配備で端から端まで | **段階 2 と 3 が噛み合う** |
 
-**P0 は単独で入る。** 既存の呼び出し側は `None` を渡せばよく、挙動は変わらない。
+**P0 は単独で入るが、無害ではない。** 既存の呼び出し側は `None` を渡せばよく挙動は
+変わらないが、触るのは `register_and_issue` を含む発行経路そのものである。
+
+**P4 は §2.3 が決まるまで着手できない。** `reason` の語彙に「タスクが終わった」が
+無く、上流に足すか `endpoint_deleted` を流用するかは**監査ログの読み方を変える
+判断**であって、実装中に決めてよいことではない。
 
 **P5 が本当の検収である。** ここまでの段階はどれも片側だけの確認で、
 「エンタイトルメントを 1 行足すと agent が繋がり、タスクが終わると消える」を
@@ -230,17 +348,20 @@ draft §6.2.1 の経路は **Identity → Gateway → Proxy** で、非同期で
 
 ## 6. 確かめていないこと
 
-1. **エンタイトルメントを誰がどう登録するか。** identity §8.9 に API はあるが、
+1. **`reason` をどうするか**（§2.3）。**P4 の前提**であり、上流の判断が要る
+2. **エンタイトルメントを誰がどう登録するか。** identity §8.9 に API はあるが、
    運用の段取り（誰が `ep:R1` を Gateway として登録し、誰が A に
    `pg-sales-ro-v1` を与えるか）は本書の外である。**P5 はこれが要る**
-2. **Grant が配られるまでの実測。** §4.1 の「秒の単位」は設計からの推測で、
+3. **Grant が配られるまでの実測。** §4.1 の「秒の単位」は設計からの推測で、
    測っていない。P3 で数字を出す
-3. **タスク単位 Endpoint が天井のクォータに当たるか。** Endpoint の登録数や
-   `max_live_endpoints` に上限があるなら、タスクごとに作る運用はそこに当たる。
-   `--enroll` の枠と同じ問題が、違う規模で出うる
-4. **同じ人の複数タスクが並行したとき。** 天井はユーザー単位なので共有される
+4. **タスク単位 Endpoint が何のクォータに当たるか。** 初版は `max_live_endpoints`
+   を挙げたが、**それは Enrollment Key から生えた Endpoint を数えるもの**で、
+   Auth0 経路には掛からない。当たるとすればユーザーごとの登録上限のほうで、
+   **どれなのかを確かめていない。** 名前を取り違えたまま P5 に臨むと、
+   間違った失敗を探すことになる
+5. **同じ人の複数タスクが並行したとき。** 天井はユーザー単位なので共有される
    （draft §6.2 の注）。分離は Endpoint 分割で行う、というのが第一版の答えだが、
-   **クォータと衝突しないかは 3 番目と同じ話である**
+   **クォータと衝突しないかは 4 番目と同じ話である**
 
 ## 7. この計画で解かないもの
 
