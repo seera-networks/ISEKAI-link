@@ -265,48 +265,52 @@ async fn issue<T: ControlPlaneTransport>(
                     .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
                     .await?);
             }
-            // Set by whichever caller actually registers. §8.1 hands back the
-            // first Endpoint Token with the registration, so the caller that
-            // did the work already holds one and must not spend a second round
-            // trip issuing another.
-            let mut minted: Option<EndpointToken> = None;
-            // **Registration happens once; the renewals issue.** `register` is
-            // a static argument re-read on every renewal, so without this the
-            // second one would register the same keypair again and take `409`,
-            // and every renewal after it would too. A task outliving one token
-            // would lose its Endpoint Token partway through.
+            // **Registration happens once; the renewals issue.** `register`
+            // is a static argument re-read on every renewal, so without this
+            // the second one would register the same keypair again and take
+            // `409`, and every renewal after it would too. A task outliving one
+            // token would lose its Endpoint Token partway through.
+            //
+            // **The cell settles on the registration, not on the token.**
+            // `register_and_issue` does both and returns one `Result`, so an
+            // issue that failed after a registration that succeeded reported a
+            // failure — leaving the cell empty and the Endpoint registered. For
+            // agent mode that is an Endpoint nothing revokes and no sweep
+            // reaches, made by exactly the ordinary case: a narrowing the
+            // server refuses, which is refused at the issue and not at the
+            // registration.
             let registered_id = registered
                 .get_or_try_init(|| async {
-                    match client
-                        .register_and_issue(
-                            &auth0,
-                            &cfg.key,
-                            cfg.device_name.as_deref(),
-                            &cfg.narrowing,
-                            cfg.token_ttl,
-                        )
-                        .await
-                    {
-                        Ok(token) => {
-                            minted = Some(token);
-                            // **The keypair's id, not the one the response
-                            // echoed** — the same reasoning the enrolment cell
-                            // gives. What this records is which keypair this
-                            // credential spent its registration on, which is a
-                            // local fact.
-                            anyhow::Ok(cfg.key.endpoint_id())
+                    let challenge = client.register_challenge(&auth0, &cfg.key).await;
+                    let registered = match challenge {
+                        Ok(challenge) => {
+                            client
+                                .register(
+                                    &auth0,
+                                    &cfg.key,
+                                    &challenge,
+                                    cfg.device_name.as_deref(),
+                                )
+                                .await
+                                .map(|_| ())
                         }
-                        // **`409` means it is already there, which is what
-                        // this cell wanted.** Registration can reach the server
-                        // and still fail here — a dropped response, a body that
-                        // will not parse — and `get_or_try_init` does not
-                        // remember failures, so without this arm every renewal
-                        // would register again, take `409` again, and keep
-                        // doing that while a plain issue would have worked.
+                        Err(e) => Err(e),
+                    };
+                    match registered {
+                        // **The keypair's id, not the one the response echoed**
+                        // — the same reasoning the enrolment cell gives. What
+                        // this records is which keypair this credential spent
+                        // its registration on, which is a local fact.
+                        Ok(()) => anyhow::Ok(cfg.key.endpoint_id()),
+                        // **`409` means it is already there, which is what this
+                        // cell wanted.** Registration can reach the server and
+                        // still fail here — a dropped response, a body that will
+                        // not parse — and `get_or_try_init` does not remember
+                        // failures, so without this arm every renewal would
+                        // register again, take `409` again, and keep doing that
+                        // while a plain issue would have worked.
                         Err(e) if e.status() == Some(409) => {
-                            tracing::info!(
-                                "this Endpoint is already registered; issuing instead",
-                            );
+                            tracing::info!("this Endpoint is already registered; issuing instead");
                             Ok(cfg.key.endpoint_id())
                         }
                         Err(e) => Err(e.into()),
@@ -326,14 +330,12 @@ async fn issue<T: ControlPlaneTransport>(
                     cfg.key.endpoint_id(),
                 );
             }
-            match minted {
-                Some(token) => Ok(token),
-                // Somebody else registered — an earlier call of ours, or the
-                // `409` above. The Endpoint exists now, so issue against it.
-                None => Ok(client
-                    .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
-                    .await?),
-            }
+            // **Always a separate call**, which costs nothing: §8.1's
+            // registration answers with the Endpoint's record and no token, so
+            // `register_and_issue` made this same call itself.
+            Ok(client
+                .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
+                .await?)
         }
         Credential::Enrollment(enrollment) => unattended(client, cfg, enrollment).await,
     }
