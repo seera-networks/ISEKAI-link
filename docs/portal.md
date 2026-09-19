@@ -142,9 +142,28 @@ organization: seera-networks (org_a1b2c3)
 
 **The id is read from the access token**, which is the same claim Identity reads
 to decide the tenant — so this answers for machines that signed in before any of
-this existed, with no second sign-in. The *name* is the part that has to be
-recorded at sign-in, since an access token carries no name; until a machine
-signs in again it shows the id alone.
+this existed, with no second sign-in.
+
+**The name is harder, and may need one line in Auth0.** Auth0 puts `org_id` in
+the tokens; whether it puts `org_name` beside it depends on the tenant, and on
+this one it does not. Without a name there is only the id, which is the one
+thing nobody can check by looking at it. So an Action can supply it:
+
+```js
+// Auth0 → Actions → Login flow, beside whatever already sets tenant_roles
+exports.onExecutePostLogin = async (event, api) => {
+  if (event.organization) {
+    api.accessToken.setCustomClaim(
+      "https://identity.isekai.tools/org_name",
+      event.organization.name,
+    );
+  }
+};
+```
+
+Read from the access token it needs no recording and no second sign-in: the next
+token refresh carries it, and `--whoami` starts printing the name. `org_name`,
+where a tenant does send it, is used the same way.
 
 ### Moving an Endpoint to an organization
 

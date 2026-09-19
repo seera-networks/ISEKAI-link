@@ -205,11 +205,12 @@ impl Auth0Tokens {
     /// somebody else's id.
     pub fn organization(&self) -> Option<Organization> {
         let id = claim(&self.access_token, "org_id")?;
-        let name = self
-            .recorded_organization
-            .as_ref()
-            .filter(|seen| seen.id == id)
-            .and_then(|seen| seen.name.clone());
+        let name = organization_name(&self.access_token).or_else(|| {
+            self.recorded_organization
+                .as_ref()
+                .filter(|seen| seen.id == id)
+                .and_then(|seen| seen.name.clone())
+        });
         Some(Organization { id, name })
     }
 
@@ -774,8 +775,23 @@ fn tokens_from(body: TokenResponse) -> Auth0Tokens {
 fn organization_of(id_token: &str) -> Option<Organization> {
     Some(Organization {
         id: claim(id_token, "org_id")?,
-        name: claim(id_token, "org_name"),
+        name: organization_name(id_token),
     })
+}
+
+/// A claim an Auth0 Action can add to say what an organization is called.
+///
+/// **Because `org_name` is not always there.** Auth0 puts `org_id` in both
+/// tokens and the name in neither, on some tenants — and an id is the one
+/// thing nobody can check by looking at it, which is the whole reason this is
+/// printed at all. A tenant that already runs an Action (ISEKAI's adds
+/// `…/tenant_roles`) can add the name in one line, and it is then read from
+/// whichever token carries it.
+pub const ORG_NAME_CLAIM: &str = "https://identity.isekai.tools/org_name";
+
+/// What an organization is called, from whichever claim says so.
+fn organization_name(jwt: &str) -> Option<String> {
+    claim(jwt, "org_name").or_else(|| claim(jwt, ORG_NAME_CLAIM))
 }
 
 /// One string claim out of a JWT's payload, without verifying anything.
@@ -1313,6 +1329,27 @@ mod tests {
         let org = tokens.organization().expect("an organization");
         assert_eq!(org.id, "org_tAUNRLW8USki2Big");
         assert_eq!(org.to_string(), "org_tAUNRLW8USki2Big");
+    }
+
+    /// **The name can arrive on the access token too**, put there by an Action,
+    /// which is the only route on a tenant whose ID token carries `org_id` and
+    /// no `org_name`. Taken from there it needs no recording and survives a
+    /// store written before any of this.
+    #[test]
+    fn a_namespaced_name_on_the_access_token_is_used() {
+        let tokens = Auth0Tokens {
+            access_token: jwt(serde_json::json!({
+                "org_id": "org_tAUNRLW8USki2Big",
+                ORG_NAME_CLAIM: "seera-networks",
+            })),
+            refresh_token: None,
+            expires_at_unix: unix_now() + 900,
+            recorded_organization: None,
+        };
+        assert_eq!(
+            tokens.organization().expect("an organization").to_string(),
+            "seera-networks (org_tAUNRLW8USki2Big)",
+        );
     }
 
     /// The recorded name fills in the half the access token does not carry.
