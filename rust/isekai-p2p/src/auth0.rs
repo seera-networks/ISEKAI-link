@@ -172,13 +172,19 @@ fn default_interval() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Auth0Tokens {
     pub access_token: String,
-    /// The organization this sign-in was for, when it was for one.
+    /// What the sign-in reported about its organization, if anything.
     ///
-    /// **Stored so it can be shown again**, by a command that did not do the
-    /// signing in — which tenant a machine registers into is a fact about the
-    /// machine, and having to decode a token to recover it is why nobody does.
-    #[serde(default)]
-    pub organization: Option<Organization>,
+    /// **The name is the part worth keeping; the id is not from here.** An
+    /// access token carries `org_id` and no name, and an ID token carries both
+    /// but is not stored — so this records what the ID token said, and
+    /// [`organization`](Self::organization) is what answers the question,
+    /// reading the id from the access token and borrowing the name from here
+    /// only when the two agree.
+    ///
+    /// That is also what makes a store written before this field existed still
+    /// answer correctly: the id was in it all along.
+    #[serde(rename = "organization", default)]
+    pub recorded_organization: Option<Organization>,
     /// Present when `offline_access` was granted. Without one the session ends
     /// with the access token and the operator has to sign in again.
     pub refresh_token: Option<String>,
@@ -188,6 +194,25 @@ pub struct Auth0Tokens {
 }
 
 impl Auth0Tokens {
+    /// Which organization these tokens belong to, if any.
+    ///
+    /// **The id comes from the access token**, which is the same claim Identity
+    /// reads to decide the tenant — so this answers with the organization that
+    /// actually governs what this machine registers, rather than with what a
+    /// sign-in once said. The name is added from
+    /// [`recorded_organization`](Self::recorded_organization) when it is about
+    /// the same organization; a stale one is dropped rather than shown against
+    /// somebody else's id.
+    pub fn organization(&self) -> Option<Organization> {
+        let id = claim(&self.access_token, "org_id")?;
+        let name = self
+            .recorded_organization
+            .as_ref()
+            .filter(|seen| seen.id == id)
+            .and_then(|seen| seen.name.clone());
+        Some(Organization { id, name })
+    }
+
     fn expires_at(&self) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(self.expires_at_unix)
     }
@@ -731,7 +756,7 @@ fn tokens_from(body: TokenResponse) -> Auth0Tokens {
         access_token: body.access_token,
         refresh_token: body.refresh_token,
         expires_at_unix: unix_now() + body.expires_in,
-        organization: body.id_token.as_deref().and_then(organization_of),
+        recorded_organization: body.id_token.as_deref().and_then(organization_of),
     }
 }
 
@@ -747,16 +772,20 @@ fn tokens_from(body: TokenResponse) -> Auth0Tokens {
 /// this has already replaced Auth0's response to a request made over TLS, and
 /// the access token beside it is what everything else stands on.
 fn organization_of(id_token: &str) -> Option<Organization> {
-    let payload = id_token.split('.').nth(1)?;
-    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
-    let id = claims.get("org_id")?.as_str()?.to_owned();
     Some(Organization {
-        name: claims
-            .get("org_name")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        id,
+        id: claim(id_token, "org_id")?,
+        name: claim(id_token, "org_name"),
     })
+}
+
+/// One string claim out of a JWT's payload, without verifying anything.
+///
+/// **Read, never trusted** — see [`organization_of`]. Nothing is decided by
+/// what comes out of here.
+fn claim(jwt: &str, name: &str) -> Option<String> {
+    let payload = jwt.split('.').nth(1)?;
+    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    Some(claims.get(name)?.as_str()?.to_owned())
 }
 
 /// Which organization a sign-in was for.
@@ -1061,8 +1090,8 @@ impl Auth0TokenSource for RefreshingAuth0Token {
             // organization a machine is signed in to — a fact that does not
             // change on a refresh, and that writing `null` over would quietly
             // erase within minutes of the sign-in that established it.
-            if renewed.organization.is_none() {
-                renewed.organization = tokens.organization.clone();
+            if renewed.recorded_organization.is_none() {
+                renewed.recorded_organization = tokens.recorded_organization.clone();
             }
             if let Some(path) = &self.store {
                 if let Err(e) = Self::save(path, &renewed) {
@@ -1248,11 +1277,83 @@ mod tests {
     /// `%` followed by a multi-byte character once panicked the task: the
     /// guard counted bytes and the slice indexed a `&str`, so it landed
     /// mid-codepoint.
-    fn id_token(claims: serde_json::Value) -> String {
+    fn jwt(claims: serde_json::Value) -> String {
         let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
         // Header and signature are not read; only the claims are, and only to
         // say a name out loud.
         format!("header.{payload}.signature")
+    }
+
+    fn id_token(claims: serde_json::Value) -> String {
+        jwt(claims)
+    }
+
+    fn signed_in_to(org_id: Option<&str>, recorded: Option<Organization>) -> Auth0Tokens {
+        Auth0Tokens {
+            access_token: jwt(match org_id {
+                Some(id) => serde_json::json!({ "sub": "auth0|u", "org_id": id }),
+                None => serde_json::json!({ "sub": "auth0|u" }),
+            }),
+            refresh_token: Some("RT".to_owned()),
+            expires_at_unix: unix_now() + 900,
+            recorded_organization: recorded,
+        }
+    }
+
+    /// **The id comes off the access token**, which is the claim Identity reads
+    /// to decide the tenant — so this answers with the organization that
+    /// actually governs what the machine registers.
+    ///
+    /// It is also what makes a store written before any of this was recorded
+    /// answer correctly: the id was in it all along, and asking somebody to
+    /// sign in again to learn something already on their disk is a poor trade.
+    #[test]
+    fn the_organization_is_read_from_the_access_token() {
+        let tokens = signed_in_to(Some("org_tAUNRLW8USki2Big"), None);
+        let org = tokens.organization().expect("an organization");
+        assert_eq!(org.id, "org_tAUNRLW8USki2Big");
+        assert_eq!(org.to_string(), "org_tAUNRLW8USki2Big");
+    }
+
+    /// The recorded name fills in the half the access token does not carry.
+    #[test]
+    fn a_recorded_name_is_used_for_the_same_organization() {
+        let tokens = signed_in_to(
+            Some("org_a1b2c3"),
+            Some(Organization {
+                id: "org_a1b2c3".to_owned(),
+                name: Some("seera-networks".to_owned()),
+            }),
+        );
+        assert_eq!(
+            tokens.organization().expect("an organization").to_string(),
+            "seera-networks (org_a1b2c3)",
+        );
+    }
+
+    /// **A name left over from another organization is dropped, not shown.**
+    /// Signing in somewhere else and seeing the old name against the new id is
+    /// worse than seeing no name: it answers the question wrongly rather than
+    /// admitting it cannot.
+    #[test]
+    fn a_name_from_another_organization_is_not_borrowed() {
+        let tokens = signed_in_to(
+            Some("org_new"),
+            Some(Organization {
+                id: "org_old".to_owned(),
+                name: Some("the-other-one".to_owned()),
+            }),
+        );
+        assert_eq!(
+            tokens.organization().expect("an organization").to_string(),
+            "org_new",
+        );
+    }
+
+    /// A personal sign-in has none, and says so by having none.
+    #[test]
+    fn no_org_id_in_the_access_token_is_no_organization() {
+        assert!(signed_in_to(None, None).organization().is_none());
     }
 
     /// **`org_a1b2c3` is not something anyone can check by looking at it.** The
@@ -1301,21 +1402,26 @@ mod tests {
             access_token: "AT".to_owned(),
             refresh_token: Some("RT".to_owned()),
             expires_at_unix: unix_now() + 900,
-            organization: Some(Organization {
+            recorded_organization: Some(Organization {
                 id: "org_a1b2c3".to_owned(),
                 name: Some("seera-networks".to_owned()),
             }),
         };
         RefreshingAuth0Token::save(&path, &tokens).expect("saved");
         let read = RefreshingAuth0Token::load(&path).expect("loaded");
-        assert_eq!(read.organization, tokens.organization);
+        assert_eq!(read.recorded_organization, tokens.recorded_organization);
         // And a store written before this field existed still loads.
         std::fs::write(
             &path,
             r#"{"access_token":"AT","refresh_token":"RT","expires_at_unix":1}"#,
         )
         .expect("written");
-        assert_eq!(RefreshingAuth0Token::load(&path).expect("loaded").organization, None);
+        assert_eq!(
+            RefreshingAuth0Token::load(&path)
+                .expect("loaded")
+                .recorded_organization,
+            None,
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1399,7 +1505,7 @@ mod tests {
             access_token: "access".to_owned(),
             refresh_token: refresh.map(str::to_owned),
             expires_at_unix: (unix_now() as i64 + expires_in_secs).max(0) as u64,
-            organization: None,
+            recorded_organization: None,
         }
     }
 

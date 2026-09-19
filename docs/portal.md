@@ -140,6 +140,12 @@ ep:8c3f28d3…
 organization: seera-networks (org_a1b2c3)
 ```
 
+**The id is read from the access token**, which is the same claim Identity reads
+to decide the tenant — so this answers for machines that signed in before any of
+this existed, with no second sign-in. The *name* is the part that has to be
+recorded at sign-in, since an access token carries no name; until a machine
+signs in again it shows the id alone.
+
 ### Moving an Endpoint to an organization
 
 **A registration cannot follow a sign-in.** An Endpoint ID is derived from its

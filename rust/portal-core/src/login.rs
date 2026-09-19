@@ -78,7 +78,7 @@ fn sign_in_config(organization: Option<&str>) -> Auth0Config {
 /// this was recorded. Every one of those means the same thing to whoever is
 /// asking: nothing here can say which organization this machine belongs to.
 pub fn signed_in_organization(store: &Path) -> Option<isekai_p2p::auth0::Organization> {
-    RefreshingAuth0Token::load(store).ok()?.organization
+    RefreshingAuth0Token::load(store).ok()?.organization()
 }
 
 /// Refuse sign-in flags on a run that is not signing in.
@@ -212,7 +212,7 @@ pub async fn sign_in(
     // registering personally while its operator believes otherwise, which is
     // the whole failure this flow was built to end.
     if let Some(asked) = organization {
-        match &tokens.organization {
+        match tokens.organization() {
             Some(got) if got.id == asked => {}
             Some(got) => tracing::warn!(
                 "asked to sign in to {asked} and signed in to {got}; the Endpoints this \
@@ -248,7 +248,7 @@ pub async fn sign_in(
     // find out was to decode the token by hand — so an operator who mistyped
     // the id, or whose organization prompt never appeared, learned it much
     // later from a `401` that names neither.
-    match &tokens.organization {
+    match tokens.organization() {
         Some(org) => println!("\nSigned in to {org}."),
         None => println!(
             "\nSigned in with no organization: Endpoints registered from this machine go to \
