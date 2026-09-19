@@ -111,9 +111,12 @@ impl Default for Auth0Config {
             // organization — and would land in the individual tenant while
             // believing otherwise. A CLI flag overrides it.
             organization: std::env::var(ORGANIZATION_VAR).ok().filter(|v| !v.is_empty()),
-            callback_port: std::env::var(CALLBACK_PORT_VAR)
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            // **Not read here.** A value that will not parse has to be
+            // refused, and this function cannot refuse anything;
+            // `start_browser_login` reads it instead. Dropping a typo silently
+            // would hand back "any ephemeral port", and the operator's tunnel
+            // forwards the one they meant.
+            callback_port: None,
         }
     }
 }
@@ -225,10 +228,14 @@ pub async fn start_browser_login(cfg: &Auth0Config) -> anyhow::Result<BrowserLog
     // **Port zero, and the port is read back.** A fixed port would collide with
     // whatever else is on the machine and, worse, with a second sign-in; RFC
     // 8252 §7.3 asks registered redirects to allow any port for exactly this.
-    let wanted = cfg.callback_port.unwrap_or(0);
+    let pinned = match cfg.callback_port {
+        Some(port) => Some(port),
+        None => parse_pinned_port(std::env::var(CALLBACK_PORT_VAR).ok().as_deref())?,
+    };
+    let wanted = pinned.unwrap_or(0);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", wanted))
         .await
-        .with_context(|| match cfg.callback_port {
+        .with_context(|| match pinned {
             // **Named, because a pinned port is somebody's decision.** "Address
             // in use" on a port this process chose would be a bug; on one an
             // operator pinned it is a fact about their machine.
@@ -273,6 +280,28 @@ pub async fn start_browser_login(cfg: &Auth0Config) -> anyhow::Result<BrowserLog
     })
 }
 
+/// The pinned loopback port named by [`CALLBACK_PORT_VAR`], if any.
+///
+/// **A value that will not parse is an error, not an absence.** "Any port" and
+/// "port 38700, mistyped" lead to different URLs, and only one of them matches
+/// the tunnel the operator set up — so a typo that quietly meant the first
+/// would fail in the browser with nothing pointing back at the variable.
+///
+/// **The raw value is a parameter**, so what is tested is the parsing rather
+/// than the process's environment: a test that set the variable would change
+/// the port every concurrent sign-in binds, and they would take each other's
+/// redirects.
+fn parse_pinned_port(raw: Option<&str>) -> anyhow::Result<Option<u16>> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let port: u16 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{CALLBACK_PORT_VAR} is `{raw}`, which is not a port"))?;
+    anyhow::ensure!(port != 0, "{CALLBACK_PORT_VAR} is 0, which asks for any port");
+    Ok(Some(port))
+}
+
 /// Wait for the redirect, then trade the code for tokens.
 ///
 /// **Waits as long as the person takes.** There is no deadline here: Auth0
@@ -308,7 +337,14 @@ pub async fn finish_browser_login(
     Ok(tokens_from(parsed))
 }
 
-/// Accept one request on the loopback port and read the code out of it.
+/// Accept requests on the loopback port until one is the redirect.
+///
+/// **No deadline on the wait, and one on each connection.** How long a person
+/// takes in a browser is their business, so nothing here gives up on the
+/// sign-in; but a connection that opens and says nothing must not become that
+/// wait. Anything on the machine can open one — a preconnect, a scanner, an
+/// `ssh -L` channel opened early — and reading it to EOF would leave the real
+/// redirect sitting unread in the accept backlog, forever.
 async fn wait_for_the_redirect(login: &BrowserLogin) -> anyhow::Result<String> {
     loop {
         let (mut sock, _) = login
@@ -316,24 +352,12 @@ async fn wait_for_the_redirect(login: &BrowserLogin) -> anyhow::Result<String> {
             .accept()
             .await
             .context("wait for the browser to come back")?;
-        // The request line is all that is wanted and it comes first, so there
-        // is no need to read the headers, let alone a body.
-        let mut buf = vec![0u8; 8192];
-        let mut filled = 0;
-        let line = loop {
-            let n = sock.read(&mut buf[filled..]).await.unwrap_or(0);
-            if n == 0 {
-                break None;
-            }
-            filled += n;
-            if let Some(end) = buf[..filled].windows(2).position(|w| w == b"\r\n") {
-                break Some(String::from_utf8_lossy(&buf[..end]).into_owned());
-            }
-            if filled == buf.len() {
-                break None;
-            }
+        let line = match tokio::time::timeout(REQUEST_LINE_WAIT, request_line(&mut sock)).await {
+            Ok(Some(line)) => line,
+            // Both are "this connection had nothing to say": dropped, and back
+            // to waiting for one that has.
+            Ok(None) | Err(_) => continue,
         };
-        let Some(line) = line else { continue };
         // `GET /callback?code=…&state=… HTTP/1.1`
         let query = line
             .split_whitespace()
@@ -359,26 +383,27 @@ async fn wait_for_the_redirect(login: &BrowserLogin) -> anyhow::Result<String> {
         // arrives on this same port, carries no query at all, and answering it
         // as an error would end the wait a moment before the real redirect.
         if code.is_none() && error.is_none() {
-            let _ = sock.write_all(page(b"404 Not Found", "Nothing here.")).await;
+            let _ = sock.write_all(&page("404 Not Found", "Nothing here.")).await;
+            continue;
+        }
+        // **`state` decides first, for a refusal as much as for a code.** It is
+        // what says a message belongs to this sign-in; checking it only on the
+        // code path leaves `?error=access_denied` as a way for anything on the
+        // machine to end somebody else's sign-in before their browser arrives.
+        if state.as_deref() != Some(login.state.as_str()) {
+            let _ = sock
+                .write_all(&page("400 Bad Request", "That sign-in did not start here."))
+                .await;
             continue;
         }
         if let Some(error) = error {
             let _ = sock
-                .write_all(page(b"400 Bad Request", "Sign-in failed. You can close this tab."))
+                .write_all(&page("400 Bad Request", "Sign-in failed. You can close this tab."))
                 .await;
             anyhow::bail!("Auth0 refused the sign-in: {error}");
         }
-        // **Compared before the code is used, not after.** The point of `state`
-        // is to refuse a code this process did not ask for, and a comparison
-        // made after the exchange refuses nothing.
-        if state.as_deref() != Some(login.state.as_str()) {
-            let _ = sock
-                .write_all(page(b"400 Bad Request", "That sign-in did not start here."))
-                .await;
-            anyhow::bail!("the sign-in came back with the wrong state; ignoring it");
-        }
         let _ = sock
-            .write_all(page(b"200 OK", "Signed in. You can close this tab."))
+            .write_all(&page("200 OK", "Signed in. You can close this tab."))
             .await;
         // Let the browser read the page before the socket goes away with the
         // listener; without this the tab can show a connection error instead.
@@ -387,9 +412,31 @@ async fn wait_for_the_redirect(login: &BrowserLogin) -> anyhow::Result<String> {
     }
 }
 
-/// A complete, tiny HTTP response. Leaked on purpose: it is built once per
-/// reply and the connection is closed immediately after.
-fn page(status: &[u8], message: &str) -> &'static [u8] {
+/// How long one connection has to produce a request line before it is dropped.
+const REQUEST_LINE_WAIT: Duration = Duration::from_secs(5);
+
+/// Read just the request line. The headers and any body are not wanted, and
+/// the line comes first.
+async fn request_line(sock: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut buf = vec![0u8; 8192];
+    let mut filled = 0;
+    loop {
+        let n = sock.read(&mut buf[filled..]).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        filled += n;
+        if let Some(end) = buf[..filled].windows(2).position(|w| w == b"\r\n") {
+            return Some(String::from_utf8_lossy(&buf[..end]).into_owned());
+        }
+        if filled == buf.len() {
+            return None;
+        }
+    }
+}
+
+/// A complete, tiny HTTP response.
+fn page(status: &str, message: &str) -> Vec<u8> {
     // **The empty icon is not decoration.** Without a `rel="icon"` a browser
     // asks for `/favicon.ico` after rendering, and by then this flow has its
     // code and the listener is gone — so the request is refused. Locally that
@@ -403,12 +450,11 @@ fn page(status: &[u8], message: &str) -> &'static [u8] {
          <body style=\"font:16px system-ui;margin:3rem\">{message}</body>"
     );
     let head = format!(
-        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\n\
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
-        String::from_utf8_lossy(status),
         body.len(),
     );
-    Box::leak(format!("{head}{body}").into_bytes().into_boxed_slice())
+    format!("{head}{body}").into_bytes()
 }
 
 /// `len` random bytes as base64url — a PKCE verifier's alphabet, and long
@@ -437,6 +483,17 @@ fn urlencode(value: &str) -> String {
     out
 }
 
+/// Two ASCII hex digits as a byte, or `None` if they are not that.
+fn hex_pair(high: u8, low: u8) -> Option<u8> {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    Some(digit(high)? * 16 + digit(low)?)
+}
+
 /// Undo the encoding a browser applied to a query value.
 fn urldecode(value: &str) -> String {
     let bytes = value.as_bytes();
@@ -444,18 +501,21 @@ fn urldecode(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(b'%');
-                        i += 1;
-                    }
+            // **Bytes, not a string slice.** `&value[i + 1..i + 3]` indexes a
+            // `&str`, and `i + 2 < bytes.len()` counts bytes — so a multi-byte
+            // character after a `%` lands mid-codepoint and panics. The query
+            // comes off a socket any local process can reach, which makes that
+            // a way to kill a sign-in from outside.
+            b'%' if i + 2 < bytes.len() => match hex_pair(bytes[i + 1], bytes[i + 2]) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 3;
                 }
-            }
+                None => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -716,6 +776,13 @@ pub enum SignInState {
 #[derive(Default)]
 struct SignIn {
     state: SignInState,
+    /// The sign-in in flight, so a new one can replace it.
+    ///
+    /// **Its listener goes when it does.** Abandoned, the task holds the
+    /// loopback port for the life of the process — and with
+    /// [`CALLBACK_PORT_VAR`] pinned, which is what an `ssh -L` operator does,
+    /// the next attempt cannot bind at all and no amount of retrying frees it.
+    task: Option<tokio::task::JoinHandle<()>>,
     /// Left by the task for the UI thread to pick up, since only the UI thread
     /// owns the place a token source is kept.
     tokens: Option<Auth0Tokens>,
@@ -739,15 +806,28 @@ impl BrowserSignIn {
     }
 
     /// Forget the sign-in. The caller drops its token source and any stored
-    /// tokens; this is only what the UI shows.
+    /// tokens; this is only what the UI shows — and whatever sign-in was still
+    /// in flight, which is no longer wanted and is holding a port.
     pub fn sign_out(&self) {
-        self.0.lock().expect("sign-in lock poisoned").state = SignInState::SignedOut;
+        let mut shared = self.0.lock().expect("sign-in lock poisoned");
+        shared.state = SignInState::SignedOut;
+        if let Some(task) = shared.task.take() {
+            task.abort();
+        }
     }
 
     /// Report that the session has ended for a reason the operator has to act
     /// on — a revoked refresh token, say. Offers signing in again, and says why.
     pub fn failed(&self, reason: impl Into<String>) {
-        self.0.lock().expect("sign-in lock poisoned").state = SignInState::Failed(reason.into());
+        let mut shared = self.0.lock().expect("sign-in lock poisoned");
+        // **A sign-in already under way is not overwritten.** This is called by
+        // the token renewal, which fails every few minutes once a refresh token
+        // is revoked — and the operator answering that by signing in would
+        // watch the URL they were told to open disappear from the window.
+        if matches!(shared.state, SignInState::Waiting { .. }) {
+            return;
+        }
+        shared.state = SignInState::Failed(reason.into());
     }
 
     /// Whatever a finished sign-in produced, once.
@@ -761,7 +841,7 @@ impl BrowserSignIn {
     /// Begin. Needs a tokio runtime, and persists to `store` when given one.
     pub fn start(&self, cfg: Auth0Config, store: Option<PathBuf>) {
         let shared = self.0.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let set = |state| shared.lock().expect("sign-in lock poisoned").state = state;
             let started = match start_browser_login(&cfg).await {
                 Ok(started) => started,
@@ -786,6 +866,14 @@ impl BrowserSignIn {
                 Err(e) => set(SignInState::Failed(format!("{e:#}"))),
             }
         });
+        // **Whatever was running stops here.** A second press means the first
+        // attempt is not the one being waited on any more, and leaving it
+        // listening would keep its port — the one the next attempt needs when
+        // it is pinned.
+        let mut shared = self.0.lock().expect("sign-in lock poisoned");
+        if let Some(previous) = shared.task.replace(task) {
+            previous.abort();
+        }
     }
 }
 
@@ -930,11 +1018,26 @@ mod tests {
     /// **Everything Auth0 needs to make the token carry an organization.**
     /// The claim that decides the tenant comes from this request and nowhere
     /// else, so a missing parameter here is an Endpoint filed personally.
+    /// **Built field by field, not from `Default`.** `Auth0Config::default()`
+    /// reads the environment, and `docs/portal.md` tells operators to export
+    /// both variables — so a test that went through it would fail on the
+    /// machine of the person most likely to run it.
+    fn test_config() -> Auth0Config {
+        Auth0Config {
+            domain: "seera-networks.jp.auth0.com".to_owned(),
+            client_id: "test-client".to_owned(),
+            audience: "https://masque.seera-networks.com/".to_owned(),
+            scope: "openid profile email offline_access".to_owned(),
+            organization: None,
+            callback_port: None,
+        }
+    }
+
     #[tokio::test]
     async fn the_authorize_url_asks_for_what_the_tenant_depends_on() {
         let cfg = Auth0Config {
             organization: Some("org_abc".to_owned()),
-            ..Auth0Config::default()
+            ..test_config()
         };
         let login = start_browser_login(&cfg).await.expect("a loopback port");
         assert!(login.url.starts_with("https://seera-networks.jp.auth0.com/authorize?"));
@@ -965,11 +1068,9 @@ mod tests {
     /// Login then decides, which is what the prompt is for.
     #[tokio::test]
     async fn no_organization_names_none() {
-        let cfg = Auth0Config {
-            organization: None,
-            ..Auth0Config::default()
-        };
-        let login = start_browser_login(&cfg).await.expect("a loopback port");
+        let login = start_browser_login(&test_config())
+            .await
+            .expect("a loopback port");
         assert!(!login.url.contains("organization="), "{}", login.url);
     }
 
@@ -987,7 +1088,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_code_comes_back_off_the_redirect() {
-        let login = start_browser_login(&Auth0Config::default()).await.unwrap();
+        let login = start_browser_login(&test_config()).await.unwrap();
         let port = login.listener.local_addr().unwrap().port();
         let state = login.state.clone();
         tokio::spawn(async move { get(port, &format!("/callback?code=THE_CODE&state={state}")).await });
@@ -995,16 +1096,22 @@ mod tests {
         assert_eq!(code, "THE_CODE");
     }
 
-    /// **A code this process did not ask for is refused.** Anything on the
-    /// machine can reach a loopback port; without this check it could hand one
-    /// over and have it exchanged for somebody else's tokens.
+    /// **A code this process did not ask for is ignored, not obeyed — and not
+    /// fatal either.** Anything on the machine can reach a loopback port. If a
+    /// wrong `state` were exchanged, it would buy somebody else's tokens; if it
+    /// ended the wait, anyone could stop a sign-in by sending one. So it is
+    /// dropped and the wait goes on.
     #[tokio::test]
-    async fn a_code_with_the_wrong_state_is_refused() {
-        let login = start_browser_login(&Auth0Config::default()).await.unwrap();
+    async fn a_code_with_the_wrong_state_is_ignored() {
+        let login = start_browser_login(&test_config()).await.unwrap();
         let port = login.listener.local_addr().unwrap().port();
-        tokio::spawn(async move { get(port, "/callback?code=THE_CODE&state=somebody_else").await });
-        let e = wait_for_the_redirect(&login).await.expect_err("refused");
-        assert!(e.to_string().contains("state"), "{e}");
+        let state = login.state.clone();
+        tokio::spawn(async move {
+            get(port, "/callback?code=NOT_OURS&state=somebody_else").await;
+            get(port, &format!("/callback?code=OURS&state={state}")).await;
+        });
+        let code = wait_for_the_redirect(&login).await.expect("the code");
+        assert_eq!(code, "OURS");
     }
 
     /// **A browser asks for more than the redirect.** `/favicon.ico` arrives on
@@ -1012,7 +1119,7 @@ mod tests {
     /// end the wait a moment before the real one arrived.
     #[tokio::test]
     async fn an_unrelated_request_does_not_end_the_wait() {
-        let login = start_browser_login(&Auth0Config::default()).await.unwrap();
+        let login = start_browser_login(&test_config()).await.unwrap();
         let port = login.listener.local_addr().unwrap().port();
         let state = login.state.clone();
         tokio::spawn(async move {
@@ -1023,16 +1130,24 @@ mod tests {
         assert_eq!(code, "AFTER_THE_NOISE");
     }
 
-    /// Auth0 reports a refusal on the redirect rather than by not arriving.
+    /// Auth0 reports a refusal on the redirect rather than by not arriving —
+    /// **carrying the `state` it was given**, which is what makes this one
+    /// belong to this sign-in and end it, where the previous test's does not.
     #[tokio::test]
     async fn a_refusal_on_the_redirect_is_reported() {
-        let login = start_browser_login(&Auth0Config::default()).await.unwrap();
+        let login = start_browser_login(&test_config()).await.unwrap();
         let port = login.listener.local_addr().unwrap().port();
+        let state = login.state.clone();
         tokio::spawn(async move {
-            get(port, "/callback?error=access_denied&error_description=No%20thanks").await
+            get(
+                port,
+                &format!("/callback?error=access_denied&error_description=No%20thanks&state={state}"),
+            )
+            .await
         });
         let e = wait_for_the_redirect(&login).await.expect_err("reported");
         assert!(e.to_string().contains("access_denied"), "{e}");
+        assert!(e.to_string().contains("No thanks"), "{e}");
     }
 
     /// **The reply has to leave the browser with nothing more to ask for.**
@@ -1041,7 +1156,7 @@ mod tests {
     /// failed.
     #[test]
     fn the_reply_asks_the_browser_for_nothing() {
-        let reply = String::from_utf8_lossy(page(b"200 OK", "Signed in.")).into_owned();
+        let reply = String::from_utf8_lossy(&page("200 OK", "Signed in.")).into_owned();
         assert!(reply.contains("rel=icon"), "{reply}");
         assert!(reply.contains("Connection: close"));
         // Nothing else to fetch: no script, style or image of its own.
@@ -1058,6 +1173,77 @@ mod tests {
             .parse()
             .expect("a number");
         assert_eq!(declared, body.len());
+    }
+
+
+    /// **A query a local process can send must not be able to stop a sign-in.**
+    /// `%` followed by a multi-byte character once panicked the task: the
+    /// guard counted bytes and the slice indexed a `&str`, so it landed
+    /// mid-codepoint.
+    #[test]
+    fn a_percent_before_a_multibyte_character_is_not_a_panic() {
+        assert_eq!(urldecode("%a€"), "%a€");
+        assert_eq!(urldecode("%"), "%");
+        assert_eq!(urldecode("%zz"), "%zz");
+        assert_eq!(urldecode("%e3%81%82"), "あ");
+    }
+
+    /// **The refusal path is guarded by `state` too.** Without that, one
+    /// `?error=access_denied` from anything on the machine ends a sign-in that
+    /// the operator's browser is still on its way to.
+    #[tokio::test]
+    async fn an_error_from_another_sign_in_is_ignored() {
+        let login = start_browser_login(&test_config()).await.unwrap();
+        let port = login.listener.local_addr().unwrap().port();
+        let state = login.state.clone();
+        tokio::spawn(async move {
+            get(port, "/callback?error=access_denied&state=somebody_else").await;
+            get(port, &format!("/callback?code=THE_REAL_ONE&state={state}")).await;
+        });
+        let code = wait_for_the_redirect(&login).await.expect("the code");
+        assert_eq!(code, "THE_REAL_ONE");
+    }
+
+    /// **A connection that says nothing must not become the wait.** Anything
+    /// can open one, and reading it to EOF left the real redirect unread in the
+    /// accept backlog — forever, since this flow has no deadline of its own.
+    #[tokio::test]
+    async fn a_silent_connection_does_not_hold_the_port() {
+        let login = start_browser_login(&test_config()).await.unwrap();
+        let port = login.listener.local_addr().unwrap().port();
+        let state = login.state.clone();
+        // Opened and held, saying nothing, for longer than the redirect takes.
+        let quiet = tokio::spawn(async move {
+            let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            get(port, &format!("/callback?code=PAST_THE_QUIET_ONE&state={state}")).await;
+        });
+        let code = tokio::time::timeout(Duration::from_secs(20), wait_for_the_redirect(&login))
+            .await
+            .expect("the wait is not held by a silent connection")
+            .expect("the code");
+        assert_eq!(code, "PAST_THE_QUIET_ONE");
+        quiet.abort();
+    }
+
+    /// **Refused rather than dropped.** A typo that quietly meant "any port"
+    /// sends the operator an authorize URL naming a port their tunnel does not
+    /// carry, and the failure arrives in the browser with nothing pointing
+    /// back at the variable.
+    #[test]
+    fn a_pinned_port_that_is_not_a_port_is_refused() {
+        let e = parse_pinned_port(Some("thirty-eight-seven-hundred")).expect_err("refused");
+        assert!(e.to_string().contains(CALLBACK_PORT_VAR), "{e}");
+        assert!(parse_pinned_port(Some("0")).is_err(), "0 is not a pinned port");
+        assert_eq!(parse_pinned_port(Some(" 38700 ")).unwrap(), Some(38700));
+        assert_eq!(parse_pinned_port(None).unwrap(), None);
+        assert_eq!(parse_pinned_port(Some("")).unwrap(), None);
     }
 
     #[test]

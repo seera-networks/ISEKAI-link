@@ -119,19 +119,23 @@ async fn browser_sign_in(cfg: &Auth0Config) -> anyhow::Result<isekai_p2p::auth0:
 /// The fallback, for a host whose browser is somewhere else.
 async fn device_code_sign_in(
     cfg: &Auth0Config,
-    organization: Option<&str>,
 ) -> anyhow::Result<isekai_p2p::auth0::Auth0Tokens> {
-    // **Refused rather than ignored.** The device grant has nowhere to put an
-    // organization, so honouring the flag is impossible and dropping it would
-    // register everything under the individual tenant while the operator
-    // believed otherwise -- which is the confusion this whole flow replaced.
+    // **Refused rather than ignored, and read off the config rather than the
+    // flag.** The device grant has nowhere to put an organization, so honouring
+    // either is impossible and dropping one would register everything under the
+    // individual tenant while the operator believed otherwise -- which is the
+    // confusion this whole flow replaced. Checking the flag alone let
+    // `ISEKAI_AUTH0_ORGANIZATION` through in silence, which is that same
+    // confusion wearing the other hat.
     anyhow::ensure!(
-        organization.is_none(),
-        "--device-code cannot carry --organization: the device grant has no way to name one, \
-         so the token comes back with no org_id and Identity files this Endpoint personally. \
+        cfg.organization.is_none(),
+        "an organization was named ({}), and --device-code cannot carry one: the device grant \
+         has no way to name it, so the token comes back with no org_id and Identity files this \
+         Endpoint personally. \
          Over SSH, forward the callback instead -- `ssh -L 38700:127.0.0.1:38700 <host>` and \
          `ISEKAI_AUTH0_CALLBACK_PORT=38700` -- and sign in in the browser you already have. \
-         Or drop --organization and accept the individual tenant",
+         Or unset it and accept the individual tenant",
+        cfg.organization.as_deref().unwrap_or_default(),
     );
     let login = start_device_login(cfg)
         .await
@@ -186,7 +190,7 @@ pub async fn sign_in(
 
     let cfg = sign_in_config(organization);
     let mut tokens = if device_code {
-        device_code_sign_in(&cfg, organization).await?
+        device_code_sign_in(&cfg).await?
     } else {
         browser_sign_in(&cfg).await?
     };
