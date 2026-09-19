@@ -36,6 +36,10 @@ rcgen = { workspace = true }
 # path builds one, but `base64` is cheap and pure Rust, so it is not worth a
 # target section -- unlike `openssl` below, which is.
 base64 = { workspace = true }
+# The PKCE verifier and the CSRF `state` of the browser sign-in (`auth0`).
+rand = { workspace = true }
+# `S256`: the PKCE challenge is the SHA-256 of the verifier (`auth0`).
+sha2 = { workspace = true }
 # CLI-only.
 argh = { workspace = true }
 serde = { workspace = true }

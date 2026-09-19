@@ -28,7 +28,10 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use isekai_p2p::auth::Auth0TokenSource;
-use isekai_p2p::auth0::{poll_device_login, start_device_login, Auth0Config, RefreshingAuth0Token};
+use isekai_p2p::auth0::{
+    finish_browser_login, poll_device_login, start_browser_login, start_device_login, Auth0Config,
+    RefreshingAuth0Token,
+};
 
 /// Where the tokens live, given the Endpoint key's path.
 ///
@@ -53,13 +56,119 @@ pub fn tokens_beside(key: &Path) -> PathBuf {
     path
 }
 
-/// Run the device flow and persist what it returns.
+/// The Auth0 settings a sign-in uses, with the flag taking precedence.
 ///
-/// Prints the code and the URL, then waits — which is the whole difference from
-/// the camera apps' version, and the reason this is not simply `auth0::` used
-/// directly: `poll_device_login` blocks until the operator finishes, and a GUI
-/// cannot block while a terminal is *expected* to.
-pub async fn sign_in(store: &Path) -> anyhow::Result<()> {
+/// **A struct-update from the default would undo the default.**
+/// `Auth0Config::default()` reads `ISEKAI_AUTH0_ORGANIZATION`, which is how the
+/// camera apps name an organization at all, and `Auth0Config { organization:
+/// flag, ..default() }` overwrites that with `None` whenever the flag is
+/// absent. Nobody sees it: the sign-in succeeds, and the tenant is personal.
+fn sign_in_config(organization: Option<&str>) -> Auth0Config {
+    let mut cfg = Auth0Config::default();
+    if let Some(named) = organization {
+        cfg.organization = Some(named.to_owned());
+    }
+    cfg
+}
+
+/// Refuse sign-in flags on a run that is not signing in.
+///
+/// **Refused rather than dropped.** Both of these change which tenant an
+/// Endpoint is registered under, and a run that accepted `--organization` and
+/// ignored it would register personally while its operator believed the
+/// opposite — which is the confusion the browser flow was introduced to end.
+pub fn check_sign_in_args(
+    login: bool,
+    organization: bool,
+    device_code: bool,
+) -> anyhow::Result<()> {
+    if login {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !organization,
+        "--organization is chosen while signing in; this run is not. Pass it with --login",
+    );
+    anyhow::ensure!(
+        !device_code,
+        "--device-code chooses how to sign in; this run is not. Pass it with --login",
+    );
+    Ok(())
+}
+
+/// The ordinary flow: a browser on this host, redirected to a loopback port.
+async fn browser_sign_in(cfg: &Auth0Config) -> anyhow::Result<isekai_p2p::auth0::Auth0Tokens> {
+    // **Bound before anything is printed.** The port is inside the URL, so
+    // there is no URL to show until the listener exists.
+    let login = start_browser_login(cfg)
+        .await
+        .context("prepare the sign-in")?;
+
+    // On stdout, because this is the output of the command rather than a
+    // remark about it — somebody piping the rest of portal's chatter to a file
+    // still has to be able to read this.
+    println!("To sign in, open:\n");
+    println!("    {}\n", login.url);
+    println!("Waiting for the browser to come back…");
+
+    finish_browser_login(cfg, login)
+        .await
+        .context("wait for the sign-in to finish")
+}
+
+/// The fallback, for a host whose browser is somewhere else.
+async fn device_code_sign_in(
+    cfg: &Auth0Config,
+    organization: Option<&str>,
+) -> anyhow::Result<isekai_p2p::auth0::Auth0Tokens> {
+    // **Refused rather than ignored.** The device grant has nowhere to put an
+    // organization, so honouring the flag is impossible and dropping it would
+    // register everything under the individual tenant while the operator
+    // believed otherwise -- which is the confusion this whole flow replaced.
+    anyhow::ensure!(
+        organization.is_none(),
+        "--device-code cannot carry --organization: the device grant has no way to name one, \
+         so the token comes back with no org_id and Identity files this Endpoint personally. \
+         Sign in with a browser on this host, or drop --organization and accept that",
+    );
+    let login = start_device_login(cfg)
+        .await
+        .context("ask Auth0 for a device code")?;
+    println!("To sign in, open:\n");
+    println!("    {}\n", login.verification_uri_complete);
+    println!("and confirm the code:  {}\n", login.user_code);
+    println!(
+        "(the plain URL is {}, if the one above will not open)",
+        login.verification_uri,
+    );
+    println!("\nWaiting…");
+    // **Said plainly, because the consequence outlives the sign-in.** Endpoints
+    // registered with this token go to the individual tenant, and nothing later
+    // says why.
+    tracing::warn!(
+        "the device grant cannot name an organization; this sign-in will register \
+         Endpoints under the individual tenant",
+    );
+    poll_device_login(cfg, &login)
+        .await
+        .context("wait for the sign-in to finish")
+}
+
+/// Sign in and persist what it returns.
+///
+/// Prints where to go, then waits — which is the whole difference from the
+/// camera apps' version, and the reason this is not simply `auth0::` used
+/// directly: finishing blocks until the operator does, and a GUI cannot block
+/// while a terminal is *expected* to.
+///
+/// `organization` names an Auth0 Organization, which is **what decides the
+/// tenant an Endpoint is registered under**. `device_code` falls back to the
+/// flow for a browser that is not on this host, which cannot carry one.
+pub async fn sign_in(
+    store: &Path,
+    organization: Option<&str>,
+    device_code: bool,
+) -> anyhow::Result<()> {
     // **Before the flow, not after it.** What follows is a person in a browser,
     // and a save that fails at the end of it throws away work only they can
     // redo. The common cause is a `--auth0-tokens` under a directory that does
@@ -73,26 +182,12 @@ pub async fn sign_in(store: &Path) -> anyhow::Result<()> {
     // does not throw away one that works — see below.
     let existing = RefreshingAuth0Token::load(store).ok();
 
-    let cfg = Auth0Config::default();
-    let login = start_device_login(&cfg)
-        .await
-        .context("ask Auth0 for a device code")?;
-
-    // On stdout, because this is the output of the command rather than a
-    // remark about it — somebody piping the rest of portal's chatter to a file
-    // still has to be able to read this.
-    println!("To sign in, open:\n");
-    println!("    {}\n", login.verification_uri_complete);
-    println!("and confirm the code:  {}\n", login.user_code);
-    println!(
-        "(the plain URL is {}, if the one above will not open)",
-        login.verification_uri,
-    );
-    println!("\nWaiting…");
-
-    let mut tokens = poll_device_login(&cfg, &login)
-        .await
-        .context("wait for the sign-in to finish")?;
+    let cfg = sign_in_config(organization);
+    let mut tokens = if device_code {
+        device_code_sign_in(&cfg, organization).await?
+    } else {
+        browser_sign_in(&cfg).await?
+    };
 
     // **A sign-in with no refresh token is the failure this feature exists to
     // remove**, so it is not announced as a success. Auth0 returns one only
@@ -290,5 +385,31 @@ mod tests {
             out.source.is_none(),
             "and nothing claims it can be refreshed",
         );
+    }
+}
+
+#[cfg(test)]
+mod sign_in_tests {
+    use super::*;
+
+    /// **The flag wins, and its absence does not lose.** The environment is the
+    /// only way a camera GUI names an organization, and an organization is what
+    /// decides which tenant an Endpoint is filed under.
+    #[test]
+    fn the_flag_overrides_the_environment_and_absence_does_not() {
+        let var = isekai_p2p::auth0::ORGANIZATION_VAR;
+        // SAFETY: single-threaded test, and the variable is restored below.
+        unsafe { std::env::set_var(var, "org_from_env") };
+        assert_eq!(
+            sign_in_config(None).organization.as_deref(),
+            Some("org_from_env"),
+            "an absent flag must not erase the environment",
+        );
+        assert_eq!(
+            sign_in_config(Some("org_from_flag")).organization.as_deref(),
+            Some("org_from_flag"),
+        );
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(sign_in_config(None).organization, None);
     }
 }

@@ -128,7 +128,7 @@ struct MyApp {
     /// another one.
     auth0_store_path: String,
     /// The device sign-in, and what to show while it runs.
-    auth0_login: camera_core::auth0::DeviceSignIn,
+    auth0_login: camera_core::auth0::BrowserSignIn,
     /// Set once tokens exist, from a sign-in or from `auth0_store_path`. What
     /// keeps a long viewing session's Endpoint Token renewable past the access
     /// token's few hours.
@@ -196,7 +196,7 @@ impl MyApp {
             proxy_url: "https://link.isekai.tools:6443".to_string(),
             auth0_token: String::new(),
             auth0_store_path: "camera-client-auth0.json".to_string(),
-            auth0_login: camera_core::auth0::DeviceSignIn::default(),
+            auth0_login: camera_core::auth0::BrowserSignIn::default(),
             // Filled in below from whatever a previous sign-in left behind.
             auth0_source: None,
             key_path: "camera-client-endpoint.pem".to_string(),
@@ -237,7 +237,7 @@ impl MyApp {
     fn with_stored_auth0(mut self) -> Self {
         let path = std::path::Path::new(&self.auth0_store_path);
         if let Ok(tokens) = camera_core::auth0::RefreshingAuth0Token::load(path) {
-            self.auth0_login = camera_core::auth0::DeviceSignIn::restored();
+            self.auth0_login = camera_core::auth0::BrowserSignIn::restored();
             self.auth0_source = Some(camera_core::auth0::RefreshingAuth0Token::with_sign_in(
                 camera_core::auth0::Auth0Config::default(),
                 tokens,
@@ -730,9 +730,10 @@ impl MyApp {
                         self.auth0_login.sign_out();
                     }
                 }
-                camera_core::auth0::SignInState::Waiting { user_code, url } => {
-                    ui.label("enter this code:");
-                    ui.monospace(user_code);
+                camera_core::auth0::SignInState::Waiting { url } => {
+                    // No code to transcribe: the browser redirects back to a
+                    // loopback port this process is already listening on.
+                    ui.label("finish signing in:");
                     ui.hyperlink_to("open the page", url);
                 }
                 camera_core::auth0::SignInState::SignedOut

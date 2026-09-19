@@ -132,6 +132,15 @@ struct Args {
     /// it. Needs --auth0-tokens, and refuses --key
     #[argh(switch)]
     agent: bool,
+    /// the Auth0 Organization to sign in to, as an `org_…` id. **This decides
+    /// which tenant an Endpoint is registered under**: without one, Identity
+    /// files it personally. Only meaningful with --login
+    #[argh(option)]
+    organization: Option<String>,
+    /// sign in by typing a code into a browser somewhere else, for a host
+    /// whose browser is not on it. Cannot carry --organization
+    #[argh(switch)]
+    device_code: bool,
     /// which Gateway should hear about this Endpoint (repeatable). Not a
     /// permission -- it selects which entitlement raises a lease, and omitting
     /// it raises one at every Gateway offering the protocol
@@ -406,6 +415,11 @@ async fn run(
     // **First, because the rest of this function reads the key's path.** Agent
     // mode has none, and what the token store defaults to is the first thing
     // that would quietly paper over that.
+    portal_core::login::check_sign_in_args(
+        args.login,
+        args.organization.is_some(),
+        args.device_code,
+    )?;
     portal_core::agent::check_args(portal_core::agent::Given {
         agent: args.agent,
         key: args.key.is_some(),
@@ -441,7 +455,12 @@ async fn run(
     // `portal-client.pem` should not block the one command that has nothing to
     // do with it. `portal-server` orders these the same way.
     if args.login {
-        return portal_core::login::sign_in(&tokens).await;
+        return portal_core::login::sign_in(
+            &tokens,
+            args.organization.as_deref(),
+            args.device_code,
+        )
+        .await;
     }
 
     // **Before the key**, because none of these need an Endpoint of this

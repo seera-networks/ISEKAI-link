@@ -166,6 +166,15 @@ struct Args {
     /// P2P protocol string
     #[argh(option, default = "String::from(\"isekai-portal-v1\")")]
     protocol: String,
+    /// the Auth0 Organization to sign in to, as an `org_…` id. **This decides
+    /// which tenant an Endpoint is registered under**: without one, Identity
+    /// files it personally. Only meaningful with --login
+    #[argh(option)]
+    organization: Option<String>,
+    /// sign in by typing a code into a browser somewhere else, for a host
+    /// whose browser is not on it. Cannot carry --organization
+    #[argh(switch)]
+    device_code: bool,
     /// register the Endpoint before issuing a token (needed on first use of a
     /// freshly generated key)
     #[argh(switch)]
@@ -1441,10 +1450,20 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         .auth0_tokens
         .clone()
         .unwrap_or_else(|| portal_core::login::tokens_beside(&args.key));
+    portal_core::login::check_sign_in_args(
+        args.login,
+        args.organization.is_some(),
+        args.device_code,
+    )?;
     if args.login {
         // Before the key, the catalogue and the network: this is what somebody
         // runs when they have none of them.
-        return portal_core::login::sign_in(&tokens).await;
+        return portal_core::login::sign_in(
+            &tokens,
+            args.organization.as_deref(),
+            args.device_code,
+        )
+        .await;
     }
 
     portal_core::ci::check_unattended_args(
