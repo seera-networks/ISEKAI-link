@@ -285,6 +285,14 @@ async fn issue<T: ControlPlaneTransport>(
             // reaches, made by exactly the ordinary case: a narrowing the
             // server refuses, which is refused at the issue and not at the
             // registration.
+            // **Whether this call did the registering.** An issue refused
+            // straight after a registration this tenant accepted cannot be a
+            // tenant mismatch, and telling an agent run — which generates a key
+            // and registers on every task — to "make a new key" would send it
+            // after a cause that is not there.
+            // `AtomicBool` and not `Cell`: the future this lives in is sent
+            // to a task, so everything it holds has to cross threads.
+            let registered_here = std::sync::atomic::AtomicBool::new(false);
             let registered_id = registered
                 .get_or_try_init(|| async {
                     let challenge = client.register_challenge(&auth0, &cfg.key).await;
@@ -316,7 +324,10 @@ async fn issue<T: ControlPlaneTransport>(
                         // — the same reasoning the enrolment cell gives. What
                         // this records is which keypair this credential spent
                         // its registration on, which is a local fact.
-                        Ok(()) => anyhow::Ok(cfg.key.endpoint_id()),
+                        Ok(()) => {
+                            registered_here.store(true, std::sync::atomic::Ordering::Relaxed);
+                            anyhow::Ok(cfg.key.endpoint_id())
+                        }
                         // **`409` means it is already there, which is what this
                         // cell wanted.** Registration can reach the server and
                         // still fail here — a dropped response, a body that will
@@ -351,7 +362,14 @@ async fn issue<T: ControlPlaneTransport>(
             client
                 .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
                 .await
-                .map_err(|e| explain_pop_failure(e, cfg))
+                .map_err(|e| match registered_here.load(std::sync::atomic::Ordering::Relaxed) {
+                    true => e.into(),
+                    // **A `409` lands here too**, and that one *is* the
+                    // cross-tenant collision: the keypair is registered
+                    // somewhere, this tenant cannot see it, and the issue that
+                    // follows is refused for exactly the reason below.
+                    false => explain_pop_failure(e, cfg),
+                })
         }
         Credential::Enrollment(enrollment) => unattended(client, cfg, enrollment).await,
     }
@@ -664,8 +682,20 @@ fn explain_pop_failure(error: IdentityError, cfg: &P2pConfig) -> anyhow::Error {
 fn is_permanent(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .filter_map(|e| e.downcast_ref::<isekai_p2p_core::identity::IdentityError>())
-        .any(|e| e.status() == Some(403))
+        .filter_map(|e| e.downcast_ref::<IdentityError>())
+        .any(|e| {
+            e.status() == Some(403)
+                // **And the `401` that means "not in this tenant".** Identity
+                // answers it for an Endpoint it cannot find as well as for a
+                // bad signature, and neither becomes true by asking again: one
+                // needs a key registered where the token points, the other a
+                // different key. Left in the transient bucket, the explanation
+                // this file attaches would be re-read out at `warn` every few
+                // minutes for the life of the process — an in-memory token
+                // source never notices a re-login elsewhere, so nothing would
+                // ever change.
+                || e.kind().as_deref() == Some("pop-signature-invalid")
+        })
 }
 
 /// Keep `proxy`'s Endpoint Token current for as long as the returned guard
@@ -727,10 +757,10 @@ pub fn spawn_token_renewal(
                         refused = true;
                         tracing::error!(
                             "the Endpoint Token cannot be renewed, and retrying will not \
-                             change that: {e:#}. Somebody has to grant it — a narrowed run \
-                             asks for one protocol, so the usual cause is an account not \
-                             entitled to it. This keeps asking every {}s in case that \
-                             happens; the session works until the current token expires",
+                             change that: {e:#}. Somebody has to act — an entitlement to \
+                             grant, or an Endpoint registered where this sign-in points. \
+                             This keeps asking every {}s in case that happens; the session \
+                             works until the current token expires",
                             REFUSED_RETRY.as_secs(),
                         );
                     } else {
@@ -840,6 +870,20 @@ mod tests {
         assert!(text.contains(&cfg.key.endpoint_id()), "{text}");
         assert!(text.contains("tenant"), "{text}");
         assert!(text.contains("new key"), "{text}");
+    }
+
+    /// **Said once and then asked for slowly, like the other refusals.**
+    /// Nothing the renewal loop does registers an Endpoint in another tenant,
+    /// and a token source that holds its tokens in memory never notices a
+    /// re-login elsewhere — so left transient, the five-line explanation would
+    /// be read out at `warn` every few minutes for the life of the process.
+    #[test]
+    fn a_tenant_mismatch_is_not_retried_every_few_minutes() {
+        let explained = explain_pop_failure(problem(401, "pop-signature-invalid"), &a_config());
+        assert!(is_permanent(&explained));
+        // The `401`s that are not this are still worth retrying: an Auth0 token
+        // the source is about to replace is one of them.
+        assert!(!is_permanent(&problem(401, "token-invalid").into()));
     }
 
     /// Every other refusal is left as it came: this explains one message, it

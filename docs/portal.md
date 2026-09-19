@@ -126,7 +126,9 @@ organization keeps pointing at an Endpoint the new tenant does not contain, and
 every call fails with:
 
 ```
-Identity API returned 401: pop-signature-invalid
+Error: Identity could not verify ep:… . It answers this both for a bad signature
+and for an Endpoint it does not find in the tenant the Auth0 token names, …
+: Identity API returned 401: {"type":".../problems/pop-signature-invalid", …}
 ```
 
 which is Identity hiding the truth from a stranger and, incidentally, from its
@@ -142,11 +144,14 @@ mv portal-client.pem portal-client.pem.personal
 portal-client --register --map …
 ```
 
-**Revoke before signing in to the organization, not after.** Revoking resolves
-its tenant from the Auth0 token too, so once the sign-in names an organization
-the old Endpoint is out of reach from that machine — `404`, for the same reason
-as above. Left alone it stays registered: nothing sweeps Endpoints on this
-route.
+**Revoke before signing in to the organization**, because revoking resolves its
+tenant from the Auth0 token as well: once the sign-in names an organization, the
+old Endpoint answers `404` from that machine, for the same reason as above.
+
+Out of order is not a dead end — revoking is a Route A command and needs no key,
+so `--login` back to a personal session, revoke, and sign in to the organization
+again. But left alone the Endpoint stays registered: **nothing sweeps Endpoints
+on this route**, so "I will get to it" means "for good".
 
 Everything that named the old Endpoint has to be redone against the new one:
 pairing, capabilities, tickets, and the entitlements that decide its ceiling —
