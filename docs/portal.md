@@ -91,16 +91,57 @@ portal-client --login          # on the machine with the local ports
 ```
 To sign in, open:
 
-    https://seera-networks.jp.auth0.com/activate?user_code=CVNR-SWDW
+    https://seera-networks.jp.auth0.com/authorize?response_type=code&…
 
-and confirm the code:  CVNR-SWDW
-
-Waiting…
+Waiting for the browser to come back…
 ```
 
-Open it, confirm the code, and that machine is signed in for good: the tokens
-land beside the Endpoint key and **refresh themselves from then on**. No command
-after this needs a token.
+Open it, sign in, and that machine is signed in for good: the tokens land
+beside the Endpoint key and **refresh themselves from then on**. No command
+after this needs a token. The browser redirects to a loopback port this process
+opened, so there is nothing to transcribe.
+
+### Which organization, and therefore which tenant
+
+```sh
+portal-client --login --organization org_…
+```
+
+**An Endpoint is filed under the organization its sign-in named.** Identity
+reads the `org_id` claim, and a token without one is filed personally — so a
+machine signed in without an organization registers into the individual tenant,
+and nothing later says so. Pass the `org_…` id (Auth0 shows it under
+Organizations; the *name* is refused). Leaving it out lets Universal Login ask,
+if the application has the organization prompt turned on.
+
+`ISEKAI_AUTH0_ORGANIZATION` does the same for the camera apps, which have no
+field to type it into.
+
+### Signing in over SSH
+
+The redirect goes to `127.0.0.1` on the machine that is signing in, which a
+browser somewhere else cannot reach. **Forward the port rather than giving up
+the organization**:
+
+```sh
+ssh -L 38700:127.0.0.1:38700 the-host          # from the machine with the browser
+ISEKAI_AUTH0_CALLBACK_PORT=38700 portal-server --login --organization org_…
+```
+
+Open the printed URL locally; the redirect lands on your own `127.0.0.1:38700`
+and the tunnel carries it to the waiting process. `ISEKAI_AUTH0_CALLBACK_PORT`
+exists for this: the port has to be known in advance to be forwarded, and it is
+in the `redirect_uri` Auth0 checks, so it must also be among the application's
+Allowed Callback URLs.
+
+**`--device-code` is the last resort, and it costs the organization.** It signs
+in by code typed into a browser anywhere — the only flow that needs no loopback
+at all — but the device grant has no way to carry an organization. Auth0 accepts
+the parameter and ignores it (measured: `/authorize` refuses an organization that
+does not exist, `/oauth/device/code` answers `200` for the same one, and the
+token comes back with no `org_id`). So everything that sign-in registers goes to
+the individual tenant. `--device-code` refuses `--organization` rather than
+pretending otherwise.
 
 **Each binary has its own store**, because each is a separate Endpoint with its
 own key — `portal-server-auth0.json` beside `portal-server.pem`,

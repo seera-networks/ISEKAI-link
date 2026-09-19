@@ -467,11 +467,17 @@ fn urldecode(value: &str) -> String {
 /// redirect cannot reach a machine reached over SSH, and this flow can: the
 /// code is typed in anywhere.
 ///
-/// **It cannot name an organization.** The device grant carries no
-/// `organization` and the token comes back with no `org_id`, so Identity files
-/// everything the run registers under the individual tenant — whatever the
-/// operator picked in the browser. Use it when loopback is impossible, and
-/// expect the tenant to be personal.
+/// **It cannot name an organization**, and this was measured rather than
+/// assumed: `/authorize` refuses an organization that does not exist with
+/// `400`, `/oauth/device/code` answers `200` for the same one, and a login
+/// completed with the parameter attached comes back with no `org_id`. Auth0
+/// takes the field and ignores it.
+///
+/// So Identity files everything such a run registers under the individual
+/// tenant — whatever the operator picked in the browser. Before reaching for
+/// this over SSH, forward the loopback port instead
+/// ([`CALLBACK_PORT_VAR`]): the browser stays where it is and the organization
+/// survives.
 pub async fn start_device_login(cfg: &Auth0Config) -> anyhow::Result<DeviceLogin> {
     let http = client()?;
     let resp = http

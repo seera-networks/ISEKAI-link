@@ -129,7 +129,9 @@ async fn device_code_sign_in(
         organization.is_none(),
         "--device-code cannot carry --organization: the device grant has no way to name one, \
          so the token comes back with no org_id and Identity files this Endpoint personally. \
-         Sign in with a browser on this host, or drop --organization and accept that",
+         Over SSH, forward the callback instead -- `ssh -L 38700:127.0.0.1:38700 <host>` and \
+         `ISEKAI_AUTH0_CALLBACK_PORT=38700` -- and sign in in the browser you already have. \
+         Or drop --organization and accept the individual tenant",
     );
     let login = start_device_login(cfg)
         .await
