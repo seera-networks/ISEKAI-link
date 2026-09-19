@@ -134,6 +134,12 @@ exists for this: the port has to be known in advance to be forwarded, and it is
 in the `redirect_uri` Auth0 checks, so it must also be among the application's
 Allowed Callback URLs.
 
+**`channel N: open failed: connect failed: Connection refused` after signing in
+is `ssh` saying the tunnel had nowhere to go** — the sign-in finished, the
+process stopped listening, and the browser asked for one more thing. Check the
+saved token rather than the message: if the sign-in worked, the file is there
+and carries the organization.
+
 **`--device-code` is the last resort, and it costs the organization.** It signs
 in by code typed into a browser anywhere — the only flow that needs no loopback
 at all — but the device grant has no way to carry an organization. Auth0 accepts

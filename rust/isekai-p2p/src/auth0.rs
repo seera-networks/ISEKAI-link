@@ -390,8 +390,16 @@ async fn wait_for_the_redirect(login: &BrowserLogin) -> anyhow::Result<String> {
 /// A complete, tiny HTTP response. Leaked on purpose: it is built once per
 /// reply and the connection is closed immediately after.
 fn page(status: &[u8], message: &str) -> &'static [u8] {
+    // **The empty icon is not decoration.** Without a `rel="icon"` a browser
+    // asks for `/favicon.ico` after rendering, and by then this flow has its
+    // code and the listener is gone — so the request is refused. Locally that
+    // is invisible; over an `ssh -L` tunnel it surfaces as
+    // `channel N: open failed: connect failed: Connection refused`, which reads
+    // like the sign-in failed at the moment it has just succeeded. `data:,` is
+    // an icon the browser already has.
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>ISEKAI</title>\
+         <link rel=icon href=\"data:,\">\
          <body style=\"font:16px system-ui;margin:3rem\">{message}</body>"
     );
     let head = format!(
@@ -1025,6 +1033,31 @@ mod tests {
         });
         let e = wait_for_the_redirect(&login).await.expect_err("reported");
         assert!(e.to_string().contains("access_denied"), "{e}");
+    }
+
+    /// **The reply has to leave the browser with nothing more to ask for.**
+    /// A `/favicon.ico` fetched after this flow has finished is refused, and
+    /// through an `ssh -L` tunnel that refusal is printed as if the sign-in had
+    /// failed.
+    #[test]
+    fn the_reply_asks_the_browser_for_nothing() {
+        let reply = String::from_utf8_lossy(page(b"200 OK", "Signed in.")).into_owned();
+        assert!(reply.contains("rel=icon"), "{reply}");
+        assert!(reply.contains("Connection: close"));
+        // Nothing else to fetch: no script, style or image of its own.
+        for asks_for_more in ["<script", "<img", "<link rel=stylesheet"] {
+            assert!(!reply.contains(asks_for_more), "{asks_for_more} in {reply}");
+        }
+        // The length has to match the body, or the browser waits for the rest.
+        let (head, body) = reply.split_once("\r\n\r\n").expect("a complete reply");
+        let declared: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .expect("a length")
+            .trim()
+            .parse()
+            .expect("a number");
+        assert_eq!(declared, body.len());
     }
 
     #[test]
