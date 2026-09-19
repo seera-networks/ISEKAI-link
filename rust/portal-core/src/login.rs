@@ -71,6 +71,16 @@ fn sign_in_config(organization: Option<&str>) -> Auth0Config {
     cfg
 }
 
+/// Which organization the sign-in saved in `store` was for, if any.
+///
+/// **A local read, and `None` for every way of not knowing** — no store, an
+/// unreadable one, a sign-in that named no organization, or one saved before
+/// this was recorded. Every one of those means the same thing to whoever is
+/// asking: nothing here can say which organization this machine belongs to.
+pub fn signed_in_organization(store: &Path) -> Option<isekai_p2p::auth0::Organization> {
+    RefreshingAuth0Token::load(store).ok()?.organization
+}
+
 /// Refuse sign-in flags on a run that is not signing in.
 ///
 /// **Refused rather than dropped.** Both of these change which tenant an
@@ -195,6 +205,26 @@ pub async fn sign_in(
         browser_sign_in(&cfg).await?
     };
 
+    // **What was asked for and what arrived are compared.** Auth0 answers a
+    // refused organization at the authorize step, so reaching here with none
+    // means the request carried none — the flag was absent and the tenant's
+    // organization prompt did not appear. Left unsaid, that is a machine
+    // registering personally while its operator believes otherwise, which is
+    // the whole failure this flow was built to end.
+    if let Some(asked) = organization {
+        match &tokens.organization {
+            Some(got) if got.id == asked => {}
+            Some(got) => tracing::warn!(
+                "asked to sign in to {asked} and signed in to {got}; the Endpoints this \
+                 machine registers will belong to the second",
+            ),
+            None => tracing::warn!(
+                "asked to sign in to {asked}, and the token names no organization at all. \
+                 Endpoints registered from this machine will go to the individual tenant",
+            ),
+        }
+    }
+
     // **A sign-in with no refresh token is the failure this feature exists to
     // remove**, so it is not announced as a success. Auth0 returns one only
     // when `offline_access` is granted; without it the store buys hours rather
@@ -210,6 +240,20 @@ pub async fn sign_in(
             usable = true;
             tracing::warn!("Auth0 returned no refresh token; keeping the one already saved here",);
         }
+    }
+
+    // **Said out loud, because `org_a1b2c3` is not something anyone can check
+    // by looking at it.** Which organization a machine signed in to decides
+    // which tenant its Endpoints register into, and until now the only way to
+    // find out was to decode the token by hand — so an operator who mistyped
+    // the id, or whose organization prompt never appeared, learned it much
+    // later from a `401` that names neither.
+    match &tokens.organization {
+        Some(org) => println!("\nSigned in to {org}."),
+        None => println!(
+            "\nSigned in with no organization: Endpoints registered from this machine go to \
+             the individual tenant.\nPass --organization org_… to choose one.",
+        ),
     }
 
     RefreshingAuth0Token::save(store, &tokens)

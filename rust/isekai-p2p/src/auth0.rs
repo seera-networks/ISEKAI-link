@@ -44,6 +44,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -171,6 +172,13 @@ fn default_interval() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Auth0Tokens {
     pub access_token: String,
+    /// The organization this sign-in was for, when it was for one.
+    ///
+    /// **Stored so it can be shown again**, by a command that did not do the
+    /// signing in — which tenant a machine registers into is a fact about the
+    /// machine, and having to decode a token to recover it is why nobody does.
+    #[serde(default)]
+    pub organization: Option<Organization>,
     /// Present when `offline_access` was granted. Without one the session ends
     /// with the access token and the operator has to sign in again.
     pub refresh_token: Option<String>,
@@ -197,6 +205,10 @@ struct TokenResponse {
     #[serde(default)]
     refresh_token: Option<String>,
     expires_in: u64,
+    /// Present because `openid` is in the scope. **Kept only to say which
+    /// organization the sign-in landed in** — see [`Auth0Tokens::organization`].
+    #[serde(default)]
+    id_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -719,6 +731,53 @@ fn tokens_from(body: TokenResponse) -> Auth0Tokens {
         access_token: body.access_token,
         refresh_token: body.refresh_token,
         expires_at_unix: unix_now() + body.expires_in,
+        organization: body.id_token.as_deref().and_then(organization_of),
+    }
+}
+
+/// The organization an ID token says the sign-in was for.
+///
+/// **Read, never trusted.** Nothing is decided by this — Identity reads the
+/// access token's `org_id` and makes its own judgement. What this is for is
+/// telling the person at the keyboard which organization they just signed in
+/// to, in the words the Auth0 dashboard shows them, because `org_a1b2c3` is not
+/// something anyone can check by looking at it.
+///
+/// The signature is not verified for that reason: an attacker able to alter
+/// this has already replaced Auth0's response to a request made over TLS, and
+/// the access token beside it is what everything else stands on.
+fn organization_of(id_token: &str) -> Option<Organization> {
+    let payload = id_token.split('.').nth(1)?;
+    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    let id = claims.get("org_id")?.as_str()?.to_owned();
+    Some(Organization {
+        name: claims
+            .get("org_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        id,
+    })
+}
+
+/// Which organization a sign-in was for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Organization {
+    /// `org_…`, which is what Auth0 put in the token.
+    pub id: String,
+    /// The name the dashboard shows, when the tenant includes it.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl std::fmt::Display for Organization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // **The name first and the id after it**, because the name is what the
+        // person recognises and the id is what they would have to paste into
+        // `--organization`. Dropping either would cost one of those.
+        match &self.name {
+            Some(name) => write!(f, "{name} ({})", self.id),
+            None => write!(f, "{}", self.id),
+        }
     }
 }
 
@@ -996,6 +1055,15 @@ impl Auth0TokenSource for RefreshingAuth0Token {
             if renewed.refresh_token.is_none() {
                 renewed.refresh_token = Some(refresh_token);
             }
+            // **Carried across the same way, and for the same reason.** A
+            // refresh answers with an ID token only sometimes, and the one
+            // thing this field is for is telling an operator which
+            // organization a machine is signed in to — a fact that does not
+            // change on a refresh, and that writing `null` over would quietly
+            // erase within minutes of the sign-in that established it.
+            if renewed.organization.is_none() {
+                renewed.organization = tokens.organization.clone();
+            }
             if let Some(path) = &self.store {
                 if let Err(e) = Self::save(path, &renewed) {
                     // Not fatal: the tokens in hand still work, and the only cost
@@ -1180,6 +1248,77 @@ mod tests {
     /// `%` followed by a multi-byte character once panicked the task: the
     /// guard counted bytes and the slice indexed a `&str`, so it landed
     /// mid-codepoint.
+    fn id_token(claims: serde_json::Value) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
+        // Header and signature are not read; only the claims are, and only to
+        // say a name out loud.
+        format!("header.{payload}.signature")
+    }
+
+    /// **`org_a1b2c3` is not something anyone can check by looking at it.** The
+    /// name is what the person recognises, the id is what they would paste into
+    /// `--organization`, so the line carries both.
+    #[test]
+    fn the_organization_is_read_for_saying_out_loud() {
+        let org = organization_of(&id_token(serde_json::json!({
+            "org_id": "org_a1b2c3",
+            "org_name": "seera-networks",
+        })))
+        .expect("an organization");
+        assert_eq!(org.id, "org_a1b2c3");
+        assert_eq!(org.to_string(), "seera-networks (org_a1b2c3)");
+    }
+
+    /// A tenant that sends no name still leaves the id worth printing.
+    #[test]
+    fn an_organization_without_a_name_is_still_the_id() {
+        let org = organization_of(&id_token(serde_json::json!({ "org_id": "org_x" })))
+            .expect("an organization");
+        assert_eq!(org.to_string(), "org_x");
+    }
+
+    /// **Absent is the ordinary answer**, and it has to survive every shape of
+    /// nothing: a personal sign-in, a token that is not a JWT, one whose claims
+    /// will not decode.
+    #[test]
+    fn no_organization_reads_as_none() {
+        assert!(organization_of(&id_token(serde_json::json!({ "sub": "auth0|u" }))).is_none());
+        assert!(organization_of("not-a-jwt").is_none());
+        assert!(organization_of("header..signature").is_none());
+        assert!(organization_of("header.!!!.signature").is_none());
+    }
+
+    /// **The store has to keep it across a refresh.** An Auth0 refresh answers
+    /// with an ID token only sometimes; writing `null` over the organization
+    /// would erase it within minutes of the sign-in that established it, and
+    /// `--whoami` would stop being able to say where this machine belongs.
+    #[test]
+    fn the_organization_survives_a_round_trip_through_the_store() {
+        let dir = std::env::temp_dir().join(format!("isekai-auth0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let path = dir.join("tokens.json");
+        let tokens = Auth0Tokens {
+            access_token: "AT".to_owned(),
+            refresh_token: Some("RT".to_owned()),
+            expires_at_unix: unix_now() + 900,
+            organization: Some(Organization {
+                id: "org_a1b2c3".to_owned(),
+                name: Some("seera-networks".to_owned()),
+            }),
+        };
+        RefreshingAuth0Token::save(&path, &tokens).expect("saved");
+        let read = RefreshingAuth0Token::load(&path).expect("loaded");
+        assert_eq!(read.organization, tokens.organization);
+        // And a store written before this field existed still loads.
+        std::fs::write(
+            &path,
+            r#"{"access_token":"AT","refresh_token":"RT","expires_at_unix":1}"#,
+        )
+        .expect("written");
+        assert_eq!(RefreshingAuth0Token::load(&path).expect("loaded").organization, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_percent_before_a_multibyte_character_is_not_a_panic() {
         assert_eq!(urldecode("%a€"), "%a€");
@@ -1260,6 +1399,7 @@ mod tests {
             access_token: "access".to_owned(),
             refresh_token: refresh.map(str::to_owned),
             expires_at_unix: (unix_now() as i64 + expires_in_secs).max(0) as u64,
+            organization: None,
         }
     }
 

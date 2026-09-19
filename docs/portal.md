@@ -109,13 +109,36 @@ portal-client --login --organization org_…
 
 **An Endpoint is filed under the organization its sign-in named.** Identity
 reads the `org_id` claim, and a token without one is filed personally — so a
-machine signed in without an organization registers into the individual tenant,
-and nothing later says so. Pass the `org_…` id (Auth0 shows it under
-Organizations; the *name* is refused). Leaving it out lets Universal Login ask,
-if the application has the organization prompt turned on.
+machine signed in without an organization registers into the individual tenant.
 
+**Better than typing the id: let Auth0 ask.** With *Display Organization
+Prompt* turned on for the application, omitting `--organization` makes Universal
+Login ask which organization to sign in to, **by name**, and the claim reaches
+the token just the same. `org_a1b2c3` is not something anyone can check by
+looking at it; a name in a browser is.
+
+Pass the id when the choice has to be made without a person — a script, an
+unattended machine, or a tenant with no prompt. Auth0 shows it under
+Organizations, and the *name* is not accepted in its place.
 `ISEKAI_AUTH0_ORGANIZATION` does the same for the camera apps, which have no
 field to type it into.
+
+**The sign-in says which organization it landed in**, by name where the tenant
+sends one:
+
+```
+Signed in to seera-networks (org_a1b2c3).
+```
+
+and says so plainly when it landed in none. Asking for one and getting another —
+or none — is a warning, not a silence. Afterwards, `--whoami` answers the same
+question without signing in again:
+
+```
+$ portal-client --whoami
+ep:8c3f28d3…
+organization: seera-networks (org_a1b2c3)
+```
 
 ### Moving an Endpoint to an organization
 
