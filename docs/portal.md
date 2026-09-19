@@ -117,6 +117,42 @@ if the application has the organization prompt turned on.
 `ISEKAI_AUTH0_ORGANIZATION` does the same for the camera apps, which have no
 field to type it into.
 
+### Moving an Endpoint to an organization
+
+**A registration cannot follow a sign-in.** An Endpoint ID is derived from its
+keypair, and one key registers once — Identity refuses the same key in a second
+tenant. So a machine that was signed in personally and is now signed in to an
+organization keeps pointing at an Endpoint the new tenant does not contain, and
+every call fails with:
+
+```
+Identity API returned 401: pop-signature-invalid
+```
+
+which is Identity hiding the truth from a stranger and, incidentally, from its
+owner: it answers the same thing for a bad signature and for an Endpoint it
+cannot find. The signature was fine.
+
+Moving means a **new key, registered under the organization**:
+
+```sh
+portal-client --revoke-endpoint ep:… --reason endpoint_deleted   # while still personal
+portal-client --login --organization org_…
+mv portal-client.pem portal-client.pem.personal
+portal-client --register --map …
+```
+
+**Revoke before signing in to the organization, not after.** Revoking resolves
+its tenant from the Auth0 token too, so once the sign-in names an organization
+the old Endpoint is out of reach from that machine — `404`, for the same reason
+as above. Left alone it stays registered: nothing sweeps Endpoints on this
+route.
+
+Everything that named the old Endpoint has to be redone against the new one:
+pairing, capabilities, tickets, and the entitlements that decide its ceiling —
+those are keyed by tenant as well, so the ones written while personal do not
+apply to the organization.
+
 ### Signing in over SSH
 
 The redirect goes to `127.0.0.1` on the machine that is signing in, which a

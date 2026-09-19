@@ -13,7 +13,9 @@ use anyhow::Context as _;
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::https::HttpsTransport;
 use isekai_p2p_core::identity::Narrowing;
-use isekai_p2p_core::identity::{EndpointToken, IdentityAuth, IdentityClient, RevokeAuth};
+use isekai_p2p_core::identity::{
+    EndpointToken, IdentityAuth, IdentityClient, IdentityError, RevokeAuth,
+};
 use isekai_p2p_core::proxy::{ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
@@ -264,9 +266,10 @@ async fn issue<T: ControlPlaneTransport>(
             // every task, so it takes the `register` arm every time — the one
             // where the narrowing was furthest from reaching the wire.
             if !*register {
-                return Ok(client
+                return client
                     .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
-                    .await?);
+                    .await
+                    .map_err(|e| explain_pop_failure(e, cfg));
             }
             // **Registration happens once; the renewals issue.** `register`
             // is a static argument re-read on every renewal, so without this
@@ -345,9 +348,10 @@ async fn issue<T: ControlPlaneTransport>(
             // **Always a separate call**, which costs nothing: §8.1's
             // registration answers with the Endpoint's record and no token, so
             // `register_and_issue` made this same call itself.
-            Ok(client
+            client
                 .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
-                .await?)
+                .await
+                .map_err(|e| explain_pop_failure(e, cfg))
         }
         Credential::Enrollment(enrollment) => unattended(client, cfg, enrollment).await,
     }
@@ -619,6 +623,35 @@ fn retry_delay(failures: u32) -> Duration {
     (RENEW_MIN * 2u32.saturating_pow(doublings)).min(RENEW_UNKNOWN)
 }
 
+/// Say what `pop-signature-invalid` usually means here, which is not what it
+/// says.
+///
+/// **The server answers it for an Endpoint it cannot find, on purpose.**
+/// Identity looks the Endpoint up by `(tenant, endpoint_id)` and, finding
+/// nothing — "including one belonging to another tenant" — reports a signature
+/// failure rather than admitting the id is unknown. That is the right answer to
+/// give a stranger and a confusing one to give the owner: the key is fine, the
+/// signature is fine, and what changed is which tenant the *token* names.
+///
+/// Signing in to an organization is exactly what changes it, so this is the
+/// error a machine meets the first time it does. An Endpoint cannot follow:
+/// its id is derived from its keypair and the same key cannot be registered
+/// twice, so the answer is a new key registered under the organization.
+fn explain_pop_failure(error: IdentityError, cfg: &P2pConfig) -> anyhow::Error {
+    if error.kind().as_deref() != Some("pop-signature-invalid") {
+        return error.into();
+    }
+    anyhow::Error::from(error).context(format!(
+        "Identity could not verify {}. It answers this both for a bad signature and for an \
+         Endpoint it does not find in the tenant the Auth0 token names, so the usual cause is \
+         that this Endpoint was registered before signing in to an organization -- or without \
+         one. A registration cannot move between tenants, because the Endpoint ID is derived \
+         from the keypair and one key registers once: make a new key and register it while \
+         signed in to the organization you mean",
+        cfg.key.endpoint_id(),
+    ))
+}
+
 /// Whether retrying this failure could ever produce a different answer.
 ///
 /// **`403` is the line.** The Identity API answers `403` when a rule refused
@@ -750,6 +783,73 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+
+    fn problem(status: u16, kind: &str) -> IdentityError {
+        IdentityError::Api {
+            status,
+            body: format!(
+                r#"{{"type":"https://identity.isekai.tools/problems/{kind}","status":{status}}}"#
+            ),
+            retry_after: None,
+        }
+    }
+
+    fn a_config() -> P2pConfig {
+        P2pConfig {
+            identity_url: "http://127.0.0.1:1".to_owned(),
+            identity_http3: false,
+            proxy_url: String::new(),
+            credential: crate::Credential::auth0("AT", None, false),
+            protocol: "isekai-portal-v1".to_owned(),
+            device_name: None,
+            token_ttl: None,
+            key: isekai_p2p_core::endpoint::EndpointKey::generate(),
+            narrowing: Default::default(),
+        }
+    }
+
+    /// **The slug is read off the body**, because the status alone cannot tell
+    /// this refusal from the others a `401` covers.
+    #[test]
+    fn the_problem_slug_is_readable() {
+        assert_eq!(
+            problem(401, "pop-signature-invalid").kind().as_deref(),
+            Some("pop-signature-invalid"),
+        );
+        assert_eq!(IdentityError::Time.kind(), None);
+        assert_eq!(
+            IdentityError::Api {
+                status: 500,
+                body: "not json".to_owned(),
+                retry_after: None,
+            }
+            .kind(),
+            None,
+        );
+    }
+
+    /// **Identity answers `pop-signature-invalid` for an Endpoint it cannot
+    /// find, deliberately.** To its owner that reads as "your key is broken",
+    /// when the key is fine and the tenant moved — which is what signing in to
+    /// an organization does. The explanation has to come from this side.
+    #[test]
+    fn a_tenant_mismatch_is_explained_rather_than_read_as_a_bad_key() {
+        let cfg = a_config();
+        let explained = explain_pop_failure(problem(401, "pop-signature-invalid"), &cfg);
+        let text = format!("{explained:#}");
+        assert!(text.contains(&cfg.key.endpoint_id()), "{text}");
+        assert!(text.contains("tenant"), "{text}");
+        assert!(text.contains("new key"), "{text}");
+    }
+
+    /// Every other refusal is left as it came: this explains one message, it
+    /// does not narrate them all.
+    #[test]
+    fn other_refusals_are_not_dressed_up() {
+        let plain = explain_pop_failure(problem(403, "insufficient-permission"), &a_config());
+        let text = format!("{plain:#}");
+        assert!(!text.contains("tenant"), "{text}");
+    }
 
     fn api_error(status: u16) -> anyhow::Error {
         anyhow::Error::from(isekai_p2p_core::identity::IdentityError::Api {

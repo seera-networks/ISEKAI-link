@@ -80,6 +80,23 @@ impl IdentityError {
             _ => None,
         }
     }
+
+    /// The problem's slug — the last segment of the `type` URI.
+    ///
+    /// **For saying more about a refusal, not for telling refusals apart.**
+    /// The uniformity above is deliberate and this does not undo it: a caller
+    /// that branches on these has rebuilt the oracle. What it is for is
+    /// recognising a message whose cause is on *this* side, and explaining it
+    /// — `pop-signature-invalid` is the case, since the server answers it both
+    /// for a bad signature and for an Endpoint it cannot find.
+    pub fn kind(&self) -> Option<String> {
+        let IdentityError::Api { body, .. } = self else {
+            return None;
+        };
+        let problem: Value = serde_json::from_str(body).ok()?;
+        let uri = problem.get("type")?.as_str()?;
+        Some(uri.rsplit('/').next().unwrap_or(uri).to_owned())
+    }
 }
 
 /// How a request to the Identity API says who is making it.
