@@ -204,14 +204,15 @@ impl Auth0Tokens {
     /// the same organization; a stale one is dropped rather than shown against
     /// somebody else's id.
     pub fn organization(&self) -> Option<Organization> {
-        let id = claim(&self.access_token, "org_id")?;
-        let name = organization_name(&self.access_token).or_else(|| {
-            self.recorded_organization
+        let mut org = organization_in(&self.access_token)?;
+        if org.name.is_none() {
+            org.name = self
+                .recorded_organization
                 .as_ref()
-                .filter(|seen| seen.id == id)
-                .and_then(|seen| seen.name.clone())
-        });
-        Some(Organization { id, name })
+                .filter(|seen| seen.id == org.id)
+                .and_then(|seen| seen.name.clone());
+        }
+        Some(org)
     }
 
     fn expires_at(&self) -> SystemTime {
@@ -779,6 +780,19 @@ fn organization_of(id_token: &str) -> Option<Organization> {
     })
 }
 
+/// The organization an access token belongs to, if any.
+///
+/// **The `org_id` claim is the one Identity reads to decide the tenant**, so
+/// this says which organization governs what the holder registers — for a
+/// pasted `--auth0-token` as much as for a saved sign-in. The name comes along
+/// when a claim carries it; see [`ORG_NAME_CLAIM`].
+pub fn organization_in(access_token: &str) -> Option<Organization> {
+    Some(Organization {
+        id: claim(access_token, "org_id")?,
+        name: organization_name(access_token),
+    })
+}
+
 /// A claim an Auth0 Action can add to say what an organization is called.
 ///
 /// **Because `org_name` is not always there.** Auth0 puts `org_id` in both
@@ -1106,8 +1120,26 @@ impl Auth0TokenSource for RefreshingAuth0Token {
             // organization a machine is signed in to — a fact that does not
             // change on a refresh, and that writing `null` over would quietly
             // erase within minutes of the sign-in that established it.
-            if renewed.recorded_organization.is_none() {
-                renewed.recorded_organization = tokens.recorded_organization.clone();
+            // **The name is what is carried, not the record.** A refresh
+            // answers with an ID token only sometimes, and when it does it may
+            // carry `org_id` and no name — which is not `None`, so a guard on
+            // the record would let it overwrite the name with nothing and
+            // `--whoami` would stop naming the organization after the first
+            // refresh. That is the failure this is here to prevent.
+            let keep = tokens
+                .recorded_organization
+                .as_ref()
+                .filter(|seen| seen.name.is_some());
+            if let Some(seen) = keep {
+                match &mut renewed.recorded_organization {
+                    Some(fresh) if fresh.id == seen.id && fresh.name.is_none() => {
+                        fresh.name = seen.name.clone();
+                    }
+                    None => renewed.recorded_organization = Some(seen.clone()),
+                    // A name of its own, or a different organization: the new
+                    // answer stands.
+                    Some(_) => {}
+                }
             }
             if let Some(path) = &self.store {
                 if let Err(e) = Self::save(path, &renewed) {
@@ -1349,6 +1381,43 @@ mod tests {
         assert_eq!(
             tokens.organization().expect("an organization").to_string(),
             "seera-networks (org_tAUNRLW8USki2Big)",
+        );
+    }
+
+    /// **A refresh that names the organization without naming it must not
+    /// erase the name.** An ID token carrying `org_id` and no `org_name` parses
+    /// to `Some(Organization { name: None })`, which is not `None` — so a guard
+    /// on the record let it overwrite the name with nothing, and `--whoami`
+    /// stopped naming the organization after the first refresh.
+    #[test]
+    fn a_refresh_without_a_name_keeps_the_one_already_known() {
+        let known = Organization {
+            id: "org_a1b2c3".to_owned(),
+            name: Some("seera-networks".to_owned()),
+        };
+        let nameless = Organization {
+            id: "org_a1b2c3".to_owned(),
+            name: None,
+        };
+        // What `refresh` does with them, in the shape the loop applies it.
+        let mut renewed = signed_in_to(Some("org_a1b2c3"), Some(nameless));
+        let held = signed_in_to(Some("org_a1b2c3"), Some(known.clone()));
+        if let Some(seen) = held
+            .recorded_organization
+            .as_ref()
+            .filter(|seen| seen.name.is_some())
+        {
+            match &mut renewed.recorded_organization {
+                Some(fresh) if fresh.id == seen.id && fresh.name.is_none() => {
+                    fresh.name = seen.name.clone();
+                }
+                None => renewed.recorded_organization = Some(seen.clone()),
+                Some(_) => {}
+            }
+        }
+        assert_eq!(
+            renewed.organization().expect("an organization").to_string(),
+            "seera-networks (org_a1b2c3)",
         );
     }
 

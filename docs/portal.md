@@ -120,8 +120,10 @@ looking at it; a name in a browser is.
 Pass the id when the choice has to be made without a person — a script, an
 unattended machine, or a tenant with no prompt. Auth0 shows it under
 Organizations, and the *name* is not accepted in its place.
-`ISEKAI_AUTH0_ORGANIZATION` does the same for the camera apps, which have no
-field to type it into.
+
+`ISEKAI_AUTH0_ORGANIZATION` names one for the camera apps, which have no field
+to type it into. It is read wherever the flag would be, so the sign-in checks
+what arrived against it the same way.
 
 **The sign-in says which organization it landed in**, by name where the tenant
 sends one:
@@ -139,6 +141,9 @@ $ portal-client --whoami
 ep:8c3f28d3…
 organization: seera-networks (org_a1b2c3)
 ```
+
+The Endpoint ID is on stdout and the organization on stderr, so
+`EP=$(portal-client --whoami)` still yields the id and nothing else.
 
 **The id is read from the access token**, which is the same claim Identity reads
 to decide the tenant — so this answers for machines that signed in before any of
