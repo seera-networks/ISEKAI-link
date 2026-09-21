@@ -159,9 +159,17 @@ async fn drive(
                 }
                 let _ = reported.send(Some(addresses));
             }
-            // One per stranger, which is the ordinary traffic of this session
-            // rather than news.
-            MasqueClientEvent::NewRemoteHost(..) => {}
+            // **The only place a sender and its socket are named together.**
+            // One per distinct remote source — ordinary traffic for this
+            // session rather than news, so `debug` — but it is the correlation
+            // `ForwardLimits` bounds, and everything downstream of the forward
+            // sees only the loopback socket. Without this the sender's address
+            // is nowhere.
+            MasqueClientEvent::NewRemoteHost(sender, forwarding_socket) => tracing::debug!(
+                %sender,
+                %forwarding_socket,
+                "a new sender reached this address; it costs one forwarding socket",
+            ),
             other => tracing::debug!("public bind session event: {other:?}"),
         }
     }

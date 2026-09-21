@@ -37,6 +37,14 @@
 //! socket appears per source, which is what `ForwardLimits` bounds. That is the
 //! other thing only this example can show — a relay leg has one peer, so the
 //! behaviour does not arise there at all.
+//!
+//! ```sh
+//! RUST_LOG=info,isekai_p2p=debug cargo run …
+//! ```
+//!
+//! pairs each sender with the socket it cost. **At `info` the sender's address
+//! is nowhere**: what the forwarded service sees is the loopback socket, and
+//! nothing downstream of the tunnel knows who is on the other end of it.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -138,11 +146,8 @@ async fn main() -> anyhow::Result<()> {
     // A public session is not cut when its lease lapses, but every *next*
     // ticket is an authenticated call, so a stale token ends the ability to
     // reconnect rather than the session in hand.
-    let _renewal = isekai_p2p::config::spawn_token_renewal(
-        cfg.clone(),
-        proxy.clone(),
-        Some(token.expires_in),
-    );
+    let _renewal =
+        isekai_p2p::config::spawn_token_renewal(cfg.clone(), proxy.clone(), Some(token.expires_in));
 
     let target: SocketAddr = args.target.parse().context("--target is an ip:port")?;
     let published = read_published(&args.state);
@@ -155,10 +160,16 @@ async fn main() -> anyhow::Result<()> {
         },
         forward_to,
         PublishOptions {
-            // **Stable across restarts, and about what is published.** A fresh
-            // key per run makes every restart another Listener, and eight of
-            // those is the quota.
-            idempotency_key: &format!("public-udp-service:{}", cfg.key.endpoint_id()),
+            // **Stable across restarts, and about what is published** — which
+            // is why the target is in it. A fresh key per run makes every
+            // restart another Listener and eight of those is the quota; a key
+            // that ignores what changed hands back the old Listener for 24
+            // hours, still advertising the target that was asked for last time.
+            idempotency_key: &format!(
+                "public-udp-service:{}:{target}:{}",
+                cfg.key.endpoint_id(),
+                args.ttl.map(|t| t.to_string()).unwrap_or_default(),
+            ),
             region: args.region.as_deref(),
             ttl: args.ttl,
             published: published.as_ref(),
@@ -167,11 +178,20 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     if let Some(moved) = endpoint.moved() {
-        println!("The address MOVED: it was {}, and is now {}.", moved.from, moved.to);
+        println!(
+            "The address MOVED: it was {}, and is now {}.",
+            moved.from, moved.to
+        );
         println!("Anything holding the old one is talking to nothing.");
     }
     let address = endpoint.advertised().clone();
-    write_published(&args.state, &address)?;
+    // **Not fatal.** The Listener exists and the session is carrying traffic;
+    // failing here loses the comparison this note enables on the next run, and
+    // exiting would throw away the publish as well — which is the trade
+    // `read_published` already refuses to make in the other direction.
+    if let Err(e) = write_published(&args.state, &address) {
+        tracing::warn!("could not remember this address; a move will go unnoticed: {e:#}");
+    }
 
     println!("listener  : {}", endpoint.listener_id());
     println!("address   : {address}");
@@ -181,9 +201,50 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("Ctrl-C to stop. The Listener is left in place; it lapses with its TTL.");
 
-    tokio::signal::ctrl_c().await?;
+    // **Both ways this ends.** Waiting only on Ctrl-C would leave the process
+    // sitting on an address that forwards nothing if the session dies — a data
+    // plane restarting, a QUIC connection lost — which looks exactly like a
+    // quiet afternoon. The watch's sender lives in the task that drives the
+    // session, so its closing is that task's ending.
+    let mut alive = endpoint.reported();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        // **Until the sender is gone, not until the value moves.** A receiver
+        // cloned after the address was reported has not seen it yet, so its
+        // first `changed()` returns at once — which ended this example a
+        // moment after it started. What is being waited for is the task that
+        // holds the sender ending, which is `Err`.
+        _ = async { while alive.changed().await.is_ok() {} } => {
+            println!("The session ended; this address is no longer carrying anything.");
+        }
+    }
     endpoint.close().await;
-    Ok(())
+    leave().await
+}
+
+/// Stop, without running the destructors that can refuse to.
+///
+/// **Returning from `main` was not an exit.** Dropping the msquic registration
+/// runs `RegistrationClose`, which blocks uninterruptibly on any handle still
+/// outstanding — the first version of this example ended in a core dump, and
+/// the second hung after Ctrl-C with "still has live handles". Draining first
+/// and then leaving through `_exit` is what every binary in this workspace
+/// does, for exactly this.
+async fn leave() -> ! {
+    if !isekai_p2p::agent::drain_msquic(std::time::Duration::from_secs(5)).await {
+        tracing::debug!("msquic still had live handles; leaving anyway");
+    }
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` ends the process; nothing after it runs, which is the
+    // point.
+    unsafe { libc_exit(0) }
+}
+
+unsafe extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
 }
 
 /// Answer every datagram with what it said.
@@ -194,10 +255,15 @@ async fn echo_forever(socket: tokio::net::UdpSocket) {
     let mut buf = vec![0u8; 2048];
     loop {
         match socket.recv_from(&mut buf).await {
-            Ok((len, from)) => {
-                tracing::info!(%from, len, "the far end reached this process");
-                if let Err(e) = socket.send_to(&buf[..len], from).await {
-                    tracing::warn!(%from, "could not answer: {e}");
+            Ok((len, via)) => {
+                // **`via`, not `from`.** This is the loopback socket the
+                // forward bound for one remote source — not the sender, whose
+                // address never reaches this far. A distinct `via` per sender
+                // is the thing `ForwardLimits` bounds; `RUST_LOG=isekai_p2p=debug`
+                // shows which sender each belongs to.
+                tracing::info!(%via, len, "a datagram arrived through the tunnel");
+                if let Err(e) = socket.send_to(&buf[..len], via).await {
+                    tracing::warn!(%via, "could not answer: {e}");
                 }
             }
             Err(e) => {
