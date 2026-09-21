@@ -1393,11 +1393,18 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// `POST /v1/public-listeners` (spec §7.7.1) — declare a UDP service
     /// public.
     ///
-    /// **Idempotent, and that is worth using.** The address it hands back is
-    /// the one the user holds, allocated once and kept; re-creating without an
-    /// `Idempotency-Key` inserts another row against a per-Endpoint quota
-    /// (default 8) that expired rows sit in until the sweep. A daemon that
-    /// re-creates on every restart runs out for good.
+    /// **Every call makes a row, and this one cannot yet say otherwise.**
+    /// The address is the user's, allocated once and kept — but the *Listener*
+    /// is not, and each creation spends one of a per-Endpoint quota (default
+    /// 8) that expired rows occupy until the sweep. So a daemon that
+    /// re-creates on every restart stops being able to publish after eight.
+    ///
+    /// The server makes creation idempotent under an `Idempotency-Key`, and
+    /// **this client has no way to send one**: `send` carries the auth headers
+    /// and nothing else, and adding that seam is P2 of
+    /// `docs/public_listener_client_plan.md`. Until then the only defence is
+    /// not to re-create blindly — **keep the `listener_id`**, and note that
+    /// there is no route here to look one up again if it is lost.
     ///
     /// `region` is a request, not a choice: the allocation is per user and
     /// permanent, so it decides only the *first* one. Read
@@ -2388,8 +2395,6 @@ mod tests {
         assert!(conn.ticket.is_none());
     }
 
-    /// Both relay-ticket calls go where §8.14 says, and carry a PoP over the
-    /// body actually sent.
     /// **A public `relay` carries no `session_id`, and that has to parse.**
     /// The field was a required `String`, so the answer this whole route
     /// exists to give could not be read at all — the server omits it, because
@@ -2442,20 +2447,32 @@ mod tests {
         let (client, _key) = client(MockTransport::with_response(201, resp));
         let listener = client
             .create_public_listener(
-                &PublicTarget { host: "127.0.0.1".into(), port: 51820 },
+                &PublicTarget {
+                    host: "127.0.0.1".into(),
+                    port: 51820,
+                },
                 Some("ap-northeast-1"),
                 Some(3600),
             )
             .await
             .unwrap();
-        assert!(listener.relay.is_none(), "this control plane holds the port");
-        assert!(listener.ticket.is_none(), "creation is idempotent; it bundles none");
+        assert!(
+            listener.relay.is_none(),
+            "this control plane holds the port"
+        );
+        assert!(
+            listener.ticket.is_none(),
+            "creation is idempotent; it bundles none"
+        );
         assert!(listener.public_address.hostname.is_none());
         assert!(listener.region.is_none(), "not an echo of the request");
 
         let calls = client.transport.calls.lock().unwrap();
         let (method, path, _, body) = calls.last().unwrap();
-        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1/public-listeners"));
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/public-listeners")
+        );
         let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
         assert_eq!(sent["target"]["host"], "127.0.0.1");
         assert_eq!(sent["target"]["port"], 51820);
@@ -2474,6 +2491,8 @@ mod tests {
         );
     }
 
+    /// Both relay-ticket calls go where §8.14 says, and carry a PoP over the
+    /// body actually sent.
     #[tokio::test]
     async fn the_relay_ticket_calls_hit_the_right_paths() {
         let resp = r#"{"ticket":"eyJ.JWT.sig","role":"target",
