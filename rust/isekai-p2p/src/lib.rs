@@ -59,6 +59,9 @@ pub mod relay_rtt;
 pub mod agent {
     pub use isekai_p2p_core::attestation::{attest, verify, Attestation, AttestationError};
     pub use isekai_p2p_core::bind::RelayOptions;
+    // **The public address's own bind** (`docs/public_listener_client_plan.md`
+    // P1). Reached from outside this crate, by the example P4 asks for.
+    pub use isekai_p2p_core::bind::{open_public_bind_session, BindSession, MasqueClientEvent};
     pub use isekai_p2p_core::endpoint::EndpointKey;
     /// Whether a peer certificate names the host that was dialled (#134).
     pub use isekai_p2p_core::hostname::certificate_matches;

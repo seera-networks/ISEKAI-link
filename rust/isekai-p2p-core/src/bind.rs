@@ -186,16 +186,55 @@ const RELAY_TICKET_HEADER: &str = "seera-relay-ticket";
 /// still binds the leg, on a single lease it will not renew. Only a proxy with
 /// the flag on refuses, and it says so with `relay-ticket-required` — which is
 /// the signal that this side is the one that needs upgrading, not the proxy.
-fn ticket_layer(
-    ticket: Option<&str>,
-) -> anyhow::Result<Option<SetRequestHeaderLayer<HeaderValue>>> {
+fn ticket_header(ticket: Option<&str>) -> anyhow::Result<Option<(HeaderName, HeaderValue)>> {
     let Some(ticket) = ticket else {
         return Ok(None);
     };
-    Ok(Some(SetRequestHeaderLayer::appending(
+    Ok(Some((
         HeaderName::from_static(RELAY_TICKET_HEADER),
         HeaderValue::from_str(ticket).context("relay ticket is not a valid header value")?,
     )))
+}
+
+/// Turn "this header, or none" into "this layer, or none".
+///
+/// **The helpers answer what goes on the wire**, which is the thing worth
+/// stating and the thing worth testing; building the layer is plumbing.
+fn header_layer(
+    header: Option<(HeaderName, HeaderValue)>,
+) -> Option<SetRequestHeaderLayer<HeaderValue>> {
+    header.map(|(name, value)| SetRequestHeaderLayer::appending(name, value))
+}
+
+/// `Seera-Signaling-Session-Id`, for the session a leg meets its peer on.
+///
+/// **Absent for a public address**, and that absence is what the data plane
+/// reads to know which of the two it is looking at.
+fn session_header(kind: BoundUdp<'_>) -> anyhow::Result<Option<(HeaderName, HeaderValue)>> {
+    let BoundUdp::Leg { connection_id } = kind else {
+        return Ok(None);
+    };
+    Ok(Some((
+        HeaderName::from_static("seera-signaling-session-id"),
+        HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
+    )))
+}
+
+/// `Seera-Prefer-Temporary-Public-Address`, which asks a proxy not to spend
+/// this user's allocated address on a leg.
+///
+/// **Absent for a public address, where the allocated one is the whole point.**
+/// A co-located control plane reads this header and binds an ephemeral port
+/// instead — the session comes up, and the `ip:port` handed to the world
+/// receives nothing.
+fn temporary_address_header(kind: BoundUdp<'_>) -> Option<(HeaderName, HeaderValue)> {
+    match kind {
+        BoundUdp::Leg { .. } => Some((
+            HeaderName::from_static("seera-prefer-temporary-public-address"),
+            HeaderValue::from_static("?1"),
+        )),
+        BoundUdp::PublicAddress => None,
+    }
 }
 
 /// A running MASQUE bind session. Keep it alive for the duration of the P2P
@@ -322,6 +361,90 @@ pub async fn open_bind_session(
     ticket: Option<&str>,
     opts: RelayOptions,
 ) -> anyhow::Result<BindSession> {
+    open_bound_udp(
+        target,
+        endpoint_token,
+        key,
+        BoundUdp::Leg { connection_id },
+        forward_to,
+        ticket,
+        opts,
+    )
+    .await
+}
+
+/// Open the bound-UDP session that **is** this Endpoint's public address
+/// (`docs/public_listener_client_plan.md` P1).
+///
+/// The socket the proxy binds for this session is the `ip:port` the control
+/// plane allocated, so traffic anyone sends there arrives here and is forwarded
+/// to `forward_to`. `target` is the `masque_uri` from the Listener's `relay`,
+/// and `ticket` the paper from `POST /v1/public-listeners/{id}/ticket`.
+///
+/// **`ticket` is `None` only when the address is on the control plane's own
+/// data path** — the case where the Listener's answer carried no `relay`.
+/// There the session's Endpoint Token is the authorization. A registered data
+/// plane with no ticket has nothing to check and refuses.
+///
+/// # Why this is not [`open_bind_session`] with an argument
+///
+/// A relay leg and a public address differ by two headers, and **the data
+/// plane decides which request it is looking at from them** rather than from
+/// the ticket inside — deliberately, so that a ticket cannot choose the check
+/// applied to it. Reusing the leg's call would send both:
+///
+/// | header | on a leg | here |
+/// | --- | --- | --- |
+/// | `Seera-Signaling-Session-Id` | names the session the two halves meet on | **absent.** Sending it puts a `role: public` ticket on the leg path, which refuses it |
+/// | `Seera-Prefer-Temporary-Public-Address` | asks for a throwaway address | **absent.** Sending it makes a co-located control plane skip the allocated port and bind an ephemeral one — **the bind succeeds and the published address is dead** |
+///
+/// The second is the reason this is a separate function rather than an
+/// `Option` parameter: it fails silently, on the deployment that looks
+/// simplest.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_public_bind_session(
+    target: &str,
+    endpoint_token: &str,
+    key: &EndpointKey,
+    forward_to: SocketAddr,
+    ticket: Option<&str>,
+    opts: RelayOptions,
+) -> anyhow::Result<BindSession> {
+    open_bound_udp(
+        target,
+        endpoint_token,
+        key,
+        BoundUdp::PublicAddress,
+        forward_to,
+        ticket,
+        opts,
+    )
+    .await
+}
+
+/// Which of the two bound-UDP sessions is being opened.
+///
+/// **The difference is a pair of headers, and it is not a flag.** What the data
+/// plane does with the request turns entirely on them, so naming the two cases
+/// is what keeps a caller from asking for one and sending the other's headers.
+#[derive(Debug, Clone, Copy)]
+enum BoundUdp<'a> {
+    /// A relay leg, meeting its peer on this connection's id.
+    Leg { connection_id: &'a str },
+    /// A public address, which meets nobody.
+    PublicAddress,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_bound_udp(
+    target: &str,
+    endpoint_token: &str,
+    key: &EndpointKey,
+    kind: BoundUdp<'_>,
+    forward_to: SocketAddr,
+    ticket: Option<&str>,
+    opts: RelayOptions,
+) -> anyhow::Result<BindSession> {
     let uri: Uri = target.parse().context("invalid proxy target URI")?;
     // **Checked on this path too.** The connect leg validates inside
     // `relay_target`; a bind leg took its target on trust, so a
@@ -357,15 +480,9 @@ pub async fn open_bind_session(
             HeaderName::from_static(pop::HEADER_POP_SIGNATURE),
             header_value(&pop.signature)?,
         ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static("seera-prefer-temporary-public-address"),
-            HeaderValue::from_static("?1"),
-        ))
-        .layer(SetRequestHeaderLayer::appending(
-            HeaderName::from_static("seera-signaling-session-id"),
-            HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
-        ))
-        .option_layer(ticket_layer(ticket)?)
+        .option_layer(header_layer(temporary_address_header(kind)))
+        .option_layer(header_layer(session_header(kind)?))
+        .option_layer(header_layer(ticket_header(ticket)?))
         .service(channel);
 
     let (out_tx, out_rx) = mpsc::channel(32);
@@ -566,7 +683,7 @@ pub async fn open_connect_relay(
             HeaderName::from_static("seera-signaling-session-id"),
             HeaderValue::from_str(connection_id).context("invalid connection id header value")?,
         ))
-        .option_layer(ticket_layer(ticket)?)
+        .option_layer(header_layer(ticket_header(ticket)?))
         .service(channel);
 
     let socket = Arc::new(
@@ -624,6 +741,55 @@ pub async fn open_connect_relay(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The value a header helper would send, for comparing against the
+    /// contract.
+    fn sent(header: Option<(HeaderName, HeaderValue)>) -> Option<String> {
+        header.map(|(_, value)| value.to_str().unwrap().to_owned())
+    }
+
+    /// **A public address sends neither of the leg's headers, and each absence
+    /// is load bearing.** The session id is what makes the data plane treat a
+    /// request as a relay leg — with one, a `role: public` ticket is carried
+    /// to the leg path and refused. The temporary-address preference makes a
+    /// co-located control plane bind an ephemeral port instead of the
+    /// allocated one, so the session comes up and the published address
+    /// receives nothing.
+    #[test]
+    fn a_public_address_sends_neither_of_the_legs_headers() {
+        assert!(session_header(BoundUdp::PublicAddress).unwrap().is_none());
+        assert!(temporary_address_header(BoundUdp::PublicAddress).is_none());
+    }
+
+    /// And a leg still sends both, unchanged.
+    #[test]
+    fn a_leg_still_meets_its_peer_and_asks_for_a_temporary_address() {
+        let kind = BoundUdp::Leg {
+            connection_id: "conn_1",
+        };
+        assert_eq!(
+            session_header(kind).unwrap().map(|(n, _)| n.to_string()),
+            Some("seera-signaling-session-id".to_owned()),
+        );
+        assert_eq!(
+            sent(session_header(kind).unwrap()).as_deref(),
+            Some("conn_1")
+        );
+        assert_eq!(sent(temporary_address_header(kind)).as_deref(), Some("?1"));
+    }
+
+    /// A ticket travels when there is one, and its absence is not an error:
+    /// the control plane's own data path authorizes the bind by the session's
+    /// Endpoint Token.
+    #[test]
+    fn the_ticket_travels_only_when_there_is_one() {
+        assert_eq!(
+            sent(ticket_header(Some("eyJ.JWT.sig")).unwrap()).as_deref(),
+            Some("eyJ.JWT.sig"),
+        );
+        assert!(ticket_header(None).unwrap().is_none());
+    }
 
     /// **What the leg reports is a base URL, not the CONNECT-UDP path.**
     ///
@@ -755,12 +921,12 @@ mod tests {
     /// error about a missing ticket would not.
     #[test]
     fn the_ticket_header_is_added_only_when_there_is_a_ticket() {
-        assert!(ticket_layer(None).unwrap().is_none());
-        assert!(ticket_layer(Some("eyJ.JWT.sig")).unwrap().is_some());
+        assert!(ticket_header(None).unwrap().is_none());
+        assert!(ticket_header(Some("eyJ.JWT.sig")).unwrap().is_some());
         // A ticket is a JWT, so this cannot normally happen — but a value that
         // would not survive as a header must fail here rather than silently
         // opening an unticketed leg.
-        assert!(ticket_layer(Some("bad\nvalue")).is_err());
+        assert!(ticket_header(Some("bad\nvalue")).is_err());
     }
 
     /// Every PoP value must survive as an HTTP header value.
