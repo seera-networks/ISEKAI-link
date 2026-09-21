@@ -53,6 +53,21 @@ pub struct PublicEndpoint {
     /// Owns the session and drains its events. Dropping it drops the session,
     /// whose `Drop` cancels the bind.
     driver: Option<tokio::task::JoinHandle<()>>,
+    /// What the address used to be, when this open found a different one.
+    moved: Option<AddressChange>,
+}
+
+/// An address that is not where it was.
+///
+/// **Whoever published the old one cannot be told by this process.** It is in
+/// somebody's DNS, or a config file, or a message sent last week — places the
+/// client cannot reach. So the only useful thing to do with this is say it
+/// loudly and let a person decide; moving quietly to the new address would let
+/// "it stopped working" happen entirely outside anywhere it would be recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressChange {
+    pub from: PublicAddress,
+    pub to: PublicAddress,
 }
 
 impl PublicEndpoint {
@@ -84,6 +99,16 @@ impl PublicEndpoint {
         self.reported.clone()
     }
 
+    /// Where the address moved to, if this open found it somewhere else.
+    ///
+    /// **Only a re-open can answer this**, and only against an address the
+    /// caller kept: the control plane re-reads its ledger when it issues a
+    /// ticket, so a retired data plane shows up as a different answer there and
+    /// nowhere else.
+    pub fn moved(&self) -> Option<&AddressChange> {
+        self.moved.as_ref()
+    }
+
     /// Stop carrying traffic. The Listener stays; deleting it is a separate
     /// decision, because an address that is still advertised may want to
     /// survive this process.
@@ -112,11 +137,26 @@ impl Drop for PublicEndpoint {
 /// one `NewRemoteHost` per distinct remote source, and its sources are
 /// strangers, so the count that wedges it is reached by a scan or by ordinary
 /// clients rotating ports. `listener.rs` drives its leg for the same reason.
-async fn drive(mut session: BindSession, reported: watch::Sender<Option<Vec<SocketAddr>>>) {
+async fn drive(
+    mut session: BindSession,
+    reported: watch::Sender<Option<Vec<SocketAddr>>>,
+    expected: Option<PublicAddress>,
+) {
     while let Some(event) = session.events.recv().await {
         match event {
             MasqueClientEvent::PublicAddresses(addresses) => {
                 tracing::info!(?addresses, "the data plane reports this session's address");
+                if expected
+                    .as_ref()
+                    .is_some_and(|expected| bound_elsewhere(expected, &addresses))
+                {
+                    tracing::warn!(
+                        expected = %expected.as_ref().expect("checked just above"),
+                        reported = ?addresses,
+                        "the session was bound somewhere other than the address that was \
+                         published; traffic sent to the published one arrives nowhere",
+                    );
+                }
                 let _ = reported.send(Some(addresses));
             }
             // One per stranger, which is the ordinary traffic of this session
@@ -148,7 +188,15 @@ pub async fn publish<T: ControlPlaneTransport>(
         )
         .await
         .context("declare this service public")?;
-    match open(cfg, proxy, &listener.listener_id, forward_to).await {
+    match open(
+        cfg,
+        proxy,
+        &listener.listener_id,
+        forward_to,
+        options.published,
+    )
+    .await
+    {
         Ok(session) => Ok(session),
         // **The remembered reply can name a Listener that has died.** The
         // idempotency window is a day; a Listener may be given an hour, so a
@@ -166,7 +214,14 @@ pub async fn publish<T: ControlPlaneTransport>(
                 .create_public_listener(&target, options.region, options.ttl, None)
                 .await
                 .context("declare this service public again")?;
-            open(cfg, proxy, &listener.listener_id, forward_to).await
+            open(
+                cfg,
+                proxy,
+                &listener.listener_id,
+                forward_to,
+                options.published,
+            )
+            .await
         }
         Err(e) => Err(e),
     }
@@ -198,6 +253,7 @@ pub async fn open<T: ControlPlaneTransport>(
     proxy: &ProxyClient<T>,
     listener_id: &str,
     forward_to: SocketAddr,
+    published: Option<&PublicAddress>,
 ) -> anyhow::Result<PublicEndpoint> {
     let ticketed = proxy
         .issue_public_listener_ticket(listener_id)
@@ -210,9 +266,10 @@ pub async fn open<T: ControlPlaneTransport>(
     // anyway sends a ticket somewhere it means nothing — and the refusal names
     // the ticket, which is the confusion `check_ticket_role` exists to keep a
     // caller out of.
-    let (target, ticket) = match chosen_relay(&ticketed) {
-        Some(relay) => (
-            relay.masque_uri.clone(),
+    let chosen = chosen_relay(&ticketed).map(|relay| relay.masque_uri.clone());
+    let (target, ticket) = match &chosen {
+        Some(masque_uri) => (
+            masque_uri.clone(),
             ticketed.ticket.as_ref().map(|t| t.ticket.clone()),
         ),
         None => (cfg.proxy_url.clone(), None),
@@ -237,13 +294,66 @@ pub async fn open<T: ControlPlaneTransport>(
 
     let inbound = session.inbound_activity();
     let (reported_tx, reported) = watch::channel(None);
+    let expect_reported = worth_comparing(chosen.is_some(), &ticketed.public_address);
     Ok(PublicEndpoint {
         listener_id: ticketed.listener_id,
+        moved: moved_since(published, &ticketed.public_address),
         advertised: ticketed.public_address,
         reported,
         inbound,
-        driver: Some(tokio::spawn(drive(session, reported_tx))),
+        driver: Some(tokio::spawn(drive(session, reported_tx, expect_reported))),
     })
+}
+
+/// What changed, if the address is not where it was.
+///
+/// **Said out loud here rather than left to the caller to notice.** The people
+/// who need to know are wherever the old address was written down, and this
+/// process cannot reach them; the least it can do is not be quiet about it.
+fn moved_since(published: Option<&PublicAddress>, now: &PublicAddress) -> Option<AddressChange> {
+    let from = published?;
+    if from == now {
+        return None;
+    }
+    tracing::warn!(
+        %from,
+        to = %now,
+        "this public address has moved; whatever was told the old one is now \
+         talking to nothing",
+    );
+    Some(AddressChange {
+        from: from.clone(),
+        to: now.clone(),
+    })
+}
+
+/// The address to check the data plane's report against, where checking it
+/// means anything.
+///
+/// **With a data plane chosen there is nothing to learn.** What it reports and
+/// what the answer said are two copies of one read of the ledger — the server
+/// puts the same value in the response and in the ticket, and the data plane
+/// echoes the ticket's rather than what it bound — so they agree by
+/// construction, and comparing them would dress a tautology up as a check.
+///
+/// **With none, the bind lands on the control plane's own data path**, which
+/// has branches of its own: a shared listener, or a temporary address. Then the
+/// report can differ from what was published, and it is the only place that
+/// difference is visible.
+fn worth_comparing(relay_chosen: bool, published: &PublicAddress) -> Option<PublicAddress> {
+    (!relay_chosen).then(|| published.clone())
+}
+
+/// Whether the session was bound somewhere other than the published address.
+///
+/// **A list, and any of it will do.** The header is comma-separated and a data
+/// plane may advertise more than one; what matters is whether the published
+/// address is among them, not which position it is in.
+///
+/// **A decision rather than a log line**, so that what is asserted in a test is
+/// the judgement the running code makes.
+fn bound_elsewhere(expected: &PublicAddress, reported: &[SocketAddr]) -> bool {
+    !reported.is_empty() && !reported.iter().any(|a| a.port() == expected.port)
 }
 
 /// Refuse a ticket that is not for a public address.
@@ -357,6 +467,90 @@ mod tests {
         assert!(chosen_relay(&listener(None, None)).is_none());
     }
 
+    fn address(ip: &str, port: u16, hostname: Option<&str>) -> PublicAddress {
+        PublicAddress {
+            hostname: hostname.map(str::to_owned),
+            ip: ip.to_owned(),
+            port,
+        }
+    }
+
+    /// **The same address is not news.** A re-ticket happens on every reopen,
+    /// so saying something each time would make the one time it matters
+    /// indistinguishable from the rest.
+    #[test]
+    fn an_address_that_stayed_put_says_nothing() {
+        let now = address("203.0.113.9", 10042, Some("udp-ap1.isekai.tools"));
+        assert_eq!(moved_since(Some(&now.clone()), &now), None);
+        assert_eq!(
+            moved_since(None, &now),
+            None,
+            "a first publish has nothing to have moved from",
+        );
+    }
+
+    /// **A retired data plane takes its addresses with it**, and this is the
+    /// only place that shows up: the control plane re-reads its ledger when it
+    /// issues a ticket.
+    #[test]
+    fn an_address_that_moved_is_reported_with_both_halves() {
+        let from = address("203.0.113.9", 10042, None);
+        let to = address("198.51.100.4", 10042, None);
+        let change = moved_since(Some(&from), &to).expect("it moved");
+        assert_eq!(change.from, from);
+        assert_eq!(change.to, to);
+        // A port that moved under the same IP counts too -- what was handed out
+        // was the pair.
+        assert!(moved_since(Some(&from), &address("203.0.113.9", 10043, None)).is_some());
+    }
+
+    /// **The name is part of what was handed out.** A published hostname that
+    /// stops resolving to this session is the same failure as a moved port,
+    /// and the pair alone cannot see it.
+    #[test]
+    fn a_changed_name_is_a_changed_address() {
+        let from = address("203.0.113.9", 10042, Some("udp-ap1.isekai.tools"));
+        let to = address("203.0.113.9", 10042, Some("udp-ap2.isekai.tools"));
+        assert!(moved_since(Some(&from), &to).is_some());
+    }
+
+    /// **The report is only worth checking where it can disagree.** With a data
+    /// plane chosen it repeats the answer's own address; on the control plane's
+    /// own data path the session may land on a shared or temporary port, and
+    /// then what was published receives nothing.
+    #[test]
+    fn a_session_bound_somewhere_else_is_worth_saying() {
+        let published = address("203.0.113.1", 10007, None);
+        assert!(
+            !bound_elsewhere(&published, &[]),
+            "nothing reported yet is not a disagreement",
+        );
+        assert!(
+            !bound_elsewhere(
+                &published,
+                &[
+                    "203.0.113.1:10007".parse().unwrap(),
+                    "[2001:db8::1]:10007".parse().unwrap(),
+                ],
+            ),
+            "the published port among several is the session being where it said",
+        );
+        assert!(
+            bound_elsewhere(&published, &["203.0.113.1:54321".parse().unwrap()]),
+            "and this is the case worth saying out loud",
+        );
+    }
+
+    /// **Comparing the report where a data plane was chosen proves nothing**,
+    /// and a check that cannot fail is worse than none: it reads as evidence.
+    /// The two values there are one read of the ledger, delivered twice.
+    #[test]
+    fn the_report_is_only_checked_where_it_can_disagree() {
+        let published = address("203.0.113.9", 10042, None);
+        assert_eq!(worth_comparing(true, &published), None);
+        assert_eq!(worth_comparing(false, &published), Some(published));
+    }
+
     /// **A remembered Listener can be dead.** The idempotency window is a
     /// day and a Listener may be given an hour, so a restart in between is
     /// handed the id of something gone — and only `listener-not-found` says
@@ -411,4 +605,13 @@ pub struct PublishOptions<'a> {
     pub region: Option<&'a str>,
     /// Seconds, clamped by the server to 60..=86,400.
     pub ttl: Option<u64>,
+    /// The address this service was published at last time, if there was a
+    /// last time.
+    ///
+    /// **Keep it across restarts.** A data plane that retires takes its
+    /// addresses with it — they cannot be moved, being literally its IP — and
+    /// the answer to a fresh ticket is the only place that shows up. Without
+    /// something to compare against, an address that died is
+    /// indistinguishable from one that never changed.
+    pub published: Option<&'a PublicAddress>,
 }

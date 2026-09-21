@@ -323,7 +323,12 @@ pub struct RelayTicket {
 }
 
 /// Where a Public UDP Listener is reachable from the outside (spec §7.7.1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// **Comparable, because the comparison is the only alarm there is.** What was
+/// published last time against what a fresh ticket names is how a client learns
+/// its data plane retired and its address moved (plan §3.3); nothing else
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicAddress {
     /// The name the proxy advertises, when it has one to advertise.
     ///
@@ -334,6 +339,18 @@ pub struct PublicAddress {
     pub hostname: Option<String>,
     pub ip: String,
     pub port: u16,
+}
+
+impl std::fmt::Display for PublicAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // **The name as well as the pair**, because what somebody handed out
+        // may have been either, and a message about an address that changed has
+        // to be recognisable as the one they gave.
+        match &self.hostname {
+            Some(hostname) => write!(f, "{hostname} ({}:{})", self.ip, self.port),
+            None => write!(f, "{}:{}", self.ip, self.port),
+        }
+    }
 }
 
 /// The UDP service this Endpoint is declaring, inside itself.
