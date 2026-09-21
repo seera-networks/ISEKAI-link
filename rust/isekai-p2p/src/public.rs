@@ -21,7 +21,7 @@
 //! hearing from nobody is a normal Tuesday; a check built on silence would
 //! report failure on a listener that works.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Context as _;
 use isekai_p2p_core::bind::{
@@ -312,7 +312,7 @@ pub async fn open<T: ControlPlaneTransport>(
 /// process cannot reach them; the least it can do is not be quiet about it.
 fn moved_since(published: Option<&PublicAddress>, now: &PublicAddress) -> Option<AddressChange> {
     let from = published?;
-    if from == now {
+    if !has_moved(from, now) {
         return None;
     }
     tracing::warn!(
@@ -344,6 +344,41 @@ fn worth_comparing(relay_chosen: bool, published: &PublicAddress) -> Option<Publ
     (!relay_chosen).then(|| published.clone())
 }
 
+/// Whether these are different addresses, rather than differently written
+/// ones.
+///
+/// **A false alarm costs this warning its meaning**, and it is the only signal
+/// a retired data plane gives. Two spellings of one IPv6 address are the same
+/// address; so is the same allocation described once with a name and once
+/// without, because `hostname` is optional in the answer and its absence is the
+/// server saying nothing rather than saying there is no name.
+///
+/// A name that changed *while both answers gave one* is a real move: whoever
+/// was handed the old name is now resolving to something else, which the pair
+/// alone cannot see.
+fn has_moved(from: &PublicAddress, to: &PublicAddress) -> bool {
+    if from.port != to.port || !same_ip(&from.ip, &to.ip) {
+        return true;
+    }
+    match (&from.hostname, &to.hostname) {
+        (Some(from), Some(to)) => from != to,
+        _ => false,
+    }
+}
+
+/// Whether two textual IPs are the same address.
+///
+/// **Parsed where they parse.** `2001:db8::1` and `2001:0db8:0:0:0:0:0:1` are
+/// one address written two ways, and a string comparison would report a move
+/// that did not happen. Anything that does not parse is compared as it was
+/// given — it is not this function's place to decide the server sent nonsense.
+fn same_ip(from: &str, to: &str) -> bool {
+    match (from.parse::<IpAddr>(), to.parse::<IpAddr>()) {
+        (Ok(from), Ok(to)) => from == to,
+        _ => from == to,
+    }
+}
+
 /// Whether the session was bound somewhere other than the published address.
 ///
 /// **A list, and any of it will do.** The header is comma-separated and a data
@@ -353,7 +388,12 @@ fn worth_comparing(relay_chosen: bool, published: &PublicAddress) -> Option<Publ
 /// **A decision rather than a log line**, so that what is asserted in a test is
 /// the judgement the running code makes.
 fn bound_elsewhere(expected: &PublicAddress, reported: &[SocketAddr]) -> bool {
-    !reported.is_empty() && !reported.iter().any(|a| a.port() == expected.port)
+    if reported.is_empty() {
+        return false;
+    }
+    !reported
+        .iter()
+        .any(|a| a.port() == expected.port && same_ip(&a.ip().to_string(), &expected.ip))
 }
 
 /// Refuse a ticket that is not for a public address.
@@ -533,12 +573,37 @@ mod tests {
                     "[2001:db8::1]:10007".parse().unwrap(),
                 ],
             ),
-            "the published port among several is the session being where it said",
+            "the published address among several is the session being where it said",
         );
         assert!(
             bound_elsewhere(&published, &["203.0.113.1:54321".parse().unwrap()]),
-            "and this is the case worth saying out loud",
+            "another port on this host is somewhere else",
         );
+        assert!(
+            bound_elsewhere(&published, &["198.51.100.4:10007".parse().unwrap()]),
+            "and so is the same port number on another address -- which a \
+             port-only check calls a match",
+        );
+    }
+
+    /// **A false alarm here costs the real one its meaning.** Two spellings of
+    /// one IPv6 address are one address; an answer that omitted the hostname
+    /// said nothing about the name rather than that there is none. Either read
+    /// as a move would have this warning crying wolf on every reconnection.
+    #[test]
+    fn a_differently_written_address_has_not_moved() {
+        let long = address("2001:0db8:0:0:0:0:0:1", 10042, None);
+        let short = address("2001:db8::1", 10042, None);
+        assert_eq!(moved_since(Some(&long), &short), None);
+
+        let named = address("203.0.113.9", 10042, Some("udp-ap1.isekai.tools"));
+        let unnamed = address("203.0.113.9", 10042, None);
+        assert_eq!(
+            moved_since(Some(&named), &unnamed),
+            None,
+            "the answer said nothing about the name, not that there is none",
+        );
+        assert_eq!(moved_since(Some(&unnamed), &named), None);
     }
 
     /// **Comparing the report where a data plane was chosen proves nothing**,
