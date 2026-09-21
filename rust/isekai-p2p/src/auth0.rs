@@ -204,7 +204,9 @@ impl Auth0Tokens {
     /// the same organization; a stale one is dropped rather than shown against
     /// somebody else's id.
     pub fn organization(&self) -> Option<Organization> {
-        let mut org = organization_in(&self.access_token)?;
+        let TokenOrganization::In(mut org) = organization_in(&self.access_token) else {
+            return None;
+        };
         if org.name.is_none() {
             org.name = self
                 .recorded_organization
@@ -711,13 +713,22 @@ fn is_terminal(error: &str) -> bool {
 /// keeps the one it has when this comes back `None`.
 pub async fn refresh(cfg: &Auth0Config, refresh_token: &str) -> Result<Auth0Tokens, RefreshError> {
     let http = client().map_err(RefreshError::Transient)?;
-    refresh_with(&http, cfg, refresh_token).await
+    refresh_with(&http, cfg, refresh_token, None).await
 }
 
+/// `held` is what this session is holding now, so a name it already knows
+/// survives a refresh that does not repeat it — see [`carry_name`].
+///
+/// **Carried here rather than by the caller.** This is the only place a
+/// refreshed `Auth0Tokens` is built, so doing it here is the difference between
+/// a rule and a step somebody has to remember: a call site can be deleted and
+/// leave every test passing, which is how the first version of this lost the
+/// name minutes after a sign-in recorded it.
 async fn refresh_with(
     http: &reqwest::Client,
     cfg: &Auth0Config,
     refresh_token: &str,
+    held: Option<&Auth0Tokens>,
 ) -> Result<Auth0Tokens, RefreshError> {
     let resp = http
         .post(cfg.url("/oauth/token"))
@@ -747,10 +758,42 @@ async fn refresh_with(
             )),
         });
     }
-    serde_json::from_slice(&body)
+    let mut renewed: Auth0Tokens = serde_json::from_slice(&body)
         .map(tokens_from)
         .context("could not read the refresh response")
-        .map_err(RefreshError::Transient)
+        .map_err(RefreshError::Transient)?;
+    if let Some(held) = held {
+        carry_name(held, &mut renewed);
+    }
+    Ok(renewed)
+}
+
+/// Keep a known organization name across a refresh that did not repeat it.
+///
+/// **The name is what is carried, not the record.** A refresh answers with an
+/// ID token only sometimes, and when it does it may carry `org_id` and no name
+/// — which is not `None`, so a guard on the whole record lets it overwrite the
+/// name with nothing, and `--whoami` stops naming the organization after the
+/// first refresh.
+///
+/// **A function so that the test can call it.** Written inline, the test could
+/// only restate it, and deleting the original left that test passing.
+fn carry_name(held: &Auth0Tokens, renewed: &mut Auth0Tokens) {
+    let Some(known) = held
+        .recorded_organization
+        .as_ref()
+        .filter(|seen| seen.name.is_some())
+    else {
+        return;
+    };
+    match &mut renewed.recorded_organization {
+        Some(fresh) if fresh.id == known.id && fresh.name.is_none() => {
+            fresh.name = known.name.clone();
+        }
+        None => renewed.recorded_organization = Some(known.clone()),
+        // A name of its own, or a different organization: the new answer stands.
+        Some(_) => {}
+    }
 }
 
 fn tokens_from(body: TokenResponse) -> Auth0Tokens {
@@ -774,10 +817,10 @@ fn tokens_from(body: TokenResponse) -> Auth0Tokens {
 /// this has already replaced Auth0's response to a request made over TLS, and
 /// the access token beside it is what everything else stands on.
 fn organization_of(id_token: &str) -> Option<Organization> {
-    Some(Organization {
-        id: claim(id_token, "org_id")?,
-        name: organization_name(id_token),
-    })
+    match organization_in(id_token) {
+        TokenOrganization::In(org) => Some(org),
+        _ => None,
+    }
 }
 
 /// The organization an access token belongs to, if any.
@@ -786,11 +829,33 @@ fn organization_of(id_token: &str) -> Option<Organization> {
 /// this says which organization governs what the holder registers — for a
 /// pasted `--auth0-token` as much as for a saved sign-in. The name comes along
 /// when a claim carries it; see [`ORG_NAME_CLAIM`].
-pub fn organization_in(access_token: &str) -> Option<Organization> {
-    Some(Organization {
-        id: claim(access_token, "org_id")?,
-        name: organization_name(access_token),
+pub fn organization_in(access_token: &str) -> TokenOrganization {
+    let Some(claims) = claims_of(access_token) else {
+        return TokenOrganization::Unreadable;
+    };
+    let Some(id) = string_claim(&claims, "org_id") else {
+        return TokenOrganization::Personal;
+    };
+    TokenOrganization::In(Organization {
+        name: string_claim(&claims, "org_name")
+            .or_else(|| string_claim(&claims, ORG_NAME_CLAIM)),
+        id,
     })
+}
+
+/// What a token says about its organization, including "it does not say".
+///
+/// **Three answers, because a caller prints them and two of them are not the
+/// same statement.** "Personal" is read out of a token: it has claims, and no
+/// `org_id` among them. "Unreadable" is the absence of anything to read — an
+/// opaque token, a truncated one, a payload that is not JSON. Reporting the
+/// second as the first tells somebody their Endpoints register personally on
+/// the strength of a token nobody could parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenOrganization {
+    In(Organization),
+    Personal,
+    Unreadable,
 }
 
 /// A claim an Auth0 Action can add to say what an organization is called.
@@ -803,18 +868,18 @@ pub fn organization_in(access_token: &str) -> Option<Organization> {
 /// whichever token carries it.
 pub const ORG_NAME_CLAIM: &str = "https://identity.isekai.tools/org_name";
 
-/// What an organization is called, from whichever claim says so.
-fn organization_name(jwt: &str) -> Option<String> {
-    claim(jwt, "org_name").or_else(|| claim(jwt, ORG_NAME_CLAIM))
-}
 
-/// One string claim out of a JWT's payload, without verifying anything.
+
+/// A JWT's payload, without verifying anything.
 ///
 /// **Read, never trusted** — see [`organization_of`]. Nothing is decided by
 /// what comes out of here.
-fn claim(jwt: &str, name: &str) -> Option<String> {
+fn claims_of(jwt: &str) -> Option<Value> {
     let payload = jwt.split('.').nth(1)?;
-    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()
+}
+
+fn string_claim(claims: &Value, name: &str) -> Option<String> {
     Some(claims.get(name)?.as_str()?.to_owned())
 }
 
@@ -1101,7 +1166,14 @@ impl Auth0TokenSource for RefreshingAuth0Token {
                      (the login did not grant `offline_access`); sign in again"
                 );
             };
-            let mut renewed = match refresh_with(&self.http, &self.cfg, &refresh_token).await {
+            let mut renewed = match refresh_with(
+                &self.http,
+                &self.cfg,
+                &refresh_token,
+                Some(&tokens),
+            )
+            .await
+            {
                 Ok(renewed) => renewed,
                 Err(e @ RefreshError::SignInRequired(_)) => {
                     self.give_up(&e.to_string());
@@ -1120,27 +1192,7 @@ impl Auth0TokenSource for RefreshingAuth0Token {
             // organization a machine is signed in to — a fact that does not
             // change on a refresh, and that writing `null` over would quietly
             // erase within minutes of the sign-in that established it.
-            // **The name is what is carried, not the record.** A refresh
-            // answers with an ID token only sometimes, and when it does it may
-            // carry `org_id` and no name — which is not `None`, so a guard on
-            // the record would let it overwrite the name with nothing and
-            // `--whoami` would stop naming the organization after the first
-            // refresh. That is the failure this is here to prevent.
-            let keep = tokens
-                .recorded_organization
-                .as_ref()
-                .filter(|seen| seen.name.is_some());
-            if let Some(seen) = keep {
-                match &mut renewed.recorded_organization {
-                    Some(fresh) if fresh.id == seen.id && fresh.name.is_none() => {
-                        fresh.name = seen.name.clone();
-                    }
-                    None => renewed.recorded_organization = Some(seen.clone()),
-                    // A name of its own, or a different organization: the new
-                    // answer stands.
-                    Some(_) => {}
-                }
-            }
+
             if let Some(path) = &self.store {
                 if let Err(e) = Self::save(path, &renewed) {
                     // Not fatal: the tokens in hand still work, and the only cost
@@ -1321,10 +1373,6 @@ mod tests {
     }
 
 
-    /// **A query a local process can send must not be able to stop a sign-in.**
-    /// `%` followed by a multi-byte character once panicked the task: the
-    /// guard counted bytes and the slice indexed a `&str`, so it landed
-    /// mid-codepoint.
     fn jwt(claims: serde_json::Value) -> String {
         let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
         // Header and signature are not read; only the claims are, and only to
@@ -1399,26 +1447,44 @@ mod tests {
             id: "org_a1b2c3".to_owned(),
             name: None,
         };
-        // What `refresh` does with them, in the shape the loop applies it.
         let mut renewed = signed_in_to(Some("org_a1b2c3"), Some(nameless));
-        let held = signed_in_to(Some("org_a1b2c3"), Some(known.clone()));
-        if let Some(seen) = held
-            .recorded_organization
-            .as_ref()
-            .filter(|seen| seen.name.is_some())
-        {
-            match &mut renewed.recorded_organization {
-                Some(fresh) if fresh.id == seen.id && fresh.name.is_none() => {
-                    fresh.name = seen.name.clone();
-                }
-                None => renewed.recorded_organization = Some(seen.clone()),
-                Some(_) => {}
-            }
-        }
+        carry_name(&signed_in_to(Some("org_a1b2c3"), Some(known.clone())), &mut renewed);
         assert_eq!(
             renewed.organization().expect("an organization").to_string(),
             "seera-networks (org_a1b2c3)",
         );
+
+        // A refresh that says nothing at all about the organization keeps it too.
+        let mut silent = signed_in_to(Some("org_a1b2c3"), None);
+        carry_name(&signed_in_to(Some("org_a1b2c3"), Some(known.clone())), &mut silent);
+        assert_eq!(silent.recorded_organization.as_ref().and_then(|o| o.name.clone()),
+                   Some("seera-networks".to_owned()));
+
+        // **And a name from another organization is not carried onto it.**
+        let mut elsewhere = signed_in_to(Some("org_new"), None);
+        carry_name(&signed_in_to(Some("org_a1b2c3"), Some(known)), &mut elsewhere);
+        assert_eq!(
+            elsewhere.organization().expect("an organization").to_string(),
+            "org_new",
+            "the record belongs to the organization that was left",
+        );
+    }
+
+    /// **An opaque or truncated token is not a statement about anything.**
+    /// Reading `None` out of it and printing "registers personally" asserts a
+    /// fact nobody established.
+    #[test]
+    fn a_token_that_cannot_be_read_says_so() {
+        assert_eq!(organization_in("not-a-jwt"), TokenOrganization::Unreadable);
+        assert_eq!(organization_in("h..s"), TokenOrganization::Unreadable);
+        assert_eq!(
+            organization_in(&jwt(serde_json::json!({ "sub": "auth0|u" }))),
+            TokenOrganization::Personal,
+        );
+        assert!(matches!(
+            organization_in(&jwt(serde_json::json!({ "org_id": "org_x" }))),
+            TokenOrganization::In(_),
+        ));
     }
 
     /// The recorded name fills in the half the access token does not carry.
@@ -1531,6 +1597,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **A query a local process can send must not be able to stop a sign-in.**
+    /// `%` followed by a multi-byte character once panicked the task: the
+    /// guard counted bytes and the slice indexed a `&str`, so it landed
+    /// mid-codepoint.
     #[test]
     fn a_percent_before_a_multibyte_character_is_not_a_panic() {
         assert_eq!(urldecode("%a€"), "%a€");

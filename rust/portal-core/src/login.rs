@@ -91,26 +91,45 @@ impl std::fmt::Display for SignedIn {
         match self {
             Self::Organization(org) => write!(f, "{org}"),
             Self::Personal => write!(f, "none (Endpoints here register personally)"),
-            Self::Unknown => write!(f, "unknown (no sign-in readable here)"),
+            Self::Unknown => write!(f, "unknown (no readable sign-in here)"),
         }
     }
 }
 
 /// Which organization this run's credential belongs to.
 ///
-/// `token` is a pasted access token where there is one: it is the credential on
-/// that run, and the saved sign-in beside it says nothing about it.
+/// **The same order `authenticate` uses, and it has to be.** A working saved
+/// sign-in wins over a pasted `--auth0-token`; the flag is what a machine falls
+/// back to when the store is unusable. Asking the flag first would answer for a
+/// credential the run is not going to use — and on a machine signed in to one
+/// organization, holding a token for another, that answer is not merely
+/// incomplete but wrong.
 pub fn signed_in_organization(store: &Path, token: Option<&str>) -> SignedIn {
-    let organization = match token {
-        Some(token) => isekai_p2p::auth0::organization_in(token),
-        None => match RefreshingAuth0Token::load(store) {
-            Ok(tokens) => tokens.organization(),
-            Err(_) => return SignedIn::Unknown,
-        },
-    };
-    match organization {
-        Some(org) => SignedIn::Organization(org),
-        None => SignedIn::Personal,
+    if store.exists() {
+        if let Ok(tokens) = RefreshingAuth0Token::load(store) {
+            // **Through the tokens, not the raw string**, so a name recorded at
+            // sign-in is still available on a tenant whose access token carries
+            // only the id.
+            return match tokens.organization() {
+                Some(org) => SignedIn::Organization(org),
+                None => read_organization(&tokens.access_token),
+            };
+        }
+    }
+    match token {
+        Some(token) => read_organization(token),
+        None => SignedIn::Unknown,
+    }
+}
+
+fn read_organization(access_token: &str) -> SignedIn {
+    use isekai_p2p::auth0::TokenOrganization;
+    match isekai_p2p::auth0::organization_in(access_token) {
+        TokenOrganization::In(org) => SignedIn::Organization(org),
+        TokenOrganization::Personal => SignedIn::Personal,
+        // **Not "personal".** Nothing was read, so nothing is known — an opaque
+        // token, or one truncated on the way into a shell.
+        TokenOrganization::Unreadable => SignedIn::Unknown,
     }
 }
 
@@ -273,7 +292,25 @@ pub async fn sign_in(
     // it with nothing would turn a partial success into a regression.
     let mut usable = tokens.refresh_token.is_some();
     if !usable {
-        if let Some(previous) = existing.and_then(|t| t.refresh_token) {
+        // **Not across a change of organization.** The kept token belongs to
+        // the sign-in that made it, so refreshing with it mints tokens for the
+        // *old* organization: the access token in hand says one thing for its
+        // few hours, and every renewal after that quietly says the other — and
+        // what an Endpoint registers under follows the renewals. A session that
+        // ends in hours and says why is better than one that changes tenant
+        // without telling anyone.
+        let previous = existing.filter(|old| {
+            let same = old.organization().map(|o| o.id) == tokens.organization().map(|o| o.id);
+            if !same {
+                tracing::warn!(
+                    "this sign-in is for a different organization than the one saved here, \
+                     and Auth0 returned no refresh token for it; the saved one is not reused \
+                     because refreshing with it would go back to the other organization",
+                );
+            }
+            same
+        });
+        if let Some(previous) = previous.and_then(|t| t.refresh_token.clone()) {
             tokens.refresh_token = Some(previous);
             usable = true;
             tracing::warn!("Auth0 returned no refresh token; keeping the one already saved here",);
