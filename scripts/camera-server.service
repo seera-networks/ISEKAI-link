@@ -1,0 +1,66 @@
+[Unit]
+Description=ISEKAI camera-server (headless, restarts capture on boot)
+# Not strictly needed: nothing here reaches the network until a human clicks
+# "Open" (CAMERA_AUTOSTART never does), by which time networking is long up.
+# Kept anyway as future-proofing against that changing -- cheap to keep,
+# expensive to notice missing if it ever stops being true.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Placeholders, not real values -- User=/SupplementaryGroups= can't be
+# pulled from EnvironmentFile= like the paths further down (systemd only
+# expands ${VAR} from Environment=/EnvironmentFile= inside Exec* command
+# lines, systemd.exec(5), never in plain directives like these), so there's
+# no way to make this file itself machine-independent for these two. The
+# standard systemd answer for "let a deployer override a vendored unit
+# without editing it" is a drop-in, not hand-editing here: create
+# /etc/systemd/system/camera-server.service.d/override.conf (copy
+# scripts/camera-server.service.d.example/override.conf, which has the
+# real syntax and the `ls -la /dev/video0` note for SupplementaryGroups=)
+# with the real values for your machine. Left as this obviously-wrong
+# placeholder rather than a plausible-looking one (e.g. some real
+# username) so a missing override fails loudly at start -- getpwnam() on
+# a nonexistent user -- instead of silently running as whatever this
+# happened to resolve to.
+#
+# (Spelled out as a literal at all, rather than via %h, for the same
+# reason an override is still needed even once set: %h only reliably
+# resolves against User= in a --user *session* unit; in a system unit like
+# this one it silently falls back to the *manager's* home, i.e. root,
+# regardless of User=, confirmed the hard way on this exact systemd (255).)
+User=CHANGE-FOR-YOUR-MACHINE-see-camera-server.service.d.example
+SupplementaryGroups=CHANGE-FOR-YOUR-MACHINE-see-camera-server.service.d.example
+
+# Machine-specific paths that a plain command line *can* draw from --
+# systemd does expand ${VAR} inside Exec* command lines from here (unlike
+# User=/SupplementaryGroups= above). Copy scripts/camera-server.env.example
+# to the path below and fill in both values for your machine; the unit
+# refuses to start if the file is missing, rather than silently falling
+# back to something wrong.
+EnvironmentFile=/etc/camera-server.env
+
+# Provides the virtual display run-camera-server.sh runs against, and ties
+# its lifecycle to this service's -- there is nothing worth having Xvfb
+# running for once camera-server itself is not.
+#
+# --auto-servernum rather than a fixed number: a display number this service
+# owns exclusively, picked around whatever else is already running an X
+# server on the machine (confirmed necessary here -- a long-running, manually
+# started `Xvfb :99` unrelated to this service was already using that number,
+# and a fixed --server-num=99 collided with it and failed to start every
+# time). xvfb-run sets DISPLAY for the process it launches either way, which
+# is what run-camera-server.sh's own DISPLAY=:99 default is a fallback for
+# (only relevant running that script by hand against a manually-started
+# Xvfb, not through this unit).
+#
+# ${CAMERA_SERVER_CHECKOUT} comes from EnvironmentFile= above -- this line
+# itself needs no per-machine editing.
+ExecStart=/usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" \
+    ${CAMERA_SERVER_CHECKOUT}/scripts/run-camera-server.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
