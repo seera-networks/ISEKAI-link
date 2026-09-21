@@ -7,11 +7,106 @@ use tokio::{net::UdpSocket, sync::mpsc, sync::oneshot};
 
 const DEFAULT_BLACKHOLE_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often a bounded session looks for sources that have gone quiet.
+///
+/// **Coarse on purpose.** What it bounds is how long a dead source's socket
+/// outlives it, and a socket costs little for a few seconds; waking up often to
+/// reclaim it would cost more than holding it.
+const IDLE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What to do about a source that has no socket yet.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    /// Under the limit; bind one.
+    Room,
+    /// At the limit; this one has to go first.
+    Evict((StreamId, SocketAddr)),
+    /// At the limit with nothing to take it from. Drop the datagram.
+    Refuse,
+}
+
+/// Whether a new source can have a socket, and at whose expense.
+///
+/// **Least recently used, which may be somebody real.** Nothing here can tell
+/// a sender that matters from one that does not — that is what makes this a
+/// bound rather than a judgement, and why the limit belongs well above the
+/// audience a caller expects.
+///
+/// **Refusing is not the same as evicting.** With every socket held by a source
+/// that has never been seen to send — which the bookkeeping should make
+/// impossible, but the limit is the last line and should not depend on that —
+/// there is nobody to take a slot from, and the only bound left is to not
+/// grant one.
+fn admit(
+    stream_id: StreamId,
+    addr: SocketAddr,
+    held: usize,
+    limit: &crate::ForwardLimits,
+    last_seen: &HashMap<(StreamId, SocketAddr), tokio::time::Instant>,
+) -> Admit {
+    if held < limit.max_sources {
+        return Admit::Room;
+    }
+    last_seen
+        .iter()
+        .filter(|((id, a), _)| *id == stream_id && *a != addr)
+        .min_by_key(|(_, seen)| **seen)
+        .map(|(key, _)| Admit::Evict(*key))
+        .unwrap_or(Admit::Refuse)
+}
+
+/// The sources that have said nothing for longer than their session allows.
+///
+/// **Only bounded sessions are swept.** A session with no limit has one peer
+/// and holds one socket; reclaiming it for being quiet would end a leg that is
+/// merely waiting.
+fn gone_quiet(
+    now: tokio::time::Instant,
+    limits: &HashMap<StreamId, crate::ForwardLimits>,
+    last_seen: &HashMap<(StreamId, SocketAddr), tokio::time::Instant>,
+) -> Vec<(StreamId, SocketAddr)> {
+    last_seen
+        .iter()
+        .filter(|((stream_id, _), seen)| {
+            limits
+                .get(stream_id)
+                .is_some_and(|l| now.duration_since(**seen) >= l.idle_after)
+        })
+        .map(|(key, _)| *key)
+        .collect()
+}
+
+/// Ask the reader to drop a source's socket, and forget when it last sent.
+///
+/// **The socket itself is not dropped here.** The reader holds its own handle,
+/// so dropping this one would leave it being read with nothing on the other
+/// side; retiring goes through the reader, which answers `SocketDisconnected`
+/// — and that is what removes this side's entry. One teardown, two doors in.
+async fn retire(
+    notification_senders: &HashMap<StreamId, mpsc::Sender<Notification>>,
+    key: (StreamId, SocketAddr),
+    last_seen: &mut HashMap<(StreamId, SocketAddr), tokio::time::Instant>,
+    retiring: &mut std::collections::HashSet<(StreamId, SocketAddr)>,
+) {
+    let (stream_id, addr) = key;
+    // Taken now rather than when the reader answers: until it does, this source
+    // must not look like the least recently used one all over again.
+    last_seen.remove(&key);
+    retiring.insert(key);
+    let Some(tx) = notification_senders.get(&stream_id) else {
+        return;
+    };
+    if tx.send(Notification::RetireSocket(addr)).await.is_err() {
+        tracing::debug!("notification receiver dropped for stream id {}", stream_id);
+    }
+}
+
 pub enum Message {
     RegisterStreamId(
         StreamId,
         crate::MasqueClientMode,
         crate::InboundActivity,
+        Option<crate::ForwardLimits>,
         mpsc::Sender<Notification>,
         oneshot::Sender<anyhow::Result<()>>,
     ),
@@ -28,6 +123,14 @@ pub enum Message {
 
 pub enum Notification {
     NewSocket(Arc<UdpSocket>, SocketAddr, bool),
+    /// **Stop reading this source's socket** — it was evicted (see
+    /// [`crate::ForwardLimits`]).
+    ///
+    /// Retiring goes out through the same door a dead socket leaves by: the
+    /// reader drops it and answers `SocketDisconnected`, which is what removes
+    /// it here. One teardown, reached two ways, so an evicted socket cannot
+    /// leave half of itself behind.
+    RetireSocket(SocketAddr),
 }
 
 #[derive(Clone)]
@@ -48,6 +151,7 @@ impl Controller {
         &self,
         mode: crate::MasqueClientMode,
         activity: crate::InboundActivity,
+        limits: Option<crate::ForwardLimits>,
     ) -> anyhow::Result<mpsc::Receiver<Notification>> {
         let (notification_tx, notification_rx) = mpsc::channel(1024);
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -56,6 +160,7 @@ impl Controller {
                 self.stream_id,
                 mode,
                 activity,
+                limits,
                 notification_tx,
                 resp_tx,
             ))
@@ -148,15 +253,42 @@ where
     let mut compression_info: HashMap<(StreamId, u64), Option<SocketAddr>> = HashMap::new();
     let mut queued_datagrams: HashMap<(StreamId, SocketAddr), Vec<Vec<u8>>> = HashMap::new();
     let mut blackholes: HashMap<(StreamId, SocketAddr), tokio::time::Instant> = HashMap::new();
+    let mut limits: HashMap<StreamId, crate::ForwardLimits> = HashMap::new();
+    // When each source last sent something. **Only sending counts**: a socket
+    // is kept because traffic is arriving through it, and what arrives from the
+    // local service on it is a consequence of that rather than evidence of its
+    // own.
+    let mut last_seen: HashMap<(StreamId, SocketAddr), tokio::time::Instant> = HashMap::new();
+    // Sources whose socket this side asked to retire, so the disconnect coming
+    // back can be told from one the socket suffered.
+    let mut retiring: std::collections::HashSet<(StreamId, SocketAddr)> =
+        std::collections::HashSet::new();
+    // Bounded sessions are swept for idle sources; unbounded ones never tick.
+    let mut sweep = tokio::time::interval(IDLE_SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = sweep.tick(), if !limits.is_empty() => {
+                let now = tokio::time::Instant::now();
+                for key in gone_quiet(now, &limits, &last_seen) {
+                    tracing::info!(
+                        "retiring the socket for stream id {} and addr {}: idle",
+                        key.0,
+                        key.1,
+                    );
+                    retire(&notification_senders, key, &mut last_seen, &mut retiring).await;
+                }
+            }
             msg = rx.recv() => {
                 match msg {
-                    Some(Message::RegisterStreamId(stream_id, mode, inbound, notification_tx, resp_tx)) => {
+                    Some(Message::RegisterStreamId(stream_id, mode, inbound, forward_limits, notification_tx, resp_tx)) => {
                         tracing::debug!("received RegisterStreamId Message for stream id {}", stream_id);
                         notification_senders.insert(stream_id, notification_tx);
                         modes.insert(stream_id, mode);
                         activity.insert(stream_id, inbound);
+                        if let Some(forward_limits) = forward_limits {
+                            limits.insert(stream_id, forward_limits);
+                        }
                         if resp_tx.send(anyhow::Ok(())).is_err() {
                             tracing::debug!("RegisterStreamId response receiver dropped");
                         }
@@ -197,8 +329,20 @@ where
                         tracing::debug!("received NotifySocketDisconnected Message for stream id {}, addr {}", stream_id, addr);
                         if let Some((_, _)) = socket_info.remove(&(stream_id, addr)) {
                             tracing::info!("notified that socket for stream id {} and addr {} is disconnected", stream_id, addr);
-                            tracing::info!("blackholing datagrams for stream id {} and addr {} for {:?}", stream_id, addr, DEFAULT_BLACKHOLE_DURATION);
-                            blackholes.insert((stream_id, addr), tokio::time::Instant::now() + DEFAULT_BLACKHOLE_DURATION);
+                            // **A socket this side retired is not blackholed.**
+                            // The blackhole is for a socket that died — the
+                            // local service refused it — where making another
+                            // immediately would fail the same way. A source
+                            // evicted for going quiet has nothing wrong with
+                            // it, and a minute of silence on its return would
+                            // be this side punishing somebody for the limit it
+                            // chose.
+                            if retiring.remove(&(stream_id, addr)) {
+                                tracing::debug!("not blackholing stream id {} and addr {}: retired, not failed", stream_id, addr);
+                            } else {
+                                tracing::info!("blackholing datagrams for stream id {} and addr {} for {:?}", stream_id, addr, DEFAULT_BLACKHOLE_DURATION);
+                                blackholes.insert((stream_id, addr), tokio::time::Instant::now() + DEFAULT_BLACKHOLE_DURATION);
+                            }
                         } else {
                             tracing::error!("no socket found for stream id {} and addr {}", stream_id, addr);
                             if resp_tx.send(Err(anyhow::anyhow!("no socket found for stream id {} and addr {}", stream_id, addr))).is_err() {
@@ -329,9 +473,49 @@ where
                         continue;
                     }
                 }
+                // **Recorded for every datagram, before anything is decided.**
+                // What keeps a source's socket alive is that the source is
+                // still sending; a reply coming back on it is a consequence of
+                // that rather than evidence of its own.
+                if limits.contains_key(&stream_id) {
+                    last_seen.insert((stream_id, addr), tokio::time::Instant::now());
+                }
                 let (socket, connected) = if let Some((socket, connected)) = socket_info.get(&(stream_id, addr)) {
                     (socket.clone(), *connected)
                 } else {
+                    // **A new source, so the count has to hold.** Checked here
+                    // rather than after binding: the cap is on how many sockets
+                    // exist, and one that exists for a moment has still been
+                    // taken from whoever the limit was protecting.
+                    if let Some(limit) = limits.get(&stream_id) {
+                        let held = socket_info
+                            .keys()
+                            .filter(|(id, _)| *id == stream_id)
+                            .count();
+                        match admit(stream_id, addr, held, limit, &last_seen) {
+                            Admit::Room => {}
+                            Admit::Evict(victim) => {
+                                tracing::warn!(
+                                    "stream id {} is at its {} source limit; retiring {} to make room for {}",
+                                    stream_id,
+                                    limit.max_sources,
+                                    victim.1,
+                                    addr,
+                                );
+                                retire(&notification_senders, victim, &mut last_seen, &mut retiring).await;
+                            }
+                            Admit::Refuse => {
+                                tracing::warn!(
+                                    "stream id {} is at its {} source limit with nothing to retire; dropping the datagram from {}",
+                                    stream_id,
+                                    limit.max_sources,
+                                    addr,
+                                );
+                                last_seen.remove(&(stream_id, addr));
+                                continue;
+                            }
+                        }
+                    }
                     let mode = match modes.get(&stream_id) {
                         Some(mode) => mode.clone(),
                         None => {
@@ -407,4 +591,114 @@ where
         }
     }
     anyhow::Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A `StreamId` for the tests. **Built through `VarInt`**, which is the
+    /// only conversion h3 offers; the number itself means nothing here beyond
+    /// telling two sessions apart.
+    fn stream(n: u64) -> StreamId {
+        StreamId::from(h3::proto::varint::VarInt::from_u64(n).expect("a small id"))
+    }
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("203.0.113.1:{port}").parse().unwrap()
+    }
+
+    fn limits(max_sources: usize, idle_secs: u64) -> crate::ForwardLimits {
+        crate::ForwardLimits {
+            max_sources,
+            idle_after: Duration::from_secs(idle_secs),
+        }
+    }
+
+    /// **Under the limit, nothing is disturbed.** The bound exists for an
+    /// address the public can reach; it must cost nothing until it binds.
+    #[test]
+    fn room_is_room() {
+        let limit = limits(4, 60);
+        assert_eq!(
+            admit(stream(0), addr(1), 3, &limit, &HashMap::new()),
+            Admit::Room,
+        );
+    }
+
+    /// **At the limit, the quietest source pays.** Which may be somebody real:
+    /// nothing here can tell a sender that matters from one that does not, so
+    /// this is a bound rather than a judgement.
+    #[test]
+    fn the_least_recently_used_source_makes_room() {
+        let stream = stream(0);
+        let now = tokio::time::Instant::now();
+        let mut last_seen = HashMap::new();
+        last_seen.insert((stream, addr(1)), now - Duration::from_secs(30));
+        last_seen.insert((stream, addr(2)), now - Duration::from_secs(90));
+        last_seen.insert((stream, addr(3)), now - Duration::from_secs(5));
+        assert_eq!(
+            admit(stream, addr(9), 3, &limits(3, 600), &last_seen),
+            Admit::Evict((stream, addr(2))),
+        );
+    }
+
+    /// **Another session's sources are not available to take from.** The limit
+    /// is per session, and a leg's single socket is not spare capacity for an
+    /// address being flooded.
+    #[test]
+    fn a_victim_is_never_taken_from_another_session() {
+        let mine = stream(0);
+        let other = stream(4);
+        let now = tokio::time::Instant::now();
+        let mut last_seen = HashMap::new();
+        last_seen.insert((other, addr(1)), now - Duration::from_secs(600));
+        last_seen.insert((mine, addr(2)), now - Duration::from_secs(1));
+        assert_eq!(
+            admit(mine, addr(9), 1, &limits(1, 600), &last_seen),
+            Admit::Evict((mine, addr(2))),
+            "the only one this session holds, old or not",
+        );
+    }
+
+    /// With nothing to take a slot from, refusing is the only bound left —
+    /// and it must not evict the very source asking for room.
+    #[test]
+    fn nothing_to_evict_refuses_rather_than_evicting_the_newcomer() {
+        let stream = stream(0);
+        let mut last_seen = HashMap::new();
+        last_seen.insert((stream, addr(9)), tokio::time::Instant::now());
+        assert_eq!(
+            admit(stream, addr(9), 2, &limits(2, 600), &last_seen),
+            Admit::Refuse,
+        );
+    }
+
+    /// **A session with no limit is never swept.** It has one peer and holds
+    /// one socket; reclaiming it for being quiet would end a leg that is
+    /// merely waiting to hear something.
+    #[test]
+    fn an_unbounded_session_is_left_alone() {
+        let stream = stream(0);
+        let now = tokio::time::Instant::now();
+        let mut last_seen = HashMap::new();
+        last_seen.insert((stream, addr(1)), now - Duration::from_secs(86_400));
+        assert!(gone_quiet(now, &HashMap::new(), &last_seen).is_empty());
+    }
+
+    #[test]
+    fn a_source_past_its_sessions_idle_window_is_swept() {
+        let stream = stream(0);
+        let now = tokio::time::Instant::now();
+        let mut limits_by_stream = HashMap::new();
+        limits_by_stream.insert(stream, limits(1024, 120));
+        let mut last_seen = HashMap::new();
+        last_seen.insert((stream, addr(1)), now - Duration::from_secs(121));
+        last_seen.insert((stream, addr(2)), now - Duration::from_secs(119));
+        assert_eq!(
+            gone_quiet(now, &limits_by_stream, &last_seen),
+            vec![(stream, addr(1))],
+        );
+    }
 }

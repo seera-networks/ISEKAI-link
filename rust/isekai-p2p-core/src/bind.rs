@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use bytes::Bytes;
-use channel_masque::{CONNECT_UDP_BIND_PATH, H3Channel, MasqueClient, MasqueClientMode};
+use channel_masque::{
+    CONNECT_UDP_BIND_PATH, ForwardLimits, H3Channel, MasqueClient, MasqueClientMode,
+};
 /// Re-exported so a caller of [`BindSession::inbound_activity`] can name what it
 /// gets back, and one draining [`BindSession::events`] can match on them,
 /// without depending on the MASQUE crate directly.
@@ -463,6 +465,21 @@ pub async fn open_public_bind_session(
     .await
 }
 
+/// How many senders a public address keeps sockets for, and how long one may
+/// stay quiet.
+///
+/// **Numbers chosen to be wrong in the cheaper direction.** Too low evicts
+/// somebody real; too high leaves more sockets held than anyone needed. So the
+/// count sits far above any audience this is likely to have — a service behind
+/// one published address — and the idle window far above the gap between two
+/// datagrams of a conversation that is still going, while staying short enough
+/// that a flood is reclaimed in minutes rather than for the life of the
+/// session.
+const PUBLIC_FORWARD_LIMITS: ForwardLimits = ForwardLimits {
+    max_sources: 1024,
+    idle_after: std::time::Duration::from_secs(120),
+};
+
 /// Which of the two bound-UDP sessions is being opened.
 ///
 /// **The difference is a pair of headers, and it is not a flag.** What the data
@@ -537,6 +554,12 @@ async fn open_bound_udp(
     // Built here rather than in the task so its activity handle can be taken
     // before it moves; afterwards there is nothing left to ask.
     let mut client = MasqueClient::new(channel, None);
+    // **A public address's senders are not a known set** (§3.5), so the sockets
+    // they cost have to have an end. A relay leg gets no limit, because a limit
+    // on its one peer is a limit on nothing.
+    if let BoundUdp::PublicAddress = kind {
+        client = client.with_forward_limits(PUBLIC_FORWARD_LIMITS);
+    }
     let inbound = client.inbound_activity();
     let task = tokio::spawn(async move {
         match client

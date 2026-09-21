@@ -35,6 +35,12 @@ pub enum Message {
     ),
     RegisterContextId(u64, Option<SocketAddr>, oneshot::Sender<anyhow::Result<()>>),
     UnregisterContextId(u64, oneshot::Sender<anyhow::Result<()>>),
+    /// Drop a source's socket because it was evicted, not because it died.
+    ///
+    /// **The same teardown the read error takes.** Both end with the socket
+    /// out of the receive group and a `SocketDisconnected` on its way back, so
+    /// there is one way for a socket to stop existing rather than two.
+    RetireSocket(SocketAddr, oneshot::Sender<anyhow::Result<()>>),
     Finish(oneshot::Sender<anyhow::Result<()>>),
 }
 
@@ -112,6 +118,18 @@ impl Controller {
         resp_rx
             .await
             .map_err(|_| anyhow::anyhow!("Failed to receive UnregisterContextId response"))?
+    }
+
+    /// Retire a source's socket: stop reading it and tell the other side.
+    pub async fn retire_socket(&self, addr: SocketAddr) -> anyhow::Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(Message::RetireSocket(addr, resp_tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send RetireSocket Message"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive RetireSocket response"))?
     }
 
     pub async fn finish(&self) -> anyhow::Result<()> {
@@ -254,6 +272,33 @@ pub async fn thread(
                         }
                         if resp_tx.send(anyhow::Ok(())).is_err() {
                             tracing::debug!("UnregisterContextId response receiver dropped");
+                        }
+                    }
+                    Some(Message::RetireSocket(addr, resp_tx)) => {
+                        // **The same cleanup a dead socket gets**, and the
+                        // same notifications: the other side learns about an
+                        // evicted socket exactly as it learns about one whose
+                        // read failed, so nothing has to know which happened.
+                        if let Some(key) = udp_recv_keys.remove(&addr) {
+                            udp_recv_group.remove(key);
+                        }
+                        let context_id = compression_info.remove(&addr);
+                        tracing::info!("retired the UDP socket for {}", addr);
+                        if let Err(e) = notification_tx
+                            .send(Notification::SocketDisconnected(addr))
+                            .await
+                        {
+                            tracing::error!("failed to send socket disconnected notification: {:?}", e);
+                        }
+                        if let Some(context_id) = context_id
+                            && let Err(e) = notification_tx
+                                .send(Notification::InvalidatedContextId(context_id))
+                                .await
+                        {
+                            tracing::error!("failed to send invalidated context id notification: {:?}", e);
+                        }
+                        if resp_tx.send(anyhow::Ok(())).is_err() {
+                            tracing::debug!("RetireSocket response receiver dropped");
                         }
                     }
                     Some(Message::Finish(resp_tx)) => {

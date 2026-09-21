@@ -612,6 +612,7 @@ where
     channel: S,
     executor: SharedExec,
     inbound: InboundActivity,
+    forward_limits: Option<ForwardLimits>,
     phantom: std::marker::PhantomData<(RespBody, ReqBodyErr)>,
 }
 
@@ -626,6 +627,31 @@ pub enum MasqueClientMode {
     /// managed per-peer socket. The client bridges them to a local UDP socket
     /// via [`masque::connect_udp`].
     ConnectUdp(tokio::sync::mpsc::Sender<Bytes>),
+}
+
+/// How many senders a forwarding session will keep sockets for, and for how
+/// long one may stay quiet.
+///
+/// **Forward mode binds a local UDP socket per remote source address**, which
+/// is how a reply from the local service is attributed back to the sender that
+/// caused it. With one peer — a relay leg — that is one socket. With an address
+/// the public can reach, it is a socket per stranger: a single datagram from an
+/// unseen source port costs one, nothing authenticates the sender, and without
+/// this nothing ever takes it back.
+///
+/// **Both bounds are needed, and neither alone is enough.** `idle_after`
+/// reclaims the ordinary case, where senders stop and never return; it does
+/// nothing about a thousand sources in one second. `max_sources` bounds that,
+/// at the price of evicting the least recently used — which can be a live
+/// sender, so it is a limit rather than a policy, and wants to be set well
+/// above the real audience.
+#[derive(Debug, Clone, Copy)]
+pub struct ForwardLimits {
+    /// Most sources with a socket at once. The least recently used is retired
+    /// to make room.
+    pub max_sources: usize,
+    /// How long a source may send nothing before its socket is retired.
+    pub idle_after: std::time::Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -706,8 +732,23 @@ where
             channel: inner,
             executor: executor.unwrap_or_else(SharedExec::tokio),
             inbound: InboundActivity::default(),
+            // **Unbounded by default**, which is what every caller before a
+            // public address had: a relay leg has one peer, so a limit on how
+            // many it may have is a limit on nothing. Bounding by default would
+            // change those sessions to fix a problem they do not have.
+            forward_limits: None,
             phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Bound the sockets a forwarding session will keep (see
+    /// [`ForwardLimits`]).
+    ///
+    /// **For a session anyone can send to.** Its senders are not a known set,
+    /// so the sockets they cost have to have an end.
+    pub fn with_forward_limits(mut self, limits: ForwardLimits) -> Self {
+        self.forward_limits = Some(limits);
+        self
     }
 
     /// A handle on what this session has received (see [`InboundActivity`]).
@@ -778,6 +819,9 @@ where
             .register_stream_id(
                 MasqueClientMode::ConnectUdp(inbound_tx),
                 self.inbound.clone(),
+                // Not a forwarding session: payloads go to a channel, and no
+                // per-source socket exists to bound.
+                None,
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to register connect-udp stream: {e}"))?;
@@ -886,7 +930,7 @@ where
 
         let mut notification_rx_from_quic = match proxy_state
             .from_quic_to_udp
-            .register_stream_id(mode.clone(), self.inbound.clone())
+            .register_stream_id(mode.clone(), self.inbound.clone(), self.forward_limits)
             .await
         {
             Ok(res) => res,
@@ -978,6 +1022,15 @@ where
                     }
                     msg = notification_rx_from_quic.recv() => {
                         match msg {
+                            Some(crate::masque::from_quic_to_udp::Notification::RetireSocket(remote_addr)) => {
+                                // Evicted rather than dead, and taken down the
+                                // same path: the reader drops it and answers
+                                // `SocketDisconnected`, which is what clears
+                                // the other side.
+                                if let Err(e) = proxy_state.from_udp_to_quic.retire_socket(remote_addr).await {
+                                    tracing::error!("Failed to retire the socket for remote_addr={remote_addr}: {e}");
+                                }
+                            }
                             Some(crate::masque::from_quic_to_udp::Notification::NewSocket(socket, remote_addr, connected)) => {
                                 let mapped_remote_addr = socket.local_addr().unwrap_or_else(|_| {
                                     tracing::warn!("Failed to get local address of socket, using remote address as fallback");
