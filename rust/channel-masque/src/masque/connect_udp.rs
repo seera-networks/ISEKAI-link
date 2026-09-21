@@ -224,7 +224,10 @@ mod tests {
         // is dropped — the bridge must NOT tear down.
         app.send_to(b"ping", sock_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handle.is_finished(), "bridge stays alive after a send error");
+        assert!(
+            !handle.is_finished(),
+            "bridge stays alive after a send error"
+        );
 
         // Proof of life: the recorded source still receives a downlink reply.
         in_tx.send(Bytes::from_static(b"pong")).await.unwrap();

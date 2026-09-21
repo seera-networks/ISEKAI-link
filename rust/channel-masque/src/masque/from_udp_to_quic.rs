@@ -275,28 +275,23 @@ pub async fn thread(
                         }
                     }
                     Some(Message::RetireSocket(addr, resp_tx)) => {
-                        // **The same cleanup a dead socket gets**, and the
-                        // same notifications: the other side learns about an
-                        // evicted socket exactly as it learns about one whose
-                        // read failed, so nothing has to know which happened.
+                        // **Drop it, and say nothing back.**
+                        //
+                        // A socket that *died* is news: the side that forwards
+                        // has to hear so it can stop and blackhole. An eviction
+                        // is not news to anybody — it was that side's decision,
+                        // and it has already forgotten the socket. Answering it
+                        // with a notification closed a cycle: this task would
+                        // push `SocketDisconnected` into a channel that only
+                        // the event loop drains, while that loop was waiting on
+                        // the reply to this very message. One sweep of a
+                        // thousand idle sources was enough to reach it, and
+                        // both tasks would have waited forever.
                         if let Some(key) = udp_recv_keys.remove(&addr) {
                             udp_recv_group.remove(key);
                         }
-                        let context_id = compression_info.remove(&addr);
+                        compression_info.remove(&addr);
                         tracing::info!("retired the UDP socket for {}", addr);
-                        if let Err(e) = notification_tx
-                            .send(Notification::SocketDisconnected(addr))
-                            .await
-                        {
-                            tracing::error!("failed to send socket disconnected notification: {:?}", e);
-                        }
-                        if let Some(context_id) = context_id
-                            && let Err(e) = notification_tx
-                                .send(Notification::InvalidatedContextId(context_id))
-                                .await
-                        {
-                            tracing::error!("failed to send invalidated context id notification: {:?}", e);
-                        }
                         if resp_tx.send(anyhow::Ok(())).is_err() {
                             tracing::debug!("RetireSocket response receiver dropped");
                         }

@@ -1023,10 +1023,15 @@ where
                     msg = notification_rx_from_quic.recv() => {
                         match msg {
                             Some(crate::masque::from_quic_to_udp::Notification::RetireSocket(remote_addr)) => {
-                                // Evicted rather than dead, and taken down the
-                                // same path: the reader drops it and answers
-                                // `SocketDisconnected`, which is what clears
-                                // the other side.
+                                // **One way, and it has to be.** The
+                                // forwarding side has already forgotten this
+                                // socket — freeing the slot is the point of
+                                // evicting — so the reader drops its handle and
+                                // answers nothing. Answering with
+                                // `SocketDisconnected` put it into a channel
+                                // only this loop drains, while this loop waited
+                                // here for the reply: a cycle one busy sweep
+                                // was enough to close.
                                 if let Err(e) = proxy_state.from_udp_to_quic.retire_socket(remote_addr).await {
                                     tracing::error!("Failed to retire the socket for remote_addr={remote_addr}: {e}");
                                 }
