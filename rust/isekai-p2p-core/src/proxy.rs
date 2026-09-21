@@ -250,7 +250,16 @@ pub struct Capability {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayInfo {
     pub masque_uri: String,
-    pub session_id: String,
+    /// The relay session a leg meets its peer on.
+    ///
+    /// **Absent for a public address** (phase-5 plan §4.2), and that absence
+    /// is the shape of the thing rather than a field the server forgot: a leg
+    /// is one of two halves that have to find each other, and a public address
+    /// is one socket with nobody to meet. The header carrying this is also
+    /// what makes the data plane treat a request as a leg, so a public bind
+    /// has nothing to put in it and must not invent one.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// The relay this connection was routed to, when the control plane chose a
     /// registered one.
     ///
@@ -276,6 +285,15 @@ pub enum RelayRole {
     Initiator,
     /// The listener's side. Binds the edge itself.
     Target,
+    /// Not a leg at all: **a public address** (phase-5 plan §4.1). Binds the
+    /// `ip:port` a user holds on that data plane, for traffic from anyone.
+    ///
+    /// **The data plane refuses this role on the leg path and the other two on
+    /// the public path**, deciding which it is from the request rather than
+    /// from the ticket — otherwise a ticket would choose the check applied to
+    /// it, and a public address would end up in the pool that authorizes
+    /// CONNECT-UDP destinations.
+    Public,
 }
 
 /// **The proxy's signed statement that a relay leg may exist** (spec §8.14.1).
@@ -302,6 +320,66 @@ pub struct RelayTicket {
     pub expires_at: String,
     /// When the leg it materializes lapses, unless renewed before then.
     pub lease_expires_at: String,
+}
+
+/// Where a Public UDP Listener is reachable from the outside (spec §7.7.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicAddress {
+    /// The name the proxy advertises, when it has one to advertise.
+    ///
+    /// **Only the control plane can say this.** The data plane reports its
+    /// advertised address as a `SocketAddr`, which has no room for a name, so
+    /// a client that learned its address from the bind alone would lose it.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    pub ip: String,
+    pub port: u16,
+}
+
+/// The UDP service this Endpoint is declaring, inside itself.
+///
+/// **The proxy does not interpret it** (spec §7.7.3 — not "unimplemented",
+/// *not implemented on purpose*). It is an address inside the Endpoint, which
+/// is behind NAT by assumption, so nothing out there can reach it. The owner
+/// forwards to it at the end of its own tunnel; this field is how the owner,
+/// and whoever reads the listing, says what is being published.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicTarget {
+    pub host: String,
+    pub port: u16,
+}
+
+/// A Public UDP Listener (spec §7.7), and where to go to serve it.
+///
+/// **`relay` and `ticket` are how this stopped being a control-plane thing.**
+/// The address belongs to a data plane now (phase-5), so the answer carries
+/// which one and the signed paper that binding it needs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicListener {
+    pub listener_id: String,
+    pub owner_endpoint: String,
+    pub public_address: PublicAddress,
+    /// The region the address is **in**, not the one that was asked for.
+    ///
+    /// The allocation is one per user and permanent (§7.7.1), so a second
+    /// listener asking for somewhere else is recorded and gets the first
+    /// one's address anyway. Saying where it actually is is what stops the
+    /// two disagreeing in silence.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Which data plane holds the port — **absent means the control plane's
+    /// own data path**, whose bind is authorized by the session's Endpoint
+    /// Token and needs no ticket.
+    #[serde(default)]
+    pub relay: Option<RelayInfo>,
+    /// **Only on the `/ticket` route.** Creation is idempotent and its reply
+    /// is cached for 24 hours; a single-use ticket good for 45 seconds cannot
+    /// live in a reply like that, so the server refuses to bundle one.
+    #[serde(default)]
+    pub ticket: Option<RelayTicket>,
+    pub status: String,
+    pub created_at: String,
+    pub expires_at: String,
 }
 
 /// What `POST /v1/relay/sessions/{id}/renew` answers (spec §8.14.3).
@@ -1312,6 +1390,70 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         .await
     }
 
+    /// `POST /v1/public-listeners` (spec §7.7.1) — declare a UDP service
+    /// public.
+    ///
+    /// **Idempotent, and that is worth using.** The address it hands back is
+    /// the one the user holds, allocated once and kept; re-creating without an
+    /// `Idempotency-Key` inserts another row against a per-Endpoint quota
+    /// (default 8) that expired rows sit in until the sweep. A daemon that
+    /// re-creates on every restart runs out for good.
+    ///
+    /// `region` is a request, not a choice: the allocation is per user and
+    /// permanent, so it decides only the *first* one. Read
+    /// [`PublicListener::region`] for where the address actually is.
+    pub async fn create_public_listener(
+        &self,
+        target: &PublicTarget,
+        region: Option<&str>,
+        ttl: Option<u64>,
+    ) -> Result<PublicListener, ProxyError> {
+        let body = serde_json::json!({ "target": target, "region": region, "ttl": ttl });
+        self.request_json("POST", "/v1/public-listeners", to_vec(&body))
+            .await
+    }
+
+    /// `POST /v1/public-listeners/{id}/ticket` (phase-5 plan §4.3) — the paper
+    /// that lets this Endpoint bind its public address.
+    ///
+    /// **The main path, not an optimization.** Nothing is bundled with the
+    /// Listener, and a ticket runs 45 seconds against a Listener's day.
+    ///
+    /// **Ask once per bind attempt.** A ticket is single-use and the data
+    /// plane spends it only after the bind succeeds, so a retry wrapped around
+    /// the bind alone presents a spent or stale one and is refused — in a way
+    /// that reads as the data plane turning this Endpoint away.
+    ///
+    /// **It is also how a moved allocation is noticed.** The server reads the
+    /// ledger again here rather than repeating what the Listener's row
+    /// remembers, so a data plane that retired shows up as a different address
+    /// in the answer — the only place it can show up (plan §3.3).
+    pub async fn issue_public_listener_ticket(
+        &self,
+        listener_id: &str,
+    ) -> Result<PublicListener, ProxyError> {
+        self.request_json(
+            "POST",
+            &format!("/v1/public-listeners/{listener_id}/ticket"),
+            to_vec(&serde_json::json!({})),
+        )
+        .await
+    }
+
+    /// `DELETE /v1/public-listeners/{id}` (spec §7.7.2).
+    ///
+    /// **Stops the declaration, not the session.** A bound UDP session outlives
+    /// this; what ends it is the session closing. Deleting is what makes the
+    /// address stop being advertised and frees the quota slot.
+    pub async fn delete_public_listener(&self, listener_id: &str) -> Result<(), ProxyError> {
+        self.request_empty(
+            "DELETE",
+            &format!("/v1/public-listeners/{listener_id}"),
+            Vec::new(),
+        )
+        .await
+    }
+
     /// `POST /v1/peer-listeners/{id}/capability` (spec §8.4.1).
     pub async fn issue_capability(
         &self,
@@ -2248,6 +2390,90 @@ mod tests {
 
     /// Both relay-ticket calls go where §8.14 says, and carry a PoP over the
     /// body actually sent.
+    /// **A public `relay` carries no `session_id`, and that has to parse.**
+    /// The field was a required `String`, so the answer this whole route
+    /// exists to give could not be read at all — the server omits it, because
+    /// a public address has no second half to meet.
+    #[tokio::test]
+    async fn a_public_ticket_names_a_data_plane_and_no_session() {
+        let resp = r#"{"listener_id":"ul_1","owner_endpoint":"ep:C","visibility":"public",
+            "public_address":{"hostname":"udp-ap1.isekai.tools","ip":"203.0.113.9","port":10042},
+            "region":"ap-northeast-1",
+            "relay":{"masque_uri":"https://dp1.example:8443/.well-known/masque/udp/%2A/%2A/",
+                     "dp_id":"dp1abc","spki_sha256":["aGFzaA"]},
+            "ticket":{"ticket":"eyJ.JWT.sig","role":"public",
+                      "expires_at":"t","lease_expires_at":"t2"},
+            "status":"active","created_at":"c","expires_at":"e"}"#;
+        let (client, key) = client(MockTransport::with_response(200, resp));
+        let listener = client.issue_public_listener_ticket("ul_1").await.unwrap();
+
+        let relay = listener.relay.expect("a data plane was named");
+        assert_eq!(relay.dp_id.as_deref(), Some("dp1abc"));
+        assert_eq!(relay.session_id, None, "there is no session to meet on");
+        let ticket = listener.ticket.expect("a ticket");
+        assert_eq!(ticket.role, RelayRole::Public);
+        assert_eq!(listener.public_address.port, 10042);
+        assert_eq!(
+            listener.public_address.hostname.as_deref(),
+            Some("udp-ap1.isekai.tools"),
+            "the name has nowhere else to come from: the data plane reports a SocketAddr",
+        );
+        assert_eq!(listener.region.as_deref(), Some("ap-northeast-1"));
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, headers, _) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1/public-listeners/ul_1/ticket")
+        );
+        assert_eq!(
+            header(headers, pop::HEADER_ENDPOINT_ID),
+            Some(key.endpoint_id().as_str()),
+        );
+    }
+
+    /// **No `relay` means the control plane's own data path**, which needs no
+    /// ticket — and creation never carries one anyway.
+    #[tokio::test]
+    async fn a_listener_on_the_control_plane_names_neither() {
+        let resp = r#"{"listener_id":"ul_2","owner_endpoint":"ep:C","visibility":"public",
+            "public_address":{"ip":"203.0.113.1","port":10007},
+            "status":"active","created_at":"c","expires_at":"e"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        let listener = client
+            .create_public_listener(
+                &PublicTarget { host: "127.0.0.1".into(), port: 51820 },
+                Some("ap-northeast-1"),
+                Some(3600),
+            )
+            .await
+            .unwrap();
+        assert!(listener.relay.is_none(), "this control plane holds the port");
+        assert!(listener.ticket.is_none(), "creation is idempotent; it bundles none");
+        assert!(listener.public_address.hostname.is_none());
+        assert!(listener.region.is_none(), "not an echo of the request");
+
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, body) = calls.last().unwrap();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1/public-listeners"));
+        let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(sent["target"]["host"], "127.0.0.1");
+        assert_eq!(sent["target"]["port"], 51820);
+        assert_eq!(sent["region"], "ap-northeast-1");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_public_listener_hits_its_path() {
+        let (client, _key) = client(MockTransport::with_response(204, ""));
+        client.delete_public_listener("ul_1").await.unwrap();
+        let calls = client.transport.calls.lock().unwrap();
+        let (method, path, _, _) = calls.last().unwrap();
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("DELETE", "/v1/public-listeners/ul_1")
+        );
+    }
+
     #[tokio::test]
     async fn the_relay_ticket_calls_hit_the_right_paths() {
         let resp = r#"{"ticket":"eyJ.JWT.sig","role":"target",
@@ -2315,7 +2541,7 @@ mod tests {
             .unwrap();
         assert_eq!(conn.connection_id, "conn_1");
         assert_eq!(conn.state, "relay");
-        assert_eq!(conn.relay.unwrap().session_id, "sess_1");
+        assert_eq!(conn.relay.unwrap().session_id.as_deref(), Some("sess_1"));
 
         // The request carried the Endpoint Token and a PoP over POST /v1/peer/connect.
         let calls = client.transport.calls.lock().unwrap();

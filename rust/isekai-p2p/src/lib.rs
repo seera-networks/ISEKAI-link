@@ -82,5 +82,11 @@ pub mod agent {
         CachedCertificate, CertificateParameters, IssuedCertificate, ProxyClient, ProxyError,
     };
     pub use isekai_p2p_core::proxy::{RelayCandidate, RelayRttSample};
+    // **A public address is reached from outside this crate.** The example
+    // `docs/public_listener_client_plan.md` P4 asks for lives in
+    // `isekai-p2p/examples/`, which sees only what is re-exported here.
+    pub use isekai_p2p_core::proxy::{
+        PublicAddress, PublicListener, PublicTarget, RelayInfo, RelayRole, RelayTicket,
+    };
     pub use isekai_p2p_core::transport::{drain_msquic, shutdown_msquic, MasqueH3Transport};
 }

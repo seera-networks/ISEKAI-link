@@ -164,6 +164,11 @@ DP は**ポート番号だけ**をチケットから取り、自分の `--public
 2 つめは既存のレグの呼び出し側すべてに波及する（`Option` になるので）。**P0 の出口
 「チケットが読める」はこれを含む** — 初版はこれを数えておらず、P0 は完了しえなかった。
 
+> **実際に波及したのは 1 箇所だった**（P0 実施時）。initiator はレグを開くのに
+> `masque_uri` と `dp_id` しか読まず、`session_id` は CONNECT-UDP のヘッダに
+> `connection_id` を使っていて、`RelayInfo` のほうは**誰も読んでいなかった**。
+> 直ったのはテスト 1 本である。
+
 ### 2.2 `open_bind_session` を分けるか、引数で分けるか
 
 **分ける。** 引数 1 つの違いに見えるが、意味が違う。
@@ -379,7 +384,7 @@ DNS や設定ファイルに書かれている。黙って新しいアドレス�
 
 | # | やること | 出口 |
 | --- | --- | --- |
-| **P0** | DTO と 3 つの API 呼び出し、`RelayRole::Public`、`session_id` を `Option` に（§2.1） | **チケットが読める** |
+| **P0** ✅ | DTO と 3 つの API 呼び出し、`RelayRole::Public`、`session_id` を `Option` に（§2.1） | **チケットが読める** |
 | **P1** | `open_public_bind_session`（§2.2）。セッション ID と `Prefer-Temporary` を**付けない** bind（§3.7） | **名指された DP に bind できる** |
 | **P1b** | 転送先ソケットの上限（§3.5） | **公開しても増え続けない** |
 | **P2** | `PublicEndpoint`：create → ticket → bind、`Idempotency-Key`、bind 試行ごとの再チケット（§2.3） | 公開したサービスが外から届く |
