@@ -28,6 +28,9 @@ pub mod initiator;
 pub mod listener;
 /// Where an unattended job's workload identity assertion comes from.
 pub mod oidc;
+/// Publishing a UDP service at a public address
+/// (`docs/public_listener_client_plan.md`).
+pub mod public;
 /// Holding a relay leg's lease open (proxy spec §8.14).
 pub mod relay_lease;
 pub mod secret;

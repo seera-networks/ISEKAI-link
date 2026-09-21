@@ -398,7 +398,7 @@ DNS や設定ファイルに書かれている。黙って新しいアドレス�
 | **P0** ✅ | DTO と 3 つの API 呼び出し、`RelayRole::Public`、`session_id` を `Option` に（§2.1） | **チケットが読める** |
 | **P1** ✅ | `open_public_bind_session`（§2.2）。セッション ID と `Prefer-Temporary` を**付けない** bind（§3.7） | **名指された DP に bind できる** |
 | **P1b** ✅ | 転送先ソケットの上限（§3.5） | **公開しても増え続けない** |
-| **P2** | `PublicEndpoint`：create → ticket → bind、`Idempotency-Key`、bind 試行ごとの再チケット（§2.3） | 公開したサービスが外から届く |
+| **P2** ✅ | `PublicEndpoint`：create → ticket → bind、`Idempotency-Key`、bind 試行ごとの再チケット（§2.3） | 公開したサービスが外から届く |
 | **P3** | 前回公開したアドレスとの比較（§3.3）、`role` の検査（§3.2）、退役の見え方（§5） | **アドレスが変わったことが分かる** |
 | **P4** | `isekai-p2p/examples/` にサンプルを置く（§6.1） | **外から誰かが来るところまで見える** |
 

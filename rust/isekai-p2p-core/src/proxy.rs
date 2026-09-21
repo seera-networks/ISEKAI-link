@@ -1393,18 +1393,22 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// `POST /v1/public-listeners` (spec §7.7.1) — declare a UDP service
     /// public.
     ///
-    /// **Every call makes a row, and this one cannot yet say otherwise.**
-    /// The address is the user's, allocated once and kept — but the *Listener*
-    /// is not, and each creation spends one of a per-Endpoint quota (default
-    /// 8) that expired rows occupy until the sweep. So a daemon that
-    /// re-creates on every restart stops being able to publish after eight.
+    /// **Ask with the same key twice and you have one Listener, not two.**
+    /// The address is the user's, allocated once and kept — but a *Listener*
+    /// is a row, and each creation spends one of a per-Endpoint quota (default
+    /// 8) that expired rows occupy until the sweep. A daemon that re-creates on
+    /// every restart runs out after eight, and `429 listener-quota-exceeded`
+    /// becomes its permanent answer.
     ///
-    /// The server makes creation idempotent under an `Idempotency-Key`, and
-    /// **this client has no way to send one**: `send` carries the auth headers
-    /// and nothing else, and adding that seam is P2 of
-    /// `docs/public_listener_client_plan.md`. Until then the only defence is
-    /// not to re-create blindly — **keep the `listener_id`**, and note that
-    /// there is no route here to look one up again if it is lost.
+    /// So `idempotency_key` is not optional in practice. The server keeps the
+    /// first reply under it for 24 hours — longer than a Listener can live — so
+    /// a restart within a Listener's lifetime gets the Listener it already had,
+    /// and one after it has expired starts fresh, which is what starting fresh
+    /// means.
+    ///
+    /// **Give it something stable about what is being published**, never
+    /// something about this run: a fresh key per process makes every restart a
+    /// new row again, which is the failure it exists to prevent.
     ///
     /// `region` is a request, not a choice: the allocation is per user and
     /// permanent, so it decides only the *first* one. Read
@@ -1414,9 +1418,13 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         target: &PublicTarget,
         region: Option<&str>,
         ttl: Option<u64>,
+        idempotency_key: Option<&str>,
     ) -> Result<PublicListener, ProxyError> {
         let body = serde_json::json!({ "target": target, "region": region, "ttl": ttl });
-        self.request_json("POST", "/v1/public-listeners", to_vec(&body))
+        let extra: Vec<(String, String)> = idempotency_key
+            .map(|key| vec![("idempotency-key".to_owned(), key.to_owned())])
+            .unwrap_or_default();
+        self.request_json_with("POST", "/v1/public-listeners", to_vec(&body), &extra)
             .await
     }
 
@@ -2219,7 +2227,18 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         path: &str,
         body: Vec<u8>,
     ) -> Result<HttpResponse, ProxyError> {
-        let headers = self.auth_headers(method, path, &body);
+        self.send_with(method, path, body, &[]).await
+    }
+
+    async fn send_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        extra: &[(String, String)],
+    ) -> Result<HttpResponse, ProxyError> {
+        let mut headers = self.auth_headers(method, path, &body);
+        headers.extend_from_slice(extra);
         self.transport
             .send(method, path, &headers, body)
             .await
@@ -2254,7 +2273,25 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         path: &str,
         body: Vec<u8>,
     ) -> Result<R, ProxyError> {
-        let resp = self.send(method, path, body).await?;
+        self.request_json_with(method, path, body, &[]).await
+    }
+
+    /// As [`request_json`](Self::request_json), with headers of the caller's
+    /// own.
+    ///
+    /// **Not covered by the PoP signature**, which is over the method, the path
+    /// and the body (§8.0). That is the right shape for what goes here — an
+    /// `Idempotency-Key` is the server's bookkeeping and changes nothing about
+    /// what is being asked for — but it does mean these headers prove nothing,
+    /// so nothing that has to be proven belongs in one.
+    async fn request_json_with<R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        extra: &[(String, String)],
+    ) -> Result<R, ProxyError> {
+        let resp = self.send_with(method, path, body, extra).await?;
         if (200..300).contains(&resp.status) {
             serde_json::from_slice(&resp.body).map_err(ProxyError::Decode)
         } else {
@@ -2453,6 +2490,7 @@ mod tests {
                 },
                 Some("ap-northeast-1"),
                 Some(3600),
+                Some("publish:127.0.0.1:51820"),
             )
             .await
             .unwrap();
@@ -2468,7 +2506,7 @@ mod tests {
         assert!(listener.region.is_none(), "not an echo of the request");
 
         let calls = client.transport.calls.lock().unwrap();
-        let (method, path, _, body) = calls.last().unwrap();
+        let (method, path, headers, body) = calls.last().unwrap();
         assert_eq!(
             (method.as_str(), path.as_str()),
             ("POST", "/v1/public-listeners")
@@ -2477,6 +2515,38 @@ mod tests {
         assert_eq!(sent["target"]["host"], "127.0.0.1");
         assert_eq!(sent["target"]["port"], 51820);
         assert_eq!(sent["region"], "ap-northeast-1");
+        // **Without this, a restart is a second Listener.** Eight of those and
+        // the Endpoint cannot publish again.
+        assert_eq!(
+            header(headers, "idempotency-key"),
+            Some("publish:127.0.0.1:51820"),
+        );
+    }
+
+    /// **It is not sent when there is none**, rather than sent empty — an empty
+    /// key is a key, and the server would cache one reply under it for every
+    /// caller that omitted one.
+    #[tokio::test]
+    async fn no_idempotency_key_means_no_header() {
+        let resp = r#"{"listener_id":"ul_3","owner_endpoint":"ep:C","visibility":"public",
+            "public_address":{"ip":"203.0.113.1","port":10007},
+            "status":"active","created_at":"c","expires_at":"e"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        client
+            .create_public_listener(
+                &PublicTarget {
+                    host: "127.0.0.1".into(),
+                    port: 51820,
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let calls = client.transport.calls.lock().unwrap();
+        let (_, _, headers, _) = calls.last().unwrap();
+        assert!(header(headers, "idempotency-key").is_none());
     }
 
     #[tokio::test]
