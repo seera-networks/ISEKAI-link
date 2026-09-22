@@ -396,7 +396,7 @@ draft §6.2.1 の経路は **Identity → Gateway → Proxy** で、非同期で
 > | --- | --- |
 > | トークン発行がリースを起こす | Gateway に `lease="al_…"` が現れる |
 > | Identity → Gateway のストリームが運ぶ | 同上 |
-> | Gateway が封筒を検査する | 属性が値域外の回は `policy: not applied: attribute 'region' is out of range` で**適用しない** |
+> | Gateway が封筒を検査する | 属性が値域外の回は ``policy: not applied: attribute `region` is out of range: …`` で**適用しない** |
 > | Grant ができる | `policy: granted … ttl=1739 leases=1 ours=true` |
 > | agent が繋ぐ | `the Grant arrived waited=796ms` → `ready` → 直接経路へ移行 |
 > | 実際に転送される | 転送先が返したバイト列がクライアント側の local port に届く |

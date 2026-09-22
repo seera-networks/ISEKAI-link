@@ -1417,12 +1417,12 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // other places for exactly that reason; the sixth recurrence of that shape
     // in this work is not the one to leave.
     //
-    // Nothing consults the policy yet -- the policy source and the PEP are
-    // later phases (`docs/portal_gateway_plan.md`). What reading it buys today
-    // is that a statement with three placeholders and two bindings, or a
-    // pattern that does not compile, is refused *here* rather than the first
-    // time an operation runs, which with the PEP deferred is not in this
-    // release at all.
+    // Reading it here rather than where it is used buys the other half: a
+    // statement with three placeholders and two bindings, or a pattern that
+    // does not compile, is refused *here* rather than the first time an
+    // operation runs -- which, with the PEP deferred, is not in this release at
+    // all. What the policy *is* consulted for from the moment it loads is
+    // whether each row the control plane sends may be applied.
     let gateway_policy = match &args.gateway_config {
         Some(path) => {
             let policy = portal_core::gateway::load(path)?;

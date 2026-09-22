@@ -843,7 +843,7 @@ its schema, is **not applied**, and the server says which:
 ```
 gateway policy: serving a protocol class  protocol=pg-sales-ro-v1 operations=1 windows=1
 policy: reconciled with the control plane  offered=2 applied=1 refused=1
-policy: not applied: attribute 'region' is out of range   lease=al_…
+policy: not applied: attribute `region` is out of range: kyoto   lease=al_…
 policy: granted  grant=gr_… allowed=ep:4d5e6f… protocol=pg-sales-ro-v1 ttl=1739 leases=1 ours=true
 ```
 
@@ -872,11 +872,20 @@ by the server's own clock, because nothing is sent when one lapses.
 ### The agent side
 
 ```sh
-portal-client --login --organization org_…       # once, as the person
+portal-client --login --organization org_…       # once, as the person;
+                                                 # saves portal-client-auth0.json
 
 portal-client --agent --task nightly-report \
+    --auth0-tokens portal-client-auth0.json \
     --protocol pg-sales-ro-v1 --gateway ep:7a8b9c… --map 5432:db
 ```
+
+**`--auth0-tokens` is not optional here**, which it is everywhere else. The
+saved sign-in is normally named after the key file, and this mode has no key
+file — so there is nothing to derive it from and the run is refused before it
+starts. It has to be the refreshing sign-in rather than a pasted
+`--auth0-token`: the revocation at the end is an authenticated call, and a long
+task would reach it holding a token that expired hours ago.
 
 That run makes a key **for the task and nothing else**: it is generated in
 memory, never written, and gone when the process is. It registers, asks for a
@@ -903,15 +912,26 @@ refused on the arguments, before anything is spent:
 | `--enroll` | authenticates a workload with an Enrollment Key. `--agent` runs as the signed-in person |
 | `--pair`, `--redeem`, a Provisioning Key | ways of being let in by the peer. An agent is let in by an entitlement |
 | `--whoami` | has no answer: the key was made seconds ago and reachability comes from the entitlement, not from being named |
+| `--capability`, `--listener` | were issued for an Endpoint that already existed. This one is made for the task, so none of them can match it |
+| `--auth0-token` | cannot be refreshed. The revocation at the end would fail on a long task |
+
+(`--login`, `--relays` and the account-level commands are refused too: each
+returns before a key is ever made, so `--agent` beside one would mean nothing
+and exit 0 — which is how an operator comes to believe a task-scoped run
+happened when an ordinary one did.)
 
 **The revocation is not best effort.** Returning a CI enrolment slot can be left
 to the idle sweep, but nothing sweeps an Endpoint registered this way — a
 revocation that did not happen leaves it registered for good. So a task that
 succeeded and could not put its Endpoint away exits non-zero and says so. (A
-task that had already failed keeps its own exit code.) It is tried once more
-after the connection closes, and it runs *before* the close rather than after,
-so that a connection taking its time to fold does not take the revocation with
-it. A second Ctrl+C skips it.
+task that had already failed keeps its own exit code.) It is tried twice, and
+**where it sits depends on how the run ended.** On a forced stop — Ctrl+C, or a
+CI runner's SIGTERM — it goes *before* the connection is closed, because closing
+reports the connection and can wait out a timeout, which is the thing a forced
+stop is escaping. On an ordinary ending it goes after, because revoking first
+makes that report fail on every successful run: it goes through the auth layer
+that has just stopped honouring this Endpoint. A second Ctrl+C skips it
+entirely.
 
 Reachability does not depend on that going through: the token renewal is the
 lease's clock, so a process that vanishes loses its grant within one lease TTL
@@ -1036,7 +1056,7 @@ connection counters and which path they are about.
 | forwarding works but stays slow | check for `forwarding moved onto the direct path`. Without it you are on the relay, which is a round trip through someone else's machine |
 | a DNS query times out and small ones work | the response is over the size limit above |
 | the agent's wait runs out with no grant | nothing raised a lease. Either no entitlement names this person and protocol, or the Gateway it names is not running with `--gateway-config`. The Gateway's log says what it was offered |
-| `policy: not applied: …` on the Gateway | the control plane sent a row this server's envelope does not accept — an unlisted window label, or an attribute outside its schema. The row is the centre's, the envelope is yours, and the log names which |
+| `policy: not applied: …` on the Gateway | a policy row the server will not act on, and the rest of the line says why. An unlisted window label or an attribute outside its schema is a disagreement with your `gateway.toml`; `the lease is too short` (under 120 s) and `no deadline` are not — those are the row itself, and there is nothing in the file to fix |
 | `capability-endpoint-mismatch` | the capability was issued for a different Endpoint. Usually a second key: `--key` defaults to `portal-client.pem` in the working directory, so running from another directory makes a new Endpoint. The client says `generating a new Endpoint key` when it does |
 | nothing below `error` in the log | you are on a build before this was fixed — `RUST_LOG=info` |
 
