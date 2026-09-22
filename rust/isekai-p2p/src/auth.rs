@@ -239,6 +239,14 @@ pub struct Enrollment {
     /// against a principal (§8.8.3). Those two are the attended case and
     /// cannot be used by a job on its own.
     pub auth0: Option<Arc<dyn Auth0TokenSource>>,
+    /// Where the key was read from — an environment variable or a file.
+    ///
+    /// **Carried so that a refusal can name it.** A CI run holds two
+    /// Enrollment Keys with different permissions (client and server), and
+    /// `403 enrollment-key-invalid` is the same string for both; without this
+    /// the message sends the operator to reissue whichever they think of
+    /// first, and the wrong one is the one that fails again next run.
+    pub source: Option<String>,
     /// Which Endpoint this credential has already grown, if any.
     ///
     /// **Shared across clones, and it has to be.** [`crate::P2pConfig`] is
@@ -290,9 +298,16 @@ impl Enrollment {
             key: key.into(),
             assertion: None,
             auth0: None,
+            source: None,
             enrolled: Arc::new(OnceCell::new()),
             attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Name where the key came from, for [`Enrollment::source`].
+    pub fn from_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 
     /// Mint assertions for the `oidc` binding from `source`.

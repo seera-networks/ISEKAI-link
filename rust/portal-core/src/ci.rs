@@ -95,7 +95,10 @@ pub fn enrollment_credential(
              an argument on purpose: an argument list is readable by anything running as this user"
         )
     })?;
-    let mut enrollment = Enrollment::new(key);
+    // **The name the operator has to go and edit**, which is not the same for
+    // the two keys a CI run holds and is not in the server's answer.
+    let source = key_file.map_or_else(|| var.to_owned(), |path| path.display().to_string());
+    let mut enrollment = Enrollment::new(key).from_source(source);
     if let Some(source) = assertions(oidc, token_files)? {
         enrollment = enrollment.with_assertions(source);
     }

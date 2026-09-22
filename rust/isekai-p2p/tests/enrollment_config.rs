@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
-use axum::response::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::post;
 use axum::Router;
 use isekai_p2p::agent::EndpointKey;
@@ -22,11 +23,35 @@ use isekai_p2p::config::{issue_endpoint_token, P2pConfig};
 use isekai_p2p::{AssertionSource, Credential, Enrollment};
 use serde_json::{json, Value};
 
-/// Every request the mock Identity API saw: (path, body).
+/// Every request the mock Identity API saw: (path, body), and which path is
+/// currently answering `403 enrollment-key-invalid`.
 #[derive(Clone, Default)]
-struct Hits(Arc<Mutex<Vec<(String, Value)>>>);
+struct Hits(Arc<Mutex<Vec<(String, Value)>>>, Arc<Mutex<Option<String>>>);
 
 impl Hits {
+    /// Make `path` answer the way Identity does once the key behind it has
+    /// expired, been revoked, or never existed — one reply for all of those.
+    fn refuse(&self, path: &str) {
+        *self.1.lock().unwrap() = Some(path.to_owned());
+    }
+
+    fn refusal(&self, path: &str) -> Option<Response> {
+        if self.1.lock().unwrap().as_deref() != Some(path) {
+            return None;
+        }
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "type": "https://identity.isekai.tools/problems/enrollment-key-invalid",
+                    "title": "enrollment key invalid",
+                    "status": 403,
+                })),
+            )
+                .into_response(),
+        )
+    }
+
     fn paths(&self) -> Vec<String> {
         self.0
             .lock()
@@ -66,7 +91,8 @@ async fn serve(hits: Hits) -> String {
             post(
                 |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
                     record(&s, "enroll/challenge", b).await;
-                    challenge_response()
+                    s.refusal("enroll/challenge")
+                        .unwrap_or_else(|| challenge_response().into_response())
                 },
             ),
         )
@@ -75,13 +101,16 @@ async fn serve(hits: Hits) -> String {
             post(
                 |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
                     record(&s, "enroll", b).await;
-                    Json(json!({
+                    s.refusal("enroll").unwrap_or_else(|| {
+                        Json(json!({
                         "endpoint_id": "ep:abc",
                         "endpoint_token": "TOKEN.FROM.ENROL",
                         "expires_in": 900,
                         "permissions": ["peer-connect:initiate"],
                         "protocols": ["isekai-portal-v1"],
-                    }))
+                        }))
+                        .into_response()
+                    })
                 },
             ),
         )
@@ -90,7 +119,8 @@ async fn serve(hits: Hits) -> String {
             post(
                 |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
                     record(&s, "refresh/challenge", b).await;
-                    challenge_response()
+                    s.refusal("refresh/challenge")
+                        .unwrap_or_else(|| challenge_response().into_response())
                 },
             ),
         )
@@ -99,14 +129,17 @@ async fn serve(hits: Hits) -> String {
             post(
                 |State(s): State<Hits>, _h: HeaderMap, b: Bytes| async move {
                     record(&s, "refresh", b).await;
-                    Json(json!({
+                    s.refusal("refresh").unwrap_or_else(|| {
+                        Json(json!({
                         "endpoint_token": "TOKEN.FROM.REFRESH",
                         "token_type": "Bearer",
                         "expires_in": 900,
                         "endpoint_id": "ep:abc",
                         "permissions": ["peer-connect:initiate"],
                         "protocols": ["isekai-portal-v1"],
-                    }))
+                        }))
+                        .into_response()
+                    })
                 },
             ),
         )
@@ -565,4 +598,42 @@ async fn a_conflict_after_our_own_attempt_still_owns_the_slot() {
         enrollment.registered_here(),
         "our own lost enrolment spent the slot; it has to come back",
     );
+}
+
+/// **All four calls present the Enrollment Key**, so all four can meet the one
+/// uniform `403` — and the two renewal calls are the ones a long-lived session
+/// meets, days after the enrolment that worked, at which point the refusal is
+/// permanent and ends the renewals for good.
+///
+/// Each of the four is driven here rather than the helper being called
+/// directly, so that dropping the explanation from any one of them fails.
+#[tokio::test]
+async fn every_call_that_presents_the_key_explains_a_refusal() {
+    for path in ["enroll/challenge", "enroll", "refresh/challenge", "refresh"] {
+        let hits = Hits::default();
+        let url = serve(hits.clone()).await;
+        let cfg = config(
+            url,
+            Enrollment::new("enr1_SECRET")
+                .from_source("ISEKAI_SERVER_ENROLLMENT_KEY")
+                .into(),
+        );
+        // The renewal paths are only reached once an enrolment has succeeded.
+        if path.starts_with("refresh") {
+            issue_endpoint_token(&cfg).await.expect("enrol");
+        }
+        hits.refuse(path);
+
+        let error = issue_endpoint_token(&cfg)
+            .await
+            .expect_err("a refused key cannot produce a token");
+        let text = format!("{error:#}");
+        assert!(text.contains("expired"), "{path}: {text}");
+        // **Which of the two keys**, since the server's answer names neither
+        // and reissuing the other leaves the job failing on this same line.
+        assert!(
+            text.contains("ISEKAI_SERVER_ENROLLMENT_KEY"),
+            "{path}: {text}"
+        );
+    }
 }

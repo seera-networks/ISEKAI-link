@@ -836,6 +836,7 @@ $ portal-client --issue-enrollment-key \
     --permissions peer-connect:initiate \
     --enrollment-protocols isekai-portal-v1 \
     --max-live-endpoints 8 --endpoint-idle-ttl 1800 \
+    --enrollment-ttl 2592000 \
     --enrollment-label gha-main                       # → ISEKAI_ENROLLMENT_KEY
 
 $ portal-client --issue-enrollment-key \
@@ -846,11 +847,16 @@ $ portal-client --issue-enrollment-key \
     --permissions peer-provisioning:create \
     --enrollment-protocols isekai-portal-v1 \
     --max-live-endpoints 8 --endpoint-idle-ttl 1800 \
+    --enrollment-ttl 2592000 \
     --enrollment-label gha-main-server                # → ISEKAI_SERVER_ENROLLMENT_KEY
 ```
 
 出た 2 本を、リポジトリのシークレット `ISEKAI_ENROLLMENT_KEY` /
 `ISEKAI_SERVER_ENROLLMENT_KEY` に入れる。**どちらも二度と取り出せない。**
+
+`--enrollment-ttl 2592000` は上限の 30 日である。**省くと既定の 7 日**で発行され、
+下の欄が言っている沈黙の停止が 1 週間で来る。発行したら**切れる日をカレンダーに書く。**
+それが唯一の警告になる。
 
 > **初版の例は 3 か所で動かなかった**（2026-09-22 に鍵を作り直して判明した）。
 >
@@ -875,16 +881,26 @@ $ portal-client --issue-enrollment-key \
 > **実際に 2026-09-05 頃から 9-22 まで、main のこのジョブは赤のままだった。**
 > PR の checks はすべて緑で、そこでは当のジョブが `skipping` と出るからである。
 > 鍵の更新はカレンダーに載せる作業であって、発行時の 1 手ではない。
+>
+> **いま入っている 2 本は 2026-09-22 発行、既定の 7 日で 2026-09-29 に切れる**
+> （`--enrollment-ttl` を足す前に発行したため）。次の交換で上限に取り直すこと。
 
 ### 6.2 揃っていなければならないもの（§8.8.10）
 
-| 項目 | Enrollment Key | Provisioning Key |
+| 項目 | client 用 Enrollment Key | server 用 Enrollment Key |
 | --- | --- | --- |
-| protocol | `protocols` に `isekai-portal-v1` | `protocol` = `isekai-portal-v1` |
-| permission | `permissions` に `peer-connect:initiate` **だけ**を明示（§9.5） | （引き換え側に追加の権限は不要） |
-| `binding.issuer` | 一致 | 一致 |
+| protocol | `enrollment-protocols` に `isekai-portal-v1` | 同じ |
+| permission | `peer-connect:initiate` **だけ**を明示（§9.5） | `peer-listener:private:create` / `peer-connect:accept` / `peer-provisioning:create` を明示（§15.2） |
+| `binding.issuer` | 一致。**`https://` から書く**（完全一致） | 同じ |
 | `binding.subject` | **完全一致**。ワイルドカード不可 | 同じ値 |
-| `binding.audience` | `isekai-identity`（運用者設定） | `isekai-proxy`（運用者設定） |
+| `binding.audience` | `isekai-identity`（運用者設定） | 同じ |
+
+**どちらも省略してはならない。** 省けば天井（サーバ既定 `DEFAULT_PERMISSIONS`）が
+焼き付き、client 側の鍵にも listener を立てる権限が付く。それが §9.5 の話である。
+
+**Provisioning Key はこの表に無い。** §15.3 で、リポジトリのシークレットではなく
+**server が実行時に発行する**ものになった。鍵の要件は Proxy 仕様 §8.13 のままだが、
+**用意するのは CI の運用者ではない。**
 
 `subject` が完全一致であることは、**ブランチを跨ぐなら鍵を分ける**ことを意味する。
 `refs/heads/main` の鍵で PR のジョブは通らない。それは意図した狭さである。
@@ -897,7 +913,7 @@ $ portal-client --issue-enrollment-key \
 | `endpoint_idle_ttl` | 1,800 | **保険**。トークン TTL の 2〜3 倍あれば足りる |
 | `grant_ttl` | 1,800 | 再引き換えで延びるので上限 3,600 を指定する理由が無い |
 | `max_live_grants` | 並列度に合わせる | 同じ Endpoint の再引き換えは枠を増やさない |
-| `ttl`（両方） | 30 日未満。無期限は指定できない | 定期交換で回す |
+| `ttl`（両方） | **上限の 30 日**（`--enrollment-ttl 2592000`）。無期限は指定できない | 既定は 7 日。切れても何も言わないので、短くする理由が無ければ上限で取って交換日を決める |
 
 §6.1 の発行例が `--max-live-endpoints 8` としているのは初版の見積もりに拠るもので、
 自己失効を呼ぶなら並列度に合わせて下げてよい。**枠を大きくするのは漏洩時の被害を広げる。**
@@ -917,6 +933,8 @@ Proxy 仕様 §8.13.3 の `--p2p-provisioning-key-quota` は Endpoint あたり 
 - Enrollment Key（`ephemeral: true`）の失効 → 派生 Endpoint も失効する。
   **走行中のジョブが落ちる。静かな時間帯に。**
 - Provisioning Key の失効 → 派生 Grant が消える。**走行中のジョブが落ちる。**
+  ただし §15.3 以降、CI の Provisioning Key は run ごとに server が発行して捨てる
+  ものなので、**交換する対象は Enrollment Key 2 本だけ**である。
 
 引き換え側は、新しい Provisioning Key が旧鍵の作った Grant を**引き取る**
 （§8.13.5）ので、「数回のジョブが通るのを確認」が本当に新しい鍵を確認している。
@@ -1145,6 +1163,13 @@ DEFAULT_PERMISSIONS に peer-provisioning:create を足す（portal-server が�
 CI ランナーに要るのは `peer-connect:initiate` **だけ**である。§6.1 の発行例に
 `--permissions peer-connect:initiate` を足した。**省略が最小権限にならない配備が
 ありうる**、というのが #34 の粒度の話がこちらへ届く形である。
+
+> **この節が禁じているのは「省略して付いてしまうこと」であって、
+> `peer-provisioning:create` そのものではない。** §15.3 で CI の形が変わり、
+> server は同じジョブの中で動いて自分の Provisioning Key を発行するようになった
+> ので、**server 用の鍵にはこの権限が要る**（§15.2）。危険なのは上の図の
+> 「permissions を省略」であり、そこが変わっていないから 2 本とも明示する。
+> client 用の鍵は `peer-connect:initiate` だけのままである。
 
 （Proxy 仕様 §8.13.2 が「引き換え側に必要な permission は `peer-connect:initiate` のみ」と
 書いているとおりで、鍵を配る側と使う側は非対称である。）

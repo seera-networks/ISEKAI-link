@@ -506,7 +506,7 @@ async fn enrol<T: ControlPlaneTransport>(
     let challenge = client
         .enroll_challenge(auth, &cfg.key)
         .await
-        .map_err(explain_key_refused)
+        .map_err(|error| explain_key_refused(error, enrollment))
         .context("could not obtain an enrolment challenge")?;
     client
         .enroll(
@@ -517,6 +517,7 @@ async fn enrol<T: ControlPlaneTransport>(
             cfg.token_ttl,
         )
         .await
+        .map_err(|error| explain_key_refused(error, enrollment))
         .context("could not enrol this Endpoint")
 }
 
@@ -533,9 +534,13 @@ async fn refresh<T: ControlPlaneTransport>(
     // identity has ended.
     let assertion = enrollment_assertion(enrollment).await?;
     let auth = identity_auth(enrollment, assertion.as_deref(), auth0.as_deref());
+    // **The key is re-checked at every renewal** (§8.8.7), so this is where an
+    // expiry is met by a session that has been up for days -- the case where
+    // the bare `403` is least readable and `is_permanent` ends the renewals.
     let challenge = client
         .refresh_challenge(auth, &cfg.key.endpoint_id())
         .await
+        .map_err(|error| explain_key_refused(error, enrollment))
         .context("could not obtain a renewal challenge")?;
     client
         // **The selector is re-sent, unlike the other two axes.** The server
@@ -551,6 +556,7 @@ async fn refresh<T: ControlPlaneTransport>(
             cfg.token_ttl,
         )
         .await
+        .map_err(|error| explain_key_refused(error, enrollment))
         .context("could not renew the endpoint token")
 }
 
@@ -679,20 +685,35 @@ fn explain_pop_failure(error: IdentityError, cfg: &P2pConfig) -> anyhow::Error {
 /// the person reading a failed job, who gets "invalid" for a key they put in a
 /// secret store and have not touched since.
 ///
-/// **Expiry is the common one**, because a key is capped at 30 days (§8.8.1)
-/// and nothing counts down to it: the only sign is this, on a schedule nobody
-/// chose. So the four are named, with that one first.
-fn explain_key_refused(error: IdentityError) -> anyhow::Error {
+/// **Expiry is the common one**, because a key lives seven days by default and
+/// 30 at the most (§8.8.1), and nothing counts down to it: the only sign is
+/// this, on a schedule nobody chose. So the four are named, with that one
+/// first.
+///
+/// **And which key**, from [`Enrollment::source`]. A CI run holds two, with
+/// different permissions, and reissuing the wrong one leaves the job failing
+/// on the same line.
+fn explain_key_refused(error: IdentityError, enrollment: &Enrollment) -> anyhow::Error {
     if error.kind().as_deref() != Some("enrollment-key-invalid") {
         return error.into();
     }
-    anyhow::Error::from(error).context(
-        "the Enrollment Key was refused. The server answers the same way for all four \
-         reasons, so it cannot say which: the key has **expired** (they last at most 30 \
-         days and nothing warns before it), or it was revoked, or its owner was, or it \
-         is not a key this deployment knows. Issue another with \
-         `portal-client --issue-enrollment-key` and replace the secret",
-    )
+    let named = match &enrollment.source {
+        Some(source) => format!("the Enrollment Key in {source}"),
+        None => "the Enrollment Key".to_owned(),
+    };
+    let replace = match &enrollment.source {
+        Some(source) => format!("put it back in {source}"),
+        None => "replace the secret".to_owned(),
+    };
+    anyhow::Error::from(error).context(format!(
+        "{named} was refused. The server answers the same way for all four reasons, so it \
+         cannot say which: the key has expired (they live seven days by default, 30 at the \
+         most, and nothing warns before it), or it was revoked, or its owner was, or it is \
+         not a key this deployment knows. Issue another with \
+         `portal-client --issue-enrollment-key` and {replace} -- naming the same \
+         `--permissions` as the key it replaces, since leaving them out burns in the \
+         server's default set rather than this role's"
+    ))
 }
 
 /// Whether retrying this failure could ever produce a different answer.
@@ -932,22 +953,45 @@ mod tests {
     /// **"Invalid" is four answers wearing one name**, and the server will not
     /// say which — deliberately, so that holding a key reveals nothing. The
     /// person reading a failed job is owed the list, and expiry first: a key
-    /// lasts at most 30 days and nothing counts down to it.
+    /// lives seven days by default and nothing counts down to it.
     #[test]
     fn a_refused_enrollment_key_says_what_that_covers() {
-        let explained = explain_key_refused(problem(403, "enrollment-key-invalid"));
+        let explained = explain_key_refused(
+            problem(403, "enrollment-key-invalid"),
+            &Enrollment::new("enr1_SECRET"),
+        );
         let text = format!("{explained:#}");
         assert!(text.contains("expired"), "{text}");
-        assert!(text.contains("30 days"), "{text}");
+        assert!(text.contains("seven days"), "{text}");
         assert!(text.contains("--issue-enrollment-key"), "{text}");
+    }
+
+    /// **The remedy has to name a key**, because a CI run holds two with
+    /// different permissions and the server's answer names neither. Without
+    /// this the operator reissues whichever comes to mind, and half the time
+    /// the job fails again on the same line.
+    #[test]
+    fn a_refusal_names_where_the_key_came_from() {
+        let explained = explain_key_refused(
+            problem(403, "enrollment-key-invalid"),
+            &Enrollment::new("enr1_SECRET").from_source("ISEKAI_SERVER_ENROLLMENT_KEY"),
+        );
+        let text = format!("{explained:#}");
+        assert!(text.contains("ISEKAI_SERVER_ENROLLMENT_KEY"), "{text}");
+        // And what a replacement has to carry, since omitting `--permissions`
+        // burns in the server default and not the role's (§9.5, §15.2).
+        assert!(text.contains("--permissions"), "{text}");
     }
 
     /// Everything else passes through as it came: this explains one refusal,
     /// not every one.
     #[test]
     fn other_enrolment_failures_are_left_alone() {
-        let plain = explain_key_refused(problem(403, "insufficient-permission"));
-        assert!(!format!("{plain:#}").contains("30 days"));
+        let plain = explain_key_refused(
+            problem(403, "insufficient-permission"),
+            &Enrollment::new("enr1_SECRET"),
+        );
+        assert!(!format!("{plain:#}").contains("seven days"));
     }
 
     /// **A rule refused, and asking again asks the same rule.** `403` is the
