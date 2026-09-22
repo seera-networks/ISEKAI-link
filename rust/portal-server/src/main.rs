@@ -700,6 +700,55 @@ fn forget_connection(live: &mut BTreeMap<String, BTreeSet<String>>, connection_i
     });
 }
 
+/// Refuse a policy whose classes this server does not serve.
+///
+/// **A grant names a protocol, and so does a Peer Listener.** The Gateway's
+/// grants are for its own Endpoint, so the agent that holds one looks for a
+/// listener of this server under that same string — and this process opens
+/// exactly one, under `--protocol`. Name a class here that `--protocol` does
+/// not, and every grant it produces is for something nobody is listening on.
+///
+/// **It fails silently and expensively.** The Gateway logs `policy: granted`,
+/// the agent logs `no Grant yet`, and thirty seconds later the agent reports
+/// that nothing is reachable — which is also what a server that is not running
+/// looks like. The two logs agree that everything worked and the connection
+/// does not happen.
+///
+/// A file may declare several classes and this serves one of them; the rest are
+/// named as unreachable rather than refused, because a deployment that runs one
+/// process per class has one file and a different `--protocol` each time.
+fn check_serves_its_own_classes(
+    policy: &portal_core::gateway::GatewayPolicy,
+    protocol: &str,
+) -> anyhow::Result<()> {
+    let mut served = false;
+    for class in policy.protocols() {
+        if class == protocol {
+            served = true;
+        } else {
+            tracing::warn!(
+                protocol = class,
+                serving = protocol,
+                "gateway policy: no listener for this class here; its grants reach nothing \
+                 from this process",
+            );
+        }
+    }
+    anyhow::ensure!(
+        served,
+        "this server listens on `{protocol}` and the gateway policy declares {}. A grant \
+         this Gateway makes is for its own Endpoint under the policy's protocol, and an \
+         agent holding one looks for a listener of exactly that -- so none of these grants \
+         would reach anything. Pass --protocol with the class you mean",
+        policy
+            .protocols()
+            .map(|p| format!("`{p}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    Ok(())
+}
+
 /// Publish what the table now allows, for the signaling loop to match against.
 fn publish_limits(
     limits: &tokio::sync::watch::Sender<PolicyLimits>,
@@ -1435,6 +1484,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
                     "gateway policy: serving a protocol class"
                 );
             }
+            check_serves_its_own_classes(&policy, &args.protocol)?;
             Some(policy)
         }
         None => None,
@@ -1696,6 +1746,29 @@ mod tests {
             assert!(d >= POLICY_RETRY_MIN, "backed off to {d:?}");
             assert!(d <= POLICY_RETRY_MAX, "backed off to {d:?}");
         }
+    }
+
+    /// **A grant names a protocol and so does a listener**, and this process
+    /// opens exactly one. A policy class that `--protocol` does not name
+    /// produces grants for something nobody is listening on — and the failure
+    /// is silent on both sides: `policy: granted` here, "nothing reachable
+    /// after 30s" there, thirty seconds apart and neither saying why.
+    #[test]
+    fn a_policy_this_server_cannot_serve_is_refused() {
+        let policy = portal_core::gateway::parse(portal_core::gateway::EXAMPLE).expect("example");
+        // The class the example declares. Serving it is the whole point.
+        check_serves_its_own_classes(&policy, "pg-sales-ro-v1").expect("the class it declares");
+
+        // The default, and what an operator who read only `--gateway-config`
+        // would still be running under.
+        let refused = check_serves_its_own_classes(&policy, "isekai-portal-v1")
+            .expect_err("no listener would answer these grants");
+        let text = format!("{refused:#}");
+        // Both strings, because the mistake is that they differ and naming one
+        // leaves the reader to guess which end to change.
+        assert!(text.contains("isekai-portal-v1"), "{text}");
+        assert!(text.contains("pg-sales-ro-v1"), "{text}");
+        assert!(text.contains("--protocol"), "{text}");
     }
 
     fn args_with(oidc: Option<&str>, subject: Option<&str>) -> Args {

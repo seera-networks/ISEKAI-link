@@ -810,8 +810,25 @@ no grant is made, and its wait runs out.
 
 ```sh
 portal-server --example-gateway-config > gateway.toml   # a starter to edit
-portal-server --gateway-config gateway.toml             # as before, plus this
+portal-server --gateway-config gateway.toml \
+              --protocol pg-sales-ro-v1                 # the class it serves
 ```
+
+**`--protocol` has to name the class in the file**, and it does not default to
+it. A grant this Gateway makes is for **its own Endpoint** under the policy's
+protocol, and the agent holding one looks for a listener of exactly that string
+— while this process opens one listener, under `--protocol`, which defaults to
+`isekai-portal-v1`. Leave it and every grant is for something nobody is
+listening on. The server refuses to start rather than let that happen:
+
+```
+Error: this server listens on `isekai-portal-v1` and the gateway policy declares
+`pg-sales-ro-v1`. … Pass --protocol with the class you mean
+```
+
+The same string appears in four places and they must all agree: the entitlement
+on the account, `[protocols."…"]` in this file, the server's `--protocol`, and
+the agent's.
 
 The file says what this server is **willing to be told**: which window labels it
 understands, what values an attribute may take, and what operations exist. The
@@ -1055,6 +1072,7 @@ connection counters and which path they are about.
 | `no relay leg claims this connection` | a connection arrived that no leg accounts for. It works, over the relay only |
 | forwarding works but stays slow | check for `forwarding moved onto the direct path`. Without it you are on the relay, which is a round trip through someone else's machine |
 | a DNS query times out and small ones work | the response is over the size limit above |
+| the agent's wait runs out although the Gateway logged `policy: granted` | the grant is for a protocol nothing listens on. The Gateway's `--protocol` must name the class its policy declares; it is refused at startup now, so this is a server started before that check |
 | the agent's wait runs out with no grant | nothing raised a lease. Either no entitlement names this person and protocol, or the Gateway it names is not running with `--gateway-config`. The Gateway's log says what it was offered |
 | `policy: not applied: …` on the Gateway | a policy row the server will not act on, and the rest of the line says why. An unlisted window label or an attribute outside its schema is a disagreement with your `gateway.toml`; `the lease is too short` (under 120 s) and `no deadline` are not — those are the row itself, and there is nothing in the file to fix |
 | `capability-endpoint-mismatch` | the capability was issued for a different Endpoint. Usually a second key: `--key` defaults to `portal-client.pem` in the working directory, so running from another directory makes a new Endpoint. The client says `generating a new Endpoint key` when it does |
