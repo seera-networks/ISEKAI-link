@@ -520,6 +520,11 @@ Listener を鍵に含まないという Proxy 仕様 §8.8 の設計の帰結**�
 
 `.github/workflows/` に、上記を使う形を 1 つ置く。まずは `portal.yml` の統合ジョブとして。
 
+> **この節は書かれた時点の形である。** 実装は §15.3 で変わった — Provisioning Key は
+> シークレットではなく **server が実行時に発行**し、シークレットは Enrollment Key
+> **2 本**（client 用・server 用）になった。動いている形は `.github/workflows/portal.yml`
+> を見ること。**発行の手順は §6.1 のほうが正しい。**
+
 ```yaml
 permissions:
   id-token: write        # これが無いと ACTIONS_ID_TOKEN_REQUEST_* が生えない
@@ -818,36 +823,56 @@ Identity 仕様 §8.8.10 が「運用で最も踏まれる」と書いている�
 
 ## 6. 運用
 
-### 6.1 鍵を作る（1 回だけ）
+### 6.1 鍵を作る（切れるたびに）
+
+**Enrollment Key を 2 本**である。役割で権限が違うので分ける（§15.2）。
 
 ```console
 $ portal-client --login                      # CI の Endpoint を所有する User として
+
 $ portal-client --issue-enrollment-key \
-    --binding-oidc token.actions.githubusercontent.com \
+    --binding-oidc https://token.actions.githubusercontent.com \
     --binding-subject 'repo:<org>/<repo>:ref:refs/heads/main' \
     --permissions peer-connect:initiate \
-    --protocols isekai-portal-v1 \
+    --enrollment-protocols isekai-portal-v1 \
     --max-live-endpoints 8 --endpoint-idle-ttl 1800 \
-    --enrollment-label gha-main
-```
+    --enrollment-label gha-main                       # → ISEKAI_ENROLLMENT_KEY
 
-```console
-$ portal-server --provisioning-key \
-    --binding-oidc token.actions.githubusercontent.com \
+$ portal-client --issue-enrollment-key \
+    --binding-oidc https://token.actions.githubusercontent.com \
     --binding-subject 'repo:<org>/<repo>:ref:refs/heads/main' \
-    --grant-ttl 1800 --max-live-grants 8 \
-    --provisioning-label gha-main
+    --permissions peer-listener:private:create \
+    --permissions peer-connect:accept \
+    --permissions peer-provisioning:create \
+    --enrollment-protocols isekai-portal-v1 \
+    --max-live-endpoints 8 --endpoint-idle-ttl 1800 \
+    --enrollment-label gha-main-server                # → ISEKAI_SERVER_ENROLLMENT_KEY
 ```
 
 出た 2 本を、リポジトリのシークレット `ISEKAI_ENROLLMENT_KEY` /
-`ISEKAI_PROVISIONING_KEY` に入れる。**どちらも二度と取り出せない。**
+`ISEKAI_SERVER_ENROLLMENT_KEY` に入れる。**どちらも二度と取り出せない。**
 
-> **「1 回だけ」ではない。鍵は最大 30 日で切れる**（§8.8.1）。そして切れたことを
-> 知らせるものは何も無い — 唯一の兆候は main のジョブが
-> `403 enrollment-key-invalid` で落ちることで、**この失敗は PR では起きない**
-> （このジョブは `refs/heads/main` の push でだけ走る、§6.2 の意図した狭さ）。
+> **初版の例は 3 か所で動かなかった**（2026-09-22 に鍵を作り直して判明した）。
 >
-> **実際に 2026-09-05 頃から 9-21 まで、main のこのジョブは赤のままだった。**
+> | 書いてあった | 実際 |
+> | --- | --- |
+> | `--binding-oidc token.actions.githubusercontent.com` | **`https://` が要る。** 許可リストとの照合は完全一致で、スキーム無しは `400 binding-not-supported` |
+> | `--protocols` | **`--enrollment-protocols`** |
+> | `--permissions a b c` | **フラグを繰り返す。** 2 つ目以降は `Unrecognized argument` |
+>
+> そして**発行すべきものが違っていた。** 2 本目として `portal-server --provisioning-key`
+> を挙げ、`ISEKAI_PROVISIONING_KEY` に入れよと書いていたが、Provisioning Key は
+> §15.3 で**server が実行時に発行する**ものになっており、リポジトリのシークレットには
+> 無い。例のとおりに進めると、**誰も使わない鍵を作り、ワークフローが要求する
+> server 用の鍵を作らないまま**終わる。
+
+> **「1 回だけ」ではない。既定で 7 日、上限 30 日で切れる**（`--enrollment-ttl` の
+> 既定は 604,800 秒。§8.8.1 の上限は 2,592,000 秒）。そして切れたことを知らせるものは
+> 何も無い — 唯一の兆候は main のジョブが `403 enrollment-key-invalid` で落ちることで、
+> **この失敗は PR では起きない**（このジョブは `refs/heads/main` の push でだけ走る、
+> §6.2 の意図した狭さ）。
+>
+> **実際に 2026-09-05 頃から 9-22 まで、main のこのジョブは赤のままだった。**
 > PR の checks はすべて緑で、そこでは当のジョブが `skipping` と出るからである。
 > 鍵の更新はカレンダーに載せる作業であって、発行時の 1 手ではない。
 
