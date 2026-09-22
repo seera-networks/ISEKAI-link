@@ -772,6 +772,179 @@ portal-client \
 keyboard. That is the point of it rather than a limitation: what you are handing
 over is one connection, not a way back in.
 
+## Letting the account decide
+
+Everything above is the far side letting you in: a code typed by a person, a
+ticket cut for a guest, a key bound to a workflow. **This one is decided
+somewhere else.** An entitlement on the account says that someone may reach a
+class of service through a particular server; the two programs carry that out,
+and nobody shows a code or holds a secret.
+
+It takes both halves, which are new modes of the two programs you already have:
+
+| | runs as | |
+| --- | --- | --- |
+| `portal-server --gateway-config` | a **Gateway** | turns entitlements into grants |
+| `portal-client --agent` | an **agent runtime** | runs one task under a key made for it |
+
+```
+  an entitlement, on the account
+        │
+        │   the agent asks for a token narrowed to one protocol and one
+        │   Gateway -- and issuing it is what raises the lease
+        ▼
+   Identity ──── lease ────▶  portal-server --gateway-config
+                                   │  checked against this server's envelope
+                                   ▼
+                             a grant at the proxy
+                                   │
+   portal-client --agent ──────────┘   connects, forwards, revokes itself
+```
+
+**Neither program registers the entitlement.** That is account administration —
+the dashboard, or Identity's API — and it is what says which Endpoint is the
+Gateway for which protocol class. Until one exists the agent raises no lease,
+no grant is made, and its wait runs out.
+
+### The Gateway side
+
+```sh
+portal-server --example-gateway-config > gateway.toml   # a starter to edit
+portal-server --gateway-config gateway.toml             # as before, plus this
+```
+
+The file says what this server is **willing to be told**: which window labels it
+understands, what values an attribute may take, and what operations exist. The
+control plane chooses within that; it cannot add to it.
+
+```toml
+[protocols."pg-sales-ro-v1"]
+windows = ["business_hours"]
+
+[protocols."pg-sales-ro-v1".attributes]
+region = { type = "enum", allowed = ["kanto", "kansai", "kyushu"] }
+
+[[protocols."pg-sales-ro-v1".operations]]
+name     = "query_sales"
+sql      = "SELECT id, region, amount FROM sales WHERE region = $1 AND month = $2"
+bind     = ["{{region}}", "$month"]
+max_rows = 1000
+
+[protocols."pg-sales-ro-v1".operations.params]
+month = { type = "string", pattern = '^[0-9]{4}-[0-9]{2}$' }
+```
+
+**Leaving a key out is not "anything".** No `windows` means no label is
+recognised, so every row carrying one is refused — which is the safe way round,
+because the other reading serves a row meant for business hours around the
+clock. A row naming a window this file does not list, or an attribute outside
+its schema, is **not applied**, and the server says which:
+
+```
+gateway policy: serving a protocol class  protocol=pg-sales-ro-v1 operations=1 windows=1
+policy: reconciled with the control plane  offered=2 applied=1 refused=1
+policy: not applied: attribute 'region' is out of range   lease=al_…
+policy: granted  grant=gr_… allowed=ep:4d5e6f… protocol=pg-sales-ro-v1 ttl=1739 leases=1 ours=true
+```
+
+The file is read at **startup**, before anything else: a statement with three
+placeholders and two bindings, or a pattern that does not compile, is refused
+there rather than the first time it would have mattered.
+
+Three things about the grants it makes are worth knowing.
+
+**It removes only what it made.** That is the `ours=true` above. Grants are
+keyed by the pair and the protocol, so creating one over a pair you had already
+paired with succeeds, answers with *your* grant id, and would otherwise be
+deleted when the lease ended. A grant it did not make is left alone — including
+one it finds already there at startup.
+
+**A refusal is per row.** The proxy caps grants at 64 per Endpoint and answers
+`429` for the one over, leaving the rest untouched, so the log says
+`policy: could not grant` and the policy is applied in part. The cap is a
+deployment setting and not something the Gateway can work around.
+
+**The stream ending is routine.** Identity closes it when the token that opened
+it expires, which is what forces the proof of possession to be checked again;
+the server reconciles and opens another. A lease that simply runs out is noticed
+by the server's own clock, because nothing is sent when one lapses.
+
+### The agent side
+
+```sh
+portal-client --login --organization org_…       # once, as the person
+
+portal-client --agent --task nightly-report \
+    --protocol pg-sales-ro-v1 --gateway ep:7a8b9c… --map 5432:db
+```
+
+That run makes a key **for the task and nothing else**: it is generated in
+memory, never written, and gone when the process is. It registers, asks for a
+token narrowed to that one protocol and that one Gateway, waits for the grant
+that arrives because of it, forwards, and on the way out revokes the Endpoint
+it registered.
+
+**`--gateway` is not a permission.** It selects which entitlement raises a
+lease. Omit it and a lease starts at *every* Gateway offering the protocol —
+harmless with one and a surprise with ten — so the client warns when it is
+missing.
+
+**It waits up to 30 seconds for the grant**, which no other client does. Every
+other client's grant has stood since it paired, so an empty answer there means
+the server is not running; this Endpoint was registered seconds ago and its
+grant is still in flight. In a live deployment the measured wait was **796 ms**.
+
+**The flags it refuses are the ones that would contradict it**, and each is
+refused on the arguments, before anything is spent:
+
+| | why |
+| --- | --- |
+| `--key` | stores a key that outlives the task; this mode keeps one that does not |
+| `--enroll` | authenticates a workload with an Enrollment Key. `--agent` runs as the signed-in person |
+| `--pair`, `--redeem`, a Provisioning Key | ways of being let in by the peer. An agent is let in by an entitlement |
+| `--whoami` | has no answer: the key was made seconds ago and reachability comes from the entitlement, not from being named |
+
+**The revocation is not best effort.** Returning a CI enrolment slot can be left
+to the idle sweep, but nothing sweeps an Endpoint registered this way — a
+revocation that did not happen leaves it registered for good. So a task that
+succeeded and could not put its Endpoint away exits non-zero and says so. (A
+task that had already failed keeps its own exit code.) It is tried once more
+after the connection closes, and it runs *before* the close rather than after,
+so that a connection taking its time to fold does not take the revocation with
+it. A second Ctrl+C skips it.
+
+Reachability does not depend on that going through: the token renewal is the
+lease's clock, so a process that vanishes loses its grant within one lease TTL
+either way. Revoking is how you stop waiting for that.
+
+### What is not enforced yet
+
+**Nothing executes the operations.** `portal-server` links no database driver;
+the statements in that file are parsed, checked against their bindings, and held.
+What the Gateway does with a policy row today is decide whether to make a grant
+for it — the part that would run `query_sales` and bind `{{region}}` to what the
+control plane chose is a separate piece of work.
+
+The limits are **validated, not enforced**, in the same sense. A row whose
+window label or attribute values fall outside the envelope is never applied, so
+it yields no grant at all. But a connection that no policy covers, or one over
+`max_concurrent`, is counted and logged rather than refused:
+
+```
+policy: a connection the policy covers   peer=ep:4d5e6f… open=1 max_concurrent=Some(4)
+policy: over the concurrent limit; enforcement would refuse it
+policy: no policy covers this peer; enforcement would refuse it
+```
+
+The point of that is being able to see how many connections *would* be turned
+away before switching it on, which is not a number anyone can guess.
+`docs/portal_gateway_plan.md` has the shape of what is still missing.
+
+One more limit worth knowing: a grant is keyed by the pair and the protocol, so
+**two leases for the same agent and the same protocol share one grant**, and the
+Gateway removes it when the last of them goes. Telling them apart needs a change
+at the proxy.
+
 ## Taking access away
 
 ```sh
@@ -862,6 +1035,8 @@ connection counters and which path they are about.
 | `no relay leg claims this connection` | a connection arrived that no leg accounts for. It works, over the relay only |
 | forwarding works but stays slow | check for `forwarding moved onto the direct path`. Without it you are on the relay, which is a round trip through someone else's machine |
 | a DNS query times out and small ones work | the response is over the size limit above |
+| the agent's wait runs out with no grant | nothing raised a lease. Either no entitlement names this person and protocol, or the Gateway it names is not running with `--gateway-config`. The Gateway's log says what it was offered |
+| `policy: not applied: …` on the Gateway | the control plane sent a row this server's envelope does not accept — an unlisted window label, or an attribute outside its schema. The row is the centre's, the envelope is yours, and the log names which |
 | `capability-endpoint-mismatch` | the capability was issued for a different Endpoint. Usually a second key: `--key` defaults to `portal-client.pem` in the working directory, so running from another directory makes a new Endpoint. The client says `generating a new Endpoint key` when it does |
 | nothing below `error` in the log | you are on a build before this was fixed — `RUST_LOG=info` |
 
@@ -883,3 +1058,6 @@ considered and rejected. The short version:
   a connection off the relay. The camera apps use the same code.
 - The service catalogue (§4.3) is the one real policy decision, and the reason
   the initiator can never name an address.
+- **`docs/portal_gateway_plan.md`** and **`docs/portal_agent_plan.md`** are the
+  two halves of the chapter above, including what each deliberately leaves for
+  later.

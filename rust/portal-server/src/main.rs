@@ -356,10 +356,11 @@ async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Res
 /// installation is.
 /// Read what the control plane says is in force, and build the table from it.
 ///
-/// **P1 of `docs/portal_gateway_plan.md`: this makes no grant.** It reads,
-/// checks every row against the operator's envelope, and says what it found —
-/// so that a deployment can see what is being handed out before anything acts
-/// on it. Holding the table without enforcing it is the point of the phase.
+/// **This one makes no grant.** It reads, checks every row against the
+/// operator's envelope, and says what it found; `settle_grants` is what acts on
+/// the table afterwards. Keeping the two apart is what lets the read be the
+/// correctness guarantee — a pass that granted as it went could not tell a row
+/// it had just learnt from one it had held all along.
 ///
 /// Reconciling is also the correctness guarantee rather than the stream, which
 /// is why this runs at startup and (in a later phase) once per token lifetime.
@@ -426,9 +427,11 @@ async fn reconcile_policies(
 /// and replays nothing, so a dropped line is repaired by the next read rather
 /// than by anything in here.
 ///
-/// **Nothing consults the table yet.** Grants are P3 and enforcement is later
-/// still; what this phase buys is that a deployment can watch what the control
-/// plane is handing out, and what this Gateway refuses, before either acts.
+/// **The table is what the grants are settled against**, on every pass and
+/// every event, and what the connection side is matched against. Enforcement of
+/// the policy's own limits is not in yet: a connection over `max_concurrent` is
+/// counted and logged rather than refused, so that a deployment can see how
+/// many would be turned away before that is switched on.
 async fn follow_policies(
     cfg: P2pConfig,
     policy: portal_core::gateway::GatewayPolicy,
