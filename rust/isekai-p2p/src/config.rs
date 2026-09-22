@@ -506,6 +506,7 @@ async fn enrol<T: ControlPlaneTransport>(
     let challenge = client
         .enroll_challenge(auth, &cfg.key)
         .await
+        .map_err(explain_key_refused)
         .context("could not obtain an enrolment challenge")?;
     client
         .enroll(
@@ -668,6 +669,30 @@ fn explain_pop_failure(error: IdentityError, cfg: &P2pConfig) -> anyhow::Error {
          signed in to the organization you mean",
         cfg.key.endpoint_id(),
     ))
+}
+
+/// Say what `enrollment-key-invalid` covers, since the server will not.
+///
+/// **§8.8.4 makes the answer uniform on purpose**: unknown, expired, revoked
+/// and revoked-owner are one reply, so that holding a key tells an attacker
+/// nothing about which. That uniformity is right on the wire and unhelpful to
+/// the person reading a failed job, who gets "invalid" for a key they put in a
+/// secret store and have not touched since.
+///
+/// **Expiry is the common one**, because a key is capped at 30 days (§8.8.1)
+/// and nothing counts down to it: the only sign is this, on a schedule nobody
+/// chose. So the four are named, with that one first.
+fn explain_key_refused(error: IdentityError) -> anyhow::Error {
+    if error.kind().as_deref() != Some("enrollment-key-invalid") {
+        return error.into();
+    }
+    anyhow::Error::from(error).context(
+        "the Enrollment Key was refused. The server answers the same way for all four \
+         reasons, so it cannot say which: the key has **expired** (they last at most 30 \
+         days and nothing warns before it), or it was revoked, or its owner was, or it \
+         is not a key this deployment knows. Issue another with \
+         `portal-client --issue-enrollment-key` and replace the secret",
+    )
 }
 
 /// Whether retrying this failure could ever produce a different answer.
@@ -902,6 +927,27 @@ mod tests {
             retry_after: None,
         })
         .context("could not renew the endpoint token")
+    }
+
+    /// **"Invalid" is four answers wearing one name**, and the server will not
+    /// say which — deliberately, so that holding a key reveals nothing. The
+    /// person reading a failed job is owed the list, and expiry first: a key
+    /// lasts at most 30 days and nothing counts down to it.
+    #[test]
+    fn a_refused_enrollment_key_says_what_that_covers() {
+        let explained = explain_key_refused(problem(403, "enrollment-key-invalid"));
+        let text = format!("{explained:#}");
+        assert!(text.contains("expired"), "{text}");
+        assert!(text.contains("30 days"), "{text}");
+        assert!(text.contains("--issue-enrollment-key"), "{text}");
+    }
+
+    /// Everything else passes through as it came: this explains one refusal,
+    /// not every one.
+    #[test]
+    fn other_enrolment_failures_are_left_alone() {
+        let plain = explain_key_refused(problem(403, "insufficient-permission"));
+        assert!(!format!("{plain:#}").contains("30 days"));
     }
 
     /// **A rule refused, and asking again asks the same rule.** `403` is the

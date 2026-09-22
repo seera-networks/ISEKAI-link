@@ -842,6 +842,15 @@ $ portal-server --provisioning-key \
 出た 2 本を、リポジトリのシークレット `ISEKAI_ENROLLMENT_KEY` /
 `ISEKAI_PROVISIONING_KEY` に入れる。**どちらも二度と取り出せない。**
 
+> **「1 回だけ」ではない。鍵は最大 30 日で切れる**（§8.8.1）。そして切れたことを
+> 知らせるものは何も無い — 唯一の兆候は main のジョブが
+> `403 enrollment-key-invalid` で落ちることで、**この失敗は PR では起きない**
+> （このジョブは `refs/heads/main` の push でだけ走る、§6.2 の意図した狭さ）。
+>
+> **実際に 2026-09-05 頃から 9-21 まで、main のこのジョブは赤のままだった。**
+> PR の checks はすべて緑で、そこでは当のジョブが `skipping` と出るからである。
+> 鍵の更新はカレンダーに載せる作業であって、発行時の 1 手ではない。
+
 ### 6.2 揃っていなければならないもの（§8.8.10）
 
 | 項目 | Enrollment Key | Provisioning Key |
