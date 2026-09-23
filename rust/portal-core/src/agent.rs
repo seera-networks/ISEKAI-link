@@ -369,8 +369,9 @@ mod tests {
 
     /// **The refusal has to survive the command an operator actually types.**
     /// `--agent --whoami` carries no `--auth0-tokens`, so a requirement checked
-    /// first would answer with that instead — and `--whoami` makes no network
-    /// call, so the advice would be beside the point.
+    /// first would answer with that instead — and supplying one would change
+    /// nothing, because the question `--whoami` asks has no answer under
+    /// `--agent`: the key is made for the task and thrown away.
     #[test]
     fn the_reason_that_helps_is_the_one_given() {
         let e = check_args(Given {

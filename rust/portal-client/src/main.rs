@@ -82,7 +82,9 @@ and they issue one with --allow. Pass it with --capability and --listener. It
 is one-shot and expires in 300 seconds at most, so have the command ready
 before they issue it.
 
---whoami needs nothing but --key and makes no network call."
+--whoami prints the Endpoint ID from --key alone, and asks Identity for the
+role beside it -- which needs the sign-in, and waits up to ten seconds. The
+Endpoint ID is printed either way, and it is the only thing on stdout."
 )]
 struct Args {
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
@@ -98,9 +100,9 @@ struct Args {
     /// proxy base URL. Defaults to the deployment the camera apps use
     #[argh(option, default = "String::from(\"https://link.isekai.tools:6443\")")]
     proxy_url: String,
-    /// auth0 access token, used only to obtain the Endpoint Token. Cannot be
-    /// refreshed -- `--login` is the way to stay signed in. Not needed with
-    /// --whoami
+    /// auth0 access token, used to obtain the Endpoint Token and to ask
+    /// Identity what this sign-in is. Cannot be refreshed -- `--login` is the
+    /// way to stay signed in
     #[argh(option)]
     auth0_token: Option<String>,
     /// sign in to Auth0 once, saving tokens that refresh from then on, and
@@ -402,11 +404,7 @@ async fn revoke_or_report(cfg: &P2pConfig, code: i32) -> i32 {
                  `portal-client --revoke-endpoint {} --reason task_finished`",
                 cfg.key.endpoint_id(),
             );
-            if code == 0 {
-                1
-            } else {
-                code
-            }
+            if code == 0 { 1 } else { code }
         }
     }
 }
@@ -450,10 +448,7 @@ async fn run(
         gateway: !args.gateway.is_empty(),
         task: args.task.is_some(),
     })?;
-    let key_path = args
-        .key
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
+    let key_path = args.key.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
         .auth0_tokens
         .clone()
@@ -884,13 +879,36 @@ async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
 /// must not take the Endpoint ID down with it, so a failure is reported in
 /// place of the role rather than raised.
 async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
+    // **Outside the budget below, and deliberately.** This can refresh the
+    // Auth0 sign-in, and a refresh dropped halfway is how a rotated refresh
+    // token is lost: Auth0 has issued the new one and invalidated the old, and
+    // the future that would have written it to disk never got there -- leaving
+    // a store whose next use is `--login`. Every other command runs this
+    // uncancelled, and one line of output is not worth being the exception.
+    //
+    // Not `?`: being signed out is one of the answers here, not an error.
+    let auth = match portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await {
+        Ok(auth) => auth,
+        Err(e) => return format!("unknown -- not signed in ({e})"),
+    };
+    let identity = isekai_p2p::enrollment::Identity::new(&args.identity_url, args.identity_http3);
     // **Bounded, because the transport is not.** The HTTP client is built with
     // no timeout, so a host that black-holes packets leaves the call hanging
     // rather than failing -- and `EP=$(portal-client --whoami)` waits for the
-    // process to exit, so the hang is the operator's too. A command that used
-    // to need no network at all must not acquire a way to stop forever.
-    match tokio::time::timeout(WHOAMI_WAIT, ask_identity(args, tokens)).await {
-        Ok(answer) => answer,
+    // process to exit, so the hang is the operator's too.
+    //
+    // **Only this call**, so that the host named in the message is the host
+    // that did not answer. Sharing the budget with the sign-in above would
+    // blame Identity for Auth0 being slow, and leave whatever was left of ten
+    // seconds for the round trip that is actually being timed.
+    match tokio::time::timeout(
+        WHOAMI_WAIT,
+        isekai_p2p::membership::me(&identity, &auth.token),
+    )
+    .await
+    {
+        Ok(Ok(me)) => isekai_p2p::membership::describe(&me),
+        Ok(Err(e)) => format!("unknown -- could not ask Identity ({e:#})"),
         Err(_) => format!(
             "unknown -- {} had not answered in {WHOAMI_WAIT:?}",
             args.identity_url
@@ -900,19 +918,6 @@ async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
 
 /// How long `--whoami` waits for Identity before answering without it.
 const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
-async fn ask_identity(args: &Args, tokens: &std::path::Path) -> String {
-    let identity = isekai_p2p::enrollment::Identity::new(&args.identity_url, args.identity_http3);
-    // Not `?`: being signed out is one of the answers here, not an error.
-    let auth = match portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await {
-        Ok(auth) => auth,
-        Err(e) => return format!("unknown -- not signed in ({e})"),
-    };
-    match isekai_p2p::membership::me(&identity, &auth.token).await {
-        Ok(me) => isekai_p2p::membership::describe(&me),
-        Err(e) => format!("unknown -- could not ask Identity ({e:#})"),
-    }
-}
 
 /// `--relays` — measure this Endpoint's relay candidates and print them.
 ///

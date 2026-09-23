@@ -359,7 +359,12 @@ async fn issue<T: ControlPlaneTransport>(
                             // hunting one that was never made.
                             cfg.credential.mark_registration_attempt();
                             client
-                                .register(&auth0, &cfg.key, &challenge, cfg.device_name.as_deref())
+                                .register(
+                                    &auth0,
+                                    &cfg.key,
+                                    &challenge,
+                                    cfg.device_name.as_deref(),
+                                )
                                 .await
                                 .map(|_| ())
                         }
