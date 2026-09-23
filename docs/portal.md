@@ -140,10 +140,18 @@ question without signing in again:
 $ portal-client --whoami
 ep:8c3f28d3…
 organization: seera-networks (org_a1b2c3)
+role: member
 ```
 
-The Endpoint ID is on stdout and the organization on stderr, so
+The Endpoint ID is on stdout and the rest on stderr, so
 `EP=$(portal-client --whoami)` still yields the id and nothing else.
+
+**`role` is Identity's answer, not this machine's.** How a tenant resolves and
+who counts as an administrator are settings of the deployment, so the question
+is asked rather than worked out from the token in hand — and it is the only way
+to see a **guest** membership and the date it ends. The network call is the one
+thing in this command that can fail, and it is allowed to: the line then says so
+and the Endpoint ID is printed anyway.
 
 **The id is read from the access token**, which is the same claim Identity reads
 to decide the tenant — so this answers for machines that signed in before any of
@@ -982,6 +990,123 @@ One more limit worth knowing: a grant is keyed by the pair and the protocol, so
 Gateway removes it when the last of them goes. Telling them apart needs a change
 at the proxy.
 
+## Joining as a contractor
+
+An organization can admit someone **until a date**: a freelancer for the length
+of a contract, a supplier for a trial. That is a **guest** membership, and it is
+the one kind of member whose access stops on its own.
+
+Nothing about signing in is different:
+
+```sh
+portal-client --login --organization org_…
+portal-client --whoami
+```
+
+```
+ep:8c3f28d3…
+organization: acme (org_a1b2c3)
+role: guest (until 2027-01-31T23:59:59Z)
+```
+
+**That date is the answer to everything that happens afterwards**, and it is
+not written anywhere else on the machine. Nothing counts down to it and nothing
+warns; the day it passes, issuing a token stops working.
+
+### What a guest may do, and what stops
+
+A guest **may connect** and **may not let anyone else in**. In permissions that
+is one word — `peer-connect:initiate` — and everything below turns on its
+absence rather than on a list of prohibitions:
+
+| | a guest |
+| --- | --- |
+| redeem a pairing code or a Ticket, and forward | **yes** — this is the whole point |
+| run `portal-server` | no. Standing a Peer Listener up is opening a door |
+| show a pairing code, cut a Ticket, `--allow` | no. All three are the same permission |
+| issue an Enrollment Key | no, and this one is refused separately — an unattended key would outlive the contract |
+| be a Gateway | no |
+
+A refusal says the same thing from either side — `not available to a guest`
+from the proxy, `guests cannot …` from Identity — but the client says it as soon
+as it has a token, rather than leaving it to be discovered one refusal at a
+time:
+
+```
+WARN this sign-in is a guest of the tenant: it may connect, and it may not open
+     a way in for anyone else -- no Peer Listener, pairing code, Ticket,
+     capability or grant. Everything it holds stops at the date above
+     until=2027-01-31T23:59:59Z permissions=peer-connect:initiate
+```
+
+So the working shape is the ordinary one with the roles fixed: **the
+organization runs `portal-server` and hands out the way in**, the guest redeems
+it and forwards. A Ticket suits this best — it expires on its own, and a
+contract that ends is exactly the case tickets were written for.
+
+### When the contract ends
+
+Two endings, and the client tells them apart because what to do about them is
+not the same:
+
+```
+Error: this guest membership has ended. Everything it was issued stops with it
+-- ask whoever invited you to extend it, which is one call on their side and
+takes effect at the next renewal: Identity API returned 403:
+{"type":"…/membership-expired","detail":"membership expired at 2027-01-31T23:59:59Z"}
+```
+
+```
+Error: this guest membership was revoked, which is not the same as running out:
+an administrator of the tenant ended it early. The date it would have run to is
+no longer the point
+```
+
+**The exact moment is stated rather than hidden.** Concealing whether something
+exists is a rule about strangers, and this is somebody asking after their own
+membership.
+
+What stops, and when:
+
+- **Issuing a token** stops at the moment the contract ends. It is a comparison
+  against the clock rather than a sweep, so there is nothing to wait for.
+- **A token already in hand stops too.** The contract's end travels in the token
+  as its own claim, separate from the expiry, and the proxy compares against
+  that — so a token with ten minutes left on it is refused the moment the
+  contract ends, as `401 token-expired`. It is the same second on both sides.
+- **Nothing derived from the contract outlives it.** Grants, the relay leg's
+  lease, the addresses and rows held behind it are all cut to the contract's end
+  when they are made.
+- **A live connection is not torn down** at that instant. One still on the relay
+  stops when its leg's lease lapses — which is the contract's end at the latest,
+  because that lease was cut to it. One that has moved to a direct path is
+  between the two machines and is not reached by any of this.
+
+`--whoami` keeps answering afterwards, and says which ending it was:
+
+```
+role: guest -- membership expired at 2027-01-31T23:59:59Z
+role: guest -- membership was revoked
+```
+
+**An extension is a single act on the organization's side**, and it takes effect
+at the guest's next token renewal — no second sign-in, no new Endpoint.
+
+### The administrator who is also a guest
+
+If someone is an administrator of the tenant *and* has a live guest membership,
+**the guest membership wins** — it is a narrowing record, and narrowing is what
+it is for. Said out loud, because the alternative is an administrator wondering
+where their administration went:
+
+```
+role: guest (until 2027-01-31T23:59:59Z) -- an administrator here, but the guest membership wins
+```
+
+It is refused when the membership is created, but administration can be granted
+afterwards, and the moment it is granted is not something Identity is told
+about.
+
 ## Taking access away
 
 ```sh
@@ -1072,6 +1197,8 @@ connection counters and which path they are about.
 | `no relay leg claims this connection` | a connection arrived that no leg accounts for. It works, over the relay only |
 | forwarding works but stays slow | check for `forwarding moved onto the direct path`. Without it you are on the relay, which is a round trip through someone else's machine |
 | a DNS query times out and small ones work | the response is over the size limit above |
+| `403` on everything, and `--whoami` says `membership expired` / `was revoked` | a guest membership has ended. It is not a fault on this machine: ask the organization to extend it, and the next renewal picks it up |
+| `insufficient-permission` when standing a server up, showing a pairing code, or cutting a Ticket | a guest may connect and may not let anyone else in. `--whoami` says whether this sign-in is one |
 | the agent's wait runs out although the Gateway logged `policy: granted` | the grant is for a protocol nothing listens on. The Gateway's `--protocol` must name the class its policy declares; it is refused at startup now, so this is a server started before that check |
 | the agent's wait runs out with no grant | nothing raised a lease. Either no entitlement names this person and protocol, or the Gateway it names is not running with `--gateway-config`. The Gateway's log says what it was offered |
 | `policy: not applied: …` on the Gateway | a policy row the server will not act on, and the rest of the line says why. An unlisted window label or an attribute outside its schema is a disagreement with your `gateway.toml`; `the lease is too short` (under 120 s) and `no deadline` are not — those are the row itself, and there is nothing in the file to fix |

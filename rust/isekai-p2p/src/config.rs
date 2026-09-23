@@ -90,13 +90,60 @@ pub async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<EndpointTok
     // The Identity API serves h1/h2 on TCP+TLS and h3 on QUIC at the same port;
     // pick one. The two branches build different concrete transports, so the
     // register/issue work is shared via the generic `issue`.
-    if cfg.identity_http3 {
+    let token = if cfg.identity_http3 {
         let client = IdentityClient::new(MasqueH3Transport::connect(&cfg.identity_url)?);
         issue(&client, cfg).await
     } else {
         let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
         issue(&client, cfg).await
+    }?;
+    say_if_guest(&token);
+    Ok(token)
+}
+
+/// Say, once, that this token belongs to a guest.
+///
+/// **Ahead of the refusal rather than after it**, because what a guest is
+/// refused for is everything that opens a door to somebody else — creating a
+/// Peer Listener, a pairing code, a Ticket, a capability, a grant — and the
+/// proxy answers all of them with a bare `insufficient-permission` that says
+/// nothing about a membership. Read at issue, the token says so plainly, and
+/// the one line covers every path that would otherwise learn it the hard way.
+///
+/// **Once per process.** This runs on every renewal, every few minutes, for as
+/// long as the session lasts.
+fn say_if_guest(token: &EndpointToken) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    let Some(principal) = token.principal() else {
+        return;
+    };
+    if !principal.is_guest() {
+        return;
     }
+    SAID.call_once(|| {
+        tracing::warn!(
+            until = principal
+                .not_after
+                .map(rfc3339)
+                .unwrap_or_else(|| "unstated".to_owned()),
+            permissions = token.permissions.join(", "),
+            "this sign-in is a guest of the tenant: it may connect, and it may not open a \
+             way in for anyone else -- no Peer Listener, pairing code, Ticket, capability \
+             or grant. Everything it holds stops at the date above",
+        );
+    });
+}
+
+/// A Unix second as the RFC 3339 the rest of this API speaks, so that one
+/// number is not printed in two shapes depending on who read it.
+fn rfc3339(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| unix.to_string())
 }
 
 /// Read the policies in force for this Endpoint as a Gateway (identity §8.10.2).
@@ -308,12 +355,7 @@ async fn issue<T: ControlPlaneTransport>(
                             // hunting one that was never made.
                             cfg.credential.mark_registration_attempt();
                             client
-                                .register(
-                                    &auth0,
-                                    &cfg.key,
-                                    &challenge,
-                                    cfg.device_name.as_deref(),
-                                )
+                                .register(&auth0, &cfg.key, &challenge, cfg.device_name.as_deref())
                                 .await
                                 .map(|_| ())
                         }
@@ -362,13 +404,12 @@ async fn issue<T: ControlPlaneTransport>(
             client
                 .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
                 .await
-                .map_err(|e| match registered_here.load(std::sync::atomic::Ordering::Relaxed) {
-                    true => e.into(),
-                    // **A `409` lands here too**, and that one *is* the
-                    // cross-tenant collision: the keypair is registered
-                    // somewhere, this tenant cannot see it, and the issue that
-                    // follows is refused for exactly the reason below.
-                    false => explain_pop_failure(e, cfg),
+                .map_err(|e| {
+                    explain_issue_failure(
+                        e,
+                        cfg,
+                        registered_here.load(std::sync::atomic::Ordering::Relaxed),
+                    )
                 })
         }
         Credential::Enrollment(enrollment) => unattended(client, cfg, enrollment).await,
@@ -716,6 +757,80 @@ fn explain_key_refused(error: IdentityError, enrollment: &Enrollment) -> anyhow:
     ))
 }
 
+/// Say what a membership refusal means for the person holding the token.
+///
+/// **Identity tells these two apart deliberately** (`guest_membership.md`
+/// §3 D5), and the difference is what the person does next: an expiry is asked
+/// to be extended, a revocation is asked about. Folded together they are a
+/// `403` that reads as a bug in the tool.
+///
+/// **The date is not hidden from the person it is about.** Concealing whether
+/// something exists is a rule about third parties, and this is a guest asking
+/// after their own membership — so the server states the moment, and this keeps
+/// it.
+///
+/// A guest refused for lack of a permission is the third shape, and the one
+/// worth catching: it arrives as an ordinary `insufficient-permission` whose
+/// detail happens to begin "guests cannot".
+fn explain_membership_refusal(error: IdentityError) -> anyhow::Error {
+    match membership_advice(&error) {
+        Some(advice) => anyhow::Error::from(error).context(advice),
+        None => error.into(),
+    }
+}
+
+/// What to tell the holder, when a refusal is about their membership.
+fn membership_advice(error: &IdentityError) -> Option<&'static str> {
+    let advice = match error.kind().as_deref() {
+        Some("membership-expired") => {
+            "this guest membership has ended. Everything it was issued stops with it -- ask \
+             whoever invited you to extend it, which is one call on their side and takes \
+             effect at the next renewal"
+        }
+        Some("membership-revoked") => {
+            "this guest membership was revoked, which is not the same as running out: an \
+             administrator of the tenant ended it early. The date it would have run to is \
+             no longer the point"
+        }
+        // **Only when the server said it is about being a guest.** Every other
+        // `insufficient-permission` is a narrowed token or a missing
+        // entitlement, and answering those with a sentence about guests sends
+        // the reader somewhere with nothing to find.
+        Some("insufficient-permission") if error.to_string().contains("guests cannot") => {
+            "a guest may connect and may not open a way in for anyone else. This is the \
+             membership doing what it is for, not a permission that can be granted \
+             separately"
+        }
+        _ => return None,
+    };
+    Some(advice)
+}
+
+/// Choose which explanation an issue's refusal gets, if any.
+///
+/// **Two guesses that must not talk over each other.** A membership refusal is
+/// an answer about the *person*, stated by the server; the cross-tenant
+/// explanation is this crate's guess about the *keypair*, offered when a run
+/// that did not register here is refused. The membership answer wins, because
+/// one of them was told to us and the other was inferred.
+fn explain_issue_failure(
+    error: IdentityError,
+    cfg: &P2pConfig,
+    registered_here: bool,
+) -> anyhow::Error {
+    if membership_advice(&error).is_some() {
+        return explain_membership_refusal(error);
+    }
+    if registered_here {
+        return error.into();
+    }
+    // **A `409` lands here too**, and that one *is* the cross-tenant collision:
+    // the keypair is registered somewhere, this tenant cannot see it, and the
+    // issue that follows is refused for exactly the reason `explain_pop_failure`
+    // gives.
+    explain_pop_failure(error, cfg)
+}
+
 /// Whether retrying this failure could ever produce a different answer.
 ///
 /// **`403` is the line.** The Identity API answers `403` when a rule refused
@@ -859,7 +974,6 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-
     fn problem(status: u16, kind: &str) -> IdentityError {
         IdentityError::Api {
             status,
@@ -992,6 +1106,95 @@ mod tests {
             &Enrollment::new("enr1_SECRET"),
         );
         assert!(!format!("{plain:#}").contains("seven days"));
+    }
+
+    fn problem_with(status: u16, kind: &str, detail: &str) -> IdentityError {
+        IdentityError::Api {
+            status,
+            body: format!(
+                r#"{{"type":"https://identity.isekai.tools/problems/{kind}","status":{status},"detail":"{detail}"}}"#
+            ),
+            retry_after: None,
+        }
+    }
+
+    /// **Expired and revoked are two different things to do something about**,
+    /// and Identity separates them on purpose. A guest whose contract ran out
+    /// asks for an extension; one who was cut off early asks why. Folded
+    /// together they read as a fault in the tool.
+    #[test]
+    fn the_two_ways_a_membership_ends_are_told_apart() {
+        let expired = explain_membership_refusal(problem_with(
+            403,
+            "membership-expired",
+            "membership expired at 2026-09-01T00:00:00Z",
+        ));
+        let text = format!("{expired:#}");
+        assert!(text.contains("has ended"), "{text}");
+        // **The server's own date survives.** It is the answer to "how long
+        // ago", and this is the person the date is about.
+        assert!(text.contains("2026-09-01T00:00:00Z"), "{text}");
+
+        let revoked = explain_membership_refusal(problem_with(
+            403,
+            "membership-revoked",
+            "membership was revoked at 2026-09-01T00:00:00Z",
+        ));
+        let text = format!("{revoked:#}");
+        assert!(text.contains("revoked"), "{text}");
+        assert!(text.contains("not the same as running out"), "{text}");
+    }
+
+    /// The refusal a guest actually meets most is an ordinary
+    /// `insufficient-permission`; only the detail says it is about a
+    /// membership. Explaining the ones that do not say so would send every
+    /// narrowed token's operator looking for a guest membership nobody has.
+    #[test]
+    fn only_a_permission_refusal_that_names_guests_is_explained_as_one() {
+        let guest = explain_membership_refusal(problem_with(
+            403,
+            "insufficient-permission",
+            "guests cannot issue enrollment keys",
+        ));
+        assert!(format!("{guest:#}").contains("open a way in"));
+
+        let narrowed = explain_membership_refusal(problem_with(
+            403,
+            "insufficient-permission",
+            "token lacks peer-listener:private:create",
+        ));
+        assert!(!format!("{narrowed:#}").contains("open a way in"));
+    }
+
+    /// **The two explanations have to compose.** A membership refusal is about
+    /// the person and must not then be second-guessed as a cross-tenant
+    /// keypair; everything else must still reach the explanation it had.
+    #[test]
+    fn a_membership_refusal_is_not_then_blamed_on_the_tenant() {
+        let cfg = a_config();
+        // The run that has not registered here is exactly the one the
+        // cross-tenant explanation is written for, so this is where the two
+        // would collide.
+        let membership = explain_issue_failure(
+            problem_with(
+                403,
+                "membership-expired",
+                "membership expired at 2026-09-01T00:00:00Z",
+            ),
+            &cfg,
+            false,
+        );
+        let text = format!("{membership:#}");
+        assert!(text.contains("has ended"), "{text}");
+        assert!(!text.contains("tenant"), "{text}");
+
+        // And the case that explanation exists for still gets it.
+        let pop = explain_issue_failure(problem(401, "pop-signature-invalid"), &cfg, false);
+        assert!(format!("{pop:#}").contains("tenant"));
+
+        // A run that did register here is told neither story.
+        let plain = explain_issue_failure(problem(401, "pop-signature-invalid"), &cfg, true);
+        assert!(!format!("{plain:#}").contains("tenant"));
     }
 
     /// **A rule refused, and asking again asks the same rule.** `403` is the

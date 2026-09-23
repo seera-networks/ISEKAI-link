@@ -1,0 +1,37 @@
+# What this Gateway is willing to be told.
+#
+# The control plane sends a protocol class, attribute values and a window
+# label. This file says which of those are acceptable -- it is the envelope a
+# compromised control plane cannot talk its way out of, so it is worth reading
+# as carefully as the service catalogue.
+
+[protocols."pg-sales-ro-v1"]
+# Window labels this Gateway understands. A policy row naming a window that is
+# not here is NOT applied.
+#
+# **Leaving this out does not mean "any window".** It means no label is
+# recognised, so every row carrying one is refused -- which is the safe way
+# round, because the alternative is a row meant for business hours being served
+# around the clock.
+windows = ["business_hours"]
+
+# The values the control plane may choose from. A row whose attribute falls
+# outside its schema is not applied.
+[protocols."pg-sales-ro-v1".attributes]
+region = { type = "enum", allowed = ["kanto", "kansai", "kyushu"] }
+
+# What may be done. Statements live here and only here; nothing the agent sends
+# becomes SQL.
+[[protocols."pg-sales-ro-v1".operations]]
+name     = "query_sales"
+sql      = "SELECT id, region, amount FROM sales WHERE region = $1 AND month = $2"
+# One entry per placeholder, in order. `{{name}}` takes the attribute the
+# control plane chose; `$name` takes a parameter the caller supplies.
+bind     = ["{{region}}", "$month"]
+max_rows = 1000
+
+[protocols."pg-sales-ro-v1".operations.params]
+# `[0-9]` and not `\d`: patterns are Unicode-aware, so `\d` also accepts Arabic
+# and mathematical digits -- `٢٠٢٦-٠٨` would pass a month check written that
+# way. Write the range you mean.
+month = { type = "string", pattern = '^[0-9]{4}-[0-9]{2}$' }

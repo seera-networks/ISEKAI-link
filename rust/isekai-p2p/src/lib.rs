@@ -26,6 +26,8 @@ pub mod endpoints;
 pub mod enrollment;
 pub mod initiator;
 pub mod listener;
+/// What the signed-in person is in this tenant (`GET /v1/me`).
+pub mod membership;
 /// Where an unattended job's workload identity assertion comes from.
 pub mod oidc;
 /// Publishing a UDP service at a public address
@@ -73,7 +75,9 @@ pub mod agent {
         EnrollmentKeyRecord, EnrollmentRecord, IdentityAuth, IdentityError, IssuedEnrollmentKey,
         NewEnrollmentKey, RevokeAuth, RevokeEffects, RevokeReason, Revoked, RevokedEnrollmentKey,
     };
-    pub use isekai_p2p_core::identity::{PolicyConstraints, PolicyEvent, PolicySnapshot};
+    pub use isekai_p2p_core::identity::{
+        Membership, PolicyConstraints, PolicyEvent, PolicySnapshot,
+    };
     pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
     pub use isekai_p2p_core::proxy::{
         pairing_code_from_input, pairing_code_in_uri, pairing_uri, proxy_authority, redact_secrets,

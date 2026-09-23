@@ -26,6 +26,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -660,6 +662,122 @@ pub struct EndpointSummary {
     pub last_token_issued_at: Option<String>,
 }
 
+/// What `GET /v1/me` says the signed-in person is (`multitenancy.md` §5.4,
+/// `guest_membership.md` §3 D5).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Membership {
+    /// The Auth0 `sub` this answer is about.
+    pub sub: String,
+    /// The tenant that was resolved — **not necessarily the `org_id`**. Reserved
+    /// names are refused, and a token with no organization falls to the
+    /// personal tenant.
+    pub tenant_id: String,
+    /// `organization` or `individual`.
+    pub tenant_kind: String,
+    /// `super_admin`, `tenant_admin`, `member` or `guest`.
+    ///
+    /// **`guest` only when a live guest membership actually won.** A row that
+    /// has ended is not a guest, and a super administrator does not step down
+    /// for one.
+    pub role: String,
+    /// A guest's contract end (RFC 3339).
+    ///
+    /// **Present whenever there is a membership row at all**, even one that has
+    /// ended and even when `role` is no longer `guest` — that date is the
+    /// reason this person's tokens are refused, so hiding it takes the
+    /// explanation away with it.
+    #[serde(default)]
+    pub not_after: Option<String>,
+    /// `expired`, `revoked` or `promoted` — why a membership no longer holds.
+    ///
+    /// **`revoked` arrives before `not_after` does**, which is the case worth
+    /// carrying: without it a revoked guest is shown "good for another month"
+    /// while every issue is refused.
+    ///
+    /// **`promoted` is not a refusal.** That person is an ordinary member
+    /// again, and the row is only the record of what they were.
+    #[serde(default)]
+    pub membership_ended: Option<String>,
+    /// **An administrator whom a guest membership outranks.**
+    ///
+    /// Administration is decided by a claim, so it can arrive *after* the
+    /// membership; guest is the narrowing record and wins. Said out loud,
+    /// because otherwise the person wonders where their administration went.
+    #[serde(default)]
+    pub demoted_to_guest: bool,
+    /// `claim` or `config` — what made this caller an administrator. Absent for
+    /// an ordinary member.
+    #[serde(default)]
+    pub admin_source: Option<String>,
+}
+
+impl EndpointToken {
+    /// What the token says about the person it was issued to (spec §15.1.1).
+    ///
+    /// **Read from the token rather than asked for.** `principal_kind` is a
+    /// claim, so it travels with the token down every route that issued it —
+    /// including the Enrollment Key route, which has no Auth0 caller to ask
+    /// about. `None` is a token from before the claim existed, and the
+    /// deployment's own migration treats that as an ordinary member.
+    ///
+    /// **The signature is not checked here.** Everything this token does is
+    /// checked by the servers that hold the signing key; reading the claim is
+    /// for explaining a refusal to the person holding it, and a forged claim
+    /// changes what they are told rather than what they may do.
+    pub fn principal(&self) -> Option<Principal> {
+        let claims: Value = self
+            .endpoint_token
+            .split('.')
+            .nth(1)
+            .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
+        Some(Principal {
+            kind: claims.get("principal_kind")?.as_str()?.to_owned(),
+            // **Only a guest carries one**, so its absence is not a fault.
+            not_after: claims.get("principal_not_after").and_then(|v| v.as_i64()),
+        })
+    }
+}
+
+/// The subject a token was issued to (spec §15.1.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principal {
+    /// `guest` or `member`.
+    ///
+    /// **`admin` is deliberately not among them.** Administration is decided by
+    /// a claim on the caller's own token, so the routes with no caller — a
+    /// renewal on an Enrollment Key — could not say it, and the same Endpoint
+    /// would change rank depending on how it renewed.
+    pub kind: String,
+    /// When a guest's contract ends (Unix seconds).
+    ///
+    /// **Separate from `exp`, on purpose.** `exp` is clamped to it, but
+    /// verifying a JWT allows for clock skew, so `exp` alone cannot say where
+    /// the contract's edge is. Anything derived from the contract — a grant, a
+    /// relay lease — is cut against this.
+    ///
+    /// **It is a copy taken when the token was issued.** A contract shortened
+    /// afterwards is not reflected until the next issue.
+    pub not_after: Option<i64>,
+}
+
+impl Principal {
+    /// Whether this token was issued to a guest.
+    pub fn is_guest(&self) -> bool {
+        self.kind == "guest"
+    }
+}
+
+impl Membership {
+    /// Whether this person is a guest right now.
+    ///
+    /// **The role rather than the row**, because the row outlives the
+    /// membership: it is kept so that an ended contract can still be explained.
+    pub fn is_guest(&self) -> bool {
+        self.role == "guest"
+    }
+}
+
 /// `GET /v1/endpoints` (§8.1.3).
 #[derive(Debug, Clone, Deserialize)]
 pub struct EndpointList {
@@ -1113,11 +1231,6 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
         self.post("/v1/endpoints/enroll", auth, None, body).await
     }
 
-    /// §8.1.3 — the Endpoints this caller owns.
-    ///
-    /// **Revoked rows are hidden unless asked for**, which is why
-    /// [`EndpointList::revoked_count`] exists and why anything showing this
-    /// should show that too.
     /// `GET /v1/policies/stream` — the changes, as they happen
     /// (identity spec §8.10.3).
     ///
@@ -1224,6 +1337,28 @@ impl<T: ControlPlaneTransport> IdentityClient<T> {
             }
         });
         Ok(receiver)
+    }
+
+    /// `GET /v1/me` — who the signed-in person is here, and under what terms.
+    ///
+    /// **Identity answers rather than the caller reading its own token.** How a
+    /// tenant is resolved and how an administrator is recognised are deployment
+    /// settings, so a client that decoded the access token itself would hold a
+    /// second copy of those rules and drift from the one that is enforced
+    /// (`multitenancy.md` §5.4).
+    ///
+    /// **It answers `200` for everyone who can authenticate**, including
+    /// somebody with no privileges at all — folding that into `403` would make
+    /// "not an administrator", "invalid token" and "no tenant" one answer.
+    pub async fn me(&self, auth0_token: &str) -> Result<Membership, IdentityError> {
+        self.request(
+            "GET",
+            "/v1/me",
+            IdentityAuth::Auth0(auth0_token),
+            None,
+            Vec::new(),
+        )
+        .await
     }
 
     /// §8.1.3 — the Endpoints this caller owns.
@@ -1680,5 +1815,47 @@ mod tests {
         assert_eq!(tok.endpoint_token, "eyJ...");
         assert_eq!(tok.expires_in, 900);
         assert_eq!(tok.permissions, vec!["peer-connect:initiate"]);
+    }
+    /// **The claim is what says a token belongs to a guest**, and it is the
+    /// only signal that travels every route — a renewal on an Enrollment Key
+    /// has no caller to ask about. Reading it is how a refusal further on gets
+    /// explained instead of arriving as a bare `insufficient-permission`.
+    #[test]
+    fn a_token_says_which_kind_of_principal_it_was_issued_to() {
+        let token = |claims: &str| EndpointToken {
+            endpoint_token: format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims)
+            ),
+            token_type: "Bearer".into(),
+            expires_in: 900,
+            endpoint_id: "ep:1".into(),
+            permissions: Vec::new(),
+            protocols: Vec::new(),
+        };
+
+        let guest = token(r#"{"principal_kind":"guest","principal_not_after":1767139199}"#)
+            .principal()
+            .expect("the claim is there");
+        assert!(guest.is_guest());
+        assert_eq!(guest.not_after, Some(1767139199));
+
+        // **A member carries the claim too**, so that its absence means "older
+        // than the claim" rather than "not a guest" — the deployment's own
+        // migration turns on that distinction.
+        let member = token(r#"{"principal_kind":"member"}"#)
+            .principal()
+            .expect("the claim is there");
+        assert!(!member.is_guest());
+        assert_eq!(member.not_after, None);
+
+        // A token from before the claim existed, and one that is not a JWT at
+        // all: neither is a guest, and neither is an error to the holder.
+        assert!(token(r#"{"sub":"ep:1"}"#).principal().is_none());
+        let opaque = EndpointToken {
+            endpoint_token: "not-a-jwt".into(),
+            ..token("{}")
+        };
+        assert!(opaque.principal().is_none());
     }
 }

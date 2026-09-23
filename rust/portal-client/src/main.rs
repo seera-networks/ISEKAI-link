@@ -573,6 +573,11 @@ async fn run(
             "organization: {}",
             portal_core::login::signed_in_organization(&tokens, args.auth0_token.as_deref()),
         );
+        // **And what this sign-in is in that tenant.** A guest is narrowed to
+        // `peer-connect:initiate` and everything they hold ends on a date, and
+        // that date is not written anywhere on this machine -- it is the answer
+        // to every refusal they are about to meet, so this is where to read it.
+        eprintln!("role: {}", this_role(&args, &tokens).await);
         return Ok(());
     }
 
@@ -860,6 +865,27 @@ async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
     if let Err(e) = portal_core::agent::revoke_the_task_endpoint(&cfg).await {
         tracing::debug!("revoking the task Endpoint failed, will try once more: {e:#}");
         *task = Some(cfg);
+    }
+}
+
+/// What Identity says this sign-in is, for `--whoami`.
+///
+/// **Best effort, and it has to be.** Every other line `--whoami` prints comes
+/// from the key and the saved tokens, so the command has always answered with
+/// no network at all — and what it answers is what the operator needs in order
+/// to ask the far side for a capability. A control plane that cannot be reached
+/// must not take the Endpoint ID down with it, so a failure is reported in
+/// place of the role rather than raised.
+async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
+    let identity = isekai_p2p::enrollment::Identity::new(&args.identity_url, args.identity_http3);
+    // Not `?`: being signed out is one of the answers here, not an error.
+    let auth = match portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await {
+        Ok(auth) => auth,
+        Err(e) => return format!("unknown -- not signed in ({e})"),
+    };
+    match isekai_p2p::membership::me(&identity, &auth.token).await {
+        Ok(me) => isekai_p2p::membership::describe(&me),
+        Err(e) => format!("unknown -- could not ask Identity ({e:#})"),
     }
 }
 
