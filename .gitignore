@@ -26,6 +26,13 @@
 # several times since — ignoring it is cheaper than noticing each time.
 /rust/portal-server.toml
 
+# The gateway policy, for the same reason and by the same route:
+# `--gateway-config` names it and `portal-server --example-gateway-config`
+# prints a starter, which `docs/portal.md` says to redirect into this very
+# path. It carries a deployment's operations and attribute ranges. This one
+# was swept in by a `git add -A` and removed again.
+/rust/gateway.toml
+
 # iOS build outputs. `ios/build-rust.sh` writes the bindings and the
 # xcframework; `xcodegen generate` writes the project and its Info.plist. Only
 # ios/project.yml and ios/IsekaiCameraClient/App are tracked.

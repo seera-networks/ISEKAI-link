@@ -1777,8 +1777,6 @@ fn drain_policy_lines(buffer: &mut Vec<u8>, out: &mut Vec<PolicyEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use p256::ecdsa::Signature;
     use p256::ecdsa::signature::Verifier;
 

@@ -402,7 +402,11 @@ async fn revoke_or_report(cfg: &P2pConfig, code: i32) -> i32 {
                  `portal-client --revoke-endpoint {} --reason task_finished`",
                 cfg.key.endpoint_id(),
             );
-            if code == 0 { 1 } else { code }
+            if code == 0 {
+                1
+            } else {
+                code
+            }
         }
     }
 }
@@ -446,7 +450,10 @@ async fn run(
         gateway: !args.gateway.is_empty(),
         task: args.task.is_some(),
     })?;
-    let key_path = args.key.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
+    let key_path = args
+        .key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
         .auth0_tokens
         .clone()
@@ -877,6 +884,24 @@ async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
 /// must not take the Endpoint ID down with it, so a failure is reported in
 /// place of the role rather than raised.
 async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
+    // **Bounded, because the transport is not.** The HTTP client is built with
+    // no timeout, so a host that black-holes packets leaves the call hanging
+    // rather than failing -- and `EP=$(portal-client --whoami)` waits for the
+    // process to exit, so the hang is the operator's too. A command that used
+    // to need no network at all must not acquire a way to stop forever.
+    match tokio::time::timeout(WHOAMI_WAIT, ask_identity(args, tokens)).await {
+        Ok(answer) => answer,
+        Err(_) => format!(
+            "unknown -- {} had not answered in {WHOAMI_WAIT:?}",
+            args.identity_url
+        ),
+    }
+}
+
+/// How long `--whoami` waits for Identity before answering without it.
+const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn ask_identity(args: &Args, tokens: &std::path::Path) -> String {
     let identity = isekai_p2p::enrollment::Identity::new(&args.identity_url, args.identity_http3);
     // Not `?`: being signed out is one of the answers here, not an error.
     let auth = match portal_core::login::authenticate(tokens, args.auth0_token.as_deref()).await {

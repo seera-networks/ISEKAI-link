@@ -31,7 +31,7 @@ async fn challenge(State(s): State<Hits>, _h: HeaderMap, _b: Bytes) -> Json<Valu
     }))
 }
 
-async fn register(State(s): State<Hits>, _h: HeaderMap, _b: Bytes) -> Json<Value> {
+async fn register_endpoint(State(s): State<Hits>, _h: HeaderMap, _b: Bytes) -> Json<Value> {
     s.0.lock().unwrap().push("register".into());
     Json(json!({
         "endpoint_id": "ep:abc",
@@ -71,7 +71,7 @@ fn config(identity_url: String, register: bool) -> P2pConfig {
 async fn serve(hits: Hits) -> String {
     let app = Router::new()
         .route("/v1/endpoints/register/challenge", post(challenge))
-        .route("/v1/endpoints/register", post(register))
+        .route("/v1/endpoints/register", post(register_endpoint))
         .route("/v1/tokens/endpoint", post(issue_token))
         .with_state(hits);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -210,7 +210,7 @@ async fn a_registration_counts_even_when_the_issue_is_refused() {
     let hits = Hits::default();
     let app = Router::new()
         .route("/v1/endpoints/register/challenge", post(challenge))
-        .route("/v1/endpoints/register", post(register))
+        .route("/v1/endpoints/register", post(register_endpoint))
         .route(
             "/v1/tokens/endpoint",
             post(|State(s): State<Hits>| async move {
@@ -253,7 +253,7 @@ async fn retrying_after_a_refused_issue_does_not_register_again() {
     let hits = Hits::default();
     let app = Router::new()
         .route("/v1/endpoints/register/challenge", post(challenge))
-        .route("/v1/endpoints/register", post(register))
+        .route("/v1/endpoints/register", post(register_endpoint))
         .route(
             "/v1/tokens/endpoint",
             post(|State(s): State<Hits>| async move {
@@ -331,4 +331,50 @@ async fn a_run_that_never_asked_claims_nothing() {
         !cfg.credential.may_have_registered(),
         "the challenge never came back, so no registration was ever attempted",
     );
+}
+
+/// **Where a contract actually ends underneath somebody.** `--register` is for
+/// a key's first use, so a settled installation issues without it on every
+/// renewal for the life of the session — and that was the one path with no
+/// explanation on it, which is to say the only path that matters here.
+///
+/// Both arms are driven, because the explanation lived on the other one.
+#[tokio::test]
+async fn a_membership_that_ended_is_explained_on_both_issue_paths() {
+    for register in [false, true] {
+        let refuse = || async {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(json!({
+                    "type": "https://identity.isekai.tools/problems/membership-expired",
+                    "status": 403,
+                    "detail": "membership expired at 2027-01-31T23:59:59Z",
+                })),
+            )
+        };
+        let app = Router::new()
+            .route("/v1/endpoints/register/challenge", post(challenge))
+            .route("/v1/endpoints/register", post(register_endpoint))
+            .route("/v1/tokens/endpoint", post(refuse))
+            .with_state(Hits::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = issue_endpoint_token(&config(format!("http://{addr}"), register))
+            .await
+            .expect_err("an ended membership issues nothing");
+        let text = format!("{error:#}");
+        assert!(text.contains("has ended"), "register={register}: {text}");
+        // The server's own moment, which is the whole of what the holder can
+        // act on -- and the person asking is the one it is about.
+        assert!(
+            text.contains("2027-01-31T23:59:59Z"),
+            "register={register}: {text}"
+        );
+        // **Not the other explanation.** A run that has not registered here is
+        // exactly what the cross-tenant guess is written for, and it would talk
+        // over an answer the server actually gave.
+        assert!(!text.contains("tenant"), "register={register}: {text}");
+    }
 }

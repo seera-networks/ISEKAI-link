@@ -150,8 +150,9 @@ The Endpoint ID is on stdout and the rest on stderr, so
 who counts as an administrator are settings of the deployment, so the question
 is asked rather than worked out from the token in hand — and it is the only way
 to see a **guest** membership and the date it ends. The network call is the one
-thing in this command that can fail, and it is allowed to: the line then says so
-and the Endpoint ID is printed anyway.
+thing in this command that can fail, and it is allowed to: it gives Identity ten
+seconds, then says what happened and prints the Endpoint ID anyway. This command
+answered with no network at all until now, and `EP=$(…)` waits for it to exit.
 
 **The id is read from the access token**, which is the same claim Identity reads
 to decide the tenant — so this answers for machines that signed in before any of

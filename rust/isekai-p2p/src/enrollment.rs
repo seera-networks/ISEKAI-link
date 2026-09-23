@@ -57,7 +57,15 @@ pub async fn issue(
     request: &NewEnrollmentKey,
 ) -> anyhow::Result<IssuedEnrollmentKey> {
     Ok(on_transport!(identity, |client| {
-        client.create_enrollment_key(auth0_token, request).await?
+        // **The one door a permission cannot close.** Issuing a key is
+        // authenticated as the person and carries no Endpoint Token, so there
+        // is nothing on it to narrow -- Identity refuses a guest here by name
+        // instead (`guest_membership.md` §3 D7), and that refusal arrives as an
+        // ordinary `insufficient-permission` unless somebody says what it was.
+        client
+            .create_enrollment_key(auth0_token, request)
+            .await
+            .map_err(crate::config::explain_membership_refusal)?
     }))
 }
 

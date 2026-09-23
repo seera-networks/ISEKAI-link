@@ -316,7 +316,11 @@ async fn issue<T: ControlPlaneTransport>(
                 return client
                     .issue_token(&auth0, &cfg.key, &cfg.narrowing, cfg.token_ttl)
                     .await
-                    .map_err(|e| explain_pop_failure(e, cfg));
+                    // **The path a settled installation is always on**, and so
+                    // the one a guest's contract ends underneath: `--register`
+                    // is for a key's first use, and every renewal after it
+                    // comes through here.
+                    .map_err(|e| explain_issue_failure(e, cfg, false));
             }
             // **Registration happens once; the renewals issue.** `register`
             // is a static argument re-read on every renewal, so without this
@@ -381,7 +385,11 @@ async fn issue<T: ControlPlaneTransport>(
                             tracing::info!("this Endpoint is already registered; issuing instead");
                             Ok(cfg.key.endpoint_id())
                         }
-                        Err(e) => Err(e.into()),
+                        // A membership that has ended refuses the
+                        // registration too, and this is a guest's very first
+                        // call -- the one where "403" with nothing attached is
+                        // least likely to be recognised.
+                        Err(e) => Err(explain_membership_refusal(e)),
                     }
                 })
                 .await?;
@@ -772,7 +780,7 @@ fn explain_key_refused(error: IdentityError, enrollment: &Enrollment) -> anyhow:
 /// A guest refused for lack of a permission is the third shape, and the one
 /// worth catching: it arrives as an ordinary `insufficient-permission` whose
 /// detail happens to begin "guests cannot".
-fn explain_membership_refusal(error: IdentityError) -> anyhow::Error {
+pub(crate) fn explain_membership_refusal(error: IdentityError) -> anyhow::Error {
     match membership_advice(&error) {
         Some(advice) => anyhow::Error::from(error).context(advice),
         None => error.into(),

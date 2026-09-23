@@ -68,7 +68,12 @@ pub fn describe(me: &Membership) -> String {
         },
         None => me.role.clone(),
     };
-    if me.demoted_to_guest {
+    // **Only while the membership is the thing in force.** Once it has ended
+    // the narrowing is over and the administration is back, so saying "the
+    // guest membership wins" beside "membership expired" asserts the opposite
+    // of what is true. Identity does not send the flag then either; this is
+    // belt and braces for the answer, not for the field.
+    if me.demoted_to_guest && me.membership_ended.is_none() {
         line.push_str(" -- an administrator here, but the guest membership wins");
     }
     line
@@ -134,6 +139,19 @@ mod tests {
             !text.contains("expired") && !text.contains("revoked"),
             "{text}"
         );
+    }
+
+    /// **The narrowing is over when the membership is.** Printing "the guest
+    /// membership wins" beside "expired" tells an administrator they are shut
+    /// out of their own tenant, which is the reverse of the truth.
+    #[test]
+    fn an_ended_membership_does_not_still_outrank_an_administrator() {
+        let mut me = membership("tenant_admin");
+        me.not_after = Some("2026-09-01T00:00:00Z".into());
+        me.membership_ended = Some("expired".into());
+        me.demoted_to_guest = true;
+        let text = describe(&me);
+        assert!(!text.contains("wins"), "{text}");
     }
 
     /// Being an administrator who is nonetheless narrowed to a guest is the
