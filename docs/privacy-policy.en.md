@@ -1,6 +1,6 @@
 # ISEKAI link Privacy Policy
 
-Version: 2026-08-15
+Version: 2026-09-24
 
 ## 1. Who we are
 
@@ -16,9 +16,17 @@ Referred to below as "we".
 
 ## 2. What this covers
 
-The ISEKAI link camera application (camera-server), the desktop viewer
-(camera-client), the iOS viewer, and the Identity API and relay (proxy) servers
-they connect to.
+Two families of application, and the Identity API and relay (proxy) servers
+both connect to.
+
+- **ISEKAI camera** — the camera application (camera-server), the desktop
+  viewer (camera-client) and the iOS viewer.
+- **ISEKAI portal** — the server that offers a service (portal-server) and the
+  client that maps a local port onto it (portal-client), including the
+  unattended uses of them: a CI job that enrols with a key, and an agent run
+  authorised by an entitlement.
+
+Where something below applies to only one of the two, it says so.
 
 ## 3. What we collect
 
@@ -37,9 +45,17 @@ Registering a device sends the following to our Identity API:
 
 - the device's public key, and the device identifier derived from it
   (Endpoint ID)
-- a device name (`camera-server`, `camera-client` or `ios-camera-client` by
-  default, or whatever you set)
+- a device name (`camera-server`, `camera-client`, `ios-camera-client`,
+  `portal-server` or `portal-client` by default, or whatever you set)
 - the times of registration and of each token issued
+
+For portal, a device may instead be registered by an unattended job rather than
+by a person at a keyboard. Where it is, we also receive:
+
+- the record of which key admitted it, and the identity the job presented
+  (for a job on a hosting service, the repository and branch it ran for)
+- the label the job gave the registration, so that a run can be recognised
+  later
 
 ### 3.3 Connections
 
@@ -48,14 +64,30 @@ When traffic passes through the relay, our servers handle:
 - **IP addresses and port numbers.** To establish a direct path, the service
   observes the public address your device appears from and tells the other side
   what it is. This is inherent to how the connection is made.
-- connection identifiers, listener identifiers, grants and pairing codes
+- connection identifiers, listener identifiers, grants, pairing codes and
+  tickets
 - operational records such as connection start and end times and traffic volume
 
-### 3.4 Video
+For portal we additionally hold, for an organization that uses one:
 
-Video sent by the camera application passes through our relay on its way to a
-viewer. It may show people, the inside of a home, or anything else in view. How
-we handle it is set out in section 5.
+- which people may reach which class of service, and — where somebody has been
+  admitted for a fixed term as a guest — the date that term ends
+- where a public address has been allocated for a service, that address and the
+  port
+
+### 3.4 What you send through it
+
+**Camera.** Video sent by the camera application passes through our relay on
+its way to a viewer. It may show people, the inside of a home, or anything else
+in view.
+
+**Portal.** Whatever the service you forward speaks passes through our relay on
+its way to the other side — a database session, a web request, a name lookup,
+anything the operator of the server chose to offer. We do not know what any of
+it is, and the list of services a portal-server offers stays on that machine
+(section 8).
+
+How we handle both is set out in section 5.
 
 ### 3.5 Logs
 
@@ -77,7 +109,7 @@ parties for any of those purposes.
 3. To investigate faults and improve quality.
 4. To meet legal obligations.
 
-## 5. Video
+## 5. Video, and what you forward
 
 **The key that encrypts your video is created on the device running the camera
 application, and does not leave it.** What reaches us is a certificate signing
@@ -111,6 +143,20 @@ Two things this does not change:
   content of the video.**
 - Separately from content, **when two devices communicated, which ones, and how
   much** is handled by our servers (sections 3.3 and 7).
+
+### Portal
+
+The connection a portal forward runs inside is the same one, made the same way
+and with the same key arrangement, so **what passes through our relay is
+ciphertext we cannot read**, and it stops passing through us once a direct path
+is established. The four statements above — that we do not view, retain,
+accumulate or hand on what is relayed — apply to it unchanged.
+
+One thing is different, and it is the operator's to know rather than ours:
+**the forward carries whatever the service speaks, and makes no promise about
+it.** A service with no password of its own is reached by whoever you let in,
+exactly as if it were exposed; the tunnel protects the transport and says
+nothing about what is at the end of it.
 
 ## 6. Sharing, processors and transfers abroad
 
@@ -150,7 +196,8 @@ in a foreign country.**
 | Account information | until you close your account |
 | Device registrations | until you remove the device |
 | Connection logs | 3 years from collection |
-| Video | not retained — relayed only |
+| Video, and what a portal forwards | not retained — relayed only |
+| Records of which unattended job registered which device | 3 years from collection |
 
 ## 8. What stays on your device
 
@@ -158,9 +205,14 @@ The following is stored on your device and not sent to us:
 
 - the device's private key, a long-lived secret that must not be shared
 - the private key used to encrypt the video connection, likewise
-- the device identifier (Endpoint ID) of each camera you have paired with
+- the device identifier (Endpoint ID) of each camera or portal server you have
+  paired with
 - your Auth0 access and refresh tokens
 - settings such as which servers to connect to
+- your agreement to this policy, and which version of it you agreed to
+- for portal: the list of services a portal-server offers and the addresses
+  behind them, the policy a gateway is willing to apply, and any key or ticket
+  you were given to let a job in
 
 Signing out of an application deletes the Auth0 tokens from that device.
 
@@ -225,8 +277,10 @@ involvement of a parent or guardian.
 ## 12. Changes
 
 If we change this policy we will update its version, and applications will ask
-for your agreement again the next time they start. We will give notice of
-significant changes by other means as well.
+for your agreement again the next time they start. For the portal programs,
+which have no window, that means printing the policy and refusing to run until
+`--accept-privacy-policy` is passed again. We will give notice of significant
+changes by other means as well.
 
 ## 13. Contact
 

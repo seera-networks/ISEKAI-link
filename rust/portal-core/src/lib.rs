@@ -26,12 +26,14 @@
 //! stream would add reliability and ordering the application did not ask for
 //! and head-of-line blocking it does not expect.
 
-/// What agent mode refuses before it starts (`docs/portal_agent_plan.md` P1).
 pub mod agent;
 /// Credentials for a run with nobody at the keyboard.
 pub mod ci;
 pub mod client;
 pub mod config;
+/// What agent mode refuses before it starts (`docs/portal_agent_plan.md` P1).
+/// The privacy policy, and refusing to run until it is agreed to.
+pub mod consent;
 pub mod datagram;
 pub mod frame;
 /// What a Gateway is willing to be told (`docs/portal_gateway_plan.md` P0).
