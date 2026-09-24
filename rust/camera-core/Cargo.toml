@@ -20,7 +20,6 @@ isekai-p2p = { workspace = true }
 isekai-privacy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-time = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -355,11 +355,14 @@ async fn main() -> anyhow::Result<()> {
     // asking after the fact. Nothing here opens a transport, so it costs a
     // process that has not agreed nothing but the reading.
     match privacy_gate(&args) {
-        Ok(Some(code)) => return portal_core::shutdown::leave(code).await,
+        // `leave` never returns, so these are the end of `main` rather than a
+        // value it produces; `return leave(..).await` makes the `.await`
+        // unreachable and says so at every build.
+        Ok(Some(code)) => portal_core::shutdown::leave(code).await,
         Ok(None) => {}
         Err(e) => {
             eprintln!("Error: {e:#}");
-            return portal_core::shutdown::leave(1).await;
+            portal_core::shutdown::leave(1).await
         }
     }
     // **Every path out of `run` goes through the same wind-down**, which is the
@@ -426,7 +429,11 @@ async fn revoke_or_report(cfg: &P2pConfig, code: i32) -> i32 {
                  `portal-client --revoke-endpoint {} --reason task_finished`",
                 cfg.key.endpoint_id(),
             );
-            if code == 0 { 1 } else { code }
+            if code == 0 {
+                1
+            } else {
+                code
+            }
         }
     }
 }
@@ -470,7 +477,10 @@ async fn run(
         gateway: !args.gateway.is_empty(),
         task: args.task.is_some(),
     })?;
-    let key_path = args.key.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
+    let key_path = args
+        .key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
         .auth0_tokens
         .clone()

@@ -18,7 +18,6 @@
 //! is not agreement to the next one. That is the whole point of
 //! [`isekai_privacy::VERSION`].
 
-use anyhow::Context as _;
 use isekai_privacy::{needs_agreement, Language};
 
 /// What the two flags between them say to do.
@@ -90,12 +89,20 @@ pub fn gate(app: &'static str, accept: bool, show: bool) -> anyhow::Result<Decis
             }
             Ok(Decision::Proceed)
         }
+        // **stdout, because here the policy *is* the answer.** Somebody who
+        // asked for it is the one redirecting it into a file or a pager, and
+        // `--show-privacy-policy > policy.txt` writing an empty file is the
+        // whole command failing quietly.
         Outcome::Print => {
-            print_policy(language);
+            println!("{}", rendered(language));
             Ok(Decision::Printed)
         }
         Outcome::Refuse => {
-            print_policy(language);
+            // **stderr on this path**, where the answer is the refusal and
+            // stdout carries what these programs are asked for -- an Endpoint
+            // ID, a pairing code. `EP=$(portal-client --whoami)` would
+            // otherwise capture a privacy policy.
+            eprintln!("{}", rendered(language));
             anyhow::bail!(
                 "{app} collects personal information, and has not been told you agree to the \
                  policy above (version {version}). Pass --accept-privacy-policy to agree and \
@@ -107,24 +114,20 @@ pub fn gate(app: &'static str, accept: bool, show: bool) -> anyhow::Result<Decis
     }
 }
 
-/// Put the policy where a person will see it.
+/// The policy as it is shown, with both links under it.
 ///
-/// **stderr, like every other word these programs say about themselves.**
-/// stdout carries answers — an Endpoint ID, a pairing code, a key — and
-/// `EP=$(portal-client --whoami)` would otherwise capture a privacy policy.
-///
-/// The other language is offered as a link rather than printed as well: two
-/// full renderings is four hundred lines, and the one that was read is the one
-/// recorded with the agreement.
-fn print_policy(language: Language) {
-    eprintln!("{}", language.text());
-    eprintln!(
-        "\n---\n{}: {}\n{}: {}",
+/// The other language is linked rather than printed as well: two full
+/// renderings is four hundred lines, and the one that was read is the one
+/// recorded with the agreement. Both labels are in the language they name.
+fn rendered(language: Language) -> String {
+    format!(
+        "{}\n---\n{}: {}\n{}: {}",
+        language.text(),
+        language.this_label(),
+        language.url(),
         language.other_label(),
         language.toggled().url(),
-        "This text",
-        language.url(),
-    );
+    )
 }
 
 /// Forget this program's recorded agreement.
@@ -132,13 +135,10 @@ fn print_policy(language: Language) {
 /// **There has to be a way back.** An agreement that cannot be withdrawn on the
 /// machine that recorded it is a setting, not an agreement.
 pub fn withdraw(app: &str) -> anyhow::Result<()> {
-    let path = isekai_privacy::config_dir()?.join(format!("{app}-privacy-consent.json"));
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        // Nothing recorded is the state this asks for, so it is not a failure.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
-    }
+    // **Not the path, rebuilt here.** Naming the file in two crates is how a
+    // rename in one of them leaves this reporting the agreement forgotten
+    // while the record is still on disk and the next run still proceeds.
+    isekai_privacy::forget(app)
 }
 
 #[cfg(test)]

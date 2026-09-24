@@ -17,7 +17,7 @@ Referred to below as "we".
 ## 2. What this covers
 
 Two families of application, and the Identity API and relay (proxy) servers
-both connect to.
+they both connect to.
 
 - **ISEKAI camera** — the camera application (camera-server), the desktop
   viewer (camera-client) and the iOS viewer.

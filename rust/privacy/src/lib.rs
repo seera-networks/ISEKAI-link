@@ -88,6 +88,19 @@ impl Language {
         }
     }
 
+    /// What to call the rendering that is on screen.
+    ///
+    /// **In the language on screen**, because it labels the link to the text
+    /// this reader has just read — and a feature built on "agreeing to a
+    /// document you cannot read is not agreement" should not caption it in the
+    /// language they did not choose.
+    pub fn this_label(self) -> &'static str {
+        match self {
+            Self::Japanese => "この文書",
+            Self::English => "This text",
+        }
+    }
+
     pub fn toggled(self) -> Self {
         match self {
             Self::Japanese => Self::English,
@@ -173,6 +186,24 @@ pub fn save(app: &str, language: Language) -> anyhow::Result<Consent> {
     std::fs::write(&path, json)
         .with_context(|| format!("failed to record consent at {}", path.display()))?;
     Ok(consent)
+}
+
+/// Forget this user's agreement, so it is asked again.
+///
+/// **There has to be a way back.** An agreement that cannot be withdrawn on
+/// the machine that recorded it is a setting, not an agreement.
+///
+/// Here rather than in the caller, because the file's name is this module's to
+/// know: a `withdraw` that rebuilt the path would go on reporting success
+/// against a record that had moved.
+pub fn forget(app: &str) -> anyhow::Result<()> {
+    let path = consent_path(app)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        // Nothing recorded is the state this asks for, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 /// Where this user's agreement is kept.
@@ -349,5 +380,18 @@ mod tests {
         assert_eq!(Language::Japanese.other_label(), "English");
         assert_eq!(Language::English.other_label(), "日本語");
         assert_eq!(Language::Japanese.toggled(), Language::English);
+    }
+
+    /// **Both labels follow the text, not the machine.** The one naming the
+    /// other language is in that language; the one naming this text is in
+    /// this one. Captioning the Japanese policy "This text" is the small
+    /// version of the mistake this whole module exists to avoid.
+    #[test]
+    fn each_rendering_names_itself_in_its_own_language() {
+        assert_eq!(Language::Japanese.this_label(), "この文書");
+        assert_eq!(Language::English.this_label(), "This text");
+        for language in [Language::Japanese, Language::English] {
+            assert_ne!(language.this_label(), language.other_label());
+        }
     }
 }
