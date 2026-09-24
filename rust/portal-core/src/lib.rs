@@ -32,6 +32,8 @@ pub mod agent;
 pub mod ci;
 pub mod client;
 pub mod config;
+/// The privacy policy, and refusing to run until it is agreed to.
+pub mod consent;
 pub mod datagram;
 pub mod frame;
 /// What a Gateway is willing to be told (`docs/portal_gateway_plan.md` P0).

@@ -15,7 +15,10 @@
 
 pub mod cameras;
 pub mod paired;
-pub mod privacy;
+// **Re-exported, not re-implemented.** The policy moved to its own crate when
+// the portal binaries came to need it (`isekai-privacy`); everything that says
+// `camera_core::privacy` still reaches the one copy.
+pub use isekai_privacy as privacy;
 pub mod server;
 pub mod shutdown;
 pub mod tls;

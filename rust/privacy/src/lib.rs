@@ -4,11 +4,18 @@
 //! information — so every application asks for agreement before it does
 //! anything, and remembers the answer.
 //!
-//! **One text, three applications.** `camera-server`, `camera-client` and the
-//! iOS viewer all show what is in `docs/privacy-policy.*.md`, compiled in here
-//! rather than copied into each. The iOS app reaches it through the FFI for the
-//! same reason: three applications agreeing to three slightly different
-//! documents is worse than having no document at all.
+//! **One text, five applications.** `camera-server`, `camera-client`, the iOS
+//! viewer, `portal-server` and `portal-client` all show what is in
+//! `docs/privacy-policy.*.md`, compiled in here rather than copied into each.
+//! The iOS app reaches it through the FFI for the same reason: applications
+//! agreeing to five slightly different documents is worse than having no
+//! document at all.
+//!
+//! **The two families ask differently, and that is all that differs.** A
+//! desktop camera application draws the text and offers a button; a portal
+//! binary has no window, so it prints the text and refuses to start until
+//! `--accept-privacy-policy` is passed. Both record the same answer in the same
+//! place, and both are re-asked when [`VERSION`] moves.
 //!
 //! **The agreement records a version.** Consent to one text is not consent to
 //! the next one, so [`Consent`] stores which version was agreed and
@@ -25,7 +32,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump it whenever the documents change in a way a person would want to know
 /// about. A test keeps it in step with what the documents themselves say.
-pub const VERSION: &str = "2026-08-15";
+pub const VERSION: &str = "2026-09-24";
 
 /// Where the authoritative copy of the Japanese text lives.
 ///
@@ -78,6 +85,19 @@ impl Language {
         match self {
             Self::Japanese => "English",
             Self::English => "日本語",
+        }
+    }
+
+    /// What to call the rendering that is on screen.
+    ///
+    /// **In the language on screen**, because it labels the link to the text
+    /// this reader has just read — and a feature built on "agreeing to a
+    /// document you cannot read is not agreement" should not caption it in the
+    /// language they did not choose.
+    pub fn this_label(self) -> &'static str {
+        match self {
+            Self::Japanese => "この文書",
+            Self::English => "This text",
         }
     }
 
@@ -168,6 +188,24 @@ pub fn save(app: &str, language: Language) -> anyhow::Result<Consent> {
     Ok(consent)
 }
 
+/// Forget this user's agreement, so it is asked again.
+///
+/// **There has to be a way back.** An agreement that cannot be withdrawn on
+/// the machine that recorded it is a setting, not an agreement.
+///
+/// Here rather than in the caller, because the file's name is this module's to
+/// know: a `withdraw` that rebuilt the path would go on reporting success
+/// against a record that had moved.
+pub fn forget(app: &str) -> anyhow::Result<()> {
+    let path = consent_path(app)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        // Nothing recorded is the state this asks for, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 /// Where this user's agreement is kept.
 ///
 /// Deliberately **not** beside the working directory, unlike the Endpoint key
@@ -180,9 +218,10 @@ fn consent_path(app: &str) -> anyhow::Result<PathBuf> {
 
 /// The per-user configuration directory, by each platform's own convention.
 ///
-/// Shared with [`crate::paired`], so what it says when there is nowhere to
-/// write names no one caller.
-pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
+/// **Public, and shared beyond the consent record** — `camera-core` keeps the
+/// list of paired Endpoints beside it — so that what it says when there is
+/// nowhere to write names no one caller.
+pub fn config_dir() -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var_os("APPDATA")
@@ -275,6 +314,33 @@ mod tests {
         assert!(TEXT_EN.contains("Privacy Policy"));
     }
 
+    /// **Both families of application have to be named in the thing people
+    /// agree to.** The portal binaries were added to this crate's callers
+    /// before the documents mentioned them, which would have had an operator
+    /// agreeing to a policy about cameras.
+    #[test]
+    fn both_documents_cover_both_families() {
+        for (name, text) in [("ja", TEXT_JA), ("en", TEXT_EN)] {
+            for program in [
+                "camera-server",
+                "camera-client",
+                "portal-server",
+                "portal-client",
+            ] {
+                assert!(
+                    text.contains(program),
+                    "privacy-policy.{name}.md does not mention {program}",
+                );
+            }
+            // The flag the portal programs refuse to start without. A policy
+            // that does not say how to answer it is one nobody can get past.
+            assert!(
+                text.contains("--accept-privacy-policy"),
+                "privacy-policy.{name}.md does not say how the portal programs ask",
+            );
+        }
+    }
+
     /// Nothing is still waiting to be filled in.
     ///
     /// This replaces a check that the placeholders were *present*, which passed
@@ -314,5 +380,18 @@ mod tests {
         assert_eq!(Language::Japanese.other_label(), "English");
         assert_eq!(Language::English.other_label(), "日本語");
         assert_eq!(Language::Japanese.toggled(), Language::English);
+    }
+
+    /// **Both labels follow the text, not the machine.** The one naming the
+    /// other language is in that language; the one naming this text is in
+    /// this one. Captioning the Japanese policy "This text" is the small
+    /// version of the mistake this whole module exists to avoid.
+    #[test]
+    fn each_rendering_names_itself_in_its_own_language() {
+        assert_eq!(Language::Japanese.this_label(), "この文書");
+        assert_eq!(Language::English.this_label(), "This text");
+        for language in [Language::Japanese, Language::English] {
+            assert_ne!(language.this_label(), language.other_label());
+        }
     }
 }

@@ -15,10 +15,11 @@ tracing = { workspace = true }
 msquic-async = { workspace = true }
 isekai-link-utils = { workspace = true }
 isekai-p2p = { workspace = true }
-# The privacy policy and the record of agreeing to it (`privacy`).
+# The privacy policy and the record of agreeing to it, re-exported as
+# `camera_core::privacy` for everything that already says so.
+isekai-privacy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-time = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

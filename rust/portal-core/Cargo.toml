@@ -18,6 +18,8 @@ isekai-link-utils = { workspace = true }
 # phase 1c-iii-b: the forwarding's own transport is this, not scaffolding
 # behind a feature.
 isekai-p2p = { workspace = true }
+# The privacy policy, its version, and the record of agreeing to it (`consent`).
+isekai-privacy = { workspace = true }
 tokio-util = { workspace = true }
 # Reading the `expires_at` the proxy puts on a grant (`grant`).
 time = { workspace = true }

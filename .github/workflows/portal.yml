@@ -216,12 +216,17 @@ jobs:
       # so a reused one is refused the second time. The forwarding side orders
       # no certificate; the serving side does, which is why its key is the one
       # that would matter if this ran often enough to meet the ACME limits.
+      # **`--accept-privacy-policy` on each of the three.** Both programs refuse
+      # to start until they are told the policy is agreed to; the agreement is
+      # recorded per user, and a runner is a fresh machine every time, so an
+      # unattended job passes the flag rather than inheriting a record.
       - name: Enrol the server and offer the service
         if: env.HAVE_KEYS == 'true'
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/portal-server.log"
           cargo run -q -p portal-server -- \
+            --accept-privacy-policy \
             --enroll --oidc github \
             --key "$RUNNER_TEMP/server-endpoint.pem" \
             --cert-key "$RUNNER_TEMP/server-cert.pem" \
@@ -248,6 +253,7 @@ jobs:
           # reading the catalogue, because a Grant names an Endpoint rather
           # than a listener.
           cargo run -q -p portal-server -- \
+            --accept-privacy-policy \
             --key "$RUNNER_TEMP/server-endpoint.pem" \
             --enroll --oidc github \
             --provisioning-key \
@@ -275,6 +281,7 @@ jobs:
           set -euo pipefail
           LOG="$RUNNER_TEMP/portal-client.log"
           cargo run -q -p portal-client -- \
+            --accept-privacy-policy \
             --enroll --oidc github \
             --provisioning-key-file "$RUNNER_TEMP/provisioning.key" \
             --key "$RUNNER_TEMP/client-endpoint.pem" \

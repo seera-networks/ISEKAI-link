@@ -136,6 +136,16 @@ ISEKAI_PROVISIONING_KEY -- see 'Letting a CI job in' in docs/portal.md, and note
 that the job also needs an Enrollment Key from the Identity side."
 )]
 struct Args {
+    /// agree to the privacy policy and carry on. It is recorded, so this is
+    /// asked once rather than on every run -- and again when the policy changes
+    #[argh(switch)]
+    accept_privacy_policy: bool,
+    /// print the privacy policy and exit
+    #[argh(switch)]
+    show_privacy_policy: bool,
+    /// forget this program's recorded agreement to the privacy policy and exit
+    #[argh(switch)]
+    withdraw_privacy_consent: bool,
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
     /// apps use
     #[argh(
@@ -699,6 +709,44 @@ fn forget_connection(live: &mut BTreeMap<String, BTreeSet<String>>, connection_i
         !held.is_empty()
     });
 }
+
+/// Answer the privacy-policy flags, and refuse a run that has not agreed.
+///
+/// `Ok(None)` carries on; `Ok(Some(code))` is a run that did what it was asked
+/// and should now stop.
+fn privacy_gate(args: &Args) -> anyhow::Result<Option<i32>> {
+    if prints_a_template_only(args) {
+        return Ok(None);
+    }
+    if args.withdraw_privacy_consent {
+        portal_core::consent::withdraw(APP)?;
+        eprintln!("forgot this machine's agreement to the privacy policy for {APP}");
+        return Ok(Some(0));
+    }
+    match portal_core::consent::gate(APP, args.accept_privacy_policy, args.show_privacy_policy)? {
+        portal_core::consent::Decision::Proceed => Ok(None),
+        portal_core::consent::Decision::Printed => Ok(Some(0)),
+    }
+}
+
+/// Whether this run does nothing but write a starter file.
+///
+/// **Not a use of the service, so not something to ask about.** These two print
+/// a template and exit, touching no network, no key and no personal
+/// information. `portal-server --example-config > portal-server.toml` is the
+/// first line of the guide, and a gate in front of it truncates that file to
+/// zero bytes and fails the *next* step on an empty catalogue — a refusal
+/// arriving as a different error, one step later.
+fn prints_a_template_only(args: &Args) -> bool {
+    args.example_config || args.example_gateway_config
+}
+
+/// The name this program's agreement is recorded under.
+///
+/// **Its own, not shared with `portal-client`.** Two programs on one machine
+/// are two installations to the person running them, which is the same reason
+/// the two camera applications are recorded apart.
+const APP: &str = "portal-server";
 
 /// Refuse a policy whose classes this server does not serve.
 ///
@@ -1389,6 +1437,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args: Args = argh::from_env();
+    // **Before `run`, and before anything `run` would do.** Standing a listener
+    // up and then asking whether personal information may be collected is
+    // asking after the fact. Nothing here opens a transport, so it costs a
+    // process that has not agreed nothing but the reading.
+    match privacy_gate(&args) {
+        // `leave` never returns, so these are the end of `main` rather than a
+        // value it produces; `return leave(..).await` makes the `.await`
+        // unreachable and says so at every build.
+        Ok(Some(code)) => portal_core::shutdown::leave(code).await,
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            portal_core::shutdown::leave(1).await
+        }
+    }
     // **Every path out of `run` goes through the same wind-down**, which is the
     // only shape that works here: `PeerDirectory`, the sessions and the
     // one-shot commands all open control-plane transports on the shared msquic
@@ -1746,6 +1809,25 @@ mod tests {
             assert!(d >= POLICY_RETRY_MIN, "backed off to {d:?}");
             assert!(d <= POLICY_RETRY_MAX, "backed off to {d:?}");
         }
+    }
+
+    /// **The guide's first line runs before anyone has agreed to anything.**
+    /// `portal-server --example-config > portal-server.toml` writes the file
+    /// the next step reads, and a gate in front of it leaves that file empty
+    /// and the failure one step away from its cause. Neither printer collects
+    /// anything, which is what the gate is about.
+    #[test]
+    fn printing_a_template_is_not_something_to_ask_about() {
+        let mut args = args_with(None, None);
+        assert!(
+            !prints_a_template_only(&args),
+            "an ordinary run has to be asked",
+        );
+        args.example_config = true;
+        assert!(prints_a_template_only(&args));
+        args.example_config = false;
+        args.example_gateway_config = true;
+        assert!(prints_a_template_only(&args));
     }
 
     /// **A grant names a protocol and so does a listener**, and this process

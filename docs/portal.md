@@ -29,6 +29,27 @@ You need an **ISEKAI account**, and a browser once, on each machine. Everything
 else — Endpoint keys, certificates, tokens — is generated or fetched on first
 use.
 
+### The privacy policy, once per program
+
+Both programs print the policy and refuse to start until they are told you
+agree to it:
+
+```sh
+portal-server --show-privacy-policy      # read it on its own
+portal-server --accept-privacy-policy …  # agree, and carry on with the run
+```
+
+**It is recorded**, per user and per program, so it is asked once rather than
+on every run — and again when the policy is revised, which is what the version
+at the top of it is for. `--withdraw-privacy-consent` forgets the answer on
+this machine.
+
+An unattended job passes the flag every time instead: a fresh runner has no
+record to inherit. The policy itself is
+[here](https://github.com/seera-networks/ISEKAI-link/blob/main/docs/privacy-policy.en.md)
+([日本語](https://github.com/seera-networks/ISEKAI-link/blob/main/docs/privacy-policy.ja.md)),
+and the programs print whichever your locale asks for.
+
 ### Download a release
 
 Grab the archive for your platform from
@@ -661,7 +682,8 @@ steps:
     run: |
       set -euo pipefail
       LOG="$RUNNER_TEMP/portal-client.log"
-      portal-client --enroll --oidc github \
+      portal-client --accept-privacy-policy \
+        --enroll --oidc github \
         --key "$RUNNER_TEMP/ci-endpoint.pem" \
         --label "gha-${GITHUB_RUN_ID}" \
         --map 15432:db > "$LOG" 2>&1 < /dev/null &
@@ -680,7 +702,11 @@ steps:
       kill -KILL "$PID" 2>/dev/null || true
 ```
 
-Four things in there are load-bearing.
+Five things in there are load-bearing.
+
+**`--accept-privacy-policy`.** Both programs refuse to start without it until
+the agreement has been recorded, and a runner is a new machine every time, so
+there is never a record to inherit.
 
 **`--key` under `$RUNNER_TEMP`.** One key registers one Endpoint, so a reused
 keypair is refused on the second run — a fresh one per job is the design, not
@@ -1198,6 +1224,7 @@ connection counters and which path they are about.
 | `no relay leg claims this connection` | a connection arrived that no leg accounts for. It works, over the relay only |
 | forwarding works but stays slow | check for `forwarding moved onto the direct path`. Without it you are on the relay, which is a round trip through someone else's machine |
 | a DNS query times out and small ones work | the response is over the size limit above |
+| the program prints the privacy policy and stops | it has not been told you agree to it. `--accept-privacy-policy` agrees and is recorded; `--show-privacy-policy` prints it without agreeing |
 | `403` on everything, and `--whoami` says `membership expired` / `was revoked` | a guest membership has ended. It is not a fault on this machine: ask the organization to extend it, and the next renewal picks it up |
 | `insufficient-permission` when standing a server up, showing a pairing code, or cutting a Ticket | a guest may connect and may not let anyone else in. `--whoami` says whether this sign-in is one |
 | the agent's wait runs out although the Gateway logged `policy: granted` | the grant is for a protocol nothing listens on. The Gateway's `--protocol` must name the class its policy declares; it is refused at startup now, so this is a server started before that check |

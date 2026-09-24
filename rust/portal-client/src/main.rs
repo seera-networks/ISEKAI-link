@@ -87,6 +87,16 @@ role beside it -- which needs the sign-in, and waits up to ten seconds. The
 Endpoint ID is printed either way, and it is the only thing on stdout."
 )]
 struct Args {
+    /// agree to the privacy policy and carry on. It is recorded, so this is
+    /// asked once rather than on every run -- and again when the policy changes
+    #[argh(switch)]
+    accept_privacy_policy: bool,
+    /// print the privacy policy and exit
+    #[argh(switch)]
+    show_privacy_policy: bool,
+    /// forget this program's recorded agreement to the privacy policy and exit
+    #[argh(switch)]
+    withdraw_privacy_consent: bool,
     /// identity API base URL (HTTPS). Defaults to the deployment the camera
     /// apps use
     #[argh(
@@ -340,6 +350,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args: Args = argh::from_env();
+    // **Before `run`, and before anything `run` would do.** Registering a
+    // device and then asking whether personal information may be collected is
+    // asking after the fact. Nothing here opens a transport, so it costs a
+    // process that has not agreed nothing but the reading.
+    match privacy_gate(&args) {
+        // `leave` never returns, so these are the end of `main` rather than a
+        // value it produces; `return leave(..).await` makes the `.await`
+        // unreachable and says so at every build.
+        Ok(Some(code)) => portal_core::shutdown::leave(code).await,
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            portal_core::shutdown::leave(1).await
+        }
+    }
     // **Every path out of `run` goes through the same wind-down**, which is the
     // only shape that works here: `PeerDirectory`, the sessions and the
     // one-shot commands all open control-plane transports on the shared msquic
@@ -404,7 +429,11 @@ async fn revoke_or_report(cfg: &P2pConfig, code: i32) -> i32 {
                  `portal-client --revoke-endpoint {} --reason task_finished`",
                 cfg.key.endpoint_id(),
             );
-            if code == 0 { 1 } else { code }
+            if code == 0 {
+                1
+            } else {
+                code
+            }
         }
     }
 }
@@ -448,7 +477,10 @@ async fn run(
         gateway: !args.gateway.is_empty(),
         task: args.task.is_some(),
     })?;
-    let key_path = args.key.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
+    let key_path = args
+        .key
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY));
     let tokens = args
         .auth0_tokens
         .clone()
@@ -869,6 +901,29 @@ async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
         *task = Some(cfg);
     }
 }
+
+/// Answer the privacy-policy flags, and refuse a run that has not agreed.
+///
+/// `Ok(None)` carries on; `Ok(Some(code))` is a run that did what it was asked
+/// and should now stop.
+fn privacy_gate(args: &Args) -> anyhow::Result<Option<i32>> {
+    if args.withdraw_privacy_consent {
+        portal_core::consent::withdraw(APP)?;
+        eprintln!("forgot this machine's agreement to the privacy policy for {APP}");
+        return Ok(Some(0));
+    }
+    match portal_core::consent::gate(APP, args.accept_privacy_policy, args.show_privacy_policy)? {
+        portal_core::consent::Decision::Proceed => Ok(None),
+        portal_core::consent::Decision::Printed => Ok(Some(0)),
+    }
+}
+
+/// The name this program's agreement is recorded under.
+///
+/// **Its own, not shared with `portal-server`.** Two programs on one machine
+/// are two installations to the person running them, which is the same reason
+/// the two camera applications are recorded apart.
+const APP: &str = "portal-client";
 
 /// What Identity says this sign-in is, for `--whoami`.
 ///

@@ -1,0 +1,15 @@
+[package]
+name = "isekai-privacy"
+version.workspace = true
+edition.workspace = true
+
+# **Its own crate, because two families of application need the same text.**
+# It began inside `camera-core`, which was right while the camera apps were the
+# only ones that asked. `portal-client` and `portal-server` ask now, and a
+# portal binary depending on `camera-core` to find out what it may collect
+# would be a worse arrangement than a small crate that knows one thing.
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
