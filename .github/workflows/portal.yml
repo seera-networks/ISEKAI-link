@@ -64,6 +64,16 @@ on:
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
+      # **The manifest and the lock.** A release is cut from a commit that
+      # moves `package.version` and nothing else, so without these a tag on it
+      # matches no path and the release job never runs -- the bundles are not
+      # built and nothing is attached. The header above predicted this for a
+      # `docs/`-only commit; a version bump is the case that actually happens.
+      # They earn their place apart from releases too: a dependency bumped in
+      # the workspace manifest changes what portal compiles against, and until
+      # now that could break it and stay green.
+      - 'rust/Cargo.toml'
+      - 'rust/Cargo.lock'
       - '.github/workflows/portal.yml'
   pull_request:
     paths:
@@ -82,6 +92,16 @@ on:
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
+      # **The manifest and the lock.** A release is cut from a commit that
+      # moves `package.version` and nothing else, so without these a tag on it
+      # matches no path and the release job never runs -- the bundles are not
+      # built and nothing is attached. The header above predicted this for a
+      # `docs/`-only commit; a version bump is the case that actually happens.
+      # They earn their place apart from releases too: a dependency bumped in
+      # the workspace manifest changes what portal compiles against, and until
+      # now that could break it and stay green.
+      - 'rust/Cargo.toml'
+      - 'rust/Cargo.lock'
       - '.github/workflows/portal.yml'
   workflow_dispatch:
 
