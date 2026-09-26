@@ -277,6 +277,18 @@ struct BindGuard {
     /// [`renew_connections`](ListenerSession::renew_connections) last looked.
     inbound: InboundActivity,
     seen: u64,
+    /// When [`carried_traffic`](Self::carried_traffic) last saw new bytes on
+    /// this leg, or when the leg was bound if it never has.
+    ///
+    /// Diagnostic only (isekai-link#212): [`renew_connections`] only renews a
+    /// connection's row with the proxy for a leg that is still carrying
+    /// traffic, which is expected to go permanently quiet once a session
+    /// migrates onto a direct path -- so a long-idle leg here is not itself
+    /// evidence of anything wrong. Logged at the point this leg gets dropped
+    /// so a real occurrence shows whether that drop lines up with a
+    /// direct-path migration (long idle) or looks like something else (short
+    /// idle, i.e. the leg was still the one actually carrying traffic).
+    last_traffic: tokio::time::Instant,
     /// Re-tickets this leg so the proxy does not reclaim it (spec §8.14).
     ///
     /// **Not what `renew_connections` does.** That reports state, which carries
@@ -305,6 +317,9 @@ impl BindGuard {
         let count = self.inbound.count();
         let moved = count != self.seen;
         self.seen = count;
+        if moved {
+            self.last_traffic = tokio::time::Instant::now();
+        }
         moved
     }
 }
@@ -508,7 +523,9 @@ impl ListenerSession {
         let (ticket, renewable) = match self.proxy.issue_relay_ticket(connection_id).await {
             Ok(ticket) => (Some(ticket), true),
             Err(e) => match crate::relay_lease::verdict(&e) {
-                crate::relay_lease::Verdict::Refused | crate::relay_lease::Verdict::LegGone => {
+                crate::relay_lease::Verdict::Refused
+                | crate::relay_lease::Verdict::LegGone
+                | crate::relay_lease::Verdict::Elsewhere => {
                     return Err(anyhow::anyhow!(
                         "the proxy will not authorize a relay leg for {connection_id}: {e}"
                     ));
@@ -600,6 +617,7 @@ impl ListenerSession {
                 handle,
                 inbound,
                 seen: 0,
+                last_traffic: tokio::time::Instant::now(),
                 _lease: lease,
             },
         );
@@ -680,6 +698,7 @@ impl ListenerSession {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ended {
+            tracing::info!(connection_id = %id, "the relay leg's own session ended; unbinding");
             self.unbind(&id);
             state.bound.remove(&id);
             state.spent.insert(id.clone());
@@ -687,6 +706,19 @@ impl ListenerSession {
         }
         // Connections the proxy no longer lists are over; drop their legs too.
         for id in forget_gone(state, &listing.connections) {
+            // Diagnostic only (isekai-link#212): distinguishes this path from
+            // `ended` above, and `idle_for` says whether this leg had already
+            // gone quiet (expected once a session migrates to a direct path,
+            // since `renew_connections` only renews a leg that is still
+            // carrying traffic) or was still active when the proxy stopped
+            // listing it (which would point elsewhere).
+            if let Some(guard) = self.binds.get(&id) {
+                tracing::warn!(
+                    connection_id = %id,
+                    idle_for = ?guard.last_traffic.elapsed(),
+                    "the proxy no longer lists this connection; unbinding its relay leg",
+                );
+            }
             self.unbind(&id);
             events.push(SignalingEvent::Unbound { connection_id: id });
         }
@@ -912,10 +944,19 @@ async fn drive_bind_session(
                         );
                         attached.attach(socket, session.observed());
                     } else {
-                        tracing::debug!("bind session event: {event:?}");
+                        // Was `debug!`: everything else this can carry --
+                        // `ResponseBodyEnded`, `ResponseBodyReceiveError`, the
+                        // `*Failed` variants -- is exactly the kind of thing
+                        // that would explain why a leg ended, and none of it
+                        // was visible at the log level portal-server normally
+                        // runs at (isekai-link#212).
+                        tracing::info!("bind session event: {event:?}");
                     }
                 }
-                None => break,
+                None => {
+                    tracing::info!("this leg's event channel closed; its session has ended");
+                    break;
+                }
             },
             changed = leg.changed(), if leg_open => {
                 leg_open = republish_observed(&mut leg, &observed_tx, changed.is_ok());
@@ -1516,6 +1557,7 @@ mod tests {
             handle: tokio::spawn(std::future::ready(())),
             inbound,
             seen: 0,
+            last_traffic: tokio::time::Instant::now(),
             _lease: None,
         }
     }
