@@ -90,10 +90,56 @@ FAIL  2. no PathAdded within 10s -- 0 datagram(s) reached the new leg,
          so the probe was never sent (no destination CID for the new path?)
 ```
 
-**これは設計の前提条件である。** 貼り直しは「予備の destination CID がある」
-ことに依存し、CID は接続越しに届く — **唯一の生きたパスが死んでいれば、
-補充できない。** `QUIC_ACTIVE_CONNECTION_ID_LIMIT` は核のコンパイル時定数で、
-Rust 側から動かす口は無い。
+#### どこで詰まっているか（追試の結果）
+
+`QuicPathIDAssignCids` の中で `QuicSendSetSendFlag` が呼ばれていない、という
+見立てを試した。**そこは直しても変わらない** — 20 回走らせて失敗の仕方も率も
+同じで、失敗した回はやはり「新しいレグに 0 個」だった。
+
+理由は**唯一の呼び出し元がすでに呼んでいる**からである。
+
+```c
+// connection.c:5397 — NEW_CONNECTION_ID を受け取ったときの処理の中
+if (QuicPathIDAssignCids(PathID)) {
+    QuicSendSetSendFlag(&Connection->Send, QUIC_CONN_SEND_FLAG_PATH_CHALLENGE);
+}
+```
+
+**そして、その唯一の呼び出し元が受信処理である。** `QuicPathIDAssignCids` も
+`QuicConnAssignPathIDs` も、**相手から NEW_CONNECTION_ID / PATH_NEW_CONNECTION_ID
+が届いたときにしか走らない。**
+
+詰まりはもう 1 段上にある。
+
+```c
+// QuicConnOpenNewPath — add_path から呼ばれる
+if (Connection->State.MultipathNegotiated) {
+    PathID = QuicPathIDSetGetUnusedPathID(&Connection->PathIDs);   // 新しい path id
+    ...
+}
+```
+
+**multipath では、新しいパスは新しい path id を取る。そして生まれたばかりの
+path id には destination CID が 1 つも無い** — それは相手が
+`PATH_NEW_CONNECTION_ID` で**その path id に対して**発行してくるものである。
+
+つまり `add_path` の時点で challenge が出るかどうかは、**相手がその path id 用の
+CID を既に発行済みかどうか**という競争に掛かっている。そして出なかった場合、
+補充は受信処理でしか起きないので、**唯一の生きたパスが死んでいれば永久に来ない。**
+
+> 古いレグを生かしたままでも 6/8 だったのは、これで説明がつく。相手は**まだ
+> 使われていない path id のために CID を先回りして出してはくれない。**
+
+#### したがって手は 3 つある
+
+| | |
+| --- | --- |
+| **A. msquic を直す** | `QuicConnOpenNewPath` が新しい path id を取ったとき、その path id 用の CID を相手に要求する（または相手が上限まで先回りして発行する）。**上流の変更** |
+| **B. レグが生きているうちにパスを開いておく** | 2 本目のパスを**健全なうちに**自分の loopback ソケットへ開き、CID を取らせておく。貼り直しは「そのソケットの先に新しい MASQUE クライアントを繋ぎ替える」になり、`add_path` を死んだあとに呼ばない |
+| **C. multipath を使わない** | `MultipathNegotiated` が偽なら新しいパスは `Paths[0]` の path id を共有し、その CID を使える（`connection.c` の `else` 側）。ただし multipath はこの計画の前提そのものである |
+
+**B が有望である。** msquic を変えずに済み、しかも「死んでから CID を待つ」と
+いう本質的に成立しない順序を避けられる。§4 の P0b はこれを試すことになる。
 
 > 試して**効かなかった**こと: レグを止める前に 0.2 秒・2 秒待つ（8 回ずつ、
 > どれも 6/8）。古いレグを生かしたまま `add_path` する（6/8）。
@@ -347,7 +393,7 @@ listener では**すべてのパスが 1 つのバインディングのローカ
 | # | やること | 出口 |
 | --- | --- | --- |
 | **P0** ◐ | **spike**（`portal-core/examples/relay_repath_spike.rs`） | **server 側の msquic 操作が要らないことは決まった。** かわりに阻害要因が出た（§0.1.1）— **destination CID が無ければプローブが出ない。** P0 はそれが解けるまで閉じない |
-| **P0b** | 予備の destination CID を確保する方法を見つける（§5-7） | **`add_path` が黙らない。** これが無いと P4 は 3 回に 1 回動かない |
+| **P0b** | §0.1.1 の **B** を試す — レグが健全なうちに 2 本目のパスを開き、CID を取らせておく | **`add_path` が黙らない。** これが無いと P4 は動いたり動かなかったりする |
 | **P1** | レグの死を client に届ける（§1.3 の配線）。貼り直しはしない | 「フォールバックが消えた」が**ログに出る**。いまは無音 |
 | **P2** | `path.rs` が「リレーのペアは動く」を知る（§1.4 の 2 箇所） | **まだ何も動かないが、P3 がこれ無しでは出せない**（§4 の注） |
 | **P3** | 貼り直し — 新しい `peer_connect` と `ConnectRelay`、古い側の後始末（§2.2） | 新しいレグが立つ。inner QUIC はまだ使わない |
@@ -386,10 +432,10 @@ listener では**すべてのパスが 1 つのバインディングのローカ
 5. **`add_path` から `PathAdded` まで**。**214 µs 〜 1.2 ms** は下限である —
    時計は `add_path` が返ったあとに始めており、イベントキューは誰も drain して
    いない
-7. **予備の destination CID をどう確保するか**（§0.1.1）。**これが P0 の成果の
-   うち、いちばん重い。** `QUIC_ACTIVE_CONNECTION_ID_LIMIT` は核の定数で、
-   msquic-async から触る口は無い。レグが死ぬ**前**に予備を持てるのか、
-   持てているかを外から確かめられるのか、どちらも分かっていない
+7. **新しい path id 用の CID をどう手に入れるか**（§0.1.1）。**これが P0 の
+   成果のうち、いちばん重い。** 相手が先回りして発行してくれない以上、
+   レグが死んだあとに取る手は無い。§0.1.1 の B（健全なうちに開いておく）が
+   成立するかは試していない
 6. **listener 側で `advertise` が 2 度目に何をするか**（§2.2-3）。spike は
    `ListenerSession` を使っていないので、ここは答えていない
 
