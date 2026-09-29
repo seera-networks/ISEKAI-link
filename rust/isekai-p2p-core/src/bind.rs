@@ -613,6 +613,8 @@ async fn open_bound_udp(
 pub struct ConnectRelay {
     /// The local UDP address the application should send its traffic to.
     pub local_addr: SocketAddr,
+    /// Cancelled when the leg stops carrying traffic, for any reason.
+    ended: CancellationToken,
     relay_origin: String,
     observed: ObservedAddressWatch,
     shutdown: CancellationToken,
@@ -642,6 +644,23 @@ impl ConnectRelay {
     /// `add_candidate_addr` to offer a direct path.
     pub fn observed(&self) -> ObservedAddressWatch {
         self.observed.clone()
+    }
+
+    /// Cancelled when the leg has stopped carrying traffic.
+    ///
+    /// **Not the same token as [`shutdown_token`](Self::shutdown_token), and
+    /// the difference is the whole point.** That one is how a holder *asks* the
+    /// leg to stop; this one is how the holder is *told* it has — including
+    /// when nobody asked, which is what a relay restarting looks like from
+    /// here.
+    ///
+    /// Until this existed there was no way to know. The bridge runs on the H3
+    /// executor and is not handed back, so a leg whose tunnel ended simply
+    /// stopped forwarding: the connection riding it went quiet, and a session
+    /// already on a direct path lost its fallback without a word
+    /// (`docs/relay_repath_plan.md` §1.3).
+    pub fn ended(&self) -> CancellationToken {
+        self.ended.clone()
     }
 
     /// The token that winds this leg down, for a holder that has to end the
@@ -752,16 +771,17 @@ pub async fn open_connect_relay(
         .context("failed to read local relay socket address")?;
 
     let session_shutdown = shutdown.clone();
-    // Signals that `start_connect_udp` has established the leg (or failed to).
-    let (ready_tx, ready_rx) = oneshot::channel();
+    // Signals that `start_connect_udp` has established the leg (or failed to),
+    // and hands back the token that says when it stopped.
+    let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<CancellationToken>>();
     let task = tokio::spawn(async move {
         let mut client = MasqueClient::new(channel, None);
         match client
             .start_connect_udp(&target_path, Vec::new(), socket, session_shutdown.clone())
             .await
         {
-            Ok(()) => {
-                let _ = ready_tx.send(Ok(()));
+            Ok(ended) => {
+                let _ = ready_tx.send(Ok(ended));
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(anyhow::anyhow!(
@@ -775,8 +795,9 @@ pub async fn open_connect_relay(
     });
 
     match ready_rx.await {
-        Ok(Ok(())) => Ok(ConnectRelay {
+        Ok(Ok(ended)) => Ok(ConnectRelay {
             local_addr,
+            ended,
             relay_origin: dialled,
             observed,
             shutdown,

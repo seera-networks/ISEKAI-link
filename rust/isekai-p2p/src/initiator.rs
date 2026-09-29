@@ -705,6 +705,18 @@ impl InitiatorSession {
             handle.shutdown_token(),
             ended.clone(),
         );
+        // **Said, because nothing else will say it.** A leg that stops carrying
+        // traffic is invisible from above: a session still on the relay goes
+        // quiet and times out half a minute later with no reason given, and a
+        // session that has migrated to a direct path keeps working -- with its
+        // fallback gone, which nobody learns until the direct path goes too
+        // (`docs/relay_repath_plan.md` P1).
+        report_when_the_leg_goes(
+            handle.ended(),
+            handle.shutdown_token(),
+            connection.connection_id.clone(),
+            handle.relay_origin().to_owned(),
+        );
         Ok(Self {
             local_addr: handle.local_addr,
             connection,
@@ -816,11 +828,104 @@ impl InitiatorSession {
     }
 }
 
+/// Watch a relay leg, and say so if it stops on its own.
+///
+/// **Only when nobody asked for it.** Winding a session down cancels the leg
+/// too, and reporting that would put a warning on every ordinary close --
+/// which is how a warning stops being read. The two tokens tell them apart:
+/// `shutdown` is the ask, `ended` is what happened.
+///
+/// This reports and does nothing else. Re-attaching is a later phase; what
+/// this buys now is that a session running on one leg instead of two can be
+/// counted (`docs/relay_repath_plan.md` §4 P1).
+fn report_when_the_leg_goes(
+    ended: CancellationToken,
+    shutdown: CancellationToken,
+    connection_id: String,
+    relay_origin: String,
+) {
+    tokio::spawn(async move {
+        if let LegOutcome::Gone = watch_leg(ended, shutdown).await {
+            tracing::warn!(
+                connection_id,
+                relay = %relay_origin,
+                "the relay leg has gone and nothing replaced it. A connection still on \
+                 the relay will stop; one that migrated to a direct path keeps working \
+                 with no fallback left, and will end if that path does",
+            );
+        }
+    });
+}
+
+/// How a relay leg stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegOutcome {
+    /// Somebody asked it to. The ordinary close.
+    WoundDown,
+    /// It stopped on its own. **This is the one worth a word.**
+    Gone,
+}
+
+/// Wait for a leg to stop, and say which kind of stopping it was.
+///
+/// **A teardown cancels both tokens**, often in the same breath, so `select!`
+/// alone would report a failure on every ordinary close -- whichever arm the
+/// scheduler happened to poll first. The re-check is what makes the answer
+/// depend on what happened rather than on which branch won.
+async fn watch_leg(ended: CancellationToken, shutdown: CancellationToken) -> LegOutcome {
+    tokio::select! {
+        _ = shutdown.cancelled() => LegOutcome::WoundDown,
+        _ = ended.cancelled() => match shutdown.is_cancelled() {
+            true => LegOutcome::WoundDown,
+            false => LegOutcome::Gone,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SERVER_NOW: i64 = 1_800_000_000;
+
+    /// A leg that stops because nobody is using the session any more is the
+    /// ordinary close, and warning about it would put a warning on every exit
+    /// -- which is how a warning stops being read.
+    #[tokio::test]
+    async fn winding_the_session_down_is_not_a_lost_leg() {
+        let ended = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert_eq!(watch_leg(ended, shutdown).await, LegOutcome::WoundDown,);
+    }
+
+    /// The case this exists for: the leg stopped and nobody asked it to.
+    #[tokio::test]
+    async fn a_leg_that_stops_on_its_own_is_reported() {
+        let ended = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        ended.cancel();
+        assert_eq!(watch_leg(ended, shutdown).await, LegOutcome::Gone);
+    }
+
+    /// **Both at once is the teardown**, because cancelling a session cancels
+    /// the leg too. Reading it as a loss would depend on which arm `select!`
+    /// polled first -- a warning that appears on some ordinary closes and not
+    /// others, which is worse than one that never appears.
+    #[tokio::test]
+    async fn a_teardown_that_cancels_both_is_still_a_teardown() {
+        for _ in 0..50 {
+            let ended = CancellationToken::new();
+            let shutdown = CancellationToken::new();
+            ended.cancel();
+            shutdown.cancel();
+            assert_eq!(
+                watch_leg(ended, shutdown).await,
+                LegOutcome::WoundDown,
+                "whichever branch won",
+            );
+        }
+    }
 
     fn stamp(unix_secs: i64) -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(unix_secs)
