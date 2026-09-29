@@ -23,7 +23,9 @@
 # the cargo workspace (`../submodules/tonic-h3`, `../submodules/msquic-async-rs`),
 # and the default copies only the workspace -- so the copy cannot resolve them
 # and every mutant is unviable. In place, the tree is mutated and restored; a
-# run killed hard leaves one file changed, which `git checkout` undoes.
+# run killed hard leaves one file changed, which `git checkout` undoes -- and
+# the next run refuses with `cargo test failed in an unmutated tree` rather
+# than testing against it, which is the right way round.
 
 # **Tests that make a connection get longer.** The auto-set timeout comes from
 # the baseline run, and a mutant that makes something loop or wait needs to be

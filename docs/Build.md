@@ -316,7 +316,10 @@ cargo mutants --in-place --package portal-core
 > and cargo-mutants' default is to copy the workspace alone — which cannot
 > resolve them, so every mutant comes back `unviable` and the run says nothing.
 > In place, each file is mutated and restored as it goes; a run killed hard
-> leaves one file changed, which `git checkout` undoes.
+> leaves one file changed, which `git checkout` undoes. The next run says so
+> rather than working around it — `cargo test failed in an unmutated tree` is
+> what a leftover mutation looks like, so check `git status` before blaming
+> the suite.
 
 Reading the output:
 
