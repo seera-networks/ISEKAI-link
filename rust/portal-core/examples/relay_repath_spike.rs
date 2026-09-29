@@ -155,22 +155,29 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
     // because the only code that assigns one runs on the receive path and
     // nothing is arriving any more.
     //
-    // **Waiting does not reliably fix it**, which is why the default is zero.
-    // Measured on an uninstrumented build, with a 0 ms control interleaved so a
-    // quiet spell could not pass for an effect:
+    // **Waited out on purpose**, and this is the whole finding of the spike.
     //
-    //     settle     failed
-    //     0 ms       11 / 30   and  4 / 20
-    //     2000 ms     6 / 30
-    //     5000 ms     3 / 20
+    // At the handshake both ends create path ids up to the limit and generate
+    // source CIDs for each (`crypto.c:1653`), and the peer's
+    // `PATH_NEW_CONNECTION_ID` frames then have to cross. An LTTng trace of a
+    // failing run shows the server queueing its CIDs for path ids 1-3
+    // **3.8 microseconds after the last packet arrived** -- the relay was
+    // already gone, and the client never gets a destination CID for path id 1.
+    // `add_path` then opens a path msquic will never probe, because the only
+    // code that assigns one runs on the receive path.
     //
-    // Five seconds is far more than the frames need, so the runs that fail are
-    // ones where the peer appears never to have sent CIDs for the new path id
-    // at all. See `docs/relay_repath_plan.md` §0.1.1.
+    // Measured under LTTng, alternating with a 0 ms control so a quiet spell
+    // could not pass for an effect:
+    //
+    //     settle      failed
+    //     0 ms        6 / 15
+    //     5000 ms     0 / 15   (and 0 / 25 separately)
+    //
+    // `RELAY_REPATH_SETTLE_MS=0` reproduces the race.
     let settle = std::env::var("RELAY_REPATH_SETTLE_MS")
         .ok()
         .and_then(|ms| ms.parse::<u64>().ok())
-        .unwrap_or(0);
+        .unwrap_or(5000);
     if settle > 0 {
         tokio::time::sleep(Duration::from_millis(settle)).await;
     }
