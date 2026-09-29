@@ -412,12 +412,35 @@ mod tests {
     /// Poisoning is ignored on purpose: a panic in one of these tests has
     /// already failed that test, and turning it into a second, confusing
     /// failure in the other helps nobody.
+    ///
+    /// **And it puts back what it found.** The directory it points at is a
+    /// `TempDir` that is deleted when the test ends, so leaving the variable
+    /// behind would aim anything added to this binary later at a path that no
+    /// longer exists -- a failure that depends on test order, which is what
+    /// this exists to stop.
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
-    fn config_dir_to_itself(dir: &std::path::Path) -> std::sync::MutexGuard<'static, ()> {
+    struct OwnedEnvironment {
+        _held: std::sync::MutexGuard<'static, ()>,
+        was: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    impl Drop for OwnedEnvironment {
+        fn drop(&mut self) {
+            match &self.was {
+                Some(was) => std::env::set_var("XDG_CONFIG_HOME", was),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    fn config_dir_to_itself(dir: &std::path::Path) -> OwnedEnvironment {
         static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let held = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+        let was = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", dir);
-        held
+        OwnedEnvironment { _held: held, was }
     }
 
     /// **Recorded, read back, and forgotten** — the three together, because

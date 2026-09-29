@@ -295,12 +295,20 @@ restates the code rather than testing its decision.
 cargo install cargo-mutants --locked
 
 # What your change would let through -- the one to run before a PR
-git diff origin/main... > /tmp/pr.diff
+git diff --relative origin/main... -- . > /tmp/pr.diff
 cargo mutants --in-place --in-diff /tmp/pr.diff
 
 # One crate, whole
 cargo mutants --in-place --package portal-core
 ```
+
+> [!IMPORTANT]
+> **`--relative` is not optional either.** Run from `rust/`, git still writes
+> paths from the repository root (`a/rust/privacy/src/lib.rs`), and
+> cargo-mutants matches them against the workspace it is running in — finds
+> nothing, prints `No mutants to filter`, and exits 0. Both of this tool's ways
+> of going wrong here are silent successes, so CI checks for this one rather
+> than trusting the command line.
 
 > [!IMPORTANT]
 > **`--in-place` is not optional in this workspace.** Several crates depend on

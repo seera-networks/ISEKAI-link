@@ -62,11 +62,19 @@ jobs:
       # is looked for rather than assumed away.
       - name: What this pull request changed
         if: github.event_name == 'pull_request'
+        # **Through the environment, not spliced into the script.** A `${{ }}`
+        # is substituted before bash sees the line, so a branch name carrying
+        # a quote would run as a command rather than name a branch.
+        env:
+          BASE: ${{ github.base_ref }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=0 origin "${{ github.base_ref }}"
-          git diff --relative "origin/${{ github.base_ref }}...HEAD" -- . \
-            > "$RUNNER_TEMP/pr.diff"
+          # **No fetch.** `fetch-depth: 0` above already brought the whole
+          # history and every remote-tracking branch. The `--depth=0` that
+          # stood here is rejected by git outright -- "depth 0 is not a
+          # positive number" -- and under `set -e` that failed the job before
+          # a single mutant was built, on every pull request.
+          git diff --relative "origin/$BASE...HEAD" -- . > "$RUNNER_TEMP/pr.diff"
           echo "diff is $(wc -l < "$RUNNER_TEMP/pr.diff") lines"
           if grep -q '^diff --git a/rust/' "$RUNNER_TEMP/pr.diff"; then
             echo "::error::the diff carries a rust/ prefix, so cargo-mutants would"
@@ -87,12 +95,17 @@ jobs:
       # blocking is deleting two characters, once the baseline is known and the
       # exclusions in `rust/.cargo/mutants.toml` have earned their place.
       - name: Test the mutants
+        # Same reasoning as above: the crate name comes from a dispatch form,
+        # and a form field is not a place to take shell from.
+        env:
+          EVENT: ${{ github.event_name }}
+          PACKAGE: ${{ inputs.package }}
         run: |
           set -uo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "$EVENT" = "pull_request" ]; then
             cargo mutants --in-place --in-diff "$RUNNER_TEMP/pr.diff" || true
-          elif [ -n "${{ inputs.package }}" ]; then
-            cargo mutants --in-place --package "${{ inputs.package }}" || true
+          elif [ -n "$PACKAGE" ]; then
+            cargo mutants --in-place --package "$PACKAGE" || true
           else
             cargo mutants --in-place || true
           fi
