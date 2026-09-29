@@ -787,6 +787,15 @@ impl InitiatorSession {
     /// runs on the way out, the connection expires on its own either way, and
     /// there is nothing a disconnecting application could do with the error.
     pub async fn close(self) {
+        // **The ask goes first, before anything that can make the leg stop.**
+        // Reporting `closed` below is what frees the connection's relay
+        // resources, so a prompt proxy tears the CONNECT-UDP session down while
+        // that call is still in flight — and with the ask unspoken, the watcher
+        // in `report_when_the_leg_goes` would read the leg's own end as a loss
+        // and warn on every clean disconnect. Cancelling here costs nothing:
+        // `report_state` rides the control-plane client, not this leg, and
+        // `relay.close()` below still does the waiting.
+        self.relay.shutdown_token().cancel();
         // Before the report: `closed` is terminal, so a renewal arriving behind
         // it is refused and logged as a failure that is only bad timing. Both
         // leases, for the same reason — a re-ticket would be refused with

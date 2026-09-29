@@ -659,6 +659,11 @@ impl ConnectRelay {
     /// stopped forwarding: the connection riding it went quiet, and a session
     /// already on a direct path lost its fallback without a word
     /// (`docs/relay_repath_plan.md` §1.3).
+    ///
+    /// **It reports the connection going, not one stream ending** — see
+    /// `MasqueClient::start_connect_udp`. A relay restarting is the first, so
+    /// the case this was built for is covered; a relay that closes just this
+    /// session and stays up is not.
     pub fn ended(&self) -> CancellationToken {
         self.ended.clone()
     }
