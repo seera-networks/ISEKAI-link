@@ -33,6 +33,15 @@
 # was swept in by a `git add -A` and removed again.
 /rust/gateway.toml
 
+# cargo-mutants writes its report here, and keeps the previous run beside it.
+/rust/mutants.out/
+/rust/mutants.out.old/
+
+# And a mutant that makes `config_dir` answer with a relative path writes the
+# consent record into the crate directory instead of the user's. The test that
+# catches that mutant runs after it, so the file is left behind either way.
+/rust/*/*-privacy-consent.json
+
 # iOS build outputs. `ios/build-rust.sh` writes the bindings and the
 # xcframework; `xcodegen generate` writes the project and its Info.plist. Only
 # ios/project.yml and ios/IsekaiCameraClient/App are tracked.

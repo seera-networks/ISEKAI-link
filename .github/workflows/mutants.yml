@@ -1,0 +1,124 @@
+# What the tests would let through.
+#
+# `cargo test` answers "does this pass?". This asks the other question: which
+# changes to the code would it still pass? Every answer is a line that is
+# exercised and not checked -- an assertion that restates the code rather than
+# testing the decision it makes. This repository has found that by hand several
+# times, by deliberately breaking something and watching the suite stay green.
+#
+# **On the diff, not the workspace.** A full run is 1,900 mutants and hours of
+# building; the diff of one pull request is tens, and it asks about the code
+# that was actually written. The cost tracks the change.
+name: Mutants
+
+on:
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/mutants.yml'
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'One crate to test whole (empty = the whole workspace)'
+        required: false
+        type: string
+
+jobs:
+  mutants:
+    name: What the tests would let through
+    runs-on: ubuntu-latest
+    # Generous, because each mutant is a build. The diff run is minutes; a
+    # manual whole-crate run is the one that needs the room.
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      # **Full history**, because the diff is taken against the base branch and
+      # a shallow clone has no merge base to take it from.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/submodules
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls quictls -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Built rather than downloaded, to avoid taking a third-party action for
+      # a two-minute compile that the cache above does not cover anyway.
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: What this pull request changed
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=0 origin "${{ github.base_ref }}"
+          git diff "origin/${{ github.base_ref }}...HEAD" -- . > "$RUNNER_TEMP/pr.diff"
+          echo "diff is $(wc -l < "$RUNNER_TEMP/pr.diff") lines"
+
+      # **`--in-place` is not a choice.** Crates here depend on paths outside
+      # the cargo workspace (`../submodules/...`), and the default copies the
+      # workspace alone -- so nothing resolves, every mutant comes back
+      # `unviable`, and the run reports success having tested nothing. A CI
+      # checkout is the process's own, so mutating it in place costs nothing.
+      #
+      # **`|| true`, deliberately.** A missed mutant is a question, not a
+      # verdict: a function whose only output is a log line has nothing to
+      # assert, and blocking on that would teach people to route around this
+      # job rather than read it. The answer is in the summary below. Making it
+      # blocking is deleting two characters, once the baseline is known and the
+      # exclusions in `rust/.cargo/mutants.toml` have earned their place.
+      - name: Test the mutants
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            cargo mutants --in-place --in-diff "$RUNNER_TEMP/pr.diff" || true
+          elif [ -n "${{ inputs.package }}" ]; then
+            cargo mutants --in-place --package "${{ inputs.package }}" || true
+          else
+            cargo mutants --in-place || true
+          fi
+
+      - name: Say what it found
+        if: always()
+        run: |
+          set -uo pipefail
+          out=mutants.out
+          [ -d "$out" ] || { echo "no report was written" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          missed=$(wc -l < "$out/missed.txt" 2>/dev/null || echo 0)
+          caught=$(wc -l < "$out/caught.txt" 2>/dev/null || echo 0)
+          unviable=$(wc -l < "$out/unviable.txt" 2>/dev/null || echo 0)
+          timeout=$(wc -l < "$out/timeout.txt" 2>/dev/null || echo 0)
+          {
+            echo "## What the tests would let through"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| caught | $caught |"
+            echo "| **missed** | **$missed** |"
+            echo "| unviable (did not compile) | $unviable |"
+            echo "| timed out (counted as caught) | $timeout |"
+            echo
+            if [ "$missed" -gt 0 ]; then
+              echo "Each line below is a change to the code that **every test still"
+              echo "passed** with. Some are fine — a function whose only output is a"
+              echo "log line has nothing to assert. The rest are tests worth having."
+              echo
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: rust/mutants.out/
+          if-no-files-found: ignore

@@ -375,6 +375,131 @@ mod tests {
         assert!(TEXT_EN.contains("SEERA Networks Corporation"));
     }
 
+    /// **Each rendering has to be the one it says it is.** Every test above
+    /// reads `TEXT_JA` and `TEXT_EN` directly, so nothing held `text()` to
+    /// returning them — a `Language` that handed back the wrong document, or
+    /// an empty one, would have passed the whole suite while showing somebody
+    /// a policy in a language they did not choose. (cargo-mutants found this:
+    /// `replace Language::text -> &'static str with ""` was missed.)
+    #[test]
+    fn a_language_hands_back_its_own_document() {
+        assert!(Language::Japanese.text().contains("プライバシーポリシー"));
+        assert!(Language::English.text().contains("Privacy Policy"));
+        assert_ne!(Language::Japanese.text(), Language::English.text());
+        // And not the other one's, which "contains" alone would allow if the
+        // documents ever quoted each other.
+        assert!(!Language::Japanese
+            .text()
+            .starts_with("# ISEKAI link Privacy"));
+    }
+
+    /// The link under the policy is the one that stays current, and following
+    /// it must not land on the document the reader just switched away from.
+    #[test]
+    fn each_link_points_at_the_text_beside_it() {
+        assert!(Language::Japanese.url().ends_with("privacy-policy.ja.md"));
+        assert!(Language::English.url().ends_with("privacy-policy.en.md"));
+        assert_eq!(Language::Japanese.toggled().url(), Language::English.url());
+    }
+
+    /// **The environment is process-wide**, and two tests that each point
+    /// `XDG_CONFIG_HOME` at their own directory will take each other's.
+    ///
+    /// It passed under `cargo test` and failed the moment cargo-mutants ran
+    /// the same suite — the ordering had been doing the work. Held rather than
+    /// hoped for.
+    ///
+    /// Poisoning is ignored on purpose: a panic in one of these tests has
+    /// already failed that test, and turning it into a second, confusing
+    /// failure in the other helps nobody.
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    fn config_dir_to_itself(dir: &std::path::Path) -> std::sync::MutexGuard<'static, ()> {
+        static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let held = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("XDG_CONFIG_HOME", dir);
+        held
+    }
+
+    /// **Recorded, read back, and forgotten** — the three together, because
+    /// separately none of them says anything: a `save` that wrote nowhere and
+    /// a `load` that always answered `None` agree with each other perfectly.
+    ///
+    /// (On Windows and macOS the directory comes from `APPDATA` and `HOME`
+    /// instead, which is why this is `cfg`-gated rather than written three
+    /// times.)
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn an_agreement_is_written_down_read_back_and_withdrawn() {
+        let dir = tempfile::tempdir().expect("a place to keep it");
+        let _environment = config_dir_to_itself(dir.path());
+        let app = "test-app";
+
+        // Nothing recorded yet, which is the state every first run is in.
+        assert!(load(app).is_none());
+        assert!(needs_agreement(load(app).as_ref()));
+
+        let written = save(app, Language::Japanese).expect("recorded");
+        // **Where it landed, not just that it round-trips.** A `config_dir`
+        // that answered with a relative path would save and load perfectly
+        // well against the working directory — which is the one place an
+        // agreement must not live, since it would then depend on where the
+        // program was started from. (cargo-mutants: `replace config_dir with
+        // Ok(Default::default())` was missed until this line.)
+        let expected = dir
+            .path()
+            .join("isekai-link")
+            .join(format!("{app}-privacy-consent.json"));
+        assert!(expected.is_file(), "nothing at {}", expected.display());
+        assert_eq!(written.version, VERSION);
+        assert_eq!(written.language, "ja");
+        // **The timestamp is the evidence half of the record**, so it has to
+        // be a time rather than whatever was cheapest to produce.
+        assert!(
+            time::OffsetDateTime::parse(
+                &written.accepted_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .is_ok(),
+            "accepted_at is {:?}",
+            written.accepted_at,
+        );
+
+        let read = load(app).expect("what was just written");
+        assert_eq!(read.version, written.version);
+        assert_eq!(read.accepted_at, written.accepted_at);
+        assert!(!needs_agreement(Some(&read)));
+
+        // **Another program's answer is not this one's.** Two programs on one
+        // machine are two installations to the person running them.
+        assert!(load("another-app").is_none());
+
+        forget(app).expect("withdrawn");
+        assert!(load(app).is_none(), "the record outlived the withdrawal");
+        // Withdrawing what is not there is the state it asks for, not an error
+        // -- a second `--withdraw-privacy-consent` must not fail.
+        forget(app).expect("withdrawing nothing");
+    }
+
+    /// **"Nothing to remove" is not the same as "could not remove it."** Only
+    /// the first is the state a withdrawal asks for; reporting the second as
+    /// success tells somebody their agreement is gone while the record is
+    /// still there and the next run still proceeds.
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn a_record_that_cannot_be_removed_is_reported() {
+        let dir = tempfile::tempdir().expect("a place to keep it");
+        let _environment = config_dir_to_itself(dir.path());
+        let app = "undeletable-app";
+        // A directory where the record goes: `remove_file` refuses it, with
+        // something that is not `NotFound`.
+        let path = dir
+            .path()
+            .join("isekai-link")
+            .join(format!("{app}-privacy-consent.json"));
+        std::fs::create_dir_all(&path).expect("a thing that is not a file");
+        forget(app).expect_err("a record that is still there is not forgotten");
+    }
+
     #[test]
     fn the_other_language_is_offered_by_name() {
         assert_eq!(Language::Japanese.other_label(), "English");

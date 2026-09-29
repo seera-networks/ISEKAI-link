@@ -13,3 +13,8 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
+
+[dev-dependencies]
+# The consent record is read and written through the platform's configuration
+# directory, so testing it at all means giving it one to use.
+tempfile = { workspace = true }

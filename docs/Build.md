@@ -11,6 +11,7 @@ This document describes how to build ISEKAI Link from source.
 - [3. Install OpenCV / libclang (for camera-server & camera-client)](#3-install-opencv--libclang-for-camera-server--camera-client)
 - [4. Build](#4-build)
 - [5. Run](#5-run)
+- [5-1. Testing, and what the tests would let through](#5-1-testing-and-what-the-tests-would-let-through)
 - [6. Connecting, and path migration](#6-connecting-and-path-migration)
 - [Troubleshooting](#troubleshooting)
 
@@ -276,6 +277,55 @@ Check the command-line arguments of each binary with `-- --help`:
 ```sh
 cargo run -p camera-server -- --help
 ```
+
+---
+
+## 5-1. Testing, and what the tests would let through
+
+```sh
+cargo test --workspace
+```
+
+The suite answers "does the code pass?". **Mutation testing asks the other
+question: which changes to the code would it still pass?** Every answer is a
+line that is exercised and not checked — the shape of an assertion that
+restates the code rather than testing its decision.
+
+```sh
+cargo install cargo-mutants --locked
+
+# What your change would let through -- the one to run before a PR
+git diff origin/main... > /tmp/pr.diff
+cargo mutants --in-place --in-diff /tmp/pr.diff
+
+# One crate, whole
+cargo mutants --in-place --package portal-core
+```
+
+> [!IMPORTANT]
+> **`--in-place` is not optional in this workspace.** Several crates depend on
+> paths outside it (`../submodules/tonic-h3`, `../submodules/msquic-async-rs`),
+> and cargo-mutants' default is to copy the workspace alone — which cannot
+> resolve them, so every mutant comes back `unviable` and the run says nothing.
+> In place, each file is mutated and restored as it goes; a run killed hard
+> leaves one file changed, which `git checkout` undoes.
+
+Reading the output:
+
+| | |
+| --- | --- |
+| `caught` | a test failed. That mutant is covered |
+| `MISSED` | **every test still passed** with the code changed. Either the behaviour is untested, or a test walks through it without asserting on what it decided |
+| `unviable` | the mutated code does not compile. Not a gap |
+| `timeout` | the mutant made something hang. Counted as caught |
+
+A `MISSED` is not automatically a defect — a function whose only output is a
+log line has nothing to assert. It is a question worth answering rather than a
+rule, and the answer is usually either a test or a note saying why not.
+
+`rust/.cargo/mutants.toml` holds what is excluded and why. CI runs this on the
+diff of every pull request that touches `rust/`, so the cost stays proportional
+to the change rather than to the workspace.
 
 ---
 

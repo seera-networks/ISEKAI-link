@@ -18,7 +18,7 @@
 //! is not agreement to the next one. That is the whole point of
 //! [`isekai_privacy::VERSION`].
 
-use isekai_privacy::{needs_agreement, Language};
+use isekai_privacy::{needs_agreement, Consent, Language};
 
 /// What the two flags between them say to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +49,7 @@ enum Outcome {
 /// configuration directory, which a test would have to move by environment
 /// variable — and environment variables are process-wide, so two tests doing it
 /// at once decide each other's outcome.
-fn decide(accept: bool, show: bool, agreed: bool) -> Outcome {
+fn decide(accept: bool, show: bool, recorded: Option<&Consent>) -> Outcome {
     // **Showing wins.** Somebody who asked to read it gets to read it, and a
     // run that passed both would otherwise print nothing and carry on --
     // agreeing to a text it never put on screen.
@@ -59,10 +59,16 @@ fn decide(accept: bool, show: bool, agreed: bool) -> Outcome {
     if accept {
         return Outcome::Record;
     }
-    if agreed {
-        return Outcome::Proceed;
+    // **The record, not a `bool` derived from it.** This took a `bool agreed`
+    // and the caller computed it with `!needs_agreement(..)` -- a negation
+    // outside every test, which cargo-mutants deleted without a single test
+    // noticing. Taking what was read closes that, and stops the three states
+    // (nothing recorded, an old version, this version) being flattened into
+    // two on the way in.
+    if needs_agreement(recorded) {
+        return Outcome::Refuse;
     }
-    Outcome::Refuse
+    Outcome::Proceed
 }
 
 /// Decide whether this run may go ahead, printing the policy when it may not.
@@ -76,8 +82,8 @@ fn decide(accept: bool, show: bool, agreed: bool) -> Outcome {
 /// and a run that did both would otherwise print nothing and carry on.
 pub fn gate(app: &'static str, accept: bool, show: bool) -> anyhow::Result<Decision> {
     let language = Language::preferred();
-    let agreed = !needs_agreement(isekai_privacy::load(app).as_ref());
-    match decide(accept, show, agreed) {
+    let recorded = isekai_privacy::load(app);
+    match decide(accept, show, recorded.as_ref()) {
         Outcome::Proceed => Ok(Decision::Proceed),
         Outcome::Record => {
             // **Not fatal when it cannot be written.** The person has agreed;
@@ -130,34 +136,53 @@ fn rendered(language: Language) -> String {
     )
 }
 
-/// Forget this program's recorded agreement.
+/// Forget this program's recorded agreement, so it is asked again.
 ///
 /// **There has to be a way back.** An agreement that cannot be withdrawn on the
 /// machine that recorded it is a setting, not an agreement.
-pub fn withdraw(app: &str) -> anyhow::Result<()> {
-    // **Not the path, rebuilt here.** Naming the file in two crates is how a
-    // rename in one of them leaves this reporting the agreement forgotten
-    // while the record is still on disk and the next run still proceeds.
-    isekai_privacy::forget(app)
-}
+///
+/// **Re-exported rather than wrapped.** The wrapper it replaces was one line
+/// of delegation, and cargo-mutants could turn it into `Ok(())` -- a
+/// withdrawal that reports success and removes nothing -- without a test
+/// noticing. A test for a line that forwards is worth less than not having the
+/// line: this way the only code is the one `isekai-privacy` tests.
+pub use isekai_privacy::forget as withdraw;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agreed(version: &str) -> Consent {
+        Consent {
+            version: version.to_owned(),
+            accepted_at: "2026-09-24T00:00:00Z".to_owned(),
+            language: "en".to_owned(),
+        }
+    }
 
     /// **The refusal is the whole feature.** A run that has not been told the
     /// policy is agreed to must not start, and the text has to reach the person
     /// who has to answer -- which is what `Refuse` carries beside the error.
     #[test]
     fn a_run_that_has_not_agreed_is_refused() {
-        assert_eq!(decide(false, false, false), Outcome::Refuse);
+        assert_eq!(decide(false, false, None), Outcome::Refuse);
     }
 
     /// Asked once, not every run. A flag that had to be repeated for ever ends
     /// up in a shell alias, which records nothing about anybody agreeing.
     #[test]
     fn a_recorded_agreement_carries_the_run() {
-        assert_eq!(decide(false, false, true), Outcome::Proceed);
+        let this = agreed(isekai_privacy::VERSION);
+        assert_eq!(decide(false, false, Some(&this)), Outcome::Proceed);
+    }
+
+    /// **The third state, which a `bool` could not carry.** An agreement to
+    /// last year's text is not an agreement to this one, and it is the state
+    /// every policy revision puts everybody into.
+    #[test]
+    fn an_agreement_to_another_version_is_refused() {
+        let old = agreed("2020-01-01");
+        assert_eq!(decide(false, false, Some(&old)), Outcome::Refuse);
     }
 
     /// Agreeing writes it down even when there is already a record: the record
@@ -165,8 +190,9 @@ mod tests {
     /// one is for.
     #[test]
     fn agreeing_records_it() {
-        assert_eq!(decide(true, false, false), Outcome::Record);
-        assert_eq!(decide(true, false, true), Outcome::Record);
+        let this = agreed(isekai_privacy::VERSION);
+        assert_eq!(decide(true, false, None), Outcome::Record);
+        assert_eq!(decide(true, false, Some(&this)), Outcome::Record);
     }
 
     /// **Reading it must be possible without agreeing to it**, which is the
@@ -174,8 +200,9 @@ mod tests {
     /// under an agreement nobody gave.
     #[test]
     fn asking_to_read_it_prints_it_and_stops() {
-        assert_eq!(decide(false, true, false), Outcome::Print);
-        assert_eq!(decide(false, true, true), Outcome::Print);
+        let this = agreed(isekai_privacy::VERSION);
+        assert_eq!(decide(false, true, None), Outcome::Print);
+        assert_eq!(decide(false, true, Some(&this)), Outcome::Print);
     }
 
     /// **Both flags together shows the policy.** The other way round is a run
@@ -183,7 +210,32 @@ mod tests {
     /// so the answer is the same whether or not there is a record already.
     #[test]
     fn showing_wins_over_accepting() {
-        assert_eq!(decide(true, true, false), Outcome::Print);
-        assert_eq!(decide(true, true, true), Outcome::Print);
+        let this = agreed(isekai_privacy::VERSION);
+        assert_eq!(decide(true, true, None), Outcome::Print);
+        assert_eq!(decide(true, true, Some(&this)), Outcome::Print);
+    }
+
+    /// **What is put on screen has to be the policy.** Nothing held `rendered`
+    /// to returning it, so a version of this that printed nothing at all would
+    /// have refused the run with a blank screen above the error and passed
+    /// every test -- which is the whole feature failing quietly.
+    #[test]
+    fn what_is_shown_is_the_policy_and_the_way_to_both_renderings() {
+        let english = rendered(Language::English);
+        assert!(english.contains("ISEKAI link Privacy Policy"), "{english}");
+        assert!(english.contains(isekai_privacy::VERSION), "{english}");
+        // Both links, so the reader can reach the other language and the
+        // current copy of this one.
+        assert!(english.contains("privacy-policy.en.md"));
+        assert!(english.contains("privacy-policy.ja.md"));
+        // Each label in the language it names (`this_label` / `other_label`).
+        assert!(english.contains("This text"));
+        assert!(english.contains("日本語"));
+
+        let japanese = rendered(Language::Japanese);
+        assert!(japanese.contains("プライバシーポリシー"), "{japanese}");
+        assert!(japanese.contains("この文書"));
+        assert!(japanese.contains("English"));
+        assert_ne!(english, japanese);
     }
 }
