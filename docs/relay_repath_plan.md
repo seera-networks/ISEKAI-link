@@ -13,8 +13,8 @@ related: portal_plan.md フェーズ4, p2p_mode_migration_plan.md, portal-core/s
 新しいレグを張り直し、multipath でそれをパスとして**足し**、古いリレーパスを
 **外す**。これがこの計画の内容である。
 
-> 以下、`§n` は本書の節。msquic の核は `submodules/msquic-async-rs/seera-msquic`
-> を指す。
+> 以下、`§n` は**本書**の節。仕様書を指すときは「**proxy 仕様 §n**」と書く。
+> msquic の核は `submodules/msquic-async-rs/seera-msquic` を指す。
 
 ---
 
@@ -37,10 +37,10 @@ forward 先にする）は成立する。**しかもこの役割分担は設計�
 
 | 操作 | portal-client（QUIC client） | portal-server（QUIC server） | 根拠 |
 | --- | :---: | :---: | --- |
-| `add_path` | **○** | ✕ `INVALID_STATE` | `QuicConnAddPath`（client は `ServerMigrationEnabled` も `Negotiated` も偽のときだけ通る／server は `Negotiated` が真のときだけ） |
+| `add_path` | **○** | ✕ `INVALID_STATE` | `QuicConnAddPath` |
 | `remove_path` | **○** | ✕ | `QuicConnRemovePath` |
 | `add_bound_addr` | ✕ | **○** | `QuicConnAddBoundAddress` |
-| `remove_bound_addr` | ✕ | **○** | `QuicConnRemoveBoundAddress`（加えて `HandshakeConfirmed` が要る） |
+| `remove_bound_addr` | ✕ | **○**（ただし §3.4） | `QuicConnRemoveBoundAddress` |
 | **受信パケットから新しいパスを作る** | ✕ | **○** | `path.c:358` |
 
 読み方は 2 つある。
@@ -51,33 +51,56 @@ forward 先にする）は成立する。**しかもこの役割分担は設計�
 
 提案はこの 2 行そのものである。
 
-### 0.2 壊れているのは client 側だけ、のはずである
+### 0.2 しかし listener は、死んだレグを貼り直さない — 意図的に
 
-| | いま何が起きるか |
+本書の初版はここに「server 側は何もしなくてよい可能性がある」と書いた。**誤りで
+ある。** 根拠にした `poll_and_bind` という関数は**存在しない** — `listener.rs:567`
+に残っている古いコメントの中の名前で、実物は `poll_signaling` である。そして
+その振る舞いは逆だった。
+
+```rust
+// listener.rs:685 — レグのタスクが終わったとき
+state.spent.insert(id.clone());
+// listener.rs:696 — 次の巡回
+|| state.spent.contains(&connection.connection_id)
+```
+
+**レグが死んだ接続は `spent` に入り、二度と bind されない。** `spent` が消えるのは
+プロキシがその接続を一覧から落としたとき（`forget_gone`）だけで、テスト
+`a_peer_whose_leg_died_is_not_bound_again` がこの規則を固定している。
+
+これは事故ではなく判断である。**同じ `connection_id` にレグを貼り直すのは、
+「一度死んだものを生き返らせる」という意味になる。**
+
+したがって server 側の道は 2 つしかない。
+
+| | |
 | --- | --- |
-| **client** | `dial` が `set_remote_addr(127.0.0.1, ConnectRelay::local_addr のポート)` で**最初のパスの宛先を固定**する。レグが死ぬとその UDP ソケットの相手が居なくなり、送り先が消える。新しいレグを開いても**新しいポート**なので、inner QUIC は古い宛先に送り続ける |
-| **server** | `ListenerSession` の `forward_to` は**セッション不変**で、`poll_and_bind` が同じ `connection_id` にレグを貼り直す。新しいレグから届くパケットは同じ `forward_to` に入り、**送信元ソケットだけが変わる** — §0.1 の 5 行目により、server 側はそれだけで新しいパスを作る |
+| **A. 新しい `connection_id` で入り直す** | client が `peer_connect` をやり直す。プロキシの一覧から古い ID が落ちれば `spent` も消え、listener は**新しい接続として**レグを貼る（既存の経路をそのまま使える） |
+| **B. `spent` の規則に例外を作る** | 「レグは死んだが inner QUIC は生きている」を listener が知る必要がある。listener はそれを知らない — 知っているのは client だけである |
 
-つまり **server 側は何もしなくてよい可能性がある。** これが最初に測ることであり
-（§4 P0）、もしそうなら `add_bound_addr` の分の作業は丸ごと消える。
+**A を採る。** B は listener に、自分の持っていない情報を前提にした例外を足す
+ことになる。A なら listener 側の変更は**ゼロかそれに近い**（§4 P0 で確かめる）。
 
-> **`add_bound_addr` が要るとすれば理由は 1 つだけ**である: `forward_to` が
-> リスナの共有バインディングを指しているために、**そこへ届いたパケットが
-> どの接続のものか DCID だけで決まる**こと。接続ごとに専用のバインディングを
-> 持たせたいなら `add_bound_addr` になる。**要ると分かってから足す。**
+その代わり **§2.2 が計画の中心になる**: 新しい `connection_id` で開いたレグを、
+**古い inner QUIC 接続**のパスとして足す、という非対称を扱うことになる。
 
-### 0.3 上限は 4 で、片付けは任意ではない
+### 0.3 上限は 4 で、しかも `remove_path` は即座には空けない
 
 `QUIC_MAX_PATH_COUNT` は **4**（`quicdef.h:398`）。リレーパス 1 + 直接経路 1 で
-既に 2 で、**貼り直すたびに 1 つ増える**。2 回目の再接続で上限に当たる。
+既に 2 で、貼り直すたびに 1 つ増える。
 
-`QuicConnAddPath` は上限で `QUIC_STATUS_OUT_OF_MEMORY` を返す。受信側
-（`path.c`）は「同じ remote address の非 active なパス」を rebind とみなして
-掃除するが、**貼り直したレグの remote address は毎回違う**ので当たらない。
+そして **multipath では `remove_path` は非同期である。** `MultipathNegotiated`
+が真のとき `QuicConnRemovePath` は `LocalClose` / `SendAbandon` を立てて
+`PATH_ABANDON` を送るだけで（`connection.c:8380` の `else` 側）、**`PathsCount`
+はその場では減らない。**
 
-したがって **`remove_path` は機能の一部**であって後始末ではない。そして
-§0.1 の表により、**それを呼べるのは client だけ**である。server 側で
-溜まったパスをどうするかは §3.4。
+- 「足してから外す」順序では、毎回 **N+1 が瞬間的な山**になる
+- リレーが数秒おきに落ちる（flapping）と、`QuicConnAddPath` が
+  `QUIC_STATUS_OUT_OF_MEMORY` を返す
+
+**片付けは機能の一部だが、それだけでは上限を保証しない。** 貼り直しの間隔に
+下限が要る（§3.3）。
 
 ---
 
@@ -90,81 +113,88 @@ forward 先にする）は成立する。**しかもこの役割分担は設計�
 conn.set_remote_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
 ```
 
-`port` は `ConnectRelay::local_addr` のポート、すなわち**この プロセスが開いた
+`port` は `ConnectRelay::local_addr` のポート、すなわち**このプロセスが開いた
 loopback UDP ソケット**で、MASQUE クライアントがその両端を面倒みている。inner
 QUIC から見れば、リレーは「loopback の相手」でしかない。
 
+### 1.2 前提は揃っている。ただし**条件付きで**
+
 `direct_path::prepare` が `share_binding(true)` / `unconnected_socket(true)` /
-`set_local_addr(127.0.0.1:0)` を立てているので、**`add_path` に必要な前提は
-すでに揃っている**（`add_path` の doc: unconnected socket ではローカルアドレスを
-具体的に指定すること、ポートは 0 でよい）。
+`set_local_addr(127.0.0.1:0)` を立てるので `add_path` の前提は揃う。
 
-### 1.2 レグが死んでも、誰も貼り直さない
+**しかし `prepare` が呼ばれるのは `candidate` があるときだけ**であり
+（`peer.rs:785`）、`MultipathEnabled` を立てる `enable_migration` も
+`candidate.is_some()` である（`peer.rs:775`）。そして `candidate` は
+`wait_for_observed` が時間内に観測アドレスを得られなければ `None` になり、
+セッションは**リレー専用**で続く（`session.rs:700`）。
 
-`InitiatorSession` は `open_connect_relay` を**一度だけ**呼ぶ。`RelayLegLease`
-はリースを延長するが、**レグそのものを作り直す口は無い**。プロキシがレグを
-忘れた場合は `handle.shutdown_token()` を引いて畳む側に回る。
+> **そしてリレー専用のセッションこそ、リレーが死ぬと即座に終わるものである。**
+> 直接経路という二本目が無いのだから。**本書の仕組みは、いちばん助けが要る
+> セッションには効かない。** §3.5 で扱う。
 
-### 1.3 `path.rs` は「リレーのペアは不変」を前提に書かれている
+### 1.3 レグが死んでも、client には誰も知らせない
 
-```rust
-let relay = match (conn.get_local_addr(), conn.get_remote_addr()) { ... };
-```
+`InitiatorSession` は `open_connect_relay` を**一度だけ**呼ぶ。そして
+`ConnectRelay` が公開しているのは `local_addr` / `relay_origin()` /
+`observed()` / `shutdown_token()` だけで、**H3 接続が終わったことを外へ出す口が
+無い**（`bind.rs:613`）。タスクは `start_connect_udp` が成功した後、自分の
+`session_shutdown.cancelled()` を待つだけである。
 
-`keep_on_the_best_path` は起動時に一度読んで、以後 `Paths::relay` として
-**定数のように扱う**。リレーパスが移動すると:
+気づく経路は事実上 `RelayLegLease` しかないが、そちらは §3.1 のとおり
+**気づいた瞬間にレグを畳んでループを抜ける**。
 
-- `Paths::added` が新しいリレーのペアを「リレーではない」＝直接経路の候補として
-  扱う
-- 直接経路が停まったときの `prefer_path(&conn, relay, relay, …)` が**死んだ
-  パスを指す**
-- `report_paths` の `preferred == None` は「リレーに乗っている」を意味する —
-  どのリレーに、が変わる
+### 1.4 `path.rs` は「リレーのペアは不変」を前提に書かれている
 
-**ここが一番作業量の読みにくい場所である。** §4 P4 で扱う。
+`keep_on_the_best_path` は起動時に一度読んで、以後**定数のように扱う**。しかも
+2 箇所に持っている:
+
+- `Paths::relay` — 「これはリレーか」の判定（`path.rs:229` ほか）
+- ループのローカル `relay`（`path.rs:465`）— `prefer_path` の 3 つの呼び出し
+  （`path.rs:538` / `:551` / `:597`）が使う
+
+**両方を動かさないと、片方だけ新しくなって死んだレグを指し続ける。**
 
 ---
 
 ## 2. 形
 
 ```text
-レグが死ぬ
+レグが死ぬ（client が知る）
    │
-   ├─ client: 新しい peer_connect →  新しい ConnectRelay（新しい loopback ポート）
-   │            │
-   │            ├─ conn.add_path(127.0.0.1:0, 新しい local_addr)
-   │            │      → PATH_CHALLENGE が新しいレグを通って出ていく
-   │            │
-   │            ├─ PathAdded（path_id 付き）を待つ
-   │            │      → Paths::relay を差し替える
-   │            │
-   │            └─ conn.remove_path(旧 local, 旧 remote)
+   ├─ 新しい peer_connect → 新しい connection_id・新しいチケット
+   │      └─ listener 側: 一覧に現れるので既存の poll_signaling がレグを貼る
    │
-   └─ server: poll_and_bind が同じ connection_id にレグを貼り直す（既存）
-                └─ 届いたパケットから新しいパスが生える（§0.1、要測定）
+   ├─ 新しい ConnectRelay（新しい loopback ポート）
+   │
+   ├─ conn.add_path(127.0.0.1:0, 新しい local_addr)
+   │      → PATH_CHALLENGE が新しいレグを通って出ていく
+   │
+   ├─ PathAdded（path_id 付き）を待つ
+   │      → path.rs の「リレーはこれ」を差し替える（§1.4、**先に要る**）
+   │
+   └─ conn.remove_path(旧 local, 旧 remote) — 非同期（§0.3）
 ```
 
 ### 2.1 `add_path` のローカルアドレス
 
 `127.0.0.1:0` を渡す。`add_path` の doc によれば、具体アドレスを渡したパスは
-**接続のバインディングを共有する** — つまりローカルポートは既存パスと同じに
-なる。新しい 4 タプルは `(同じ local, 新しい remote)` で、remote が違うので
-別のパスになる。
+**接続のバインディングを共有する** — ローカルポートは既存パスと同じになる。
+新しい 4 タプルは `(同じ local, 新しい remote)` で、remote が違うので別のパス
+になる。重複判定は 4 タプル一致なので `ADDRESS_IN_USE` は起きない。
 
-**`ADDRESS_IN_USE` は起きない**（`QuicConnAddPath` の重複判定は 4 タプル一致）。
+### 2.2 inner QUIC は 1 つ、`connection_id` は 2 つ
 
-### 2.2 「新しい peer_connect」なのか「同じ connection_id の貼り直し」なのか
+§0.2 の A を採ると、**プロキシから見た「接続」が変わるのに、その上を通る QUIC
+接続は同じ**という状態になる。確かめることが 3 つある。
 
-レグを開くには**チケット**が要り（§8.14）、チケットは `peer_connect` の応答に
-乗ってくる。リレーが死んだとき、
-
-- **同じ `connection_id` のまま新しいチケットを取れる**なら、貼り直しは安い
-- 取れない（プロキシ側でエッジごと消えている）なら、**`peer_connect` をやり直す**
-  ことになり、`connection_id` が変わる。すると server 側の `poll_and_bind` は
-  **別の接続として**レグを貼る — inner QUIC は同じなのに
-
-**これは Proxy 側の契約の問題であって、クライアント側だけでは決まらない。**
-§5-1 に挙げる。
+1. 古い `connection_id` のリース／エッジは、client が畳んでよいのか
+   （畳まないと枠を食い、畳むと listener 側の `spent` が消える契機にもなる）
+2. 新しい `connection_id` のレグが立つまでの時間。listener の巡回間隔がそのまま
+   下限になる
+3. listener 側で `direct_path::advertise` がもう一度走り、`add_bound_addr` が
+   **同じアドレスに対して** `ADDRESS_IN_USE` を返す（`direct_path.rs:138` が
+   既に書いている）。新しいレグのバインディングは別アドレスなので通るはずだが、
+   **それは 2 本目の直接経路候補を増やすことでもある** — 上限 4 に効く
 
 ---
 
@@ -172,38 +202,62 @@ let relay = match (conn.get_local_addr(), conn.get_remote_addr()) { ... };
 
 ### 3.1 「リレーが落ちた」をどう知るか
 
-3 つの候補がある。
-
-| | いつ分かるか | 誤検知 |
+| | いつ分かるか | 問題 |
 | --- | --- | --- |
-| `ConnectRelay` の H3 接続が終わる | 即座 | 無い。**これが第一候補** |
-| `RelayLegLease` の更新が `connection-not-found` を返す | 1 リース TTL 以内 | 「プロキシが忘れた」と「落ちた」の区別が要る |
-| `path.rs` の失速ウォッチドッグ | `STALLED_GRACE` 後 | 直接経路に乗っている間は**そもそもリレーに何も流れない**ので当たらない |
+| `ConnectRelay` の H3 接続が終わる | 即座 | **口が無い**（§1.3）。`MasqueClient` / `H3Channel` から出す配線が要る |
+| `RelayLegLease` の `Verdict::LegGone` | 1 リース TTL 以内 | **気づいた瞬間に `leg.cancel(); return;`**（`relay_lease.rs:288` / `:365`）。検知に使うなら、貼り直しは `RelayLegLease` の**外**に置き、リースを張り直す側になる |
+| `path.rs` の失速ウォッチドッグ | `STALLED_GRACE` 後 | 直接経路に乗っている間は**リレーに何も流れない**ので当たらない |
 
 3 つ目が当たらないことが重要である。**直接経路に乗っているセッションは、リレー
-パスが死んだことを自力では気づけない。** 気づく口は 1 つ目しかない。
+パスが死んだことを自力では気づけない。**
+
+1 つ目が第一候補だが、**これは「既にある信号を読む」ではなく「信号を作る」**
+作業である。P1 の見積もりはそれを含む。
 
 ### 3.2 直接経路に乗っているときも貼り直すか
 
 **貼り直す。** それがこの機能の目的である — 直接経路が生きているうちは通信に
 影響が無く、だからこそ「フォールバックが消えている」ことに誰も気づかない。
-気づくのは直接経路が切れた瞬間で、そのときにはもう遅い。
 
 ### 3.3 何回、どれくらいの間隔で
 
-リレーの再起動は数秒から数十秒で終わる。**指数バックオフで上限を持ち、
-諦めたら言う。** 諦めた後のセッションは「直接経路だけで動いている」状態で、
-それは**動いてはいるが一本足である**ことを運用者が知るべき状態である。
+指数バックオフで上限を持つ。**下限も要る**（§0.3）: `remove_path` が非同期な
+ので、間隔が短すぎると `PathsCount` が減る前に次を足してしまう。
 
-### 3.4 server 側に溜まったパスをどうするか
+諦めた後のセッションは「直接経路だけで動いている」状態で、それは**動いては
+いるが一本足である**ことを運用者が知るべき状態である。
 
-server は `remove_path` を呼べない（§0.1）。呼べるのは `remove_bound_addr` で、
-これはバインディングを解放し source CID を外すが、**`Connection->Paths[]` の
-エントリを消すとは書かれていない**。
+### 3.4 `remove_bound_addr` は掃除ではない。**接続を殺しうる**
 
-- `add_bound_addr` が不要（§0.2）なら、そもそも `remove_bound_addr` も不要で、
-  この節は消える
-- 必要なら、**上限 4 に当たるのが先か、`remove_bound_addr` が効くのかを測る**
+初版は「パスのエントリを消すとは書かれていない」として測定項目に置いた。
+**書かれている。そして危険である。**
+
+`QuicConnRemoveBoundAddress` はバインディング一覧を過ぎたあと
+`Connection->Paths[]` を走査し（`connection.c:8213`）、**LocalAddress だけで
+一致を取る**。一致したパスが `IsActive` か、または最後の 1 本なら
+`QuicConnSilentlyAbort` を呼んで `QUIC_STATUS_ABORTED` を返す
+（`connection.c:8229`〜`:8246`）。
+
+listener では**すべてのパスが 1 つのバインディングのローカルアドレスを共有する**。
+直接経路が張れていないセッションで、古いリレーレグのアドレスに対してこれを
+呼べば、**セッションごと静かに落ちる。**
+
+→ **server 側で `remove_bound_addr` を呼ぶ案は、そのままでは採れない。**
+§0.2 の A なら、そもそも呼ぶ必要が無い（古い接続は別の接続として終わる）。
+
+### 3.5 リレー専用のセッションをどうするか
+
+§1.2 のとおり、`candidate` が無いセッションには multipath も共有バインディングも
+無く、`add_path` は成立しない。**そして、そのセッションこそリレーが死ぬと終わる。**
+
+選べるのは 2 つ。
+
+| | |
+| --- | --- |
+| **本書の対象外と言う** | 助ける対象は「直接経路があるセッションのフォールバック」に限る。**正直だが、価値の大きい半分を落とす** |
+| **`enable_migration` を無条件にする** | `candidate` の有無と multipath の有無を切り離す。`prepare` の 3 つの設定は候補アドレスを要求しない — `add_candidate_addr` だけが要求する。**影響範囲は `peer.rs` の 2 行だが、全セッションのハンドシェイクに効く** |
+
+**決めずに実装を始めてはいけない。** 後者なら P0 の前に単独で出せる。
 
 ---
 
@@ -211,15 +265,19 @@ server は `remove_path` を呼べない（§0.1）。呼べるのは `remove_bo
 
 | # | やること | 出口 |
 | --- | --- | --- |
-| **P0** | **spike。** リレーを殺して、client 側だけを手で貼り直す最小の実験。server 側が何もせずに新しいパスを受け入れるか（§0.2）、`add_path` が loopback 宛に通るか（§2.1）、`PathAdded` が来るかを見る | **server 側の作業が要るかどうかが決まる。** ここで形が半分になりうる |
-| **P1** | レグの死を検知して報告する。貼り直しはまだしない（§3.1） | 「フォールバックが消えた」が**ログに出る**。いまは無音 |
-| **P2** | 貼り直し — 新しいチケット／`peer_connect` を取り、新しい `ConnectRelay` を開く（§2.2） | 新しいレグが立つ。inner QUIC はまだ使わない |
-| **P3** | `add_path` と `PathAdded` 待ち、`remove_path` で古いものを外す（§0.3） | **inner QUIC が新しいリレーを使う** |
-| **P4** | `path.rs` が「リレーのペアは動く」を知る（§1.3） | 直接経路が落ちたとき、**生きているリレー**に戻る |
+| **P0** | **spike。** リレーを殺し、手で `peer_connect` をやり直して `add_path` する最小の実験。§0.2 A が通るか、`add_path` が loopback 宛に通るか、`PathAdded` が来るか、server 側にパスが生えるか | **形が決まる。** §5 の 1・2・5 がここで答えになる |
+| **P1** | レグの死を client に届ける（§1.3 の配線）。貼り直しはしない | 「フォールバックが消えた」が**ログに出る**。いまは無音 |
+| **P2** | `path.rs` が「リレーのペアは動く」を知る（§1.4 の 2 箇所） | **まだ何も動かないが、P3 がこれ無しでは出せない**（§4 の注） |
+| **P3** | 貼り直し — 新しい `peer_connect` と `ConnectRelay`、古い側の後始末（§2.2） | 新しいレグが立つ。inner QUIC はまだ使わない |
+| **P4** | `add_path` と `PathAdded` 待ち、`remove_path`、間隔の下限（§0.3） | **inner QUIC が新しいリレーを使う** |
 | **P5** | 実配備でリレーを再起動して端から端まで | — |
 
-**P0 が本当の分岐点である。** §0.2 が当たっていれば P3 は client 側だけの話に
-なり、外れていれば `add_bound_addr` と forward 先の付け替えが P3 の前に入る。
+> **P2 は P3 より前でなければならない。** 初版は逆に並べていた。`PathAdded` は
+> `keep_on_the_best_path` の中でしか観測できず、そこに新しいリレーの
+> `PathAdded` が届くと `Paths::added` は「リレーではないペア」として **true** を
+> 返し、`Step::MoveOnto` → `prefer_path` が走る。つまり **生きている直接経路から、
+> 立てたばかりのリレーへ転送を移してしまう** — しかも統計は `direct` と
+> ラベルされる。P4 だけを先に出すと、**いまより悪くなる。**
 
 **P1 は単独で価値がある。** いまは「フォールバックが永久に失われた」ことを
 誰も知らない。貼り直しが入る前でも、それが**見える**ようになるだけで、
@@ -229,24 +287,23 @@ server は `remove_path` を呼べない（§0.1）。呼べるのは `remove_bo
 
 ## 5. 確かめていないこと
 
-1. **`peer_connect` をやり直さずに新しいチケットが取れるか**（§2.2）。取れない
-   なら `connection_id` が変わり、server 側は**別の接続として**レグを貼る。
-   inner QUIC の同一性と `connection_id` の同一性がここで離れる
-2. **server 側が受信だけで新しいパスを作るか**（§0.2）。核の条件（`path.c:358`）
-   は許しているが、`forward_to` が共有バインディングであることの影響は読んで
-   いない
-3. **`remove_bound_addr` がパスのエントリまで消すか**（§3.4）
-4. **`add_path` が返った後、`PathAdded` はどれくらいで来るか。** 直接経路では
-   796 ms だった（`portal_agent_plan.md` §5）が、リレー越しの検証は往復が違う
-5. **MASQUE の `Forward` モードが、同じ送信元から来る新しいレグをどう扱うか。**
-   サーバ側は送信元アドレスごとに UDP ソケットを開く。リレーが再起動しても
-   **リレーのアドレスは同じ**なので、古いソケットが残っていると新しいレグの
-   パケットが古いソケットから出る可能性がある — そうなると server から見た
-   remote address が変わらず、**新しいパスが生えない**
-6. **4 パスの上限に、実際の運用でどれだけ近づくか**（§0.3）
+1. **新しい `connection_id` で入り直したとき、listener 側が本当にレグを貼るか**
+   （§0.2 A）。`spent` は古い ID のもので、新しい ID は素通しのはずだが、
+   プロキシの一覧に両方が並ぶ時間がある
+2. **古い `connection_id` のエッジを client が畳めるか。** 畳めないと枠を食う
+3. **MASQUE の `Forward` モードが、再起動したリレーをどう扱うか。** サーバ側は
+   送信元アドレスごとに UDP ソケットを開く。リレーが再起動しても**アドレスは
+   同じ**なので、古いソケットが残っていると新しいレグのパケットが古いソケットから
+   出る可能性がある — そうなると server から見た remote address が変わらず、
+   新しいパスが生えない
+4. **`PATH_ABANDON` が完了して `PathsCount` が減るまでの時間**（§0.3）
+5. **`add_path` が返ってから `PathAdded` が来るまでの時間。** 直接経路の
+   `PathAdded` の実測値は本書には無い（`portal_agent_plan.md` の 796 ms は
+   **Grant が届くまで**の数字であって、パスの話ではない）
+6. **listener 側で `advertise` が 2 度目に何をするか**（§2.2-3）
 
-> 5 は、当たっていれば §0.2 の楽観がそのまま崩れる。**P0 で最初に見るのは
-> これである。**
+> 3 は、当たっていれば server 側にパスが生えず、`add_bound_addr` を使う案に
+> 戻ることになる。**P0 で最初に見るのはこれである。**
 
 ---
 
@@ -255,6 +312,7 @@ server は `remove_path` を呼べない（§0.1）。呼べるのは `remove_bo
 1. **リレー自身の冗長化。** 別のリレーへ張り替えるのは
    `relay_proximity_client.md` の続きであって、本書は「同じ相手にもう一度」だけ
    を扱う
-2. **listener 側からの貼り直しの起点。** `poll_and_bind` は既にある
+2. **listener 側から貼り直しを起こすこと。** listener は「レグが死んだが QUIC は
+   生きている」を知らない（§0.2 B）
 3. **直接経路が落ちたときの再探索。** 本書はフォールバックを取り戻すだけで、
    直接経路をもう一度 punch する話はしない
