@@ -2,7 +2,7 @@
 //!
 //! A relay server restarting takes the leg with it, and today the inner QUIC
 //! connection never uses a relay again. The plan is to open a new leg and swap
-//! it in over multipath. Four questions decide the shape, and none of them
+//! it in over multipath. Five questions decide the shape, and none of them
 //! needs a relay to answer: a UDP forwarder on loopback stands in for the
 //! client's CONNECT-UDP leg, the relay and the server's bind leg all at once,
 //! and killing it is the relay restarting.
@@ -16,6 +16,19 @@
 //! | 3 | **Does the server grow a path with no server-side call at all?** | If yes, `add_bound_addr` and the forward re-pointing leave the plan |
 //! | 4 | Does traffic actually cross the new leg once the old one is dead? | A validated path that carries nothing is the failure this exists to avoid |
 //! | 5 | Does `remove_path` free a slot, and when? | `QUIC_MAX_PATH_COUNT` is 4 and the plan says the removal is asynchronous |
+//!
+//! # **Run it more than once**
+//!
+//! About one run in three fails question 2 and everything after it: `add_path`
+//! returns `Ok`, the path count rises, and **no probe is ever sent**, because
+//! the new path was given no destination connection id — `connection.c:9363`
+//! guards the `PATH_CHALLENGE` on `Path->DestCid != NULL`, and `pathid.c:750`
+//! assigns one only while a spare is in the pool. The failure line says which
+//! silence it was, by reporting how many datagrams reached the new leg.
+//!
+//! **That is a finding, not a flaw in the harness** (`relay_repath_plan.md`
+//! §0.1.1), and it is why one green run says nothing. The first four runs of
+//! this spike all passed, and the plan recorded them as settled fact.
 //!
 //! **The connection is built by `transport::connect`**, so the answers are
 //! about the arrangement portal actually ships: the same settings, the same
