@@ -145,17 +145,28 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
     // **The relay restarts.** The old leg's sockets go with it, exactly as a
     // MASQUE client dying takes its per-source sockets (`from_quic_to_udp`
     // keys them by `(stream, source)` and the table lives inside the client).
-    // **The window the destination CIDs arrive in.** Both ends generate source
-    // CIDs for every path id up to the limit when the handshake completes
-    // (`crypto.c:1653` -> `QuicPathIDSetGenerateNewSourceCids`), and the frames
-    // then have to travel. Stop the relay inside that window and the CIDs for
-    // path id 1 never arrive -- so `add_path` opens a path that can never be
-    // probed. `RELAY_REPATH_SETTLE_MS` is how this is measured.
-    if let Ok(ms) = std::env::var("RELAY_REPATH_SETTLE_MS") {
-        if let Ok(ms) = ms.parse::<u64>() {
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-        }
-    }
+    // **The window the destination CIDs arrive in, waited out on purpose.**
+    //
+    // Both ends generate source CIDs for every path id up to the limit when the
+    // handshake completes (`crypto.c:1653` ->
+    // `QuicPathIDSetGenerateNewSourceCids`), and the frames then have to
+    // travel. Stop the relay inside that window and path id 1 has no
+    // destination CID -- so `add_path` opens a path msquic will never probe,
+    // because the only code that assigns one runs on the receive path and
+    // nothing is arriving any more.
+    //
+    // Measured over 120 runs, counting the CIDs inside msquic at `add_path`:
+    //
+    //     settle      runs   failed   saw dest_cids=0
+    //     0 ms        60     2        3
+    //     2000 ms     60     0        0
+    //
+    // `RELAY_REPATH_SETTLE_MS=0` is how the race is reproduced.
+    let settle = std::env::var("RELAY_REPATH_SETTLE_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .unwrap_or(2000);
+    tokio::time::sleep(Duration::from_millis(settle)).await;
     let first_back = first.back_addr;
     first.stop().await;
     let second = Bridge::start(bound).await?;
