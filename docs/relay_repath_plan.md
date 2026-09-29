@@ -151,13 +151,45 @@ CID は `add_path` を待たずに割り当てられる。
 > 「効かない」と結論したが、率そのものが 33〜75% で揺れる（負荷に依る）以上、
 > 8 回はどちらの向きにも判定できない標本だった。
 
-#### ここから先は、観測しないと分からない
+#### 観測した（`QUIC_LOGGING_TYPE=stdout` と、その場の printf）
 
-`Path->DestCid` が NULL になる理由は、**まだ分かっていない。** 到着待ちでは
-なく、`QuicSendSetSendFlag` の欠落でもない。次に取る手は推測を重ねることでは
-なく、**msquic の trace を見ること**である — `QUIC_ENABLE_LOGGING` と
-`QUIC_LOGGING_TYPE=stdout` で C ライブラリを建て直し、失敗した回に
-`QuicPathIDAssignCids` が何を見ているかを読む。
+C ライブラリを logging 付きで建て直し、`QUIC_PARAM_CONN_ADD_PATH` の直後で
+**新しいパスの path id が持っている destination CID を数えた。**
+
+```
+PASS  2 | ADDPATH pathid=1 had_cid=1 assigned=0 dest_cids=4 unused=3
+FAIL  2 | ADDPATH pathid=1 had_cid=0 assigned=0 dest_cids=0 unused=0
+```
+
+**10 回中 10 回、`had_cid` が成否を言い当てる。** そして失敗した回の path id 1 は
+`dest_cids=0` — **その path id 用の CID が 1 つも届いていない。**
+
+つまり詰まりはこうである。
+
+1. `add_path` は `Path->DestCid != NULL` のときしか `PATH_CHALLENGE` を
+   キューしない（`connection.c:9363`）
+2. 新しいパスは新しい path id を取り、その path id の destination CID は
+   **相手の `PATH_NEW_CONNECTION_ID` で届く**
+3. 届いた CID をパスに**割り当てるのは `QuicPathIDAssignCids` だけ**で、
+   その唯一の呼び出し元は**受信処理**である
+4. したがって、**CID が届いていない状態で追加されたパスは、何も届かない限り
+   永久に probe されない** — そして「何も届かない」は、リレーが死んだあとの
+   まさにその状態である
+
+> **`QuicPathIDAssignCids` を `add_path` からも呼ぶ**ようにして測った。効かない。
+> 失敗する回は `assigned=0` で返る — **未使用の CID が無い**のだから当然である。
+> 欠けているのは呼び出しでもフラグでもなく、**CID そのもの**だった。
+
+> **率は環境に強く依る。** 同じコードで 20%〜67% の失敗率を観測し、最後の
+> 22 回（CPU 負荷を掛けた分を含む）は全部通った。**だから率での A/B は
+> 信用できない** — 判定は `dest_cids` を見ること。
+
+#### 設計への帰結
+
+**§0.1.1 の B（レグが健全なうちに 2 本目のパスを開いておく）を採るべき理由が、
+推測ではなく観測になった。** 健全なうちなら CID は届いており（`dest_cids=4`）、
+パスは検証される。貼り直しは「そのパスの先に新しい MASQUE クライアントを
+繋ぎ替える」になり、**`add_path` を接続が聞こえなくなってから呼ぶことがなくなる。**
 
 #### したがって手は 3 つある
 
