@@ -145,6 +145,17 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
     // **The relay restarts.** The old leg's sockets go with it, exactly as a
     // MASQUE client dying takes its per-source sockets (`from_quic_to_udp`
     // keys them by `(stream, source)` and the table lives inside the client).
+    // **The window the destination CIDs arrive in.** Both ends generate source
+    // CIDs for every path id up to the limit when the handshake completes
+    // (`crypto.c:1653` -> `QuicPathIDSetGenerateNewSourceCids`), and the frames
+    // then have to travel. Stop the relay inside that window and the CIDs for
+    // path id 1 never arrive -- so `add_path` opens a path that can never be
+    // probed. `RELAY_REPATH_SETTLE_MS` is how this is measured.
+    if let Ok(ms) = std::env::var("RELAY_REPATH_SETTLE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
     let first_back = first.back_addr;
     first.stop().await;
     let second = Bridge::start(bound).await?;
