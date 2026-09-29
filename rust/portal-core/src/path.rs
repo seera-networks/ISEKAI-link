@@ -314,8 +314,17 @@ enum Datagrams {
     /// **Checked rather than adopted**: [`crate::datagram::MAX_PAYLOAD`] is a
     /// promise `docs/portal.md` makes to callers, and raising it per connection
     /// would leave DNS working on one network and not another.
-    TooSmall,
-    Fine,
+    ///
+    /// **The number comes with it**, because it is the whole diagnosis: a peer
+    /// at 900 against a limit of 1200 has most of its UDP forwarding broken,
+    /// and one at 1199 loses only the largest DNS responses. Without it both
+    /// read as the same sentence.
+    TooSmall {
+        max_send_length: u16,
+    },
+    Fine {
+        max_send_length: u16,
+    },
 }
 
 /// What an event asks the loop to do about the connection.
@@ -436,9 +445,9 @@ fn datagram_state(send_enabled: bool, max_send_length: u16) -> Datagrams {
     if !send_enabled {
         Datagrams::Refused
     } else if usize::from(max_send_length) < LARGEST_DATAGRAM {
-        Datagrams::TooSmall
+        Datagrams::TooSmall { max_send_length }
     } else {
-        Datagrams::Fine
+        Datagrams::Fine { max_send_length }
     }
 }
 
@@ -615,14 +624,17 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
             // The one direction the constant cannot absorb: under the limit
             // means payloads this end accepts are refused by the connection,
             // and counted as `unsent` rather than carried.
-            Step::Datagrams(Datagrams::TooSmall) => tracing::warn!(
+            Step::Datagrams(Datagrams::TooSmall { max_send_length }) => tracing::warn!(
+                max_send_length,
                 largest = LARGEST_DATAGRAM,
                 "the connection takes smaller datagrams than portal will send; \
                  payloads near the limit will be refused and counted as unsent",
             ),
-            Step::Datagrams(Datagrams::Fine) => {
-                tracing::debug!(largest = LARGEST_DATAGRAM, "the peer receives datagrams")
-            }
+            Step::Datagrams(Datagrams::Fine { max_send_length }) => tracing::debug!(
+                max_send_length,
+                largest = LARGEST_DATAGRAM,
+                "the peer receives datagrams",
+            ),
         }
     }
 }
@@ -638,6 +650,7 @@ pub async fn keep_on_the_best_path(conn: Connection, shutdown: CancellationToken
 /// `None` for `preferred` means the relay is carrying traffic, and then there is
 /// nothing to call stalled: the relay path is the one QUIC falls back to, and
 /// declaring *it* dead has nowhere to go.
+///
 /// **What is left here needs a connection**, which is why it is the shape it
 /// is: read the statistics, say what they are, hand the judging to [`judge`].
 /// Mutation testing cannot reach past `get_path_statistics`, and that is the
@@ -764,12 +777,6 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-/// Stay on the relay, and hold every path that turns up as backup.
-///
-/// The fallback for a connection whose own addresses could not be read. Without
-/// them there is nothing to compare a path against, so none can be preferred —
-/// but **doing nothing is not the same as staying on the relay**, and that
-/// distinction is this function's whole reason for existing rather than being a
 /// Whether a path msquic has just added should be held as backup.
 ///
 /// **Every path except the relay's own.** `path_id` 0 is the path the handshake
@@ -785,6 +792,12 @@ fn hold_as_backup(path_id: u32) -> bool {
     path_id != RELAY_PATH_ID
 }
 
+/// Stay on the relay, and hold every path that turns up as backup.
+///
+/// The fallback for a connection whose own addresses could not be read. Without
+/// them there is nothing to compare a path against, so none can be preferred —
+/// but **doing nothing is not the same as staying on the relay**, and that
+/// distinction is this function's whole reason for existing rather than being a
 /// `while` loop over events.
 ///
 /// A path is active the moment msquic adds it. Left alone it sits alongside the
@@ -796,6 +809,7 @@ fn hold_as_backup(path_id: u32) -> bool {
 ///
 /// The events have to be drained regardless: this is also how the caller learns
 /// the connection closed.
+///
 /// **Not reachable from a test**, for the same reason as [`report_paths`]: it
 /// polls a live connection's event stream. The one decision it makes is
 /// [`hold_as_backup`], which is.
@@ -1124,19 +1138,31 @@ mod tests {
     #[test]
     fn what_the_peer_will_take_has_three_answers() {
         assert_eq!(datagram_state(false, 65535), Datagrams::Refused);
+        let small = (LARGEST_DATAGRAM - 1) as u16;
         assert_eq!(
-            datagram_state(true, (LARGEST_DATAGRAM - 1) as u16),
-            Datagrams::TooSmall,
+            datagram_state(true, small),
+            Datagrams::TooSmall {
+                max_send_length: small,
+            },
+            "and the number the operator needs comes with it",
         );
         // **The boundary is "at least", not "more than".** `LARGEST_DATAGRAM`
         // is what this end will send, so a peer taking exactly that is fine;
         // an off-by-one here warns on every healthy connection, which is how a
         // warning stops being read.
+        let exact = LARGEST_DATAGRAM as u16;
         assert_eq!(
-            datagram_state(true, LARGEST_DATAGRAM as u16),
-            Datagrams::Fine
+            datagram_state(true, exact),
+            Datagrams::Fine {
+                max_send_length: exact,
+            },
         );
-        assert_eq!(datagram_state(true, 65535), Datagrams::Fine);
+        assert_eq!(
+            datagram_state(true, 65535),
+            Datagrams::Fine {
+                max_send_length: 65535,
+            },
+        );
     }
 
     /// **The watchdog starts again whenever the preference moves.** Carrying
