@@ -155,18 +155,25 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
     // because the only code that assigns one runs on the receive path and
     // nothing is arriving any more.
     //
-    // Measured over 120 runs, counting the CIDs inside msquic at `add_path`:
+    // **Waiting does not reliably fix it**, which is why the default is zero.
+    // Measured on an uninstrumented build, with a 0 ms control interleaved so a
+    // quiet spell could not pass for an effect:
     //
-    //     settle      runs   failed   saw dest_cids=0
-    //     0 ms        60     2        3
-    //     2000 ms     60     0        0
+    //     settle     failed
+    //     0 ms       11 / 30   and  4 / 20
+    //     2000 ms     6 / 30
+    //     5000 ms     3 / 20
     //
-    // `RELAY_REPATH_SETTLE_MS=0` is how the race is reproduced.
+    // Five seconds is far more than the frames need, so the runs that fail are
+    // ones where the peer appears never to have sent CIDs for the new path id
+    // at all. See `docs/relay_repath_plan.md` §0.1.1.
     let settle = std::env::var("RELAY_REPATH_SETTLE_MS")
         .ok()
         .and_then(|ms| ms.parse::<u64>().ok())
-        .unwrap_or(2000);
-    tokio::time::sleep(Duration::from_millis(settle)).await;
+        .unwrap_or(0);
+    if settle > 0 {
+        tokio::time::sleep(Duration::from_millis(settle)).await;
+    }
     let first_back = first.back_addr;
     first.stop().await;
     let second = Bridge::start(bound).await?;
