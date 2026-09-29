@@ -130,6 +130,19 @@ jobs:
             echo "| unviable (did not compile) | $unviable |"
             echo "| timed out (counted as caught) | $timeout |"
             echo
+            # **"Nothing was viable" is not "the build is broken."** When a
+            # diff's only mutants are `-> Default::default()` on a type with no
+            # `Default`, they cannot compile and cargo-mutants warns that
+            # something may be wrong with the build. Nothing is; the run simply
+            # had nothing to ask. Said here, because a scary warning under a
+            # green tick is how a job stops being read.
+            if [ $((caught + missed)) -eq 0 ]; then
+              echo "Nothing in this diff could be mutated into something that"
+              echo "compiles, so there is no signal either way. cargo-mutants"
+              echo "warns about the build when that happens; it is not a"
+              echo "failure."
+              echo
+            fi
             if [ "$missed" -gt 0 ]; then
               echo "Each line below is a change to the code that **every test still"
               echo "passed** with. Some are fine — a function whose only output is a"
