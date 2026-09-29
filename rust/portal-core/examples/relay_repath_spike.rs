@@ -122,19 +122,32 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
     // read it after waiting for the client's `PathAdded` -- by which time the
     // server had already grown its path, so the comparison was against the
     // answer and question 3 reported the opposite of what happened.
-    let server_at_handshake = paths(&server);
+    let server_at_handshake = paths(&server)?;
     println!(
         "  paths: client {}  server {server_at_handshake}",
-        paths(&client),
+        paths(&client)?,
     );
     let old_pair = (client.get_local_addr()?, client.get_remote_addr()?);
 
     // **The relay restarts.** The old leg's sockets go with it, exactly as a
     // MASQUE client dying takes its per-source sockets (`from_quic_to_udp`
     // keys them by `(stream, source)` and the table lives inside the client).
+    let first_back = first.back_addr;
     first.stop().await;
     let second = Bridge::start(bound).await?;
-    println!("\n  relay stand-in 1 stopped; 2 at {}", second.front_addr);
+    println!(
+        "\n  relay stand-in 1 stopped; 2 at {} (the server will see {})",
+        second.front_addr, second.back_addr,
+    );
+    // The one way this experiment can lie about question 3: the kernel handing
+    // the replacement the port it just freed, so the server's view of the
+    // remote never changes and no path could grow whatever msquic did.
+    anyhow::ensure!(
+        first_back != second.back_addr,
+        "the replacement leg got the port the old one just freed ({}); \
+         run again -- this experiment cannot say anything about question 3",
+        second.back_addr,
+    );
 
     // ---- 1 ----
     let added = client.add_path(
@@ -161,7 +174,22 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
             began.elapsed(),
         ),
         None => {
-            println!("FAIL  2. no PathAdded for the new leg within {PATIENCE:?}");
+            // **Which of the two silences it was.** `add_path` returns `Ok`
+            // and raises the path count either way, but no `PATH_CHALLENGE`
+            // is queued unless the new path has a destination connection id
+            // (`connection.c:9363`, guarded on `Path->DestCid != NULL`), and
+            // one is only assigned while a spare is in the pool
+            // (`pathid.c:750`). Nothing leaving the client is that case;
+            // packets leaving and no answer coming back is a different one.
+            println!(
+                "FAIL  2. no PathAdded within {PATIENCE:?} -- {} datagram(s) reached \
+                 the new leg, so the probe {}",
+                second.forwarded(),
+                match second.forwarded() {
+                    0 => "was never sent (no destination CID for the new path?)",
+                    _ => "went out and went unanswered",
+                },
+            );
             failures.push("2");
         }
     }
@@ -172,12 +200,15 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
     // packets arriving at the binding it already had, from the new leg's new
     // source socket -- which is the one case the core lets a server open a path
     // for (`path.c:358`, server with no server-migration negotiated).
-    let grew = wait_until(PATIENCE, || paths(&server) > server_at_handshake).await;
+    let grew = wait_until(PATIENCE, || {
+        paths(&server).is_ok_and(|n| n > server_at_handshake)
+    })
+    .await;
     if grew {
         println!(
             "PASS  3. the server grew a path with no server-side call ({} -> {})",
             server_at_handshake,
-            paths(&server),
+            paths(&server)?,
         );
     } else {
         println!(
@@ -203,10 +234,10 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
     }
 
     // ---- 5 ----
-    let before = paths(&client);
+    let before = paths(&client)?;
     match client.remove_path(old_pair.0, old_pair.1) {
         Ok(()) => {
-            let freed = wait_until(PATIENCE, || paths(&client) < before).await;
+            let freed = wait_until(PATIENCE, || paths(&client).is_ok_and(|n| n < before)).await;
             println!(
                 "PASS  5. remove_path returned; the slot {} ({} -> {})",
                 if freed {
@@ -215,7 +246,7 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
                     "had NOT come back -- asynchronous, as the plan says"
                 },
                 before,
-                paths(&client),
+                paths(&client)?,
             );
         }
         Err(e) => {
@@ -226,8 +257,8 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
 
     println!(
         "\n  final: client {} path(s), server {} path(s), cap is 4",
-        paths(&client),
-        paths(&server),
+        paths(&client)?,
+        paths(&server)?,
     );
 
     shutdown.cancel();
@@ -240,9 +271,16 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
     Ok(failures)
 }
 
-/// How many paths msquic is tracking, or 0 when it will not say.
-fn paths(conn: &Connection) -> usize {
-    conn.get_path_statistics().map(|p| p.len()).unwrap_or(0)
+/// How many paths msquic is tracking.
+///
+/// **An error is not zero.** Reading a baseline as 0 because the call failed
+/// turns "no growth" into "grew from nothing", which is the class of
+/// mis-measurement this spike has already made once.
+fn paths(conn: &Connection) -> anyhow::Result<usize> {
+    Ok(conn
+        .get_path_statistics()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .len())
 }
 
 /// Wait for `PathAdded` naming `remote`, draining everything else.
@@ -288,6 +326,10 @@ async fn wait_until(limit: Duration, mut ready: impl FnMut() -> bool) -> bool {
 /// and the whole table dies with the MASQUE client.
 struct Bridge {
     front_addr: SocketAddr,
+    /// What the server sees as the remote. **A new leg has to present a new
+    /// one** or no path can grow, and the kernel may hand back a port it just
+    /// freed -- so this is reported rather than assumed.
+    back_addr: SocketAddr,
     forwarded: Arc<AtomicU64>,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<()>,
@@ -298,6 +340,7 @@ impl Bridge {
         let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let front_addr = front.local_addr()?;
+        let back_addr = back.local_addr()?;
         let shutdown = CancellationToken::new();
         let forwarded = Arc::new(AtomicU64::new(0));
 
@@ -313,16 +356,21 @@ impl Bridge {
                     r = front.recv_from(&mut up) => match r {
                         Ok((n, src)) => {
                             client = Some(src);
-                            let _ = back.send_to(&up[..n], target).await;
-                            counter.fetch_add(1, Ordering::Relaxed);
+                            // **Counted only when it left.** Counting the
+                            // attempt lets question 4 report traffic crossing
+                            // a leg that refused every datagram.
+                            if back.send_to(&up[..n], target).await.is_ok() {
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(_) => break,
                     },
                     r = back.recv_from(&mut down) => match r {
                         Ok((n, _)) => {
                             if let Some(dst) = client {
-                                let _ = front.send_to(&down[..n], dst).await;
-                                counter.fetch_add(1, Ordering::Relaxed);
+                                if front.send_to(&down[..n], dst).await.is_ok() {
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         Err(_) => break,
@@ -332,6 +380,7 @@ impl Bridge {
         });
         Ok(Self {
             front_addr,
+            back_addr,
             forwarded,
             shutdown,
             task,
