@@ -54,13 +54,25 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
 
+      # **`--relative`, and then checked.** Run from `rust/`, git still writes
+      # paths from the repository root (`a/rust/privacy/src/lib.rs`), and
+      # cargo-mutants matches them against the workspace it is running in --
+      # finds nothing, says `No mutants to filter`, and exits 0. A job that
+      # tests nothing and reports success is worse than no job, so the prefix
+      # is looked for rather than assumed away.
       - name: What this pull request changed
         if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
           git fetch --no-tags --depth=0 origin "${{ github.base_ref }}"
-          git diff "origin/${{ github.base_ref }}...HEAD" -- . > "$RUNNER_TEMP/pr.diff"
+          git diff --relative "origin/${{ github.base_ref }}...HEAD" -- . \
+            > "$RUNNER_TEMP/pr.diff"
           echo "diff is $(wc -l < "$RUNNER_TEMP/pr.diff") lines"
+          if grep -q '^diff --git a/rust/' "$RUNNER_TEMP/pr.diff"; then
+            echo "::error::the diff carries a rust/ prefix, so cargo-mutants would"
+            echo "::error::match nothing and pass without testing anything."
+            exit 1
+          fi
 
       # **`--in-place` is not a choice.** Crates here depend on paths outside
       # the cargo workspace (`../submodules/...`), and the default copies the
