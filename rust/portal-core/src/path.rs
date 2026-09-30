@@ -492,8 +492,9 @@ pub async fn keep_on_the_best_path(
     shutdown: CancellationToken,
     // **The relay leg's own end**, not this loop's. Cancelled when the tunnel
     // under the relay path stops carrying traffic, which is what a relay
-    // restarting looks like from here (`isekai_p2p::agent::ConnectRelay::ended`).
-    // Until this existed the fallback was assumed to be there for ever.
+    // restarting looks like from here — `isekai_p2p::InitiatorSession::relay_ended`
+    // is where a portal session gets it. Until this existed the fallback was
+    // assumed to be there for ever.
     relay_ended: CancellationToken,
 ) {
     // No event names the path the handshake ran on — `PathAdded` reports paths
@@ -507,7 +508,7 @@ pub async fn keep_on_the_best_path(
                  without them, so every path that turns up is held as backup and the \
                  relay keeps the traffic",
             );
-            stay_on_the_relay(&conn, &shutdown).await;
+            stay_on_the_relay(&conn, &shutdown, &relay_ended).await;
             return;
         }
     };
@@ -524,6 +525,9 @@ pub async fn keep_on_the_best_path(
     // preference moves, so a new path starts with a clean grace period.
     let mut stalled = Stalled::default();
     let mut ticks: u32 = 0;
+    // Said once. See the `None` arm below: nothing there clears the stall, so
+    // the answer repeats every tick and only the latch stops the log with it.
+    let mut said_no_fallback = false;
 
     // The reporting the camera apps have, with the one thing they cannot say
     // added: which path the numbers are about. `get_stats` is sampled here
@@ -541,12 +545,22 @@ pub async fn keep_on_the_best_path(
             // connection on a direct path is unaffected until something tries
             // to fall back, and one already on the relay is about to find out
             // by itself.
+            //
+            // **The record is kept either way; only the warning asks why.** A
+            // session being wound down or refused cancels the leg too (a
+            // refused re-ticket cancels both tokens together), and saying "the
+            // relay leg has gone" for a close is the false warning
+            // `isekai_p2p`'s own watcher re-checks to avoid. The fallback is
+            // still gone, so the bookkeeping stands; there is simply nobody to
+            // tell.
             _ = relay_ended.cancelled(), if paths.relay_usable => {
-                tracing::warn!(
-                    local = %paths.relay.0, remote = %paths.relay.1,
-                    "the relay leg has gone; this connection has no fallback until one \
-                     replaces it",
-                );
+                if !shutdown.is_cancelled() {
+                    tracing::warn!(
+                        local = %paths.relay.0, remote = %paths.relay.1,
+                        "the relay leg has gone; this connection has no fallback until one \
+                         replaces it",
+                    );
+                }
                 paths.relay_is_gone();
                 continue;
             }
@@ -571,39 +585,62 @@ pub async fn keep_on_the_best_path(
                     }
                 }
                 if report_paths(&conn, paths.preferred, &paths.direct, &mut stalled) {
-                    // **Preferring the relay again, not tearing anything down.**
-                    // Under multipath the relay was never left, only declared
-                    // backup, so this is withdrawing a preference — nothing in
-                    // flight is lost by asking.
                     let stale = paths.preferred;
-                    tracing::warn!(
-                        local = %stale.map(|p| p.0.to_string()).unwrap_or_default(),
-                        remote = %stale.map(|p| p.1.to_string()).unwrap_or_default(),
-                        "the direct path has held data for {STALLED_GRACE:?} without a single \
-                         acknowledgement; forwarding goes back to the relay",
-                    );
-                    // **Only forget the preference if the move happened.**
-                    // `prefer_path` answers `false` when nothing changed, and
-                    // clearing `preferred` anyway would leave traffic on the
-                    // stalled path with the watchdog switched off — it only
-                    // judges a path it believes is preferred, so there would be
-                    // no second attempt.
                     match paths.fall_back() {
                         Some(relay) => {
+                            // **Preferring the relay again, not tearing
+                            // anything down.** Under multipath the relay was
+                            // never left, only declared backup, so this is
+                            // withdrawing a preference — nothing in flight is
+                            // lost by asking.
+                            //
+                            // **Said here, not before the question.** It used
+                            // to be logged first, so with the leg gone the log
+                            // read "forwarding goes back to the relay" and then,
+                            // on the next line, that it had not moved.
+                            tracing::warn!(
+                                local = %stale.map(|p| p.0.to_string()).unwrap_or_default(),
+                                remote = %stale.map(|p| p.1.to_string()).unwrap_or_default(),
+                                "the direct path has held data for {STALLED_GRACE:?} without \
+                                 a single acknowledgement; forwarding goes back to the relay",
+                            );
+                            // **Only forget the preference if the move
+                            // happened.** `prefer_path` answers `false` when
+                            // nothing changed, and clearing `preferred` anyway
+                            // would leave traffic on the stalled path with the
+                            // watchdog switched off — it only judges a path it
+                            // believes is preferred, so there would be no
+                            // second attempt.
                             if prefer_path(&conn, relay, relay, &paths.direct) {
                                 paths.preferred = None;
                                 stalled.reset();
                             }
                         }
                         // **Nowhere to go.** Declaring the dead relay available
-                        // would take the stalled path down to backup with it
-                        // and stop the connection outright -- worse than
-                        // leaving it on a path that may yet recover.
-                        None => tracing::error!(
-                            "the direct path has stalled and the relay leg is gone, so \
-                             there is nothing to fall back to; leaving the forwards where \
-                             they are",
-                        ),
+                        // would take the stalled path down to backup with it and
+                        // stop the connection outright — worse than leaving it
+                        // on a path that may yet recover.
+                        //
+                        // **Once.** Nothing here resets the watchdog or moves
+                        // the preference, deliberately, so `report_paths`
+                        // answers `true` on every tick from now on: without the
+                        // latch this is an `error` a second for the rest of the
+                        // connection, on the level operators alert on. The
+                        // `Some` arm repeats on purpose — a failed `prefer_path`
+                        // is worth retrying — and here there is nothing to
+                        // retry.
+                        None => {
+                            if !said_no_fallback {
+                                said_no_fallback = true;
+                                tracing::error!(
+                                    local = %stale.map(|p| p.0.to_string()).unwrap_or_default(),
+                                    remote = %stale.map(|p| p.1.to_string()).unwrap_or_default(),
+                                    "the direct path has stalled and the relay leg is gone, \
+                                     so there is nothing to fall back to; leaving the \
+                                     forwards where they are",
+                                );
+                            }
+                        }
                     }
                 }
                 continue;
@@ -677,11 +714,24 @@ pub async fn keep_on_the_best_path(
                 "a path this connection was not using was removed",
             ),
             Step::Demoted { pair, path_id } => {
-                tracing::warn!(
-                    path_id, local = %pair.0, remote = %pair.1,
-                    "the peer declared the path we were using backup; \
-                     forwarding is on the relay again",
-                );
+                // **Nothing to do either way** — the peer's PATH_BACKUP has
+                // already moved this end off the path — but what to *say*
+                // depends on whether there is a relay left underneath.
+                // `preferred` is now `None`, which switches the watchdog off,
+                // so if this line were wrong nothing else would speak up and
+                // the connection would die at its idle timeout in silence.
+                match paths.fall_back() {
+                    Some(_) => tracing::warn!(
+                        path_id, local = %pair.0, remote = %pair.1,
+                        "the peer declared the path we were using backup; \
+                         forwarding is on the relay again",
+                    ),
+                    None => tracing::error!(
+                        path_id, local = %pair.0, remote = %pair.1,
+                        "the peer declared the path we were using backup and the relay \
+                         leg is gone, so this connection has no path left",
+                    ),
+                }
                 stalled.reset();
             }
             Step::PeerChangedAPath {
@@ -888,10 +938,32 @@ fn hold_as_backup(path_id: u32) -> bool {
 /// **Not reachable from a test**, for the same reason as [`report_paths`]: it
 /// polls a live connection's event stream. The one decision it makes is
 /// [`hold_as_backup`], which is.
-async fn stay_on_the_relay(conn: &Connection, shutdown: &CancellationToken) {
+async fn stay_on_the_relay(
+    conn: &Connection,
+    shutdown: &CancellationToken,
+    relay_ended: &CancellationToken,
+) {
+    // **Said here too, and only said.** This branch holds every path it sees as
+    // backup because it cannot tell one from another without the addresses, so
+    // the relay is carrying everything -- and when its leg goes, that is the
+    // whole connection, not a fallback. Promoting one of the held paths would
+    // need only the path id the event carried, but choosing *which* is the
+    // judgement this branch exists because it cannot make.
+    let mut said = false;
     loop {
         let event = tokio::select! {
             _ = shutdown.cancelled() => return,
+            _ = relay_ended.cancelled(), if !said => {
+                said = true;
+                if !shutdown.is_cancelled() {
+                    tracing::error!(
+                        "the relay leg has gone, and this connection could not read its \
+                         own addresses -- so every path that turned up is held as backup \
+                         and there is nothing left carrying traffic",
+                    );
+                }
+                continue;
+            }
             event = std::future::poll_fn(|cx| conn.poll_event(cx)) => event,
         };
         let Ok(event) = event else { return };
