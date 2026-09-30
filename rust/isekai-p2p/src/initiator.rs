@@ -438,8 +438,8 @@ const REATTACH_ATTEMPTS: u32 = 8;
 /// something other than those two took the time.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long to wait before attempt `attempt` (0-based) at replacing a leg that
-/// had been up for `age`.
+/// How long to wait before attempt `attempt` (0-based) at replacing a leg,
+/// given that it stood up `since_stood_up` ago.
 ///
 /// Exponential with a ceiling, and a **floor that is not backoff at all**
 /// (`docs/relay_repath_plan.md` §0.3). Under multipath `remove_path` is
@@ -449,14 +449,17 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// path and a direct one. A relay that flaps every few hundred milliseconds
 /// would otherwise cost a `peer_connect` every few hundred milliseconds.
 ///
-/// `age` is what keeps that floor off the ordinary case. A leg that has been
-/// up for hours has long since paid it, and its replacement starts on the
-/// backoff alone.
-fn reattach_delay(attempt: u32, age: Duration) -> Duration {
+/// `since_stood_up` is what keeps that floor off the ordinary case, and it is
+/// counted from the leg standing up rather than from it dying — a leg that
+/// carried a session for hours has long since paid the interval, and its
+/// replacement starts on the backoff alone. **It includes the time the retry
+/// loop has already spent**, so the floor is charged once rather than once per
+/// attempt: from the second attempt on, the waiting itself has covered it.
+fn reattach_delay(attempt: u32, since_stood_up: Duration) -> Duration {
     let backoff = REATTACH_FIRST_DELAY
         .saturating_mul(1u32 << attempt.min(16))
         .min(REATTACH_MAX_DELAY);
-    backoff.max(REATTACH_MIN_INTERVAL.saturating_sub(age))
+    backoff.max(REATTACH_MIN_INTERVAL.saturating_sub(since_stood_up))
 }
 
 /// The initiator's view of the control plane, before any relay leg exists.
@@ -1071,6 +1074,12 @@ async fn attach(
 /// `closed` is terminal and a renewal arriving behind it is refused and logged
 /// as a failure that is really just bad timing.
 ///
+/// **This is also what closes the loopback socket** the application was told
+/// to send to. Every caller reads that port once, at setup, so it is only ever
+/// right to do this when the leg is finished with: after a replacement has
+/// taken over, or on the way out. It is why nothing here runs while a
+/// replacement is still being looked for.
+///
 /// **The report is worth making even for a leg that is already dead.** The
 /// listener finds out who is waiting for it by listing its connections in
 /// state `relay`, and a connection nobody reports stays in that listing until
@@ -1182,15 +1191,31 @@ async fn supervise(
             ?age,
             "the relay leg has gone; making a new connection to stand one in its place",
         );
-        // **Retired before the replacement is asked for, not after.** The leg
-        // is dead either way, and a `connect` made while the old row is still
-        // being claimed is one more against whatever the proxy lets an Endpoint
-        // hold at once (`docs/relay_repath_plan.md` §5-2).
-        retire(attachment, &proxy, &ended).await;
+        // **The old attachment is kept until a new one is up, not retired to
+        // make room for it.** Its leg is dead and carries nothing, but it is
+        // what holds the connection row, and two things hang off that row.
+        // Its lease is the only thing in this process that can be *told* this
+        // Endpoint has been revoked — `ended` is cancelled from a refused
+        // renewal and from nowhere else — and the row itself is how the
+        // control plane and the peer can still see a session that is running
+        // on a direct path. Retiring first would buy back one connection
+        // against whatever an Endpoint may hold at once, and would cost both
+        // of those for as long as the relay stayed down: if it never came
+        // back, for the rest of the session.
         let Some(replacement) = stand_up_again(&inputs, &proxy, &ended, &shutdown, age).await
         else {
+            // Nothing replaced it, or the session is being closed. Either way
+            // this is where P1 left things: running on whatever path it has,
+            // still claiming its connection, until somebody closes it.
+            shutdown.cancelled().await;
+            current = Some(attachment);
             break;
         };
+        // **Now**, with somewhere for the listener to go. Reporting `closed`
+        // is what frees the old row, and the listener — which retired the dead
+        // leg on its own and will not bind that connection again — finds the
+        // new one in the same listing it was already polling (plan §0.2 A).
+        retire(attachment, &proxy, &ended).await;
         tracing::info!(
             was = %was,
             connection_id = %replacement.connection.connection_id,
@@ -1226,24 +1251,35 @@ async fn stand_up_again(
     // one at `warn` would be a paragraph about a thing that then worked. What
     // is worth saying at `error` is the last one, once, if none of them worked.
     let mut last: Option<anyhow::Error> = None;
+    let started = Instant::now();
     for attempt in 0..REATTACH_ATTEMPTS {
         tokio::select! {
             _ = shutdown.cancelled() => return None,
             _ = ended.cancelled() => {
                 // The Endpoint is refused, not the relay. A new connection id
                 // would be refused as well, and saying so belongs to whoever
-                // cancelled this.
+                // cancelled this — the lease that was told so, which is still
+                // running because the old attachment is still here.
                 return None;
             }
-            _ = tokio::time::sleep(reattach_delay(attempt, age)) => {}
+            // **`age` plus what this loop has spent**, which together are the
+            // time since the leg stood up. Passing `age` alone would charge
+            // the `PATH_ABANDON` floor again at every attempt, and the backoff
+            // would not climb past it until the fourth.
+            _ = tokio::time::sleep(reattach_delay(attempt, age + started.elapsed())) => {}
         }
         // **The attempt is abandoned if the session is, and not awaited.**
         // `attach` makes two network calls to a proxy that has just been
         // failing, and `close` waits for this task; without the arm below, a
         // Ctrl+C landing here waits out whatever those calls do before the
-        // process can exit. What is dropped mid-flight is a connection row the
-        // proxy expires on its own, which is the same thing that happens when
-        // a process is killed.
+        // process can exit.
+        //
+        // Dropping it mid-flight is safe as far as the leg goes:
+        // `open_connect_relay` arms a drop guard on the token its spawned task
+        // parks on, so a leg established while this future was being cancelled
+        // is cancelled with it. What is left behind is a connection row, which
+        // the proxy expires on its own — the same thing it does for a process
+        // that was killed.
         let made = tokio::select! {
             _ = shutdown.cancelled() => return None,
             made = attach(
@@ -1281,7 +1317,8 @@ async fn stand_up_again(
         attempts = REATTACH_ATTEMPTS,
         listener_id = %inputs.listener_id,
         "gave up replacing the relay leg; this session has no fallback left. It keeps \
-         working for as long as its direct path does, and ends with it{}",
+         working, and claiming its connection, for as long as its direct path does, \
+         and ends with it{}",
         last.map(|e| format!(": {e:#}")).unwrap_or_default(),
     );
     None
@@ -1347,6 +1384,25 @@ mod reattach_tests {
             reattach_delay(0, flapped),
             REATTACH_MIN_INTERVAL - flapped,
             "the first attempt waits for what is left of the interval, not the backoff",
+        );
+    }
+
+    /// **And it is charged once.** The floor keeps two *stand-ups* apart, and
+    /// by the second attempt the waiting has already done that — so what the
+    /// backoff asks for from there on is the backoff.
+    #[test]
+    fn the_floor_is_not_charged_again_at_every_attempt() {
+        let mut since = Duration::from_millis(200);
+        let mut delays = Vec::new();
+        for attempt in 0..4 {
+            let delay = reattach_delay(attempt, since);
+            since += delay;
+            delays.push(delay.as_secs_f64());
+        }
+        assert_eq!(
+            delays,
+            vec![4.8, 2.0, 4.0, 8.0],
+            "the first waits out what is left of the interval; the rest are the backoff",
         );
     }
 

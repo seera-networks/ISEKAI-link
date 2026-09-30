@@ -527,6 +527,15 @@ async fn open_bound_udp(
     let pop = sign_connect_udp(key, CONNECT_UDP_BIND_PATH);
     let shutdown = CancellationToken::new();
     let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
+    // **Armed against this function being dropped before it returns.**
+    // Everything below runs on a task of its own holding a clone of
+    // `shutdown`, and a `CancellationToken` does not cancel when a clone is
+    // dropped — so a caller whose future is cancelled while this waits on
+    // `ready_rx` would leave an established leg, its socket and its H3
+    // connection running with nothing left in the process that could stop
+    // them. Disarmed on the way out, where the token moves into the handle
+    // that owns it from then on.
+    let armed = shutdown.clone().drop_guard();
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
         connector, uri, None,
     );
@@ -591,7 +600,8 @@ async fn open_bound_udp(
             relay_origin: dialled,
             observed,
             inbound,
-            shutdown,
+            // Established, so the handle is what stops it from here on.
+            shutdown: armed.disarm(),
             task: Some(task),
         }),
         Ok(Err(e)) => {
@@ -749,6 +759,15 @@ pub async fn open_connect_relay(
     let dialled = origin_of(&uri);
     let shutdown = CancellationToken::new();
     let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
+    // **Armed against this function being dropped before it returns.**
+    // Everything below runs on a task of its own holding a clone of
+    // `shutdown`, and a `CancellationToken` does not cancel when a clone is
+    // dropped — so a caller whose future is cancelled while this waits on
+    // `ready_rx` would leave an established leg, its socket and its H3
+    // connection running with nothing left in the process that could stop
+    // them. Disarmed on the way out, where the token moves into the handle
+    // that owns it from then on.
+    let armed = shutdown.clone().drop_guard();
     let channel = H3Channel::<_, StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>>::new(
         connector, uri, None,
     );
@@ -805,7 +824,8 @@ pub async fn open_connect_relay(
             ended,
             relay_origin: dialled,
             observed,
-            shutdown,
+            // Established, so the handle is what stops it from here on.
+            shutdown: armed.disarm(),
             task: Some(task),
         }),
         Ok(Err(e)) => {
