@@ -1196,6 +1196,18 @@ async fn supervise(
             current = Some(attachment);
             break;
         }
+        // **Said first, before any reason to stop is considered.** The leg is
+        // dead by the time `watch_leg` answers `Gone`, and every branch below
+        // either takes minutes or does not come back at all — so "the fallback
+        // has gone" is reported here rather than on the way to somewhere.
+        // `portal_core::path` reads this to stop offering the relay as
+        // somewhere to retreat to.
+        //
+        // **This used to come after the revocation check**, which is the one
+        // branch that leaves the peer connection running: it may still be on a
+        // direct path, and it would have been left believing a dead relay was
+        // there to fall back to.
+        published.leg_is_gone();
         if ended.is_cancelled() {
             // **The Endpoint was refused, not the relay.** What cancelled the
             // leg is the lease that was told so, and it has already said it at
@@ -1205,11 +1217,6 @@ async fn supervise(
             current = Some(attachment);
             break;
         }
-        // **Said before anything is attempted**, because everything below it
-        // can take minutes and a fallback that has gone is gone now. This is
-        // what `portal_core::path` reads to stop offering the relay as
-        // somewhere to retreat to.
-        published.leg_is_gone();
         let was = attachment.connection.connection_id.clone();
         let relay_origin = attachment.relay.relay_origin().to_owned();
         let age = stood_up.elapsed();

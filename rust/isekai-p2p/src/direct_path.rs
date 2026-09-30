@@ -380,8 +380,18 @@ pub fn prefer_path(
             // active paths, and msquic picks among them at random — so traffic
             // would split across both, which is the state this whole call
             // exists to avoid. The other order leaves a window with none, and
-            // `QuicConnChoosePath` falls back to `Paths[0]`, the relay: still a
-            // working path, which is the safe side to be wrong on.
+            // `QuicConnChoosePath` falls back to `Paths[0]` — which is a
+            // working path on every connection that has only ever had one
+            // relay.
+            //
+            // **Not on one whose relay has been re-attached.** `Paths[0]` is
+            // then the *old* leg: abandoning it under multipath sets
+            // `LocalClose` and leaves it where it is (`connection.c:8380`), so
+            // the window falls back to a path that carries nothing. It is
+            // still the safer side to be wrong on — a window of one round trip
+            // against a split that persists — but it is no longer free, which
+            // is why `portal_core::path` demotes the old relay path itself
+            // rather than leaving it to this.
             for id in &backup {
                 if let Err(e) = conn.set_path_status(*id, false) {
                     tracing::warn!(path_id = id, "could not declare a path backup: {e}");

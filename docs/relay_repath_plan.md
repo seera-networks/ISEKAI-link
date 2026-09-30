@@ -645,6 +645,19 @@ camera 側は `RelayPath::first(relay_path)` を渡す（camera は貼り直さ�
   msquic は追加したパスを active にするので、放っておくと
   `QuicConnChoosePath` が直接経路とリレーを**ランダムに選ぶ**
 
+#### リレーのパスは「取り上げられる」ようになった
+
+ハンドシェイクのパスは接続ごとしか失われないが、**貼り直したリレーは普通の
+パスなので、相手が `PATH_ABANDON` できる。** `PathRemoved` を「使っていない
+パス」として読むと、**死んだパスを退避先として提供し続ける** — そこへ退避すると
+直接経路を全部 backup に落としたあと、msquic が忘れた id の promote に失敗して
+**active なパスが 0 本**になる。`Paths::removed` がリレーのペアを見るように
+した。
+
+なお `PathStatusChanged`（相手が backup と宣言）は**別物として扱わない**。
+backup のパスは bind も検証も keepalive も生きており、退避先として消えてはいない。
+そもそもこの系では listener 側は宣言しない（決めるのは initiator である）。
+
 #### watch は最新値しか持たない
 
 `None` → `Some` が速いと `None` は潰れて `Some` だけが届く。なので `Some` を

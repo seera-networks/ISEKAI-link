@@ -377,11 +377,17 @@ impl Paths {
             return Added::Nothing;
         }
         if self.relay_remotes.contains(&pair.1) {
-            let awaited = self.awaiting_relay.is_some_and(|(r, _)| r == pair.1);
-            self.awaiting_relay = None;
-            if !awaited {
+            // **Only the one being waited for ends the wait.** A leg that was
+            // superseded can still have its `PATH_RESPONSE` arrive — msquic
+            // raises `PathAdded` from the response frame without asking
+            // whether the path is being abandoned — and clearing the wait on
+            // that would disarm the patience for the leg that *is* current.
+            // Its own event would then arrive too late to be anything, and
+            // nothing would ever say the connection had lost its fallback.
+            if !self.awaiting_relay.is_some_and(|(r, _)| r == pair.1) {
                 return Added::RelayTooLate;
             }
+            self.awaiting_relay = None;
             let old = self.relay;
             self.relay = RelayPath { pair, path_id };
             // **Here and not at `add_path`.** A path that has been opened is
@@ -423,9 +429,18 @@ impl Paths {
 
     /// `PathRemoved`: a path is gone.
     ///
-    /// Returns whether it was the one carrying traffic, which is the only case
-    /// that has to ask for the relay back.
-    fn removed(&mut self, pair: Pair) -> bool {
+    /// **Including the relay's, since P4.** A re-attached relay is an ordinary
+    /// added path, so the peer can abandon it and msquic raises the same event
+    /// it raises for any other — where the original handshake path could only
+    /// ever be lost with the connection. Read as "a path we were not using"
+    /// that would leave `relay_usable` true for a path that no longer exists,
+    /// and the next thing to fall back would demote every direct path and then
+    /// fail to promote an id msquic has forgotten: no active path at all.
+    fn removed(&mut self, pair: Pair) -> Removed {
+        if pair == self.relay.pair {
+            self.relay_usable = false;
+            return Removed::TheRelay;
+        }
         self.direct.remove(&pair);
         // Validated, then abandoned before it was ever preferred: waiting out
         // the grace would end in switching onto a path that no longer exists.
@@ -434,7 +449,10 @@ impl Paths {
         if was_carrying {
             self.preferred = None;
         }
-        was_carrying
+        match was_carrying {
+            true => Removed::WeWereOnIt,
+            false => Removed::OneWeWereNotUsing,
+        }
     }
 
     /// `PathStatusChanged`: the peer declared a path active or backup.
@@ -445,6 +463,14 @@ impl Paths {
     /// happen is `preferred` staying behind, because it labels the per-second
     /// statistics: the operator would read `direct` off a connection running
     /// on the relay, which is the failure this module was written for.
+    ///
+    /// **The relay's own path is not treated as demotable here**, and that is
+    /// deliberate rather than an oversight of P4. A path declared backup is
+    /// still bound, still validated and still pinged, so a backup relay is a
+    /// fallback that has not gone anywhere — unlike [`removed`](Self::removed),
+    /// where it has. Nothing in this system sends such a declaration in any
+    /// case: the initiator is the end that decides which path carries traffic,
+    /// and the listener only ever echoes.
     fn status_changed(&mut self, pair: Pair, is_active: bool) -> bool {
         let demoted = !is_active && self.preferred == Some(pair);
         if demoted {
@@ -464,6 +490,17 @@ impl Paths {
             self.awaiting_id = None;
         }
     }
+}
+
+/// What a `PathRemoved` turned out to be about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removed {
+    /// The path that was carrying traffic. Something has to take it over.
+    WeWereOnIt,
+    /// A path nothing was using.
+    OneWeWereNotUsing,
+    /// **The relay's own.** Not a fallback any more, whatever else is running.
+    TheRelay,
 }
 
 /// What a `PathAdded` turned out to be about.
@@ -542,6 +579,11 @@ enum Step {
     BackToTheRelay { pair: Pair, path_id: u32 },
     /// A path went away that nothing was using.
     LostOneWeWereNotUsing { pair: Pair, path_id: u32 },
+    /// **The relay's own path went away**, which since P4 is something a peer
+    /// can do: a re-attached relay is an ordinary path and can be abandoned
+    /// like one. There is nothing to fall back to until another leg replaces
+    /// it.
+    TheRelayWentAway { pair: Pair, path_id: u32 },
     /// The peer declared the path in use backup, so this end is already off it.
     Demoted { pair: Pair, path_id: u32 },
     /// The peer changed some other path's status.
@@ -609,11 +651,15 @@ fn step(event: &ConnectionEvent, paths: &mut Paths, now: tokio::time::Instant) -
         } => {
             let pair = (*local_address, *peer_address);
             match paths.removed(pair) {
-                true => Step::BackToTheRelay {
+                Removed::WeWereOnIt => Step::BackToTheRelay {
                     pair,
                     path_id: *path_id,
                 },
-                false => Step::LostOneWeWereNotUsing {
+                Removed::OneWeWereNotUsing => Step::LostOneWeWereNotUsing {
+                    pair,
+                    path_id: *path_id,
+                },
+                Removed::TheRelay => Step::TheRelayWentAway {
                     pair,
                     path_id: *path_id,
                 },
@@ -829,7 +875,6 @@ pub async fn keep_on_the_best_path(
                 }
                 continue;
             }
-            // Nothing to wait for unless a pair has validated without an id.
             // Nothing to wait for unless a path was opened to a replacement
             // relay leg. See `RELAY_PATH_PATIENCE` for the silence this bounds.
             _ = sleep_until(paths.awaiting_relay.map(|(_, at)| at)) => {
@@ -848,6 +893,7 @@ pub async fn keep_on_the_best_path(
                 drop_the_path(&conn, (any_local(), remote));
                 continue;
             }
+            // Nothing to wait for unless a pair has validated without an id.
             _ = sleep_until(paths.awaiting_id.map(|(_, at)| at)) => {
                 let (pair, _) = paths.awaiting_id.take().expect("only armed with a pair");
                 // No `PathAdded` in all that time, so the peer negotiated no
@@ -876,6 +922,11 @@ pub async fn keep_on_the_best_path(
         match step(&event, &mut paths, tokio::time::Instant::now()) {
             Step::Nothing => {}
             Step::RelayMoved { pair, path_id, old } => {
+                // **"No fallback" is a recoverable state now**, so the latch
+                // that made the stall watchdog say so once has to be released
+                // — or a second genuine episode, after this relay goes too, is
+                // silent on the level operators alert on.
+                said_no_fallback = false;
                 match paths.preferred {
                     // Nothing else is carrying traffic, which means the
                     // connection has been sending over a relay path that
@@ -907,10 +958,25 @@ pub async fn keep_on_the_best_path(
                         }
                     }
                 }
-                // **Either way**, and after the new one is in hand: under
-                // multipath this is a `PATH_ABANDON` rather than a removal, so
-                // the slot comes back when the peer answers and not here
-                // (`docs/relay_repath_plan.md` §0.3).
+                // **Demoted before it is abandoned, and that is not belt and
+                // braces.** Abandoning is asynchronous and can fail, and a
+                // path left active is one `QuicConnChoosePath` picks at random
+                // — while the old relay's id has just dropped out of every
+                // future `preference_for` backup list, since the relay's id is
+                // the new one and `direct` never held the old. Nothing else
+                // would ever demote it, so traffic would split onto a leg that
+                // carries nothing.
+                if let Err(e) = conn.set_path_status(old.path_id, false) {
+                    tracing::debug!(
+                        path_id = old.path_id,
+                        "could not hold the old relay path as backup; msquic may have \
+                         forgotten it already: {e}",
+                    );
+                }
+                // **Then abandoned**, and only after the new one is in hand:
+                // under multipath this is a `PATH_ABANDON` rather than a
+                // removal, so the slot comes back when the peer answers and
+                // not here (`docs/relay_repath_plan.md` §0.3).
                 drop_the_path(&conn, old.pair);
             }
             Step::RelayTooLate { pair, path_id } => tracing::debug!(
@@ -957,6 +1023,11 @@ pub async fn keep_on_the_best_path(
             Step::LostOneWeWereNotUsing { pair, path_id } => tracing::debug!(
                 path_id, local = %pair.0, remote = %pair.1,
                 "a path this connection was not using was removed",
+            ),
+            Step::TheRelayWentAway { pair, path_id } => tracing::warn!(
+                path_id, local = %pair.0, remote = %pair.1,
+                "the relay path was abandoned; this connection has no fallback until \
+                 another leg replaces it",
             ),
             Step::Demoted { pair, path_id } => {
                 // **Nothing to do either way** — the peer's PATH_BACKUP has
@@ -1658,6 +1729,64 @@ mod tests {
         );
     }
 
+    /// **A superseded leg can still answer, and it must not speak for the
+    /// current one.** msquic raises `PathAdded` from a `PATH_RESPONSE` without
+    /// asking whether the path is being abandoned, so the probe sent to a leg
+    /// that has since been replaced can validate after the replacement was
+    /// opened. Letting it end the wait disarms the patience for the leg that
+    /// matters: the real one then arrives too late to be anything, the relay
+    /// never moves, and nothing is left to report that the fallback is gone.
+    #[test]
+    fn a_superseded_leg_answering_late_does_not_end_the_wait_for_the_current_one() {
+        let mut paths = watching();
+        let now = tokio::time::Instant::now();
+        paths.relay_is_gone();
+        let (old_leg, new_leg) = (addr(9), addr(11));
+        paths.opening_to(old_leg, now + RELAY_PATH_PATIENCE);
+        // That leg went too, and a path was opened to its replacement.
+        paths.stop_opening();
+        paths.opening_to(new_leg, now + RELAY_PATH_PATIENCE);
+
+        assert_eq!(
+            paths.added((addr(1), old_leg), 3),
+            Added::RelayTooLate,
+            "the superseded leg is not the relay coming back",
+        );
+        assert_eq!(
+            paths.awaiting_relay.map(|(remote, _)| remote),
+            Some(new_leg),
+            "and the current leg is still being waited for",
+        );
+
+        assert!(matches!(
+            paths.added((addr(1), new_leg), 4),
+            Added::TheRelayMoved { .. }
+        ));
+    }
+
+    /// **The relay is an ordinary path now, and the peer can abandon it.** The
+    /// handshake's path could only be lost with the connection; a re-attached
+    /// one raises the same `PathRemoved` as any other. Read as "a path we were
+    /// not using", it would leave a dead path on offer as somewhere to fall
+    /// back to — and falling back to it demotes every direct path and then
+    /// fails to promote an id msquic has forgotten, leaving none active at all.
+    #[test]
+    fn the_relay_path_being_abandoned_is_the_fallback_going_away() {
+        let mut paths = watching();
+        let direct = (addr(3), addr(4));
+        paths.added(direct, 7);
+        paths.now_carrying(direct);
+
+        assert_eq!(paths.removed(paths.relay.pair), Removed::TheRelay);
+
+        assert_eq!(paths.fall_back(), None, "there is nothing to fall back to");
+        assert_eq!(
+            paths.preferred,
+            Some(direct),
+            "and the direct path is untouched by it",
+        );
+    }
+
     /// A replacement that validates after the patience ran out is still not a
     /// direct path. It has already been asked to go away, and reading it as
     /// somewhere to move onto would be the same failure arriving late.
@@ -1785,11 +1914,15 @@ mod tests {
         paths.added(theirs, 2);
         paths.now_carrying(ours);
 
-        assert!(!paths.removed(theirs), "not the one carrying traffic");
+        assert_eq!(
+            paths.removed(theirs),
+            Removed::OneWeWereNotUsing,
+            "not the one carrying traffic"
+        );
         assert_eq!(paths.preferred, Some(ours), "and it did not move us");
         assert!(!paths.direct.contains_key(&theirs), "but it is forgotten");
 
-        assert!(paths.removed(ours), "this one is ours");
+        assert_eq!(paths.removed(ours), Removed::WeWereOnIt, "this one is ours");
         assert_eq!(paths.preferred, None, "back to the relay");
     }
 
@@ -1800,7 +1933,11 @@ mod tests {
         let mut paths = watching();
         let direct = (addr(3), addr(4));
         paths.wait_for_id(direct, tokio::time::Instant::now());
-        assert!(!paths.removed(direct), "it was never carrying traffic");
+        assert_eq!(
+            paths.removed(direct),
+            Removed::OneWeWereNotUsing,
+            "it was never carrying traffic"
+        );
         assert_eq!(paths.awaiting_id, None);
     }
 

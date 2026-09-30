@@ -710,15 +710,24 @@ async fn the_path_watcher_returns_when_the_connection_ends() {
     // the second half would put two pollers on one event queue, which is the
     // thing this module says must not happen — and a `JoinHandle` dropped after
     // a timeout detaches rather than aborts, so the first would still be there.
+    // **The sender is held**, not dropped at the end of the expression. A
+    // dropped one makes the first `changed()` answer `Err`, which the watcher
+    // reads as "nothing will move this leg again" and stops listening — so the
+    // test would pass having exercised the wrong arm. Held, and with a leg in
+    // place, it is the state a loopback connection is actually in: a relay
+    // that is there and never moves.
+    let (_leg, leg) = tokio::sync::watch::channel(Some(
+        halves
+            .connection()
+            .get_remote_addr()
+            .expect("a live connection"),
+    ));
     let mut watching = tokio::spawn(portal_core::path::keep_on_the_best_path(
         halves.connection().clone(),
         // Its own token, so what ends this is the connection and not the
         // teardown — the cancel arm would pass this test for the wrong reason.
         CancellationToken::new(),
-        // No relay session in this test, so nothing ever moves the leg. A
-        // watch nobody sends on leaves the fallback where it is, which is the
-        // state a loopback connection is actually in.
-        tokio::sync::watch::channel(None).1,
+        leg,
     ));
     assert!(
         tokio::time::timeout(Duration::from_millis(500), &mut watching)
