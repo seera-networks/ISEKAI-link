@@ -744,6 +744,16 @@ impl InitiatorSession {
         self.ended.clone()
     }
 
+    /// Cancelled when the **relay leg** stops carrying traffic.
+    ///
+    /// Not [`ended`](Self::ended), which is the session being refused. This is
+    /// the fallback going away underneath a session that may be perfectly
+    /// healthy on a direct path — and the reason anything that would fall back
+    /// to the relay has to ask first (`portal_core::path`).
+    pub fn relay_ended(&self) -> CancellationToken {
+        self.relay.ended()
+    }
+
     /// The connection id, to hand to the target so it can bind its relay leg.
     pub fn connection_id(&self) -> &str {
         &self.connection.connection_id

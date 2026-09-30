@@ -715,6 +715,10 @@ async fn the_path_watcher_returns_when_the_connection_ends() {
         // Its own token, so what ends this is the connection and not the
         // teardown — the cancel arm would pass this test for the wrong reason.
         CancellationToken::new(),
+        // No relay in this test, so nothing can take one away. A token nobody
+        // cancels leaves the fallback in place, which is the state a loopback
+        // connection is actually in.
+        CancellationToken::new(),
     ));
     assert!(
         tokio::time::timeout(Duration::from_millis(500), &mut watching)
