@@ -248,7 +248,41 @@ fn apply(conn: &Connection, address: ObservedAddress) {
 /// There is no event that names it: `PathAdded` reports paths that were opened
 /// after a probe validated, and the path the handshake ran on was never probed.
 /// It is `Paths[0]`, whose path id is 0.
+///
+/// **Only the first one.** A relay that restarts can be re-attached as a path
+/// of its own (`docs/relay_repath_plan.md` P4), and that one was probed and
+/// does carry an id — see [`RelayPath`].
 pub const RELAY_PATH_ID: u32 = 0;
+
+/// Which path the relay is on: the addresses it runs over and the id msquic
+/// gave it.
+///
+/// **This was a constant until the relay could move.** Every connection had
+/// exactly one relay path, the one the handshake ran on, so
+/// [`RELAY_PATH_ID`] answered for all of them. Since P4 of
+/// `docs/relay_repath_plan.md` a restarted relay is attached as a new path
+/// with an id of its own, and a caller that still assumed 0 would declare the
+/// *dead* path available and take the live one down with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayPath {
+    /// The local and remote addresses, which is how a path is named before it
+    /// has an id and how one without multipath is named for ever.
+    pub pair: (SocketAddr, SocketAddr),
+    /// What msquic calls it. [`RELAY_PATH_ID`] for the path the handshake ran
+    /// on; whatever `PathAdded` carried for one attached since.
+    pub path_id: u32,
+}
+
+impl RelayPath {
+    /// The path the handshake ran on, which is every connection's relay path
+    /// until one is re-attached.
+    pub fn first(pair: (SocketAddr, SocketAddr)) -> Self {
+        Self {
+            pair,
+            path_id: RELAY_PATH_ID,
+        }
+    }
+}
 
 /// What a request to move onto a path turns into.
 ///
@@ -297,14 +331,14 @@ pub enum PathPreference {
 /// is not always one path.
 pub fn preference_for(
     wanted: (SocketAddr, SocketAddr),
-    relay_path: (SocketAddr, SocketAddr),
+    relay: RelayPath,
     direct_paths: &BTreeMap<(SocketAddr, SocketAddr), u32>,
 ) -> PathPreference {
     if direct_paths.is_empty() {
         return PathPreference::Switch;
     }
-    let available = if wanted == relay_path {
-        RELAY_PATH_ID
+    let available = if wanted == relay.pair {
+        relay.path_id
     } else {
         match direct_paths.get(&wanted) {
             Some(id) => *id,
@@ -314,7 +348,11 @@ pub fn preference_for(
             None => return PathPreference::Switch,
         }
     };
-    let backup = std::iter::once(RELAY_PATH_ID)
+    // **The relay's own id, not the constant.** A re-attached relay is on a
+    // path msquic numbered itself, and the path numbered 0 is the dead one it
+    // replaced — declaring *that* available is how a connection is moved onto
+    // a leg that carries nothing.
+    let backup = std::iter::once(relay.path_id)
         .chain(direct_paths.values().copied())
         .filter(|id| *id != available)
         .collect();
@@ -332,11 +370,11 @@ pub fn preference_for(
 pub fn prefer_path(
     conn: &Connection,
     wanted: (SocketAddr, SocketAddr),
-    relay_path: (SocketAddr, SocketAddr),
+    relay: RelayPath,
     direct_paths: &BTreeMap<(SocketAddr, SocketAddr), u32>,
 ) -> bool {
     let (local, remote) = wanted;
-    match preference_for(wanted, relay_path, direct_paths) {
+    match preference_for(wanted, relay, direct_paths) {
         PathPreference::Declare { available, backup } => {
             // Demote first. Promoting first would leave a window with two
             // active paths, and msquic picks among them at random — so traffic
@@ -389,11 +427,17 @@ mod tests {
 
     /// The relay pair, standing in for the loopback bridge the video connection
     /// actually runs over.
-    fn relay() -> (SocketAddr, SocketAddr) {
+    fn relay_pair() -> (SocketAddr, SocketAddr) {
         (
             SocketAddr::from(([127, 0, 0, 1], 5000)),
             SocketAddr::from(([127, 0, 0, 1], 5001)),
         )
+    }
+
+    /// The relay as it is on every connection that has never re-attached one:
+    /// the handshake's path, numbered 0.
+    fn relay() -> RelayPath {
+        RelayPath::first(relay_pair())
     }
 
     /// A camera without multipath never sends `PathAdded`, so there are no path
@@ -431,7 +475,7 @@ mod tests {
     fn going_back_to_the_relay_is_the_same_operation_reversed() {
         let direct = BTreeMap::from([(pair(1000), 1)]);
         assert_eq!(
-            preference_for(relay(), relay(), &direct),
+            preference_for(relay_pair(), relay(), &direct),
             PathPreference::Declare {
                 available: RELAY_PATH_ID,
                 backup: vec![1],
@@ -453,6 +497,35 @@ mod tests {
                 available: 2,
                 backup: vec![RELAY_PATH_ID, 1],
             },
+        );
+    }
+
+    /// **A re-attached relay is on its own path, and 0 is the dead one.** The
+    /// pair moved and so did the id; reading either from where it used to be
+    /// declares the path that stopped answering available and demotes the one
+    /// that works.
+    #[test]
+    fn a_relay_that_moved_is_declared_by_the_id_it_moved_to() {
+        let moved = RelayPath {
+            pair: pair(7000),
+            path_id: 7,
+        };
+        let direct = BTreeMap::from([(pair(1000), 1)]);
+        assert_eq!(
+            preference_for(pair(7000), moved, &direct),
+            PathPreference::Declare {
+                available: 7,
+                backup: vec![1],
+            },
+            "going back to the relay means its new id",
+        );
+        assert_eq!(
+            preference_for(pair(1000), moved, &direct),
+            PathPreference::Declare {
+                available: 1,
+                backup: vec![7],
+            },
+            "and the relay it holds as backup is the new one too, not path 0",
         );
     }
 

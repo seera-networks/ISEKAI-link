@@ -22,7 +22,7 @@ use isekai_p2p::agent::{ObservedAddress, ObservedAddressWatch};
 // The path arithmetic and the two ways of moving onto a path went to the
 // layer with the rest of the direct-path machinery in phase 4; what stays
 // here is when this app asks for a move, which is a camera question.
-use isekai_p2p::direct_path::prefer_path;
+use isekai_p2p::direct_path::{prefer_path, RelayPath};
 use isekai_p2p::peer::log_connection_stats;
 // Re-exported under the names the viewers and the FFI already import.
 pub use isekai_p2p::peer::{AttestedPeer, Unpinnable};
@@ -519,7 +519,7 @@ pub async fn receive_frames_with(
                              direct path; going back to the relay path",
                         );
                         migrated_since = None;
-                        if prefer_path(&conn, relay_path, relay_path, &direct_paths) {
+                        if prefer_path(&conn, relay_path, RelayPath::first(relay_path), &direct_paths) {
                             report_path(&path_events, PathEvent::Activated {
                                 local: relay_path.0,
                                 remote: relay_path.1,
@@ -594,7 +594,15 @@ pub async fn receive_frames_with(
             request = async { migrate.as_mut().unwrap().recv().await }, if migrate.is_some() => {
                 match request {
                     Some((local, remote)) => {
-                        if prefer_path(&conn, (local, remote), relay_path, &direct_paths) {
+                        if prefer_path(
+                            &conn,
+                            (local, remote),
+                            // **Always the handshake's path here.** Only portal
+                            // re-attaches a relay leg, so the camera's relay is
+                            // the one it started on and keeps its id.
+                            RelayPath::first(relay_path),
+                            &direct_paths,
+                        ) {
                             // Watch a move *away* from the relay; a move back to
                             // it is the recovery, not something to time out.
                             migrated_since = ((local, remote) != relay_path).then(Instant::now);

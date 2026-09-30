@@ -46,6 +46,8 @@ pub struct InitiatorSession {
     /// happens on a task nobody here is waiting for, so a reader holding a
     /// borrow across one would be holding the leg that died.
     facts: watch::Receiver<Facts>,
+    /// Where the relay leg is, as it moves — see [`relay_leg`](Self::relay_leg).
+    leg: RelayLegWatch,
     /// Cancelled when the proxy stops accepting this Endpoint for this
     /// connection — see [`ended`](Self::ended).
     ended: CancellationToken,
@@ -100,6 +102,19 @@ struct Attachment {
     relay_lease: RelayLegLease,
 }
 
+/// Where a session's relay leg answers, and a notification each time it moves.
+///
+/// **`None` is the leg having gone with nothing in its place** — no fallback,
+/// for as long as it lasts. `Some` is the loopback address the leg answers on
+/// now, which is the *remote* of the relay path from the peer connection's
+/// point of view.
+///
+/// One signal rather than two, and that is deliberate: "it has gone" and "it
+/// is over here now" are the same question asked at different moments, and a
+/// separate token for the first would go on answering about a leg that has
+/// since been replaced.
+pub type RelayLegWatch = watch::Receiver<Option<SocketAddr>>;
+
 /// What a holder of the session can read about the attachment in force.
 ///
 /// A copy rather than a view. The attachment belongs to the supervisor task,
@@ -109,9 +124,33 @@ struct Facts {
     local_addr: SocketAddr,
     connection: PeerConnection,
     observed: ObservedAddressWatch,
-    /// **The current leg's**, so a caller that asks after a replacement is
-    /// handed a token about the leg it would actually fall back to.
-    leg_ended: CancellationToken,
+}
+
+/// The two channels the supervisor writes and the session reads.
+///
+/// Together rather than as two arguments, because they are written in the same
+/// breath and a replacement that updated one of them alone would be a session
+/// reporting two different legs depending on which question was asked.
+struct Published {
+    facts: watch::Sender<Facts>,
+    leg: watch::Sender<Option<SocketAddr>>,
+}
+
+impl Published {
+    /// A leg has taken over.
+    fn now_at(&self, attachment: &Attachment) {
+        self.facts.send_replace(Facts::of(attachment));
+        self.leg.send_replace(Some(attachment.relay.local_addr));
+    }
+
+    /// The leg has gone, and nothing is in its place yet.
+    ///
+    /// **`facts` is left alone.** The connection row and the loopback address
+    /// it names are still what the application is using; what has changed is
+    /// only that the leg behind them stopped carrying.
+    fn leg_is_gone(&self) {
+        self.leg.send_replace(None);
+    }
 }
 
 impl Facts {
@@ -120,7 +159,6 @@ impl Facts {
             local_addr: attachment.relay.local_addr,
             connection: attachment.connection.clone(),
             observed: attachment.relay.observed(),
-            leg_ended: attachment.relay.ended(),
         }
     }
 }
@@ -810,6 +848,7 @@ impl InitiatorSession {
         let renewal = renewal
             .unwrap_or_else(|| Arc::new(spawn_token_renewal(cfg.clone(), proxy.clone(), None)));
         let (facts, watching) = watch::channel(Facts::of(&attachment));
+        let (leg, leg_at) = watch::channel(Some(attachment.relay.local_addr));
         let shutdown = CancellationToken::new();
         let (reported, closed) = oneshot::channel();
         // **The supervisor owns the attachment from here on.** It is the one
@@ -827,13 +866,14 @@ impl InitiatorSession {
                 opts,
             },
             proxy.clone(),
-            facts,
+            Published { facts, leg },
             ended.clone(),
             shutdown.clone(),
             reported,
         ));
         Ok(Self {
             facts: watching,
+            leg: leg_at,
             ended,
             shutdown,
             closed: Some(closed),
@@ -857,21 +897,19 @@ impl InitiatorSession {
         self.ended.clone()
     }
 
-    /// Cancelled when the **relay leg** stops carrying traffic.
+    /// Where the **relay leg** is, and a notification each time that moves.
     ///
     /// Not [`ended`](Self::ended), which is the session being refused. This is
     /// the fallback going away underneath a session that may be perfectly
-    /// healthy on a direct path — and the reason anything that would fall back
-    /// to the relay has to ask first (`portal_core::path`).
+    /// healthy on a direct path, and then coming back somewhere else — the
+    /// reason anything that would fall back to the relay has to ask first
+    /// (`portal_core::path`), and the reason it can then re-attach.
     ///
-    /// **A snapshot, like everything else here.** What comes back is the token
-    /// for the leg in force when it was asked for, so a holder that keeps one
-    /// across a replacement is holding an answer about a leg that has been
-    /// retired. That is exactly what `portal_core::path` wants today — it was
-    /// told the relay pair it knows is gone, and P4 is what will move the pair
-    /// — and it is why the signal P4 needs is a new one rather than this.
-    pub fn relay_ended(&self) -> CancellationToken {
-        self.facts.borrow().leg_ended.clone()
+    /// **A live channel, not a snapshot**, because a replacement leg answers
+    /// at a new loopback address and a holder that read the old one would be
+    /// pointing a path at a closed socket. See [`RelayLegWatch`].
+    pub fn relay_leg(&self) -> RelayLegWatch {
+        self.leg.clone()
     }
 
     /// The local UDP address the application should send its traffic to.
@@ -1146,7 +1184,7 @@ async fn supervise(
     first: Attachment,
     inputs: Reattach,
     proxy: ProxyClient<MasqueH3Transport>,
-    facts: watch::Sender<Facts>,
+    published: Published,
     ended: CancellationToken,
     shutdown: CancellationToken,
     reported: oneshot::Sender<()>,
@@ -1167,6 +1205,11 @@ async fn supervise(
             current = Some(attachment);
             break;
         }
+        // **Said before anything is attempted**, because everything below it
+        // can take minutes and a fallback that has gone is gone now. This is
+        // what `portal_core::path` reads to stop offering the relay as
+        // somewhere to retreat to.
+        published.leg_is_gone();
         let was = attachment.connection.connection_id.clone();
         let relay_origin = attachment.relay.relay_origin().to_owned();
         let age = stood_up.elapsed();
@@ -1224,7 +1267,7 @@ async fn supervise(
             "a new relay leg is up. Nothing has moved onto it yet: the peer connection \
              goes on using the path it has (`docs/relay_repath_plan.md` P4)",
         );
-        facts.send_replace(Facts::of(&replacement));
+        published.now_at(&replacement);
         stood_up = Instant::now();
         current = Some(replacement);
     }

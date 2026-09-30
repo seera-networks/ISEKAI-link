@@ -46,7 +46,7 @@ pub use config::{
 // this crate alone, so without the re-export agent mode could only ever write
 // `Default::default()` -- the ceiling, which is the thing it exists to avoid.
 pub use isekai_p2p_core::identity::Narrowing;
-pub use initiator::{InitiatorSession, PeerDirectory};
+pub use initiator::{InitiatorSession, PeerDirectory, RelayLegWatch};
 pub use listener::{
     AcceptPolicy, LegDirectory, ListenerSession, SignalingEvent, SignalingState,
     MAX_CONCURRENT_PEERS,

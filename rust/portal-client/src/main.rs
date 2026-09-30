@@ -826,10 +826,12 @@ async fn run(
     // owned token, and a temporary inside the `select!` is dropped before it is
     // polled.
     let ended = connected.session.ended();
-    // **The relay leg's own end**, which is not the session's: the leg can go
-    // while the connection carries on over a direct path. `keep_on_the_best_path`
-    // needs it so that nothing tries to fall back to a relay that has gone.
-    let relay_ended = connected.session.relay_ended();
+    // **Where the relay leg is**, which is not the session's business: the leg
+    // can go while the connection carries on over a direct path, and a
+    // replacement answers somewhere new. `keep_on_the_best_path` needs it so
+    // that nothing falls back to a relay that has gone -- and so that a
+    // replacement is attached as a path when one turns up.
+    let relay_leg = connected.session.relay_leg();
     let peer = connected.peer.connection().clone();
     // **Armed only when the stop was an interrupt**, because the hatch turns the
     // *next* Ctrl+C into an immediate exit. On the other two arms nobody has
@@ -851,7 +853,7 @@ async fn run(
         // usable — which is what this arm is here for. They cannot be two
         // tasks: a connection's events are a single queue, so a second poller
         // would take events belonging to the first.
-        _ = portal_core::path::keep_on_the_best_path(peer, shutdown.clone(), relay_ended) => {
+        _ = portal_core::path::keep_on_the_best_path(peer, shutdown.clone(), relay_leg) => {
             tracing::warn!("the peer connection closed; the forwards are going with it");
         }
     }
