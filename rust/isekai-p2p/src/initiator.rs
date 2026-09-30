@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use isekai_p2p_core::bind::{open_connect_relay, ConnectRelay, RelayOptions};
@@ -19,24 +19,64 @@ use isekai_p2p_core::proxy::{
 use isekai_p2p_core::transport::MasqueH3Transport;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{issue_endpoint_token, spawn_token_renewal, P2pConfig, TokenRenewal};
 use crate::relay_lease::RelayLegLease;
 
-/// An initiator-side P2P session. Holds the relay connect leg open until dropped
+/// An initiator-side P2P session. Holds a relay connect leg open until dropped
 /// or [`close`](InitiatorSession::close)d.
+///
+/// **Not always the leg it started with.** When the relay restarts, the leg
+/// stops carrying traffic and the proxy's row for the connection goes with it;
+/// since `docs/relay_repath_plan.md` P3 this session answers by making a new
+/// connection and a new leg to stand where the old one did. What it reports —
+/// [`local_addr`](Self::local_addr), [`connection`](Self::connection) and the
+/// rest — is the attachment in force now, which is why they are accessors and
+/// not the fields they used to be.
+///
+/// **Nothing has moved onto the new leg yet.** That is P4. Until it lands, a
+/// peer connection that migrated to a direct path gets its fallback back
+/// without being told, and one riding the relay itself ends as it always did.
 pub struct InitiatorSession {
-    /// The local UDP address to send application traffic to.
-    pub local_addr: SocketAddr,
-    /// The `peer_connect` response, including `connection_id` (hand this to the
-    /// target so it can bind) and the relay info.
-    pub connection: PeerConnection,
+    /// What a holder may read about the attachment in force.
+    ///
+    /// Kept beside the attachment rather than borrowed out of it: the swap
+    /// happens on a task nobody here is waiting for, so a reader holding a
+    /// borrow across one would be holding the leg that died.
+    facts: watch::Receiver<Facts>,
+    /// Cancelled when the proxy stops accepting this Endpoint for this
+    /// connection — see [`ended`](Self::ended).
+    ended: CancellationToken,
+    /// Asks the supervisor to take the session down. Cancelled by
+    /// [`close`](Self::close) and by `Drop`, so a session nobody closed still
+    /// stops claiming.
+    shutdown: CancellationToken,
+    /// Answered once the supervisor has reported the connection closed and the
+    /// leg has wound down. Taken by [`close`](Self::close), which is the only
+    /// thing that waits for it.
+    closed: Option<oneshot::Receiver<()>>,
+    /// Replaces the Endpoint Token before it expires. Shared with the
+    /// [`PeerDirectory`] this was opened over, when there was one, so there is
+    /// one renewal loop however many handles are holding the same client.
+    _renewal: Arc<TokenRenewal>,
+}
+
+/// One relay attachment: a Peer Connection, the leg that carries it, and the
+/// two leases that keep each alive.
+///
+/// **These four live and die together**, which is the reason they are a type.
+/// Both leases are keyed on the connection id, and one of them on the leg's
+/// origin as well, so a leg replaced without them is a pair of loops renewing
+/// things that no longer exist — and the failures that produces name the
+/// proxy rather than this.
+struct Attachment {
+    /// The `peer_connect` response, including `connection_id` (hand this to
+    /// the target so it can bind) and the relay info.
+    connection: PeerConnection,
     relay: ConnectRelay,
-    /// Kept so [`close`](Self::close) can tell the proxy the connection is
-    /// over, and so the lease below can be renewed.
-    proxy: ProxyClient<MasqueH3Transport>,
-    /// Keeps the Peer Connection's lease alive while this session exists.
+    /// Keeps the Peer Connection's lease alive while this attachment exists.
     ///
     /// **Held here, on the side that is using the connection.** A renewal is a
     /// claim that somebody is still there (spec §8.5.4), and this is the only
@@ -58,13 +98,31 @@ pub struct InitiatorSession {
     /// Against a proxy that predates §8.14 this stops itself on the first
     /// attempt and nothing else changes.
     relay_lease: RelayLegLease,
-    /// Cancelled when the proxy stops accepting this Endpoint for this
-    /// connection — see [`ended`](Self::ended).
-    ended: CancellationToken,
-    /// Replaces the Endpoint Token before it expires. Shared with the
-    /// [`PeerDirectory`] this was opened over, when there was one, so there is
-    /// one renewal loop however many handles are holding the same client.
-    _renewal: Arc<TokenRenewal>,
+}
+
+/// What a holder of the session can read about the attachment in force.
+///
+/// A copy rather than a view. The attachment belongs to the supervisor task,
+/// and it is replaced whole.
+#[derive(Clone)]
+struct Facts {
+    local_addr: SocketAddr,
+    connection: PeerConnection,
+    observed: ObservedAddressWatch,
+    /// **The current leg's**, so a caller that asks after a replacement is
+    /// handed a token about the leg it would actually fall back to.
+    leg_ended: CancellationToken,
+}
+
+impl Facts {
+    fn of(attachment: &Attachment) -> Self {
+        Self {
+            local_addr: attachment.relay.local_addr,
+            connection: attachment.connection.clone(),
+            observed: attachment.relay.observed(),
+            leg_ended: attachment.relay.ended(),
+        }
+    }
 }
 
 /// What fraction of the remaining lease to let pass before renewing.
@@ -291,6 +349,116 @@ enum Authorization<'a> {
     Grant,
 }
 
+/// What it took to stand this session's relay leg up, kept so it can be done
+/// again (`docs/relay_repath_plan.md` P3).
+///
+/// **The listener id is remembered rather than looked up again.** A Grant
+/// outlives the listener it was made against — spec §8.8 keeps Listener out of
+/// its key precisely so that restarting the server does not mean pairing again
+/// — but the id itself is new after every restart of the *peer*. So this
+/// replaces a leg lost to the **relay** restarting, which is what the plan set
+/// out to do; a peer that restarted underneath is a reconnect, and the
+/// application above is what owns that.
+struct Reattach {
+    cfg: P2pConfig,
+    auth: OwnedAuthorization,
+    listener_id: String,
+    candidates: Vec<Candidate>,
+    local_bind: SocketAddr,
+    opts: RelayOptions,
+}
+
+/// How a session was let in, in the form that outlives the call that used it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedAuthorization {
+    /// **Spent.** A capability authorizes one `connect` (spec §8.4), and the
+    /// string itself is not kept, because keeping it would only make it look
+    /// like something this could use twice.
+    SpentCapability,
+    /// A standing grant. The proxy still holds it, so it can be used again.
+    Grant,
+}
+
+impl Reattach {
+    /// Why this session cannot stand a new leg up, when it cannot.
+    ///
+    /// Answered here rather than attempted and failed, because the two reasons
+    /// look nothing alike from a failed `peer_connect`: a spent capability
+    /// answers with a refusal that reads like a permissions problem, and a
+    /// connected socket answers with success and a leg that no path can ever
+    /// be moved onto.
+    fn refusal(&self) -> Option<&'static str> {
+        refusal(self.auth, self.opts.unconnected)
+    }
+}
+
+/// [`Reattach::refusal`], over the two things it actually reads.
+fn refusal(auth: OwnedAuthorization, unconnected: bool) -> Option<&'static str> {
+    match auth {
+        OwnedAuthorization::SpentCapability => Some(
+            "it was let in by a one-shot capability, and a capability authorizes one \
+             connect. Connect on a standing grant to have a leg that replaces itself",
+        ),
+        // **§3.5 of the plan, answered by leaving it out.** Without
+        // `unconnected` the leg is on a connected socket that no other path can
+        // share, so multipath was never negotiated and there is nothing a
+        // replacement leg could be attached to. Such a session is exactly the
+        // one that dies with its relay — worth fixing, and a different change
+        // (`peer.rs`, every session's handshake) from this one.
+        OwnedAuthorization::Grant if !unconnected => Some(
+            "its leg is on a connected socket, so no path could be moved onto a \
+             replacement (`docs/relay_repath_plan.md` §3.5)",
+        ),
+        OwnedAuthorization::Grant => None,
+    }
+}
+
+/// How long to wait before the first attempt at replacing a lost relay leg.
+///
+/// **Not zero.** A relay that has stopped answering is usually a relay that is
+/// restarting, and a `peer_connect` issued in the same breath as the leg's
+/// death is the one most likely to be answered by nothing at all.
+const REATTACH_FIRST_DELAY: Duration = Duration::from_secs(1);
+/// The ceiling the backoff climbs to.
+const REATTACH_MAX_DELAY: Duration = Duration::from_secs(30);
+/// The shortest time between one leg standing up and the next attempt to
+/// replace it — see [`reattach_delay`], which is where this is not backoff.
+const REATTACH_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// How many attempts before the session is left without a fallback for good.
+///
+/// With the delays above that is a little over two minutes: long enough to
+/// ride out a relay restart, short enough that a session running on one path
+/// is *reported* as such rather than spending the rest of its life asking.
+const REATTACH_ATTEMPTS: u32 = 8;
+/// How long [`InitiatorSession::close`] waits for the supervisor to report the
+/// connection closed and wind the leg down.
+///
+/// Covers both of the bounds it is waiting on — [`REPORT_CLOSED_TIMEOUT`] and
+/// the leg's own wind-down — with room to spare, so a warning here means
+/// something other than those two took the time.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait before attempt `attempt` (0-based) at replacing a leg that
+/// had been up for `age`.
+///
+/// Exponential with a ceiling, and a **floor that is not backoff at all**
+/// (`docs/relay_repath_plan.md` §0.3). Under multipath `remove_path` is
+/// asynchronous — msquic sends `PATH_ABANDON` and `PathsCount` does not drop
+/// until the peer answers — so legs replaced faster than paths retire walk the
+/// connection into `QUIC_MAX_PATH_COUNT`, which is 4 and already holds a relay
+/// path and a direct one. A relay that flaps every few hundred milliseconds
+/// would otherwise cost a `peer_connect` every few hundred milliseconds.
+///
+/// `age` is what keeps that floor off the ordinary case. A leg that has been
+/// up for hours has long since paid it, and its replacement starts on the
+/// backoff alone.
+fn reattach_delay(attempt: u32, age: Duration) -> Duration {
+    let backoff = REATTACH_FIRST_DELAY
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(REATTACH_MAX_DELAY);
+    backoff.max(REATTACH_MIN_INTERVAL.saturating_sub(age))
+}
+
 /// The initiator's view of the control plane, before any relay leg exists.
 ///
 /// Everything an app needs to answer "what can I reach, and how do I get let
@@ -410,7 +578,6 @@ impl PeerDirectory {
         InitiatorSession::connect_over(
             cfg,
             &self.proxy,
-            &self.endpoint_token(),
             Some(Arc::clone(&self.renewal)),
             Authorization::Grant,
             listener_id,
@@ -590,7 +757,6 @@ impl InitiatorSession {
         Self::connect_over(
             cfg,
             &proxy,
-            endpoint_token,
             // This opened the client, so nothing else is renewing its token.
             None,
             auth,
@@ -610,7 +776,6 @@ impl InitiatorSession {
     async fn connect_over(
         cfg: &P2pConfig,
         proxy: &ProxyClient<MasqueH3Transport>,
-        endpoint_token: &str,
         // The caller's renewal when it has one, so `proxy`'s token is not being
         // replaced by two loops at once. `None` starts one here.
         renewal: Option<Arc<TokenRenewal>>,
@@ -620,111 +785,55 @@ impl InitiatorSession {
         local_bind: SocketAddr,
         opts: RelayOptions,
     ) -> anyhow::Result<Self> {
-        // **Measured here, in front of the request that decides**
-        // (the relay proximity plan §4). The relay is chosen once, during
-        // this `connect`, and the target is not present for it — so an
-        // initiator that wants a say has to have measured by now. The target's
-        // numbers were reported against its listener long before.
-        //
-        // Bounded tightly and never fatal: this sits in front of a connection
-        // somebody is waiting on. Measuring nothing means the target's
-        // measurements decide alone, which is a worse relay and not a failure.
-        let relay_rtt = crate::relay_rtt::measure_for_connect(
-            proxy,
-            &crate::relay_rtt::ProbeOptions::initiator_defaults(),
-        )
-        .await;
-        let connection = match auth {
-            Authorization::Capability(capability) => {
-                proxy
-                    .peer_connect_measured(
-                        capability,
-                        listener_id,
-                        &cfg.protocol,
-                        candidates,
-                        &relay_rtt,
-                    )
-                    .await?
-            }
-            Authorization::Grant => {
-                proxy
-                    .peer_connect_with_grant_measured(
-                        listener_id,
-                        &cfg.protocol,
-                        candidates,
-                        &relay_rtt,
-                    )
-                    .await?
-            }
+        // Read before `auth` is spent on the first attach. What survives it is
+        // only the *kind*: a capability cannot be used twice, so keeping the
+        // string would make this look like something it is not.
+        let owned = match &auth {
+            Authorization::Capability(_) => OwnedAuthorization::SpentCapability,
+            Authorization::Grant => OwnedAuthorization::Grant,
         };
-        let relay = connection.relay.as_ref().context(
-            "connect response has no relay info; the proxy did not allocate a relay edge",
-        )?;
-        // **The ticket is what brings the leg into existence** (spec §8.14).
-        // It rides along in the `connect` response, so no extra round trip.
-        //
-        // `None` means either a proxy that predates §8.14 — which asks for no
-        // ticket — or one that could not sign. Opening the leg without one is
-        // right in both cases: the first accepts it, and the second answers
-        // `relay-ticket-required`, which names the real problem.
-        let ticket = connection.ticket.clone();
-        let handle = open_connect_relay(
-            &cfg.proxy_url,
-            endpoint_token,
-            &cfg.key,
-            &connection.connection_id,
-            &relay.masque_uri,
+        let ended = CancellationToken::new();
+        let attachment = attach(
+            cfg,
+            proxy,
+            auth,
+            listener_id,
+            candidates,
             local_bind,
-            ticket.as_ref().map(|t| t.ticket.as_str()),
-            relay.dp_id.as_deref(),
-            opts,
+            opts.clone(),
+            &ended,
         )
         .await?;
         let renewal = renewal
             .unwrap_or_else(|| Arc::new(spawn_token_renewal(cfg.clone(), proxy.clone(), None)));
-        let ended = CancellationToken::new();
-        let lease = ConnectionLease::spawn(
+        let (facts, watching) = watch::channel(Facts::of(&attachment));
+        let shutdown = CancellationToken::new();
+        let (reported, closed) = oneshot::channel();
+        // **The supervisor owns the attachment from here on.** It is the one
+        // thing that both replaces a lost leg and takes the last one down, and
+        // splitting those between a task and a `close` on this side is how the
+        // two end up racing over the same leg.
+        tokio::spawn(supervise(
+            attachment,
+            Reattach {
+                cfg: cfg.clone(),
+                auth: owned,
+                listener_id: listener_id.to_owned(),
+                candidates: candidates.to_vec(),
+                local_bind,
+                opts,
+            },
             proxy.clone(),
-            &connection,
-            handle.shutdown_token(),
+            facts,
             ended.clone(),
-        );
-        // Timed off the lease the ticket just wrote, so the first renewal lands
-        // where every one after it does. The same two tokens `ConnectionLease`
-        // takes, and they part company here: a leg the proxy has simply
-        // forgotten winds the relay down, while a leg it *refuses* to re-ticket
-        // is this Endpoint being told it may not hold the connection at all,
-        // which is what `ended` means to the application.
-        let relay_lease = RelayLegLease::spawn(
-            proxy.clone(),
-            // **From the leg itself**, so the renewal cannot address a
-            // different host than the one it is renewing on.
-            handle.relay_origin(),
-            connection.connection_id.clone(),
-            ticket.as_ref(),
-            handle.shutdown_token(),
-            ended.clone(),
-        );
-        // **Said, because nothing else will say it.** A leg that stops carrying
-        // traffic is invisible from above: a session still on the relay goes
-        // quiet and times out half a minute later with no reason given, and a
-        // session that has migrated to a direct path keeps working -- with its
-        // fallback gone, which nobody learns until the direct path goes too
-        // (`docs/relay_repath_plan.md` P1).
-        report_when_the_leg_goes(
-            handle.ended(),
-            handle.shutdown_token(),
-            connection.connection_id.clone(),
-            handle.relay_origin().to_owned(),
-        );
+            shutdown.clone(),
+            reported,
+        ));
         Ok(Self {
-            local_addr: handle.local_addr,
-            connection,
-            relay: handle,
-            proxy: proxy.clone(),
-            lease,
-            relay_lease,
+            facts: watching,
             ended,
+            shutdown,
+            closed: Some(closed),
             _renewal: renewal,
         })
     }
@@ -739,7 +848,8 @@ impl InitiatorSession {
     /// times out half a minute later, rather than a reason.
     ///
     /// Revocation is the emergency stop. This is how it reaches whoever is
-    /// watching.
+    /// watching. It is also what stops a lost leg being replaced: a refused
+    /// Endpoint will not be let back in under a new connection id either.
     pub fn ended(&self) -> CancellationToken {
         self.ended.clone()
     }
@@ -750,13 +860,36 @@ impl InitiatorSession {
     /// the fallback going away underneath a session that may be perfectly
     /// healthy on a direct path — and the reason anything that would fall back
     /// to the relay has to ask first (`portal_core::path`).
+    ///
+    /// **A snapshot, like everything else here.** What comes back is the token
+    /// for the leg in force when it was asked for, so a holder that keeps one
+    /// across a replacement is holding an answer about a leg that has been
+    /// retired. That is exactly what `portal_core::path` wants today — it was
+    /// told the relay pair it knows is gone, and P4 is what will move the pair
+    /// — and it is why the signal P4 needs is a new one rather than this.
     pub fn relay_ended(&self) -> CancellationToken {
-        self.relay.ended()
+        self.facts.borrow().leg_ended.clone()
+    }
+
+    /// The local UDP address the application should send its traffic to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.facts.borrow().local_addr
+    }
+
+    /// The `peer_connect` response for the attachment in force, including
+    /// `connection_id` (hand this to the target so it can bind) and the relay
+    /// info.
+    ///
+    /// **A clone, and it used to be a field.** It is replaced whole when a lost
+    /// leg is stood back up, so what a caller holds is a snapshot of the
+    /// connection that was current when it asked.
+    pub fn connection(&self) -> PeerConnection {
+        self.facts.borrow().connection.clone()
     }
 
     /// The connection id, to hand to the target so it can bind its relay leg.
-    pub fn connection_id(&self) -> &str {
-        &self.connection.connection_id
+    pub fn connection_id(&self) -> String {
+        self.facts.borrow().connection.connection_id.clone()
     }
 
     /// How the proxy sees this session's relay connect leg — `None` until the
@@ -772,108 +905,386 @@ impl InitiatorSession {
     /// `RelayOptions { unconnected: true, .. }`; a leg on a plain connected
     /// socket has no binding a direct path could use.
     pub fn observed_address(&self) -> ObservedAddressWatch {
-        self.relay.observed()
+        self.facts.borrow().observed.clone()
     }
 
     /// The loopback FQDN to dial for the video QUIC so its per-endpoint
     /// certificate can be validated, or `None` when the proxy has relay
     /// certificates disabled (dial `127.0.0.1` unvalidated instead).
-    pub fn video_host(&self) -> Option<&str> {
-        self.connection.video_host.as_deref()
+    pub fn video_host(&self) -> Option<String> {
+        self.facts.borrow().connection.video_host.clone()
     }
 
-    /// Tear down the relay connect leg.
     /// Report the connection closed and take the relay connect leg down.
     ///
-    /// The report is the important half, and it is easy to miss why. The
-    /// listener finds out who is waiting for it by listing its connections in
-    /// state `relay`, and binds its single leg to one of them. A connection
-    /// nobody reports stays in that listing until the proxy expires it — so a
-    /// peer that disconnects goes on occupying the listener's leg for minutes,
-    /// and another peer already waiting is not picked up in the meantime. What
-    /// looks like "the camera stopped accepting anyone" is this.
+    /// **The work is the supervisor's**; this asks for it and waits. That is
+    /// not indirection for its own sake: the supervisor is the thing that
+    /// replaces a lost leg, so it is also the only thing that knows which leg
+    /// there is to take down. Doing it from here would mean two owners for one
+    /// attachment and a race over which of them retires it.
     ///
-    /// Bounded by [`REPORT_CLOSED_TIMEOUT`] and never fails the caller: this
-    /// runs on the way out, the connection expires on its own either way, and
-    /// there is nothing a disconnecting application could do with the error.
-    pub async fn close(self) {
-        // **The ask goes first, before anything that can make the leg stop.**
-        // Reporting `closed` below is what frees the connection's relay
-        // resources, so a prompt proxy tears the CONNECT-UDP session down while
-        // that call is still in flight — and with the ask unspoken, the watcher
-        // in `report_when_the_leg_goes` would read the leg's own end as a loss
-        // and warn on every clean disconnect. Cancelling here costs nothing:
-        // `report_state` rides the control-plane client, not this leg, and
-        // `relay.close()` below still does the waiting.
-        self.relay.shutdown_token().cancel();
-        // Before the report: `closed` is terminal, so a renewal arriving behind
-        // it is refused and logged as a failure that is only bad timing. Both
-        // leases, for the same reason — a re-ticket would be refused with
-        // `connection-closed` just as a state report would.
-        self.lease.stop();
-        self.relay_lease.stop();
-        if self.ended.is_cancelled() {
-            // Revoked. `report_state` goes through the same auth layer that
-            // just refused the renewal, so it can only be refused too — and
-            // waiting out `REPORT_CLOSED_TIMEOUT` to be told so would end a
-            // revocation with a warning about the listener's leg staying
-            // reserved, which is neither true nor the point.
-            self.relay.close().await;
+    /// Bounded by [`CLOSE_TIMEOUT`] and never fails the caller: this runs on
+    /// the way out, the connection expires on its own either way, and there is
+    /// nothing a disconnecting application could do with the error.
+    pub async fn close(mut self) {
+        self.shutdown.cancel();
+        let Some(closed) = self.closed.take() else {
             return;
+        };
+        if tokio::time::timeout(CLOSE_TIMEOUT, closed).await.is_err() {
+            tracing::warn!(
+                "the relay leg did not finish winding down within {CLOSE_TIMEOUT:?}; \
+                 the listener's leg stays reserved until the proxy expires it",
+            );
         }
-        let reported = tokio::time::timeout(
-            REPORT_CLOSED_TIMEOUT,
-            self.proxy
-                .report_state(&self.connection.connection_id, "closed", &[]),
-        )
-        .await;
-        match reported {
-            Ok(Ok(_)) => tracing::debug!(
-                connection_id = %self.connection.connection_id,
-                "reported the peer connection closed"
-            ),
-            Ok(Err(e)) => tracing::warn!(
-                connection_id = %self.connection.connection_id,
-                "could not report the peer connection closed; the listener's leg \
-                 stays reserved until the proxy expires it: {e}"
-            ),
-            Err(_) => tracing::warn!(
-                connection_id = %self.connection.connection_id,
-                "timed out reporting the peer connection closed; the listener's leg \
-                 stays reserved until the proxy expires it"
-            ),
-        }
-        self.relay.close().await;
     }
 }
 
-/// Watch a relay leg, and say so if it stops on its own.
+impl Drop for InitiatorSession {
+    /// A session that is dropped rather than closed still has to stop claiming.
+    ///
+    /// **It used to do this by itself.** The leg and both leases were fields
+    /// here, and each cancels or aborts when dropped. They belong to the
+    /// supervisor now, so the ask has to be made out loud — and unlike
+    /// [`close`](Self::close) there is nobody here to wait for the answer.
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+/// Stand one relay attachment up: `peer_connect`, the leg, and the two leases.
 ///
-/// **Only when nobody asked for it.** Winding a session down cancels the leg
-/// too, and reporting that would put a warning on every ordinary close --
-/// which is how a warning stops being read. The two tokens tell them apart:
-/// `shutdown` is the ask, `ended` is what happened.
+/// **Called again for every replacement**, which is why it reads the Endpoint
+/// Token off the proxy rather than taking one. `ProxyClient` holds the token
+/// the renewal loop keeps replacing, so a leg stood up an hour into a session
+/// is opened with the token in force then and not with the one the session
+/// started with.
+#[allow(clippy::too_many_arguments)]
+async fn attach(
+    cfg: &P2pConfig,
+    proxy: &ProxyClient<MasqueH3Transport>,
+    auth: Authorization<'_>,
+    listener_id: &str,
+    candidates: &[Candidate],
+    local_bind: SocketAddr,
+    opts: RelayOptions,
+    ended: &CancellationToken,
+) -> anyhow::Result<Attachment> {
+    // **Measured here, in front of the request that decides**
+    // (the relay proximity plan §4). The relay is chosen once, during
+    // this `connect`, and the target is not present for it — so an
+    // initiator that wants a say has to have measured by now. The target's
+    // numbers were reported against its listener long before.
+    //
+    // Bounded tightly and never fatal: this sits in front of a connection
+    // somebody is waiting on. Measuring nothing means the target's
+    // measurements decide alone, which is a worse relay and not a failure.
+    let relay_rtt = crate::relay_rtt::measure_for_connect(
+        proxy,
+        &crate::relay_rtt::ProbeOptions::initiator_defaults(),
+    )
+    .await;
+    let connection = match auth {
+        Authorization::Capability(capability) => {
+            proxy
+                .peer_connect_measured(
+                    capability,
+                    listener_id,
+                    &cfg.protocol,
+                    candidates,
+                    &relay_rtt,
+                )
+                .await?
+        }
+        Authorization::Grant => {
+            proxy
+                .peer_connect_with_grant_measured(
+                    listener_id,
+                    &cfg.protocol,
+                    candidates,
+                    &relay_rtt,
+                )
+                .await?
+        }
+    };
+    let relay = connection
+        .relay
+        .as_ref()
+        .context("connect response has no relay info; the proxy did not allocate a relay edge")?;
+    // **The ticket is what brings the leg into existence** (spec §8.14).
+    // It rides along in the `connect` response, so no extra round trip.
+    //
+    // `None` means either a proxy that predates §8.14 — which asks for no
+    // ticket — or one that could not sign. Opening the leg without one is
+    // right in both cases: the first accepts it, and the second answers
+    // `relay-ticket-required`, which names the real problem.
+    let ticket = connection.ticket.clone();
+    let handle = open_connect_relay(
+        &cfg.proxy_url,
+        &proxy.endpoint_token(),
+        &cfg.key,
+        &connection.connection_id,
+        &relay.masque_uri,
+        local_bind,
+        ticket.as_ref().map(|t| t.ticket.as_str()),
+        relay.dp_id.as_deref(),
+        opts,
+    )
+    .await?;
+    let lease = ConnectionLease::spawn(
+        proxy.clone(),
+        &connection,
+        handle.shutdown_token(),
+        ended.clone(),
+    );
+    // Timed off the lease the ticket just wrote, so the first renewal lands
+    // where every one after it does. The same two tokens `ConnectionLease`
+    // takes, and they part company here: a leg the proxy has simply
+    // forgotten winds the relay down, while a leg it *refuses* to re-ticket
+    // is this Endpoint being told it may not hold the connection at all,
+    // which is what `ended` means to the application.
+    let relay_lease = RelayLegLease::spawn(
+        proxy.clone(),
+        // **From the leg itself**, so the renewal cannot address a
+        // different host than the one it is renewing on.
+        handle.relay_origin(),
+        connection.connection_id.clone(),
+        ticket.as_ref(),
+        handle.shutdown_token(),
+        ended.clone(),
+    );
+    Ok(Attachment {
+        connection,
+        relay: handle,
+        lease,
+        relay_lease,
+    })
+}
+
+/// Take an attachment down and tell the proxy its connection is over.
 ///
-/// This reports and does nothing else. Re-attaching is a later phase; what
-/// this buys now is that a session running on one leg instead of two can be
-/// counted (`docs/relay_repath_plan.md` §4 P1).
-fn report_when_the_leg_goes(
+/// **The order is the whole of it, and the ask goes first.** Reporting
+/// `closed` is what frees the connection's relay resources, so a prompt proxy
+/// tears the CONNECT-UDP session down while that call is still in flight —
+/// and with the ask unspoken the supervisor would read the leg's own end as a
+/// loss and go stand another one up on the way out. Then the leases, because
+/// `closed` is terminal and a renewal arriving behind it is refused and logged
+/// as a failure that is really just bad timing.
+///
+/// **The report is worth making even for a leg that is already dead.** The
+/// listener finds out who is waiting for it by listing its connections in
+/// state `relay`, and a connection nobody reports stays in that listing until
+/// the proxy expires it — so the peer that just lost its leg goes on occupying
+/// the listener's for minutes, including against the replacement this is
+/// making room for.
+async fn retire(
+    attachment: Attachment,
+    proxy: &ProxyClient<MasqueH3Transport>,
+    ended: &CancellationToken,
+) {
+    let Attachment {
+        connection,
+        relay,
+        lease,
+        relay_lease,
+    } = attachment;
+    relay.shutdown_token().cancel();
+    lease.stop();
+    relay_lease.stop();
+    if ended.is_cancelled() {
+        // Revoked. `report_state` goes through the same auth layer that
+        // just refused the renewal, so it can only be refused too — and
+        // waiting out `REPORT_CLOSED_TIMEOUT` to be told so would end a
+        // revocation with a warning about the listener's leg staying
+        // reserved, which is neither true nor the point.
+        relay.close().await;
+        return;
+    }
+    let reported = tokio::time::timeout(
+        REPORT_CLOSED_TIMEOUT,
+        proxy.report_state(&connection.connection_id, "closed", &[]),
+    )
+    .await;
+    match reported {
+        Ok(Ok(_)) => tracing::debug!(
+            connection_id = %connection.connection_id,
+            "reported the peer connection closed"
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            connection_id = %connection.connection_id,
+            "could not report the peer connection closed; the listener's leg \
+             stays reserved until the proxy expires it: {e}"
+        ),
+        Err(_) => tracing::warn!(
+            connection_id = %connection.connection_id,
+            "timed out reporting the peer connection closed; the listener's leg \
+             stays reserved until the proxy expires it"
+        ),
+    }
+    relay.close().await;
+}
+
+/// Own the session's attachment: replace it when its leg goes, and retire it
+/// when the session ends (`docs/relay_repath_plan.md` P3).
+///
+/// **The replacement is a new connection, not a revived one.** A listener puts
+/// a connection whose leg died into `spent` and never binds it again, on
+/// purpose — the same id coming back would mean reviving something it watched
+/// die, and the listener has no way to tell that from a stale row. So this
+/// asks for a new `connection_id`, which the listener picks up through the
+/// path it already has (plan §0.2 A).
+async fn supervise(
+    first: Attachment,
+    inputs: Reattach,
+    proxy: ProxyClient<MasqueH3Transport>,
+    facts: watch::Sender<Facts>,
     ended: CancellationToken,
     shutdown: CancellationToken,
-    connection_id: String,
-    relay_origin: String,
+    reported: oneshot::Sender<()>,
 ) {
-    tokio::spawn(async move {
-        if let LegOutcome::Gone = watch_leg(ended, shutdown).await {
-            tracing::warn!(
-                connection_id,
-                relay = %relay_origin,
-                "the relay leg has gone and nothing replaced it. A connection still on \
-                 the relay will stop; one that migrated to a direct path keeps working \
-                 with no fallback left, and will end if that path does",
-            );
+    let mut current = Some(first);
+    let mut stood_up = Instant::now();
+    while let Some(attachment) = current.take() {
+        if let LegOutcome::WoundDown = watch_leg(attachment.relay.ended(), shutdown.clone()).await {
+            current = Some(attachment);
+            break;
         }
-    });
+        if ended.is_cancelled() {
+            // **The Endpoint was refused, not the relay.** What cancelled the
+            // leg is the lease that was told so, and it has already said it at
+            // `error`; the leg stopping is the consequence, not the event.
+            // Nothing this process asks for next would be let in either, so
+            // there is no replacement to make and no second warning to add.
+            current = Some(attachment);
+            break;
+        }
+        let was = attachment.connection.connection_id.clone();
+        let relay_origin = attachment.relay.relay_origin().to_owned();
+        let age = stood_up.elapsed();
+        if let Some(why) = inputs.refusal() {
+            tracing::warn!(
+                connection_id = %was,
+                relay = %relay_origin,
+                "the relay leg has gone and this session cannot replace it: {why}. A \
+                 connection still on the relay will stop; one that migrated to a direct \
+                 path keeps working with no fallback left, and will end if that path does",
+            );
+            // **Not retired.** The peer connection may be running perfectly
+            // well on a direct path, and reporting it closed would say
+            // otherwise to everyone who can see it.
+            shutdown.cancelled().await;
+            current = Some(attachment);
+            break;
+        }
+        tracing::warn!(
+            connection_id = %was,
+            relay = %relay_origin,
+            ?age,
+            "the relay leg has gone; making a new connection to stand one in its place",
+        );
+        // **Retired before the replacement is asked for, not after.** The leg
+        // is dead either way, and a `connect` made while the old row is still
+        // being claimed is one more against whatever the proxy lets an Endpoint
+        // hold at once (`docs/relay_repath_plan.md` §5-2).
+        retire(attachment, &proxy, &ended).await;
+        let Some(replacement) = stand_up_again(&inputs, &proxy, &ended, &shutdown, age).await
+        else {
+            break;
+        };
+        tracing::info!(
+            was = %was,
+            connection_id = %replacement.connection.connection_id,
+            relay = %replacement.relay.relay_origin(),
+            local = %replacement.relay.local_addr,
+            "a new relay leg is up. Nothing has moved onto it yet: the peer connection \
+             goes on using the path it has (`docs/relay_repath_plan.md` P4)",
+        );
+        facts.send_replace(Facts::of(&replacement));
+        stood_up = Instant::now();
+        current = Some(replacement);
+    }
+    if let Some(attachment) = current {
+        retire(attachment, &proxy, &ended).await;
+    }
+    // Whether there was anything left to retire or not: what `close` waits for
+    // is that nothing more is going to happen to this session's attachment.
+    let _ = reported.send(());
+}
+
+/// Try to put a new attachment where the old one was, backing off between
+/// attempts, until one stands up or this session gives up on having a
+/// fallback.
+async fn stand_up_again(
+    inputs: &Reattach,
+    proxy: &ProxyClient<MasqueH3Transport>,
+    ended: &CancellationToken,
+    shutdown: &CancellationToken,
+    age: Duration,
+) -> Option<Attachment> {
+    // **Held rather than raised at each attempt.** A relay that is restarting
+    // refuses in several different ways on the way back up, and reporting each
+    // one at `warn` would be a paragraph about a thing that then worked. What
+    // is worth saying at `error` is the last one, once, if none of them worked.
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..REATTACH_ATTEMPTS {
+        tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            _ = ended.cancelled() => {
+                // The Endpoint is refused, not the relay. A new connection id
+                // would be refused as well, and saying so belongs to whoever
+                // cancelled this.
+                return None;
+            }
+            _ = tokio::time::sleep(reattach_delay(attempt, age)) => {}
+        }
+        // **The attempt is abandoned if the session is, and not awaited.**
+        // `attach` makes two network calls to a proxy that has just been
+        // failing, and `close` waits for this task; without the arm below, a
+        // Ctrl+C landing here waits out whatever those calls do before the
+        // process can exit. What is dropped mid-flight is a connection row the
+        // proxy expires on its own, which is the same thing that happens when
+        // a process is killed.
+        let made = tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            made = attach(
+                &inputs.cfg,
+                proxy,
+                // A capability was spent on the first one; `Reattach::refusal`
+                // has already turned such a session away, so what is left here
+                // is a Grant.
+                Authorization::Grant,
+                &inputs.listener_id,
+                &inputs.candidates,
+                inputs.local_bind,
+                inputs.opts.clone(),
+                ended,
+            ) => made,
+        };
+        match made {
+            Ok(attachment) => return Some(attachment),
+            Err(e) => {
+                tracing::debug!(
+                    attempt = attempt + 1,
+                    of = REATTACH_ATTEMPTS,
+                    "could not stand a new relay leg up: {e:#}",
+                );
+                last = Some(e);
+            }
+        }
+    }
+    // **At `error`, because this is the state the plan wants counted**
+    // (`docs/relay_repath_plan.md` §3.3): a session that goes on working while
+    // standing on one leg. Nothing retries after this — the relay had two
+    // minutes to come back and did not, and a loop that asks forever is a loop
+    // whose log nobody reads.
+    tracing::error!(
+        attempts = REATTACH_ATTEMPTS,
+        listener_id = %inputs.listener_id,
+        "gave up replacing the relay leg; this session has no fallback left. It keeps \
+         working for as long as its direct path does, and ends with it{}",
+        last.map(|e| format!(": {e:#}")).unwrap_or_default(),
+    );
+    None
 }
 
 /// How a relay leg stopped.
@@ -898,6 +1309,90 @@ async fn watch_leg(ended: CancellationToken, shutdown: CancellationToken) -> Leg
             true => LegOutcome::WoundDown,
             false => LegOutcome::Gone,
         },
+    }
+}
+
+#[cfg(test)]
+mod reattach_tests {
+    use super::*;
+
+    /// The shape the backoff is supposed to have: doubling from the first
+    /// delay, and then flat. Read off a leg old enough that the floor has
+    /// nothing to say, so what is being checked is the backoff alone.
+    #[test]
+    fn the_backoff_doubles_and_then_stops() {
+        let old = Duration::from_secs(3600);
+        let delays: Vec<u64> = (0..REATTACH_ATTEMPTS)
+            .map(|n| reattach_delay(n, old).as_secs())
+            .collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        // The point of the ceiling: a session that has been trying for a while
+        // is not trying any harder than one that just started.
+        assert_eq!(
+            reattach_delay(u32::MAX, old),
+            REATTACH_MAX_DELAY,
+            "nothing overflows its way past the ceiling",
+        );
+    }
+
+    /// **The floor is about `PATH_ABANDON`, not about politeness**
+    /// (`docs/relay_repath_plan.md` §0.3). A relay that comes up and falls over
+    /// again immediately must not cost a `peer_connect` each time it does --
+    /// under multipath the paths it leaves behind have not retired yet, and
+    /// four is all there are.
+    #[test]
+    fn a_leg_that_flapped_waits_out_the_floor() {
+        let flapped = Duration::from_millis(200);
+        assert_eq!(
+            reattach_delay(0, flapped),
+            REATTACH_MIN_INTERVAL - flapped,
+            "the first attempt waits for what is left of the interval, not the backoff",
+        );
+    }
+
+    /// And the floor stays off the case this feature exists for. A leg that
+    /// has carried a session for an hour has long since paid the interval, so
+    /// its replacement starts on the first backoff delay.
+    #[test]
+    fn a_leg_that_lasted_does_not_wait_for_it() {
+        assert_eq!(
+            reattach_delay(0, REATTACH_MIN_INTERVAL),
+            REATTACH_FIRST_DELAY,
+            "an interval already elapsed asks for nothing more",
+        );
+        assert!(
+            REATTACH_FIRST_DELAY < REATTACH_MIN_INTERVAL,
+            "or this proves nothing"
+        );
+    }
+
+    /// A standing grant is what makes a leg replaceable: the proxy still holds
+    /// it, so it can authorize the next `connect` as it did the first.
+    #[test]
+    fn a_grant_on_a_shareable_leg_can_be_used_again() {
+        assert_eq!(refusal(OwnedAuthorization::Grant, true), None);
+    }
+
+    /// **A capability authorizes one connect** (spec §8.4). Trying anyway
+    /// would spend the backoff on a refusal that reads like a permissions
+    /// problem, which is the wrong thing for an operator to go and check.
+    #[test]
+    fn a_spent_capability_cannot_stand_another_leg_up() {
+        let why = refusal(OwnedAuthorization::SpentCapability, true)
+            .expect("a capability is spent by the connect it authorized");
+        assert!(
+            why.contains("grant"),
+            "and it says what to do instead: {why}"
+        );
+    }
+
+    /// **§3.5 of the plan, answered by saying no.** Without a shared
+    /// unconnected binding there is no multipath, so a replacement leg is a
+    /// leg nothing could ever be moved onto -- and standing one up would look
+    /// like a recovery while changing nothing.
+    #[test]
+    fn a_connected_leg_has_nowhere_to_put_a_replacement() {
+        assert!(refusal(OwnedAuthorization::Grant, false).is_some());
     }
 }
 

@@ -152,7 +152,7 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
     )
     .await?;
     let connection_id = session.connection_id().to_owned();
-    let local_addr = session.local_addr;
+    let local_addr = session.local_addr();
     // Dial the per-endpoint FQDN with validation when the proxy issued a relay
     // certificate; otherwise fall back to 127.0.0.1 unvalidated (dev).
     let (video_host, verify) = match session.video_host() {

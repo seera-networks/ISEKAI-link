@@ -144,7 +144,7 @@ async fn run(
     )
     .await?;
     let connection_id = session.connection_id().to_owned();
-    let local_addr = session.local_addr;
+    let local_addr = session.local_addr();
     let (video_host, verify) = match session.video_host() {
         Some(host) => (host.to_string(), true),
         None => ("127.0.0.1".to_string(), false),

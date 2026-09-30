@@ -355,7 +355,7 @@ impl MyApp {
             // proxy names both.
             match camera_core::paired::check(
                 &expected_endpoint,
-                session.connection.peer_endpoint.as_deref(),
+                session.connection().peer_endpoint.as_deref(),
             ) {
                 // Said either way. A connection that was held against a pairing
                 // and one that had nothing to be held against both go on to
@@ -376,7 +376,7 @@ impl MyApp {
                     return;
                 }
             }
-            let local_port = session.local_addr.port();
+            let local_port = session.local_addr().port();
             // Dial the peer's loopback FQDN (which resolves to 127.0.0.1) so the
             // per-endpoint relay certificate can be validated. When the proxy has
             // relay certificates disabled, fall back to 127.0.0.1 unvalidated.
@@ -387,7 +387,7 @@ impl MyApp {
             // What the peer signed about its own key, if it has said anything.
             // Absent is ordinary and changes nothing; present means the
             // handshake has to produce that key (§8.6.5).
-            let pin = match camera_core::AttestedPeer::from_connection(&session.connection) {
+            let pin = match camera_core::AttestedPeer::from_connection(&session.connection()) {
                 Ok(pin) => {
                     tracing::info!(
                         peer = %pin.peer_endpoint,

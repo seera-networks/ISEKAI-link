@@ -674,7 +674,7 @@ async fn open_the_peer_connection(
     // What the peer signed about its own key, if it has said anything. Absent
     // is ordinary and changes nothing; present means the handshake has to
     // produce that key (spec §8.6.5).
-    let pin = match AttestedPeer::from_connection(&session.connection) {
+    let pin = match AttestedPeer::from_connection(&session.connection()) {
         Ok(pin) => {
             tracing::info!(
                 peer = %pin.peer_endpoint,
@@ -702,7 +702,7 @@ async fn open_the_peer_connection(
     let peer = transport::connect(
         Some(reg),
         &host,
-        session.local_addr.port(),
+        session.local_addr().port(),
         transport::ConnectOptions {
             verify,
             pin,

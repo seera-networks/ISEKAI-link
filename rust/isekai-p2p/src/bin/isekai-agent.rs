@@ -416,13 +416,13 @@ async fn connect(a: Connect) -> anyhow::Result<()> {
         local_bind,
     )
     .await?;
-    print_json(&session.connection)?;
+    print_json(&session.connection())?;
     print_json(&serde_json::json!({
-        "relay_local_addr": session.local_addr.to_string(),
+        "relay_local_addr": session.local_addr().to_string(),
     }))?;
     tracing::info!(
         "relay leg running; send UDP to {} (Ctrl-C to stop)",
-        session.local_addr
+        session.local_addr()
     );
     tokio::signal::ctrl_c()
         .await
