@@ -1,0 +1,28 @@
+[package]
+name = "portal-client-ffi"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace root, same reasoning as portal-server/portal-client:
+# not added to the parent rust/Cargo.toml's members, per the user's
+# don't-touch-existing-files instruction mid-project.
+[workspace]
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2.0.16"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "time", "tracing-log"] }
+msquic-async = { path = "../../submodules/msquic-async-rs/msquic-async", default-features = false, features = ["tokio", "msquic-seera"] }
+isekai-p2p = { path = "../isekai-p2p" }
+portal-core = { path = "../portal-core" }
+uniffi = { version = "0.28", features = ["cli"] }
