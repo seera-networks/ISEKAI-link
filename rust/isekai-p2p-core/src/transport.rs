@@ -308,9 +308,21 @@ pub(crate) enum Liveness {
     /// this keeps msquic's own disconnect timeout and a keepalive sized only
     /// to stay inside the idle timeout.
     ControlPlane,
-    /// A relay leg, whose death is now on a clock — and whose replacement
-    /// costs under two seconds.
+    /// A relay leg carrying a peer connection: the initiator's connect leg, or
+    /// a listener's bind leg. **Both halves**, and [`RELAY_LEG_KEEPALIVE`]
+    /// says why the listener's is in here too.
     RelayLeg,
+    /// A published public address.
+    ///
+    /// **Patient, like the control plane, and for the opposite reason to a
+    /// leg.** Nothing replaces one of these and nothing watches it:
+    /// `isekai_p2p::public` has no renewal loop and no health check by
+    /// design, and its driving loop simply falls out when the events channel
+    /// closes, with nothing logged and nothing re-opened. Giving it a leg's
+    /// impatience would end a published listener on a few seconds of
+    /// interrupted uplink, leaving an address that still resolves and answers
+    /// nothing until somebody restarts it.
+    PublicAddress,
 }
 
 /// How often an idle control-plane connection pings.
@@ -343,12 +355,42 @@ const CONTROL_PLANE_KEEPALIVE: u32 = 10_000;
 /// seconds. The ping decides when the clock *starts*; the disconnect timeout
 /// decides when it *finishes*.
 ///
-/// **What this costs is sensitivity.** Six seconds of interrupted network now
-/// ends a leg that would have survived. That is affordable only because
-/// losing one is no longer permanent: a replacement is stood up in about two
-/// seconds, and `portal_core::path`'s floor keeps a flapping relay from
-/// turning that into a `peer_connect` every few hundred milliseconds
-/// (§0.3). Before any of that existed, these numbers would have been reckless.
+/// **What this costs is sensitivity, and the cost is not symmetric.**
+///
+/// On the initiator's connect leg it is small: six seconds of interrupted
+/// network now ends a leg that would have survived, and losing one stopped
+/// being permanent — `isekai_p2p::initiator` stands a replacement up in about
+/// two seconds, and `reattach_delay`'s `REATTACH_MIN_INTERVAL` floor there
+/// keeps a flapping relay from turning that into a `peer_connect` every few
+/// hundred milliseconds (§0.3). Before that existed these numbers would have
+/// been reckless.
+///
+/// **A listener's bind leg gets them too, and there nothing replaces it.**
+/// `isekai_p2p::listener` puts a connection whose leg died into `spent` and
+/// never binds that id again, and the initiator cannot tell — its own leg is
+/// healthy, so nothing asks for a replacement. The peer connection's relay
+/// path then goes unacknowledged and takes the whole connection with it.
+/// **That was true before this change and is now true for shorter blips**:
+/// about eight seconds of interrupted uplink on the listener's side rather
+/// than about twenty-five.
+///
+/// It is here anyway because the re-attach does not work without it. The
+/// initiator opens its replacement path about ten seconds in, and the
+/// listener has to have a live leg by then for the proxy to bind the new
+/// connection to — one that took twenty-six seconds to notice would still be
+/// on its dead leg when `portal_core::path`'s patience ran out. So the
+/// exposure is deliberate, and what would remove it is the listener learning
+/// to re-bind a connection whose leg died while the connection is still being
+/// claimed (`docs/relay_repath_plan.md` §0.2 B, rejected there on grounds this
+/// measurement partly answers).
+///
+/// **It also tightens the handshake.** `DisconnectTimeoutMs` is not
+/// conditioned on the handshake being finished — the loss-detection timer
+/// guards only on there being an outstanding packet — so a leg's handshake
+/// budget becomes six seconds rather than the ten `HandshakeIdleTimeoutMs`
+/// defaults to. One round trip plus retransmissions fits that on any ordinary
+/// path; a very slow or very lossy one may not, and there the replacement's
+/// eight attempts are what covers it.
 const RELAY_LEG_KEEPALIVE: u32 = 2_000;
 /// See [`RELAY_LEG_KEEPALIVE`].
 const RELAY_LEG_DISCONNECT_TIMEOUT: u32 = 6_000;
@@ -395,7 +437,7 @@ pub(crate) fn make_client_config(
         // leg's death noticeable in time — which is what the shorter
         // interval is for. See [`RELAY_LEG_KEEPALIVE`].
         .set_KeepAliveIntervalMs(match liveness {
-            Liveness::ControlPlane => CONTROL_PLANE_KEEPALIVE,
+            Liveness::ControlPlane | Liveness::PublicAddress => CONTROL_PLANE_KEEPALIVE,
             Liveness::RelayLeg => RELAY_LEG_KEEPALIVE,
         })
         // `DestCidUpdateIdleTimeoutMs` is left at its default, and its
@@ -407,8 +449,9 @@ pub(crate) fn make_client_config(
         //
         // **This does not get the rotation back, and is not meant to.**
         // The gate is 20 s since the last flush (`send.c`), and the
-        // keepalive above flushes every 10, so on any connection
-        // configured like this one it will not fire. What the removal
+        // keepalive above flushes every 10 seconds here — every 2 on a relay
+        // leg — so on any connection configured like this one it will not
+        // fire. What the removal
         // achieves is that a workaround whose reason is gone stops
         // being carried — and stops being copied into the next
         // configuration somebody writes. Wanting the rotation to
@@ -459,7 +502,7 @@ pub(crate) fn make_client_config(
     // msquic's sixteen seconds for the control plane, where a connection that
     // gave up this readily would turn a blip into a failed request.
     let settings = match liveness {
-        Liveness::ControlPlane => settings,
+        Liveness::ControlPlane | Liveness::PublicAddress => settings,
         Liveness::RelayLeg => settings.set_DisconnectTimeoutMs(RELAY_LEG_DISCONNECT_TIMEOUT),
     };
     let configuration = registration.open_configuration(&alpn, Some(&settings))?;
