@@ -567,7 +567,7 @@ listener では**すべてのパスが 1 つのバインディングのローカ
 | **P2** ✅ | `path.rs` が「リレーは永遠ではない」を知る（§1.4） | **`relay` の二重持ちを解消し、退避先が問いになった。** 「移った」は P4 で同じ引数を広げる |
 | **P3** ✅ | 貼り直し — 新しい `peer_connect` と `ConnectRelay`、古い側の後始末（§2.2） | **新しいレグが立つ。inner QUIC はまだ使わない**（§4.1） |
 | **P4** ✅ | `add_path` と `PathAdded` 待ち、`remove_path`、間隔の下限（§0.3） | **inner QUIC が新しいリレーを使う**（§4.2） |
-| **P5** | 実配備でリレーを再起動して端から端まで | — |
+| **P5** ◐ | 実配備でリレーを再起動して端から端まで | **P3・P4 は設計どおり動いた。そして前提が間違っていた**（§7） |
 
 > **P2 は P3 より前でなければならない。** 初版は逆に並べていた。`PathAdded` は
 > `keep_on_the_best_path` の中でしか観測できず、そこに新しいリレーの
@@ -671,6 +671,335 @@ backup のパスは bind も検証も keepalive も生きており、退避先�
 **P1 は単独で価値がある。** いまは「フォールバックが永久に失われた」ことを
 誰も知らない。貼り直しが入る前でも、それが**見える**ようになるだけで、
 一本足で走っているセッションを運用者が数えられる。
+
+---
+
+## 7. P5 で測った（2026-10-02）
+
+実配備。`portal-server` + `portal-client`（どちらも seera-networks /
+`org_tAUNRLW8USki2Big`）、リレーは `dp18c7c32424973fa65f0`（minazuki）。
+2 秒ごとに転送先（`ssh`）へ TCP を張ってバナーを読むプローブを掛けながら、
+リレーを再起動した。直接経路は毎回張れている（`192.168.1.59` 同士、path_id 1）。
+
+### 7.1 P3・P4 は設計どおりに動いた
+
+| | 測った値 |
+| --- | --- |
+| レグの死を検知するまで | **18 〜 22 秒**（3 回: 22.5 / 18.3 / 18.9 s） |
+| 新しいレグが立つまで（P3） | **1.9 秒**（1.93 / 1.89 / 1.96 s） |
+| `add_path` → `PathAdded`（P4） | **64 ms**（2 回とも 63〜64 ms） |
+| 古いパスの片付け | `remove_path` → `get_path_statistics` から path_id 0 が**消えた**（§0.3 を実機で確認） |
+
+そして **§5 の未確認項目 1・2 に答えが出た。**
+
+```
+16:14:33.221  a new relay leg is up   was=conn_PUa743MhF1oo  connection_id=conn_z7qmLPLEP8Yx
+16:14:33.221  [server] Unbound { connection_id: "conn_PUa743MhF1oo" }
+16:14:33.221  [server] Bound   { connection_id: "conn_z7qmLPLEP8Yx" }
+16:14:33.252  [server] a peer is reaching this leg
+16:14:33.284  the relay is back on a path of its own, held as backup; the direct path keeps the traffic  path_id=2
+```
+
+1. **listener は新しい `connection_id` にレグを貼る。** 古い ID は `Unbound`
+   になり、新しい ID が `Bound` になって数十 ms 後にパスが検証された（＝
+   往復がレグを通った）
+2. **古い接続の `closed` 報告は通る**（`reported the peer connection closed`）
+3. **CID の窓には当たらなかった。** `RELAY_PATH_PATIENCE` の満了は 1 度も
+   起きていない。§0.1.1 の「数分走った接続なら CID は揃っている」という読みは
+   実機で持った
+
+### 7.2 しかし接続は死ぬ。そして**それは貼り直しのせいではない**
+
+3 回とも、貼り直しが成功したあとで peer connection が落ちた。
+
+```
+16:14:13  リレー再起動
+16:14:33  貼り直し完了（直接経路は 285〜343 µs で健全）
+16:14:50  プローブ最後の PASS
+16:14:52  the peer connection closed  (QUIC_STATUS_CONNECTION_TIMEOUT)
+```
+
+**対照を取った。** リレーを*停めたまま*にして貼り直しが成立しない状態で同じ
+ことをすると、接続は **21 秒後**に落ちた — その 1 秒前の直接経路は
+`rtt_us=243 min_rtt_us=87 bandwidth=50`、**完全に健全**である。
+
+| | リレーが停まってから接続が落ちるまで |
+| --- | --- |
+| 再起動（貼り直しが成立） | **39 〜 40 秒** |
+| 停止（貼り直し不成立、対照） | **21 秒** |
+
+つまり **P4 は接続の寿命を 18 秒ほど延ばした。救ってはいない。**
+
+### 7.3 機構: 1 本のパスの loss detection が接続ごと殺す
+
+```c
+// loss_detection.c:2049 — QuicLossDetectionOnLossDetectionTimeout
+if (OldestPacket != NULL &&
+    CxPlatTimeDiff64(OldestPacket->SentTime, TimeNow) >=
+        MS_TO_US((uint64_t)Connection->Settings.DisconnectTimeoutMs)) {
+    // Assume the path is dead and close the connection.
+    QuicConnCloseLocally(Connection, ..., QUIC_STATUS_CONNECTION_TIMEOUT, NULL);
+}
+```
+
+`QuicLossDetectionGetPathID(LossDetection)->Connection` — **loss detection は
+path id ごとにあり、閉じるのは接続である。** つまり **どれか 1 本のパスで
+`DisconnectTimeoutMs` の間 ACK されないパケットが outstanding になると、他の
+パスがどれほど健全でも接続が閉じる。**
+
+`QUIC_DEFAULT_DISCONNECT_TIMEOUT` は **16000 ms**（`quicdef.h:315`）で、
+このワークスペースはどこでも上書きしていない。
+
+観測と合う: `path_id=0 in_flight=2440` が張り付いたまま 16 秒。
+
+### 7.4 したがって P1〜P4 が立っていた前提は間違っている
+
+P1 と P2 は「**直接経路に移ったセッションは、リレーのレグが死んでも動き続ける
+— ただしフォールバックが無いまま**」と書いた。実機ではそうならない。
+**リレーパスが ACK を返さなくなってから 16 秒で接続ごと落ちる。**
+
+そして **検知だけで 18 秒かかる。** 予算は 16 秒である。
+
+> **貼り直しの速さは問題ではなかった。** 1.9 秒で立ち、64 ms で貼れている。
+> 間に合わないのは**検知**で、しかもレグの死の検知自身が同じ 16 秒クロック
+> （レグの QUIC 接続の `DisconnectTimeoutMs`）に乗っているので、
+> 「検知してから貼り直す」という形では構造的に勝てない。
+
+手は 3 つある。どれも P5 の範囲外で、測ってから決めるべきものである。
+
+| | |
+| --- | --- |
+| **死んだパスを早く畳む** | `remove_path` はそのパスの loss detection を止める。レグが死んだと分かった時点で（＝置き換えを待たずに）畳めば、残りのパスは死んだパスの時計から自由になる。**run 2 では実際に畳んでおり、それが 18 秒を稼いだ分である** |
+| **検知を速くする** | `RelayLegLease` の `Verdict::LegGone` はリース TTL 以内に分かる。レグ自身に短い keepalive を置く手もある。**16 秒より十分内側に入る必要がある** |
+| **`DisconnectTimeoutMs` を上げる / msquic を直す** | 健全なパスがあるのに接続を閉じるのは multipath としては不適切に見える。上流の変更 |
+
+### 7.5 path_id 2 が ACK を受け取らない件 — LTTng で追った
+
+§7.2 の「説明がついていないこと」を LTTng で追った（2026-10-02）。
+`QUIC_ENABLE_LOGGING=on`（Linux では既定 `off` なので `build.rs` を一時的に
+patch、計測後に revert）、`LD_PRELOAD=libmsquic.lttng.so`、
+`lttng enable-event -u 'CLOG_*'` に `vpid`/`procname` コンテキストを付ける。
+**両プロセスが同じセッションに入るので、どちらが何をしたかはこれが無いと
+区別できない。** 追試 3 回（r1/r2/r3）＋初回（t1）。
+
+#### 分かったこと
+
+| | |
+| --- | --- |
+| client 側 | `ConnPathInitialized Path[2]` → `ConnPathValidated Path[2]` が **63 ms**。毎回成功している |
+| **server 側もパスを生やす** | `ConnPathInitialized Path[3]`。§2.2 の未測定項目 3 が実トラフィックで確認された（spike ではなく） |
+| 両方向に通っている | トレースの `DatapathSend`/`DatapathRecv` が **約 62 ms 周期で対になって**最後まで並ぶ。リレー側の `forwarded_bytes` も同じ |
+| **それでも ACK が来ない** | client の path_id 2 は `rtt_us` が検証時の 1 サンプルで凍り、`in_flight` が 1220 →2440 のまま接続の最後まで減らない。**1220 は padding 済みの PATH_CHALLENGE 自身である** |
+
+そして死ぬのは §7.3 のとおり `loss_detection.c:2049` である。
+
+#### 見つかった**別のバグ**: リレーが 1 個落とす
+
+4 回のうち 2 回（t1・r2）、リレー側ログにこれが出た。
+
+```
+17:…:12.492078  received COMPRESSION_ASSIGN capsule: context id 2, addr Some(127.0.0.1:38955)
+17:…:12.492143  registered compressed context id 2        (from_udp_to_quic)
+17:…:12.492162  from_quic_to_udp: unknown context id 2    ← 落とした
+17:…:12.492167  received RegisterContextID Message … context id 2
+17:…:12.492197  sending datagram 1220 bytes for context id 2
+```
+
+`from_udp_to_quic` が context を登録して相手に `COMPRESSION_ASSIGN` を返す
+一方、`from_quic_to_udp` にはそれが**メッセージ経由で**伝わる。**その 19 µs
+の窓に届いたデータグラムは捨てられる。** 貼り直しでは server 側 msquic が
+新しい送信元を見た直後に 2 発まとめて返すので、この窓に当たりやすい。
+
+落ちたのが **server 自身の PATH_CHALLENGE** だった場合、msquic は
+**challenge を再送しない**ので 3 PTO 後に
+`ConnPathValidationTimeout` → server はそのパスを捨てる。すると
+`QuicSendWritePathAckFrames`（`send.c:286`）は **`Connection->Paths[]` を
+回して各パスの path id の ACK を書く**実装なので、**path id 2 のパスが
+無くなった server は path id 2 の ACK を永久に書けない。** t1・r2 の
+「ACK が来ない」はこれで説明がつく。
+
+#### しかし r3 がその答えを拒否する
+
+**r3 ではリレーは何も落とさず、server の `Path[3]` は 63 ms で検証を通り、
+最後まで消えていない。** それでも client の path_id 2 は
+`in_flight=2440` のまま ACK を 1 つも受け取らず、接続は 22 秒後に落ちた。
+
+> **つまり「ACK が来ない」には 2 つ目の原因がある。** リレーの取りこぼしは
+> 実在するバグだが、死因そのものではない。**1 回の観測で満足していたら
+> そう結論していた** — §0.1.1 で 3 回間違えたのと同じ形である。
+
+**次に手を付けるのはここである。** 推測ではなく、server 側で path id 2 の
+ack tracker が何をしているかを計測する（`QuicAckTrackerAckFrameEncode` が
+path id 2 に対して呼ばれているか）。backup と宣言したパスの扱いが絡んで
+いる可能性はあるが、**`QuicSendPathResponses` は IsActive を見ない**ことは
+確認済みなので、そこではない。
+
+### 7.5.1 ack tracker を計測した — そして ack tracker は無罪だった
+
+`QuicAckTrackerAckPacket` / `QuicAckTrackerAckFrameEncode` /
+`QuicSendWritePathAckFrames` に `fprintf(stderr, "[AT] …")` を 3 本入れて
+（multipath の接続だけ、毎秒数行なので §0.1.1 の「stdout backend は時間を
+変える」には当たらない）、path id ごとに「mark したか」「encode したか」
+「writer が何を見たか」を取った。計測後に revert 済み。
+
+| | path id 0 | path id 1（直接経路） | **path id 2（貼り直し）** |
+| --- | --- | --- | --- |
+| server が mark した数 | 8 | 25 | **2** |
+| server が encode した数 | 5 | 16 | **2** |
+| client が mark した数 | 10 | 25 | 7 |
+| client が encode した数 | 7 | 19 | 6 |
+
+**ack tracker は正しく動いている。** server は path id 2 で受け取った 2 個を
+2 個とも mark して ACK を書いており、client も server の path-2 パケット
+（pn 216〜222）を ack している。
+
+**問題は届いていないことだった。** 貼り直し後の 40 秒間に server の msquic が
+受け取ったデータグラムは **10 個**で、リレーが server 方向へ転送した数も
+**ちょうど 10 個**だった（`ctx0 -> 127.0.0.1:30038` の内訳を数えた）。
+**リレーもレグも 1 個も落としていない。**
+
+#### 落としていたのは server 自身の binding である
+
+client が path id 2 に送った 1220 バイトのパケットは 3 つ
+（pn=180・182・184）。pn=180 は PATH_CHALLENGE で、**これだけが接続に
+マッチした。** 残りの 2 つは **10 秒間隔**で、msquic の
+**path keepalive**（backup パスを生かすための padding 済み PING）である。
+その 2 つはこうなっていた。
+
+```
+17:22:59.912  PacketTxStatelessReset   (token f6491fb4…)
+17:22:59.937  BindingDropPacket  src=127.0.0.1:54538  Reason=Already in stateless oper table
+17:23:09.939  PacketTxStatelessReset
+17:23:10.028  BindingDropPacket  src=127.0.0.1:54538  Reason=Already in stateless oper table
+```
+
+`BindingDropPacket` は**接続にマッチしなかった**パケットである。
+つまり **server は、client が貼り直したパスで使っている destination CID を
+知らない**ので、stateless reset を返している。client はそのトークンが合わない
+ので無視し、keepalive を投げ続け、16 秒後に §7.3 が接続を閉じる。
+
+**その CID は server が発行したものである。** client の `FirstCidUsage` は
+path 2 で `5125eae4f344ce6456` — 直接経路の `512541c72083e2836a` と同じ
+`5125` プレフィックス、すなわち server 自身の CID である。
+**発行して相手に広告した CID を、binding が解決できない。**
+
+#### 対照: 古いパスを畳むのは何に効いているのか
+
+同じ時間帯で A/B を取った（`RELAY_REPATH_KEEP_OLD_PATH=1` で
+`drop_the_path` を飛ばす実験パッチ、計測後 revert）。
+
+| | リレー停止から接続が落ちるまで |
+| --- | --- |
+| **A. 置き換えが検証されたら古いパスを畳む**（現状） | **40 秒** |
+| **B. 畳まない** | **20 秒** — 貼り直しを始めた **0.2 秒後**に落ちた |
+
+B は**古いパス自身の 16 秒**で落ちている（リレーが落ちた時刻 + 16 秒に
+一致）。**畳むことは必要で、約 20 秒を稼いでいる。** そして B は新しいパスが
+立つ前に死ぬので、**CID の件の原因が「畳んだこと」かどうかは B では判定
+できない**（§7.4 のとおり、検知 18 秒と予算 16 秒が同じ時計に乗っている）。
+
+#### 残る 1 つは上流にある
+
+**seera-msquic の multipath CID 管理である。** `Connected` の時点で
+`QuicPathIDSetGenerateNewSourceCids` が追加 path id 用の source CID を作って
+相手に広告するが、**相手が後から `add_path` したパスでそれを使うと、
+binding がそれを解決できない。** portal 側でもリレー側でもない。
+
+> **ここでも 1 回で結論しなかったのが効いた。** 「backup にしたから
+> PATH_RESPONSE が返らない」も「ack tracker が path id 2 を飛ばす」も、
+> 測って潰した仮説である（前者は `QuicSendPathResponses` が `IsActive` を
+> 見ないことを読んで、後者はこの節の計測で）。
+
+### 7.5.2 原因を特定した: 1 本の path id を畳むと**全部**の CID が消える
+
+`pathid_set.c:303`、`QuicPathIDSetTryFreePathID`（path id 1 本の後始末）:
+
+```c
+if (!Path->UseBound) {
+    QuicBindingRemoveAllSourceConnectionIDs(Path->Binding, Connection);
+}
+```
+
+そして `QuicBindingRemoveAllSourceConnectionIDs`（`binding.c:637`）は
+
+```c
+QuicPathIDSetGetPathIDs(&Connection->PathIDs, PathIDs, &PathIDCount);
+for (uint8_t i = 0; i < PathIDCount; i++) {        // ← この接続の **全** path id
+    for (… PathIDs[i]->SourceCids …) { … HashEntry->Binding == Binding → 削除 … }
+```
+
+**1 本を畳んでいるのに、その binding に登録されている*すべての* path id の
+source CID を消す。** そして **server では全パスが listener の binding を
+共有している。** だから古いリレーパス（path id 0）を畳んだ瞬間に、
+**生きている path id 1〜3 の CID も listener の binding から消える。**
+
+以降、client が path id 2 の CID で送ったパケットは接続にマッチせず、
+`BindingDropPacket` → `PacketTxStatelessReset`（§7.5.1 の測定どおり）。
+
+**しかも直後の `QuicPathIDFreeSourceCids(PathID)`（`pathid.c:153`）が
+「畳む path id の CID だけを、登録されている全 binding から消す」という
+正しい範囲の処理をすでにしている。** つまり上の `RemoveAll` は
+**畳む path id については冗長で、他の path id については破壊的**である。
+
+#### 直して測った
+
+`RemoveAll` の呼び出しを「この path id の CID だけをこの binding から外す」
+に狭めて（`QuicPathIDFreeSourceCids` の内側のループと同じ形）、実配備で
+リレーを再起動した。**ただし §7.4 の予算（16 秒）が先に切れて貼り直しが
+間に合わないので、測定のために両端の `DisconnectTimeoutMs` を 60 秒に
+上げた**（これも実験で、revert 済み）。
+
+| | path id 2 の様子 | 接続 |
+| --- | --- | --- |
+| **CID を狭めた + 予算 60s** | `in_flight=0`、`rtt_us` が **31181 → 31161 → 31046** と更新され続ける | **リレー再起動を越えて生き残った。** プローブが 2 分 26 秒、1 度も落ちずに PASS |
+| **対照: 予算 60s だけ**（CID はそのまま） | `rtt_us` が検証時の 32690 で**凍結**、`in_flight` が 1259 → 7941 と単調増加 | **ちょうど 60 秒後**に落ちた（同じ機構が後ろへずれただけ） |
+
+**対照が結論を出している。** 予算を上げるのは死を遅らせるだけで、
+**貼り直したパスが実際に使えるようになるのは CID の修正である。**
+
+> **これが P5 で初めて「リレー再起動を越えてセッションが生き残った」記録で
+> ある。**
+
+#### 修正は seera-msquic 側に作った
+
+`seera-networks/msquic` の `masa-koz/pathid-cid-scope`、
+`b9002f44` *Retire one path ID's source CIDs, not every path ID's*。
+`QuicPathIDFreeSourceCids(PathID)` を `QuicLibraryReleaseBinding` の**前**へ
+移し、広い呼び出しを削った。狭い複製を書くのではなく移動にしたのは、
+**それがすでに正しい範囲の処理だから**である。移動は必須で、装飾ではない:
+CID のハッシュエントリは自分の binding ポインタを持っており、
+binding の最後の参照が解放されたあとではそれが freed を指す。
+
+`pathid.c` の `QuicPathIDCheckDestCids` に**同じ広さの削除がもう 1 つある。**
+そこは直さずコメントだけ入れた — パスは消えるが path id は残るので、
+欲しい条件は「この binding を他のパス/bound address が使っていないか」であり、
+**その分岐（非アクティブなパスが destination CID を切らす）の再現手段が無い。**
+
+#### 5 回走らせて、3 つの欠陥が独立に効いていることが分かった
+
+| 走行 | リレーの取りこぼし | 貼り直し完走 | 生存 |
+| --- | --- | --- | --- |
+| fix3 | なし | ✅ | **✅ 2 分 26 秒、プローブ 0 失敗** |
+| ctl3（対照・CID 未修正） | なし | ✅ | ❌ **ちょうど 60 秒**で落ちた |
+| ver1 | **あり** | ✅ | ❌ |
+| ver2 | **あり** | ❌（検知レースに負けた） | ❌ |
+| ver3 | なし | ✅ | **✅ プローブ 0 失敗** |
+
+**CID 修正があって、かつリレーが取りこぼさず、かつ検知が予算に間に合った
+回は、すべて生き残った。** 落ちた回はそれぞれ §7.6 の別の欠陥で説明がつく。
+3 つは独立である。
+
+### 7.6 したがって直すべきものは 4 つある
+
+| | どこ | |
+| --- | --- | --- |
+| 1 | **msquic（本命・原因特定済み）** | `QuicPathIDSetTryFreePathID` が 1 本の path id を畳むときに、その binding の**全** path id の source CID を消す（§7.5.2）。**狭めると貼り直しが実際に効き、セッションがリレー再起動を越えて生き残る** |
+| 2 | **リレー**（`axum_masque`） | context 登録の競合で 1 個落とす。貼り直しに限らず、新しい送信元の最初のデータグラムが落ちうる |
+| 3 | **msquic** | 健全なパスがあるのに 1 本の loss detection で接続を閉じる（`loss_detection.c:2049`）。また challenge を再送しない |
+| 4 | **本書の前提** | §7.4 のとおり。16 秒の予算に対し検知が 18 秒かかる |
+
+**どれも P4 の中の間違いではない。** P3・P4 は設計どおり動いており
+（§7.1）、足りないのはその下の層である。
 
 ---
 
