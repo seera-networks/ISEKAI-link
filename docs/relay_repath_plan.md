@@ -960,13 +960,34 @@ source CID を消す。** そして **server では全パスが listener の bin
 > **これが P5 で初めて「リレー再起動を越えてセッションが生き残った」記録で
 > ある。**
 
-#### 修正は seera-msquic 側にある
+#### 修正は seera-msquic 側に作った
 
-`QuicPathIDSetTryFreePathID` の `QuicBindingRemoveAllSourceConnectionIDs`
-呼び出しを、畳む path id に限った削除へ差し替える（または、
-`QuicPathIDFreeSourceCids` が後でやるので削るだけでよいか検討する — ただし
-その binding の最後の参照だった場合の解放順序に注意）。**本リポジトリの
-変更ではない。**
+`seera-networks/msquic` の `masa-koz/pathid-cid-scope`、
+`b9002f44` *Retire one path ID's source CIDs, not every path ID's*。
+`QuicPathIDFreeSourceCids(PathID)` を `QuicLibraryReleaseBinding` の**前**へ
+移し、広い呼び出しを削った。狭い複製を書くのではなく移動にしたのは、
+**それがすでに正しい範囲の処理だから**である。移動は必須で、装飾ではない:
+CID のハッシュエントリは自分の binding ポインタを持っており、
+binding の最後の参照が解放されたあとではそれが freed を指す。
+
+`pathid.c` の `QuicPathIDCheckDestCids` に**同じ広さの削除がもう 1 つある。**
+そこは直さずコメントだけ入れた — パスは消えるが path id は残るので、
+欲しい条件は「この binding を他のパス/bound address が使っていないか」であり、
+**その分岐（非アクティブなパスが destination CID を切らす）の再現手段が無い。**
+
+#### 5 回走らせて、3 つの欠陥が独立に効いていることが分かった
+
+| 走行 | リレーの取りこぼし | 貼り直し完走 | 生存 |
+| --- | --- | --- | --- |
+| fix3 | なし | ✅ | **✅ 2 分 26 秒、プローブ 0 失敗** |
+| ctl3（対照・CID 未修正） | なし | ✅ | ❌ **ちょうど 60 秒**で落ちた |
+| ver1 | **あり** | ✅ | ❌ |
+| ver2 | **あり** | ❌（検知レースに負けた） | ❌ |
+| ver3 | なし | ✅ | **✅ プローブ 0 失敗** |
+
+**CID 修正があって、かつリレーが取りこぼさず、かつ検知が予算に間に合った
+回は、すべて生き残った。** 落ちた回はそれぞれ §7.6 の別の欠陥で説明がつく。
+3 つは独立である。
 
 ### 7.6 したがって直すべきものは 4 つある
 
