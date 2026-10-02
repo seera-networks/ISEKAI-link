@@ -79,8 +79,9 @@ impl MasqueH3Transport {
     /// Connect to the proxy at `target` (e.g. `https://link.isekai.tools:6443`).
     pub fn connect(target: &str) -> anyhow::Result<Self> {
         let uri: Uri = target.parse().context("invalid proxy target URI")?;
-        let (registration, config) = make_client_config(None, false)?;
-        let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+        let (registration, config) = make_client_config(None, false, Liveness::ControlPlane)?;
+        let (registration, config_qmux) =
+            make_client_config(Some(registration), true, Liveness::ControlPlane)?;
         // The certificate has to name the host we dialled, and that is checked
         // here rather than assumed of the layer below (#134).
         let host = uri
@@ -294,6 +295,106 @@ pub async fn shutdown_msquic(timeout: Duration) -> bool {
     }
 }
 
+/// How soon a client connection should conclude that the far end has stopped
+/// answering.
+///
+/// **Two answers, because the two kinds of connection are losing different
+/// things.** A control-plane request that fails can be retried; a relay leg
+/// that dies unnoticed takes a *peer connection* with it, and has a deadline
+/// to beat doing so — see [`RELAY_LEG_KEEPALIVE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// The control plane. A blip should cost a retry, not the connection, so
+    /// this keeps msquic's own disconnect timeout and a keepalive sized only
+    /// to stay inside the idle timeout.
+    ControlPlane,
+    /// A relay leg carrying a peer connection: the initiator's connect leg, or
+    /// a listener's bind leg. **Both halves**, and [`RELAY_LEG_KEEPALIVE`]
+    /// says why the listener's is in here too.
+    RelayLeg,
+    /// A published public address.
+    ///
+    /// **Patient, like the control plane, and for the opposite reason to a
+    /// leg.** Nothing replaces one of these and nothing watches it:
+    /// `isekai_p2p::public` has no renewal loop and no health check by
+    /// design, and its driving loop simply falls out when the events channel
+    /// closes, with nothing logged and nothing re-opened. Giving it a leg's
+    /// impatience would end a published listener on a few seconds of
+    /// interrupted uplink, leaving an address that still resolves and answers
+    /// nothing until somebody restarts it.
+    PublicAddress,
+}
+
+/// How often an idle control-plane connection pings.
+///
+/// Without it, whether one of these survives depends on the caller happening
+/// to send something every thirty seconds, and a client between requests has
+/// no such guarantee. Ten seconds leaves two attempts inside the idle timeout.
+const CONTROL_PLANE_KEEPALIVE: u32 = 10_000;
+
+/// How often a **relay leg** pings, and how long it may then go unanswered.
+///
+/// **These two numbers are a deadline, not a preference.** When the relay
+/// stops answering, the peer connection's own relay *path* starts its
+/// `DisconnectTimeoutMs` — sixteen seconds, msquic's default — from its first
+/// unacknowledged packet, and when that expires msquic closes the **whole
+/// connection**, however healthy its direct path is
+/// (`loss_detection.c`, and `docs/relay_repath_plan.md` §7.3). Everything that
+/// replaces the leg has to finish inside that.
+///
+/// A leg notices its own death after `keepalive + disconnect timeout`: the
+/// ping is what makes loss detection have something outstanding to run on, and
+/// the disconnect timeout is how long it waits. At the control plane's
+/// settings that is 10 + 16 = **26 seconds**, which is why re-attaching used
+/// to lose the race — measured at 18 to 26 seconds, against a budget of 16
+/// (§7.4). At these it is 2 + 6 = **8**, leaving the replacement's measured
+/// 1.9 s and the new path's 64 ms inside the budget with room to spare.
+///
+/// **The keepalive alone would not do it**, which is worth saying because it
+/// looks like the whole fix: a one-second ping still leaves 1 + 16 = 17
+/// seconds. The ping decides when the clock *starts*; the disconnect timeout
+/// decides when it *finishes*.
+///
+/// **What this costs is sensitivity, and the cost is not symmetric.**
+///
+/// On the initiator's connect leg it is small: six seconds of interrupted
+/// network now ends a leg that would have survived, and losing one stopped
+/// being permanent — `isekai_p2p::initiator` stands a replacement up in about
+/// two seconds, and `reattach_delay`'s `REATTACH_MIN_INTERVAL` floor there
+/// keeps a flapping relay from turning that into a `peer_connect` every few
+/// hundred milliseconds (§0.3). Before that existed these numbers would have
+/// been reckless.
+///
+/// **A listener's bind leg gets them too, and there nothing replaces it.**
+/// `isekai_p2p::listener` puts a connection whose leg died into `spent` and
+/// never binds that id again, and the initiator cannot tell — its own leg is
+/// healthy, so nothing asks for a replacement. The peer connection's relay
+/// path then goes unacknowledged and takes the whole connection with it.
+/// **That was true before this change and is now true for shorter blips**:
+/// about eight seconds of interrupted uplink on the listener's side rather
+/// than about twenty-five.
+///
+/// It is here anyway because the re-attach does not work without it. The
+/// initiator opens its replacement path about ten seconds in, and the
+/// listener has to have a live leg by then for the proxy to bind the new
+/// connection to — one that took twenty-six seconds to notice would still be
+/// on its dead leg when `portal_core::path`'s patience ran out. So the
+/// exposure is deliberate, and what would remove it is the listener learning
+/// to re-bind a connection whose leg died while the connection is still being
+/// claimed (`docs/relay_repath_plan.md` §0.2 B, rejected there on grounds this
+/// measurement partly answers).
+///
+/// **It also tightens the handshake.** `DisconnectTimeoutMs` is not
+/// conditioned on the handshake being finished — the loss-detection timer
+/// guards only on there being an outstanding packet — so a leg's handshake
+/// budget becomes six seconds rather than the ten `HandshakeIdleTimeoutMs`
+/// defaults to. One round trip plus retransmissions fits that on any ordinary
+/// path; a very slow or very lossy one may not, and there the replacement's
+/// eight attempts are what covers it.
+const RELAY_LEG_KEEPALIVE: u32 = 2_000;
+/// See [`RELAY_LEG_KEEPALIVE`].
+const RELAY_LEG_DISCONNECT_TIMEOUT: u32 = 6_000;
+
 /// Build an msquic client registration + configuration (ALPN `h3` or `h3qx-01`
 /// for qmux), mirroring the `agent` crate's client setup.
 ///
@@ -305,6 +406,7 @@ pub async fn shutdown_msquic(timeout: Duration) -> bool {
 pub(crate) fn make_client_config(
     registration: Option<Arc<msquic_async::Registration>>,
     is_qmux: bool,
+    liveness: Liveness,
 ) -> anyhow::Result<(Arc<msquic_async::Registration>, Arc<msquic::Configuration>)> {
     let registration = match registration {
         Some(registration) => registration,
@@ -315,85 +417,95 @@ pub(crate) fn make_client_config(
     } else {
         [msquic::BufferRef::from("h3")]
     };
-    let configuration = registration.open_configuration(
-        &alpn,
-        Some(
-            &msquic::Settings::new()
-                .set_IdleTimeoutMs(30_000)
-                // Keep the connection from going idle into that timeout.
-                //
-                // Without it, whether one of these survives depends on the
-                // caller happening to send something every thirty seconds —
-                // a control-plane client between requests, or a relay leg
-                // whose peer has gone quiet, has no such guarantee. Ten
-                // seconds leaves two attempts inside the timeout.
-                //
-                // This is the *connection* keepalive and not
-                // `PathKeepAliveIntervalMs`: it is re-armed by any activity
-                // anywhere on the connection, so it fires only when the whole
-                // thing is quiet, which is exactly the case being covered.
-                // Keeping an idle *path* warm is a different setting and a
-                // different problem (see `camera-core`'s video connection).
-                .set_KeepAliveIntervalMs(10_000)
-                // `DestCidUpdateIdleTimeoutMs` is left at its default, and its
-                // absence is a decision rather than an omission.
-                //
-                // Every configuration in this repository used to pin it to 0,
-                // switching off the destination CID rotation to work around an
-                // msquic defect. That defect is fixed, so none of them does now.
-                //
-                // **This does not get the rotation back, and is not meant to.**
-                // The gate is 20 s since the last flush (`send.c`), and the
-                // keepalive above flushes every 10, so on any connection
-                // configured like this one it will not fire. What the removal
-                // achieves is that a workaround whose reason is gone stops
-                // being carried — and stops being copied into the next
-                // configuration somebody writes. Wanting the rotation to
-                // actually happen would mean settling the keepalive interval
-                // against that 20 s, which is a different question.
-                .set_PeerBidiStreamCount(100)
-                .set_PeerUnidiStreamCount(100)
-                .set_DatagramReceiveEnabled()
-                // Floor this connection's MTU high enough to carry a *relayed*
-                // inner QUIC packet in one datagram, from the very first one.
-                //
-                // The arithmetic, because the number matters and the failure is
-                // silent. The inner video connection cannot go below 1248:
-                // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
-                // (`core/settings.c`), so a full inner packet is 1248 bytes and
-                // there is no way to ask for less. As a CONNECT-UDP payload
-                // that is 1248 + 1 context-id byte, and the HTTP datagram
-                // carrying it prefixes a quarter-stream-id varint — so about
-                // 1250 goes on the wire. That varint is one byte because a
-                // relay leg opens an H3 connection of its own and CONNECT-UDP
-                // is its first request stream; a quarter stream id needs two
-                // bytes only past 63, which is stream id 255. A caller that
-                // kept opening requests on one connection would cross that,
-                // and would owe this sum another byte. This connection's max-datagram length
-                // runs about 42 bytes under its MTU. So the floor has to be at
-                // least ~1292; anything lower and **every** full-size inner
-                // packet fails to send and is dropped, while
-                // ACKs and control packets still fit — which looks like a lossy
-                // path rather than a misconfigured one.
-                //
-                // 1350 clears that with room for a longer connection ID, and is
-                // as low as it can usefully go. It was 1400, which is more than
-                // needed and excludes networks that carry 1360 but not 1400 —
-                // one such network is what turned this up. Paths below ~1300
-                // remain unsupported: the inner connection has a hard 1248-byte
-                // floor, so there is nothing left to give.
-                .set_MinimumMtu(1350)
-                .set_MaximumMtu(1500)
-                .set_StreamMultiReceiveEnabled()
-                // Ask the proxy to report the address it observes this
-                // connection at. On a relay leg that report is how the Endpoint
-                // learns its own NAT mapping, which the video connection then
-                // names as a direct-path candidate
-                // (docs/p2p_mode_migration_plan.md §2.2.3). Harmless on the
-                // control-plane connections, which simply never look at it.
-                .set_ReceiveObservedAddressReports(),
-        ),
-    )?;
+    let settings = msquic::Settings::new()
+        .set_IdleTimeoutMs(30_000)
+        // Keep the connection from going idle into that timeout.
+        //
+        // Without it, whether one of these survives depends on the
+        // caller happening to send something every thirty seconds —
+        // a control-plane client between requests, or a relay leg
+        // whose peer has gone quiet, has no such guarantee.
+        //
+        // This is the *connection* keepalive and not
+        // `PathKeepAliveIntervalMs`: it is re-armed by any activity
+        // anywhere on the connection, so it fires only when the whole
+        // thing is quiet, which is exactly the case being covered.
+        // Keeping an idle *path* warm is a different setting and a
+        // different problem (see `camera-core`'s video connection).
+        //
+        // On a relay leg it is also doing a second job — making the
+        // leg's death noticeable in time — which is what the shorter
+        // interval is for. See [`RELAY_LEG_KEEPALIVE`].
+        .set_KeepAliveIntervalMs(match liveness {
+            Liveness::ControlPlane | Liveness::PublicAddress => CONTROL_PLANE_KEEPALIVE,
+            Liveness::RelayLeg => RELAY_LEG_KEEPALIVE,
+        })
+        // `DestCidUpdateIdleTimeoutMs` is left at its default, and its
+        // absence is a decision rather than an omission.
+        //
+        // Every configuration in this repository used to pin it to 0,
+        // switching off the destination CID rotation to work around an
+        // msquic defect. That defect is fixed, so none of them does now.
+        //
+        // **This does not get the rotation back, and is not meant to.**
+        // The gate is 20 s since the last flush (`send.c`), and the
+        // keepalive above flushes every 10 seconds here — every 2 on a relay
+        // leg — so on any connection configured like this one it will not
+        // fire. What the removal
+        // achieves is that a workaround whose reason is gone stops
+        // being carried — and stops being copied into the next
+        // configuration somebody writes. Wanting the rotation to
+        // actually happen would mean settling the keepalive interval
+        // against that 20 s, which is a different question.
+        .set_PeerBidiStreamCount(100)
+        .set_PeerUnidiStreamCount(100)
+        .set_DatagramReceiveEnabled()
+        // Floor this connection's MTU high enough to carry a *relayed*
+        // inner QUIC packet in one datagram, from the very first one.
+        //
+        // The arithmetic, because the number matters and the failure is
+        // silent. The inner video connection cannot go below 1248:
+        // msquic clamps `MaximumMtu` up to QUIC_DPLPMTUD_MIN_MTU
+        // (`core/settings.c`), so a full inner packet is 1248 bytes and
+        // there is no way to ask for less. As a CONNECT-UDP payload
+        // that is 1248 + 1 context-id byte, and the HTTP datagram
+        // carrying it prefixes a quarter-stream-id varint — so about
+        // 1250 goes on the wire. That varint is one byte because a
+        // relay leg opens an H3 connection of its own and CONNECT-UDP
+        // is its first request stream; a quarter stream id needs two
+        // bytes only past 63, which is stream id 255. A caller that
+        // kept opening requests on one connection would cross that,
+        // and would owe this sum another byte. This connection's max-datagram length
+        // runs about 42 bytes under its MTU. So the floor has to be at
+        // least ~1292; anything lower and **every** full-size inner
+        // packet fails to send and is dropped, while
+        // ACKs and control packets still fit — which looks like a lossy
+        // path rather than a misconfigured one.
+        //
+        // 1350 clears that with room for a longer connection ID, and is
+        // as low as it can usefully go. It was 1400, which is more than
+        // needed and excludes networks that carry 1360 but not 1400 —
+        // one such network is what turned this up. Paths below ~1300
+        // remain unsupported: the inner connection has a hard 1248-byte
+        // floor, so there is nothing left to give.
+        .set_MinimumMtu(1350)
+        .set_MaximumMtu(1500)
+        .set_StreamMultiReceiveEnabled()
+        // Ask the proxy to report the address it observes this
+        // connection at. On a relay leg that report is how the Endpoint
+        // learns its own NAT mapping, which the video connection then
+        // names as a direct-path candidate
+        // (docs/p2p_mode_migration_plan.md §2.2.3). Harmless on the
+        // control-plane connections, which simply never look at it.
+        .set_ReceiveObservedAddressReports();
+    // **Only the legs**, and `RELAY_LEG_KEEPALIVE` has the arithmetic. Left at
+    // msquic's sixteen seconds for the control plane, where a connection that
+    // gave up this readily would turn a blip into a failed request.
+    let settings = match liveness {
+        Liveness::ControlPlane | Liveness::PublicAddress => settings,
+        Liveness::RelayLeg => settings.set_DisconnectTimeoutMs(RELAY_LEG_DISCONNECT_TIMEOUT),
+    };
+    let configuration = registration.open_configuration(&alpn, Some(&settings))?;
     // **`USE_TLS_BUILTIN_CERTIFICATE_VALIDATION` is deliberately not set here.**
     // It was, briefly, and it is wrong on three of the four platforms:
     //

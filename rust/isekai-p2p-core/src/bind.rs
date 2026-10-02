@@ -50,7 +50,7 @@ use tower_http::auth::AddAuthorizationLayer;
 use crate::endpoint::EndpointKey;
 use crate::observed::{ObservedAddressWatch, spawn_observed_address_watch};
 use crate::pop;
-use crate::transport::make_client_config;
+use crate::transport::{Liveness, make_client_config};
 
 /// How a relay leg's underlying QUIC connection is set up.
 ///
@@ -144,9 +144,10 @@ fn relay_connector(
     uri: Uri,
     opts: &RelayOptions,
     shutdown: CancellationToken,
+    liveness: Liveness,
 ) -> anyhow::Result<(H3MsQuicAsyncConnector, ObservedAddressWatch)> {
-    let (registration, config) = make_client_config(opts.registration.clone(), false)?;
-    let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+    let (registration, config) = make_client_config(opts.registration.clone(), false, liveness)?;
+    let (registration, config_qmux) = make_client_config(Some(registration), true, liveness)?;
     // The leg goes to the same proxy the control plane does, and gets the same
     // check: the certificate has to name the host dialled (#134).
     let host = uri.host().context("relay URI has no host")?.to_owned();
@@ -526,7 +527,17 @@ async fn open_bound_udp(
     let dialled = origin_of(&uri);
     let pop = sign_connect_udp(key, CONNECT_UDP_BIND_PATH);
     let shutdown = CancellationToken::new();
-    let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
+    // **A leg notices its own death in time; a published address is left
+    // patient.** `transport::RELAY_LEG_KEEPALIVE` has both halves of why: a
+    // peer connection riding on a leg closes itself sixteen seconds after its
+    // relay path stops being acknowledged, so the leg has to be inside that —
+    // while a public address has nothing that would replace it and nothing
+    // watching, so the same impatience would only end it sooner.
+    let liveness = match kind {
+        BoundUdp::PublicAddress => Liveness::PublicAddress,
+        BoundUdp::BindLeg { .. } | BoundUdp::ConnectLeg { .. } => Liveness::RelayLeg,
+    };
+    let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone(), liveness)?;
     // **Armed against this function being dropped before it returns.**
     // Everything below runs on a task of its own holding a clone of
     // `shutdown`, and a `CancellationToken` does not cancel when a clone is
@@ -758,7 +769,10 @@ pub async fn open_connect_relay(
     // work it out again — see [`ConnectRelay::relay_origin`].
     let dialled = origin_of(&uri);
     let shutdown = CancellationToken::new();
-    let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone())?;
+    // The initiator's connect leg — the one thing here that replaces itself,
+    // and the reason these timings exist (`transport::RELAY_LEG_KEEPALIVE`).
+    let (connector, observed) =
+        relay_connector(uri.clone(), &opts, shutdown.clone(), Liveness::RelayLeg)?;
     // **Armed against this function being dropped before it returns.**
     // Everything below runs on a task of its own holding a clone of
     // `shutdown`, and a `CancellationToken` does not cancel when a clone is
