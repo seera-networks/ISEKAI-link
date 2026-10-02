@@ -567,7 +567,7 @@ listener では**すべてのパスが 1 つのバインディングのローカ
 | **P2** ✅ | `path.rs` が「リレーは永遠ではない」を知る（§1.4） | **`relay` の二重持ちを解消し、退避先が問いになった。** 「移った」は P4 で同じ引数を広げる |
 | **P3** ✅ | 貼り直し — 新しい `peer_connect` と `ConnectRelay`、古い側の後始末（§2.2） | **新しいレグが立つ。inner QUIC はまだ使わない**（§4.1） |
 | **P4** ✅ | `add_path` と `PathAdded` 待ち、`remove_path`、間隔の下限（§0.3） | **inner QUIC が新しいリレーを使う**（§4.2） |
-| **P5** | 実配備でリレーを再起動して端から端まで | — |
+| **P5** ◐ | 実配備でリレーを再起動して端から端まで | **P3・P4 は設計どおり動いた。そして前提が間違っていた**（§7） |
 
 > **P2 は P3 より前でなければならない。** 初版は逆に並べていた。`PathAdded` は
 > `keep_on_the_best_path` の中でしか観測できず、そこに新しいリレーの
@@ -671,6 +671,120 @@ backup のパスは bind も検証も keepalive も生きており、退避先�
 **P1 は単独で価値がある。** いまは「フォールバックが永久に失われた」ことを
 誰も知らない。貼り直しが入る前でも、それが**見える**ようになるだけで、
 一本足で走っているセッションを運用者が数えられる。
+
+---
+
+## 7. P5 で測った（2026-10-02）
+
+実配備。`portal-server` + `portal-client`（どちらも seera-networks /
+`org_tAUNRLW8USki2Big`）、リレーは `dp18c7c32424973fa65f0`（minazuki）。
+2 秒ごとに転送先（`ssh`）へ TCP を張ってバナーを読むプローブを掛けながら、
+リレーを再起動した。直接経路は毎回張れている（`192.168.1.59` 同士、path_id 1）。
+
+### 7.1 P3・P4 は設計どおりに動いた
+
+| | 測った値 |
+| --- | --- |
+| レグの死を検知するまで | **18 〜 22 秒**（3 回: 22.5 / 18.3 / 18.9 s） |
+| 新しいレグが立つまで（P3） | **1.9 秒**（1.93 / 1.89 / 1.96 s） |
+| `add_path` → `PathAdded`（P4） | **64 ms**（2 回とも 63〜64 ms） |
+| 古いパスの片付け | `remove_path` → `get_path_statistics` から path_id 0 が**消えた**（§0.3 を実機で確認） |
+
+そして **§5 の未確認項目 1・2 に答えが出た。**
+
+```
+16:14:33.221  a new relay leg is up   was=conn_PUa743MhF1oo  connection_id=conn_z7qmLPLEP8Yx
+16:14:33.221  [server] Unbound { connection_id: "conn_PUa743MhF1oo" }
+16:14:33.221  [server] Bound   { connection_id: "conn_z7qmLPLEP8Yx" }
+16:14:33.252  [server] a peer is reaching this leg
+16:14:33.284  the relay is back on a path of its own, held as backup; the direct path keeps the traffic  path_id=2
+```
+
+1. **listener は新しい `connection_id` にレグを貼る。** 古い ID は `Unbound`
+   になり、新しい ID が `Bound` になって数十 ms 後にパスが検証された（＝
+   往復がレグを通った）
+2. **古い接続の `closed` 報告は通る**（`reported the peer connection closed`）
+3. **CID の窓には当たらなかった。** `RELAY_PATH_PATIENCE` の満了は 1 度も
+   起きていない。§0.1.1 の「数分走った接続なら CID は揃っている」という読みは
+   実機で持った
+
+### 7.2 しかし接続は死ぬ。そして**それは貼り直しのせいではない**
+
+3 回とも、貼り直しが成功したあとで peer connection が落ちた。
+
+```
+16:14:13  リレー再起動
+16:14:33  貼り直し完了（直接経路は 285〜343 µs で健全）
+16:14:50  プローブ最後の PASS
+16:14:52  the peer connection closed  (QUIC_STATUS_CONNECTION_TIMEOUT)
+```
+
+**対照を取った。** リレーを*停めたまま*にして貼り直しが成立しない状態で同じ
+ことをすると、接続は **21 秒後**に落ちた — その 1 秒前の直接経路は
+`rtt_us=243 min_rtt_us=87 bandwidth=50`、**完全に健全**である。
+
+| | リレーが停まってから接続が落ちるまで |
+| --- | --- |
+| 再起動（貼り直しが成立） | **39 〜 40 秒** |
+| 停止（貼り直し不成立、対照） | **21 秒** |
+
+つまり **P4 は接続の寿命を 18 秒ほど延ばした。救ってはいない。**
+
+### 7.3 機構: 1 本のパスの loss detection が接続ごと殺す
+
+```c
+// loss_detection.c:2049 — QuicLossDetectionOnLossDetectionTimeout
+if (OldestPacket != NULL &&
+    CxPlatTimeDiff64(OldestPacket->SentTime, TimeNow) >=
+        MS_TO_US((uint64_t)Connection->Settings.DisconnectTimeoutMs)) {
+    // Assume the path is dead and close the connection.
+    QuicConnCloseLocally(Connection, ..., QUIC_STATUS_CONNECTION_TIMEOUT, NULL);
+}
+```
+
+`QuicLossDetectionGetPathID(LossDetection)->Connection` — **loss detection は
+path id ごとにあり、閉じるのは接続である。** つまり **どれか 1 本のパスで
+`DisconnectTimeoutMs` の間 ACK されないパケットが outstanding になると、他の
+パスがどれほど健全でも接続が閉じる。**
+
+`QUIC_DEFAULT_DISCONNECT_TIMEOUT` は **16000 ms**（`quicdef.h:315`）で、
+このワークスペースはどこでも上書きしていない。
+
+観測と合う: `path_id=0 in_flight=2440` が張り付いたまま 16 秒。
+
+### 7.4 したがって P1〜P4 が立っていた前提は間違っている
+
+P1 と P2 は「**直接経路に移ったセッションは、リレーのレグが死んでも動き続ける
+— ただしフォールバックが無いまま**」と書いた。実機ではそうならない。
+**リレーパスが ACK を返さなくなってから 16 秒で接続ごと落ちる。**
+
+そして **検知だけで 18 秒かかる。** 予算は 16 秒である。
+
+> **貼り直しの速さは問題ではなかった。** 1.9 秒で立ち、64 ms で貼れている。
+> 間に合わないのは**検知**で、しかもレグの死の検知自身が同じ 16 秒クロック
+> （レグの QUIC 接続の `DisconnectTimeoutMs`）に乗っているので、
+> 「検知してから貼り直す」という形では構造的に勝てない。
+
+手は 3 つある。どれも P5 の範囲外で、測ってから決めるべきものである。
+
+| | |
+| --- | --- |
+| **死んだパスを早く畳む** | `remove_path` はそのパスの loss detection を止める。レグが死んだと分かった時点で（＝置き換えを待たずに）畳めば、残りのパスは死んだパスの時計から自由になる。**run 2 では実際に畳んでおり、それが 18 秒を稼いだ分である** |
+| **検知を速くする** | `RelayLegLease` の `Verdict::LegGone` はリース TTL 以内に分かる。レグ自身に短い keepalive を置く手もある。**16 秒より十分内側に入る必要がある** |
+| **`DisconnectTimeoutMs` を上げる / msquic を直す** | 健全なパスがあるのに接続を閉じるのは multipath としては不適切に見える。上流の変更 |
+
+### 7.5 説明がついていないこと
+
+**貼り直したパス（path_id 2）が、検証の 1 往復のあと ACK を受け取らなくなる。**
+
+- リレーは**両方向に転送し続けている**（リレー側ログの `forwarded_bytes`
+  が `quic_to_udp` / `udp_to_quic` 対で 16:14:50 まで出ている）
+- それでも client 側の path_id 2 は `rtt_us` が検証時の 1 サンプル
+  （32288 µs）で凍り、`in_flight` が 1220 → 3859 と単調に増えて減らない
+
+**これが分からないままでは、7.4 の「死んだパスを早く畳む」も効かない可能性が
+ある** — 畳んだ先の新しいパスが同じことになるなら、予算を使い切る相手が
+変わるだけである。次に手を付けるならここである。
 
 ---
 
