@@ -910,11 +910,69 @@ binding がそれを解決できない。** portal 側でもリレー側でも�
 > 測って潰した仮説である（前者は `QuicSendPathResponses` が `IsActive` を
 > 見ないことを読んで、後者はこの節の計測で）。
 
+### 7.5.2 原因を特定した: 1 本の path id を畳むと**全部**の CID が消える
+
+`pathid_set.c:303`、`QuicPathIDSetTryFreePathID`（path id 1 本の後始末）:
+
+```c
+if (!Path->UseBound) {
+    QuicBindingRemoveAllSourceConnectionIDs(Path->Binding, Connection);
+}
+```
+
+そして `QuicBindingRemoveAllSourceConnectionIDs`（`binding.c:637`）は
+
+```c
+QuicPathIDSetGetPathIDs(&Connection->PathIDs, PathIDs, &PathIDCount);
+for (uint8_t i = 0; i < PathIDCount; i++) {        // ← この接続の **全** path id
+    for (… PathIDs[i]->SourceCids …) { … HashEntry->Binding == Binding → 削除 … }
+```
+
+**1 本を畳んでいるのに、その binding に登録されている*すべての* path id の
+source CID を消す。** そして **server では全パスが listener の binding を
+共有している。** だから古いリレーパス（path id 0）を畳んだ瞬間に、
+**生きている path id 1〜3 の CID も listener の binding から消える。**
+
+以降、client が path id 2 の CID で送ったパケットは接続にマッチせず、
+`BindingDropPacket` → `PacketTxStatelessReset`（§7.5.1 の測定どおり）。
+
+**しかも直後の `QuicPathIDFreeSourceCids(PathID)`（`pathid.c:153`）が
+「畳む path id の CID だけを、登録されている全 binding から消す」という
+正しい範囲の処理をすでにしている。** つまり上の `RemoveAll` は
+**畳む path id については冗長で、他の path id については破壊的**である。
+
+#### 直して測った
+
+`RemoveAll` の呼び出しを「この path id の CID だけをこの binding から外す」
+に狭めて（`QuicPathIDFreeSourceCids` の内側のループと同じ形）、実配備で
+リレーを再起動した。**ただし §7.4 の予算（16 秒）が先に切れて貼り直しが
+間に合わないので、測定のために両端の `DisconnectTimeoutMs` を 60 秒に
+上げた**（これも実験で、revert 済み）。
+
+| | path id 2 の様子 | 接続 |
+| --- | --- | --- |
+| **CID を狭めた + 予算 60s** | `in_flight=0`、`rtt_us` が **31181 → 31161 → 31046** と更新され続ける | **リレー再起動を越えて生き残った。** プローブが 2 分 26 秒、1 度も落ちずに PASS |
+| **対照: 予算 60s だけ**（CID はそのまま） | `rtt_us` が検証時の 32690 で**凍結**、`in_flight` が 1259 → 7941 と単調増加 | **ちょうど 60 秒後**に落ちた（同じ機構が後ろへずれただけ） |
+
+**対照が結論を出している。** 予算を上げるのは死を遅らせるだけで、
+**貼り直したパスが実際に使えるようになるのは CID の修正である。**
+
+> **これが P5 で初めて「リレー再起動を越えてセッションが生き残った」記録で
+> ある。**
+
+#### 修正は seera-msquic 側にある
+
+`QuicPathIDSetTryFreePathID` の `QuicBindingRemoveAllSourceConnectionIDs`
+呼び出しを、畳む path id に限った削除へ差し替える（または、
+`QuicPathIDFreeSourceCids` が後でやるので削るだけでよいか検討する — ただし
+その binding の最後の参照だった場合の解放順序に注意）。**本リポジトリの
+変更ではない。**
+
 ### 7.6 したがって直すべきものは 4 つある
 
 | | どこ | |
 | --- | --- | --- |
-| 1 | **msquic（本命）** | 追加 path id 用に発行・広告した source CID を binding が解決できない（§7.5.1）。**これが貼り直しを無意味にしている直接の原因である** |
+| 1 | **msquic（本命・原因特定済み）** | `QuicPathIDSetTryFreePathID` が 1 本の path id を畳むときに、その binding の**全** path id の source CID を消す（§7.5.2）。**狭めると貼り直しが実際に効き、セッションがリレー再起動を越えて生き残る** |
 | 2 | **リレー**（`axum_masque`） | context 登録の競合で 1 個落とす。貼り直しに限らず、新しい送信元の最初のデータグラムが落ちうる |
 | 3 | **msquic** | 健全なパスがあるのに 1 本の loss detection で接続を閉じる（`loss_detection.c:2049`）。また challenge を再送しない |
 | 4 | **本書の前提** | §7.4 のとおり。16 秒の予算に対し検知が 18 秒かかる |
