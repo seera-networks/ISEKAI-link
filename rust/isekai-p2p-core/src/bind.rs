@@ -50,7 +50,7 @@ use tower_http::auth::AddAuthorizationLayer;
 use crate::endpoint::EndpointKey;
 use crate::observed::{ObservedAddressWatch, spawn_observed_address_watch};
 use crate::pop;
-use crate::transport::make_client_config;
+use crate::transport::{Liveness, make_client_config};
 
 /// How a relay leg's underlying QUIC connection is set up.
 ///
@@ -145,8 +145,15 @@ fn relay_connector(
     opts: &RelayOptions,
     shutdown: CancellationToken,
 ) -> anyhow::Result<(H3MsQuicAsyncConnector, ObservedAddressWatch)> {
-    let (registration, config) = make_client_config(opts.registration.clone(), false)?;
-    let (registration, config_qmux) = make_client_config(Some(registration), true)?;
+    // **A leg, so it notices its own death in time.** See
+    // `transport::RELAY_LEG_KEEPALIVE`: the peer connection riding on this leg
+    // closes itself sixteen seconds after its relay path stops being
+    // acknowledged, and everything that replaces the leg has to fit inside
+    // that.
+    let (registration, config) =
+        make_client_config(opts.registration.clone(), false, Liveness::RelayLeg)?;
+    let (registration, config_qmux) =
+        make_client_config(Some(registration), true, Liveness::RelayLeg)?;
     // The leg goes to the same proxy the control plane does, and gets the same
     // check: the certificate has to name the host dialled (#134).
     let host = uri.host().context("relay URI has no host")?.to_owned();
