@@ -773,18 +773,77 @@ P1 と P2 は「**直接経路に移ったセッションは、リレーのレ�
 | **検知を速くする** | `RelayLegLease` の `Verdict::LegGone` はリース TTL 以内に分かる。レグ自身に短い keepalive を置く手もある。**16 秒より十分内側に入る必要がある** |
 | **`DisconnectTimeoutMs` を上げる / msquic を直す** | 健全なパスがあるのに接続を閉じるのは multipath としては不適切に見える。上流の変更 |
 
-### 7.5 説明がついていないこと
+### 7.5 path_id 2 が ACK を受け取らない件 — LTTng で追った
 
-**貼り直したパス（path_id 2）が、検証の 1 往復のあと ACK を受け取らなくなる。**
+§7.2 の「説明がついていないこと」を LTTng で追った（2026-10-02）。
+`QUIC_ENABLE_LOGGING=on`（Linux では既定 `off` なので `build.rs` を一時的に
+patch、計測後に revert）、`LD_PRELOAD=libmsquic.lttng.so`、
+`lttng enable-event -u 'CLOG_*'` に `vpid`/`procname` コンテキストを付ける。
+**両プロセスが同じセッションに入るので、どちらが何をしたかはこれが無いと
+区別できない。** 追試 3 回（r1/r2/r3）＋初回（t1）。
 
-- リレーは**両方向に転送し続けている**（リレー側ログの `forwarded_bytes`
-  が `quic_to_udp` / `udp_to_quic` 対で 16:14:50 まで出ている）
-- それでも client 側の path_id 2 は `rtt_us` が検証時の 1 サンプル
-  （32288 µs）で凍り、`in_flight` が 1220 → 3859 と単調に増えて減らない
+#### 分かったこと
 
-**これが分からないままでは、7.4 の「死んだパスを早く畳む」も効かない可能性が
-ある** — 畳んだ先の新しいパスが同じことになるなら、予算を使い切る相手が
-変わるだけである。次に手を付けるならここである。
+| | |
+| --- | --- |
+| client 側 | `ConnPathInitialized Path[2]` → `ConnPathValidated Path[2]` が **63 ms**。毎回成功している |
+| **server 側もパスを生やす** | `ConnPathInitialized Path[3]`。§2.2 の未測定項目 3 が実トラフィックで確認された（spike ではなく） |
+| 両方向に通っている | トレースの `DatapathSend`/`DatapathRecv` が **約 62 ms 周期で対になって**最後まで並ぶ。リレー側の `forwarded_bytes` も同じ |
+| **それでも ACK が来ない** | client の path_id 2 は `rtt_us` が検証時の 1 サンプルで凍り、`in_flight` が 1220 →2440 のまま接続の最後まで減らない。**1220 は padding 済みの PATH_CHALLENGE 自身である** |
+
+そして死ぬのは §7.3 のとおり `loss_detection.c:2049` である。
+
+#### 見つかった**別のバグ**: リレーが 1 個落とす
+
+4 回のうち 2 回（t1・r2）、リレー側ログにこれが出た。
+
+```
+17:…:12.492078  received COMPRESSION_ASSIGN capsule: context id 2, addr Some(127.0.0.1:38955)
+17:…:12.492143  registered compressed context id 2        (from_udp_to_quic)
+17:…:12.492162  from_quic_to_udp: unknown context id 2    ← 落とした
+17:…:12.492167  received RegisterContextID Message … context id 2
+17:…:12.492197  sending datagram 1220 bytes for context id 2
+```
+
+`from_udp_to_quic` が context を登録して相手に `COMPRESSION_ASSIGN` を返す
+一方、`from_quic_to_udp` にはそれが**メッセージ経由で**伝わる。**その 19 µs
+の窓に届いたデータグラムは捨てられる。** 貼り直しでは server 側 msquic が
+新しい送信元を見た直後に 2 発まとめて返すので、この窓に当たりやすい。
+
+落ちたのが **server 自身の PATH_CHALLENGE** だった場合、msquic は
+**challenge を再送しない**ので 3 PTO 後に
+`ConnPathValidationTimeout` → server はそのパスを捨てる。すると
+`QuicSendWritePathAckFrames`（`send.c:286`）は **`Connection->Paths[]` を
+回して各パスの path id の ACK を書く**実装なので、**path id 2 のパスが
+無くなった server は path id 2 の ACK を永久に書けない。** t1・r2 の
+「ACK が来ない」はこれで説明がつく。
+
+#### しかし r3 がその答えを拒否する
+
+**r3 ではリレーは何も落とさず、server の `Path[3]` は 63 ms で検証を通り、
+最後まで消えていない。** それでも client の path_id 2 は
+`in_flight=2440` のまま ACK を 1 つも受け取らず、接続は 22 秒後に落ちた。
+
+> **つまり「ACK が来ない」には 2 つ目の原因がある。** リレーの取りこぼしは
+> 実在するバグだが、死因そのものではない。**1 回の観測で満足していたら
+> そう結論していた** — §0.1.1 で 3 回間違えたのと同じ形である。
+
+**次に手を付けるのはここである。** 推測ではなく、server 側で path id 2 の
+ack tracker が何をしているかを計測する（`QuicAckTrackerAckFrameEncode` が
+path id 2 に対して呼ばれているか）。backup と宣言したパスの扱いが絡んで
+いる可能性はあるが、**`QuicSendPathResponses` は IsActive を見ない**ことは
+確認済みなので、そこではない。
+
+### 7.6 したがって直すべきものは 3 つある
+
+| | どこ | |
+| --- | --- | --- |
+| 1 | **リレー**（`axum_masque`） | context 登録の競合で 1 個落とす。貼り直しに限らず、新しい送信元の最初のデータグラムが落ちうる |
+| 2 | **msquic** | 健全なパスがあるのに 1 本の loss detection で接続を閉じる（`loss_detection.c:2049`）。また challenge を再送しない |
+| 3 | **本書の前提** | §7.4 のとおり。16 秒の予算に対し検知が 18 秒かかる |
+
+**どれも P4 の中の間違いではない。** P3・P4 は設計どおり動いており
+（§7.1）、足りないのはその下の層である。
 
 ---
 
