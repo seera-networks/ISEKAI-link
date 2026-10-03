@@ -5177,7 +5177,7 @@ dependencies = [
 
 [[package]]
 name = "seera-msquic"
-version = "2.6.0-beta3"
+version = "2.7.0-beta"
 dependencies = [
  "bitflags 2.13.0",
  "c-types",
