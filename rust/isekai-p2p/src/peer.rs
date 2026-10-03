@@ -197,6 +197,15 @@ pub fn client_config(
         // relay tunnel and packets are dropped as `TooLarge`.
         .set_MaximumMtu(PEER_MTU)
         .set_PeerUnidiStreamCount(100)
+        // **Opt in to `PathValidated`, which stopped arriving by default.**
+        // seera-msquic 2.7.0 put `QUIC_CONNECTION_EVENT_PATH_VALIDATED` behind
+        // `PathValidatedEventEnabled`, having raised it for every connection
+        // before. Two loops here read it — `portal_core::path`, where it starts
+        // the grace window that decides whether the peer has multipath, and
+        // `camera_core::video` — and neither would have been told it had gone
+        // quiet: a validated path with no `PathAdded` behind it simply stops
+        // being noticed, which looks like a peer that never punched one.
+        .set_PathValidatedEventEnabled()
         .set_StreamMultiReceiveEnabled();
     // Asked for by whoever will receive them, which is why it is an option
     // rather than always on: this advertises to the *peer* that it may send.

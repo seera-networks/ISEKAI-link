@@ -146,6 +146,13 @@ pub fn make_msquic_async_listener_with(
         // until P1 of `docs/portal_mtu_plan.md` — raising one end alone would
         // have left this one refusing every datagram at the new limit.
         .set_MaximumMtu(isekai_p2p_core::mtu::PEER_MTU)
+        // **The same opt-in as the dialling half** (`isekai_p2p::peer`), and
+        // for the same reason: seera-msquic 2.7.0 put
+        // `QUIC_CONNECTION_EVENT_PATH_VALIDATED` behind a setting. Set on both
+        // ends because which end sees it depends on which one sent the
+        // `PATH_CHALLENGE` — the server for the initial path, and either for a
+        // path added later.
+        .set_PathValidatedEventEnabled()
         // Keeps the *connection* from going idle. It does not keep a path warm:
         // it is re-armed by any activity anywhere on the connection, so on a
         // connection that is carrying traffic it never fires at all. Keeping an

@@ -1210,6 +1210,14 @@ fn client_config(reg: &Registration, enable_natt: bool) -> anyhow::Result<msquic
         // As `isekai_p2p::peer::client_config` does, which this reproduces.
         .set_KeepAliveIntervalMs(10_000)
         .set_PeerUnidiStreamCount(100)
+        // **Every check from 6a down waits for `PathValidated`**, and since
+        // seera-msquic 2.7.0 it is raised only for a connection that asked:
+        // `QUIC_SETTINGS.PathValidatedEventEnabled`, where before it came to
+        // everyone. Without this the spike reports "15s 以内に PathValidated が
+        // 来ず" for every one of them — a silence that reads as the adopted
+        // design not working, rather than as the event not being asked for.
+        // `isekai_p2p::peer` sets it too, which is what this reproduces.
+        .set_PathValidatedEventEnabled()
         .set_StreamMultiReceiveEnabled()
         .set_ReceiveObservedAddressReports();
     // Two settings differ between this spike (which migrates everywhere) and
@@ -1329,6 +1337,10 @@ async fn spawn_listener_variant(
                     .set_DatagramReceiveEnabled()
                     .set_StreamMultiReceiveEnabled()
                     .set_ReceiveObservedAddressReports()
+                    // The same opt-in as the client above. Both ends, because
+                    // which one is told depends on which sent the
+                    // `PATH_CHALLENGE`.
+                    .set_PathValidatedEventEnabled()
                     .set_AddAddressMode(msquic::AddAddressMode::NatTraversal),
             ),
         )?;

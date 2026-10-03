@@ -1,12 +1,29 @@
 //! A certificate that is perfectly valid and is for somebody else does not get
 //! a connection (#134).
 //!
-//! **This is the test the unit ones cannot be.** `certificate_matches` is
-//! exercised directly elsewhere, but a matcher that is never reached looks
-//! exactly like a matcher that works: the callback has to be installed, the
-//! credential has to carry the flags that make msquic hand the certificate
-//! over, and the verdict has to reach the handshake. Only a real connection
-//! shows all three.
+//! **Since seera-msquic 2.7.0 the refusal comes from msquic, not from us.**
+//! It validates the name itself and answers `bad_certificate` without
+//! indicating the certificate, so `install_certificate_check` never runs and
+//! the `refused` slot the dial reads stays empty — which is precisely the case
+//! `untrusted_chain.rs` was written for, now reached by a name as well as by an
+//! issuer. Nothing is less safe: the connection is refused, and classified off
+//! the transport's status as permanent rather than retried to the deadline,
+//! which is what #141 was about. What is gone is the message naming the name
+//! that arrived, because this side never sees it.
+//!
+//! **So this test no longer shows that a verdict from our callback reaches the
+//! handshake**, and that is worth stating rather than leaving to be discovered.
+//! It was the only integration test that did: `certificate_matches` has unit
+//! tests, but a matcher that is never reached looks exactly like a matcher that
+//! works. The mechanism is intact and still has a user — the key pin in
+//! `isekai_p2p::peer::install_certificate_check`, where the chain is valid and
+//! the name is right and only the key is wrong, so msquic indicates the
+//! certificate and the callback decides. **A test for that is the way to get
+//! this coverage back**, and there is not one yet.
+//!
+//! What is still checked here is what the bug was: a certificate that is
+//! perfectly valid and is for somebody else gets no connection, promptly, with
+//! an error an operator can act on.
 //!
 //! So there is a throwaway CA here. Without one the wrong-name certificate
 //! would be refused for chain reasons before the name was ever looked at, and
@@ -17,10 +34,10 @@
 //! One test rather than two, and one `#[test]` in the file: it sets
 //! `SSL_CERT_FILE`, which is process-wide.
 //!
-//! `untrusted_chain.rs` is the other half of the pair. There the name is right
-//! and the *issuer* is the difference, so the refusal comes from msquic's own
-//! validation instead of from the callback below — and never reaches the slot
-//! the dial reads, which is #141.
+//! `untrusted_chain.rs` is the other half of the pair: there the name is right
+//! and the *issuer* is the difference. Both refusals now come from msquic's own
+//! validation and neither reaches the slot the dial reads; they differ in the
+//! alert the transport sends, which is why each test asserts its own number.
 //!
 //! # Why this only runs on the quictls platforms
 //!
@@ -55,6 +72,13 @@ const DIALED: &str = "right.test";
 /// The name the certificate in the failing half is for.
 const OTHER: &str = "wrong.test";
 
+/// How long the refused half may take before the refusal counts as a retry.
+///
+/// The same thirty seconds `untrusted_chain.rs` allows, and for the same
+/// reason: a permanent answer that is retried is the bug, and the only way a
+/// test sees the difference is the clock.
+const REFUSAL_BUDGET: Duration = Duration::from_secs(30);
+
 /// Not `#[tokio::test]`: the environment is settled before the runtime exists.
 ///
 /// `set_var` is a data race against every other thread in the process, which is
@@ -80,13 +104,46 @@ fn a_certificate_for_another_host_does_not_get_a_connection() {
         .block_on(async {
             let reg = Arc::new(Registration::new(&msquic::RegistrationConfig::default()).unwrap());
 
-            // ── The half that must fail ──────────────────────────────────────
-            let refusal = dial_against(&reg, ca.issue(OTHER), DIALED).await;
-            let refusal = refusal.expect_err("a certificate for another host must not connect");
+            // ── The half that must fail, and must fail quickly ───────────────
+            //
+            // **The budget is half the assertion.** A certificate for another
+            // host is refused on every attempt, so a dial that is still going
+            // is one retrying a permanent answer — the #141 failure, which
+            // costs a viewer the full fifteen-minute deadline and then reports
+            // a timeout.
+            let refusal =
+                tokio::time::timeout(REFUSAL_BUDGET, dial_against(&reg, ca.issue(OTHER), DIALED))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                    "still dialling after {REFUSAL_BUDGET:?}: a certificate for another host is \
+                     being retried rather than classified, which is #141",
+                )
+                    })
+                    .expect_err("a certificate for another host must not connect");
             let refusal = format!("{refusal:#}");
+            // **The name dialled, not the name that arrived.** msquic refuses
+            // this itself now and does not hand the certificate over, so the
+            // other name never reaches this side — see the module header.
             assert!(
-                refusal.contains(OTHER) && refusal.contains(DIALED),
-                "the refusal should say which name arrived and which was wanted: {refusal}",
+                refusal.contains(DIALED),
+                "the refusal should name the host that was dialled, which is the one an \
+                 operator can do something about: {refusal}",
+            );
+            // 42 is `bad_certificate`, which is what this platform's verifier
+            // sends for a name mismatch. Asserted for the same reason
+            // `untrusted_chain.rs` asserts 48: without it the test passes on
+            // any refusal at all, including ones that have nothing to do with
+            // the name.
+            assert!(
+                refusal.contains("TLS alert 42"),
+                "the refusal should name the alert the transport actually sent for a name \
+                 mismatch: {refusal}",
+            );
+            assert!(
+                !refusal.contains("did not complete within"),
+                "reported as a handshake that went unanswered, which is the failure #141 \
+                 describes: {refusal}",
             );
 
             // ── The same setup, one name different ───────────────────────────
