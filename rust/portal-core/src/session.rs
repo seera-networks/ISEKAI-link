@@ -183,6 +183,7 @@ pub async fn serve(
     cert_key_path: &Path,
     catalogue: Catalogue,
     policy: AcceptPolicy,
+    routing: Routing,
     shutdown: CancellationToken,
 ) -> anyhow::Result<ServerHandle> {
     // Issued once and reused for both the certificate and the session, so
@@ -245,7 +246,20 @@ pub async fn serve(
                     Ok(conn) => {
                         let catalogue = catalogue.clone();
                         let serving = accepting.clone();
-                        direct_path::advertise(conn.clone(), legs.clone(), serving.clone());
+                        // **Both ends have to stay quiet for a session to
+                        // really be relay-only.** A client that offers no
+                        // candidate still gets a direct path if this side
+                        // advertises one, because the advertisement is what
+                        // makes the *peer* probe — measured: withholding the
+                        // client's candidate alone left a path validated
+                        // anyway, by the pre-multipath switch.
+                        if let Routing::PreferDirect = routing {
+                            direct_path::advertise(
+                                conn.clone(),
+                                legs.clone(),
+                                serving.clone(),
+                            );
+                        }
                         // One task per peer: a forward that stalls must not
                         // stop the next peer being accepted.
                         tokio::spawn(async move {
@@ -392,12 +406,37 @@ pub enum Reach<'a> {
     },
 }
 
+/// Whether this session may leave the relay.
+///
+/// **A diagnostic as much as a setting.** A session on a direct path and one
+/// still on the relay fail in different ways, and when only one of them
+/// misbehaves there is no way to tell them apart from the outside — a direct
+/// path happens or does not according to what two NATs do. This makes the
+/// relay-only case reproducible on a machine where punching always succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Routing {
+    /// Offer a direct-path candidate and move onto one if it validates. What
+    /// every session does unless told otherwise.
+    PreferDirect,
+    /// Stay on the relay.
+    ///
+    /// **Offers no candidate at all**, rather than offering one and declining
+    /// to prefer it. A candidate is what makes the peer probe this end, so
+    /// withholding it means no direct path is ever validated — which is the
+    /// state a session behind two unpunchable NATs is in, and the one being
+    /// reproduced. Declining to *prefer* a path that exists would be a
+    /// different thing, and would leave a validated path the connection could
+    /// still be moved onto.
+    RelayOnly,
+}
+
 /// Connect to a portal server and open the peer QUIC to it.
 ///
 /// See [`Reach`] for the two ways of being allowed to.
 pub async fn connect(
     cfg: &P2pConfig,
     reach: Reach<'_>,
+    routing: Routing,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Connected> {
     // **One registration for both, and it has to be made here.** msquic looks
@@ -414,7 +453,7 @@ pub async fn connect(
             listener_id,
         } => connect_on_a_capability(cfg, capability, listener_id, reg.clone()).await?,
     };
-    open_the_peer_connection(session, reg, shutdown).await
+    open_the_peer_connection(session, reg, routing, shutdown).await
 }
 
 /// Find the listener this client is paired with, and connect to it.
@@ -660,6 +699,7 @@ async fn connect_on_a_capability(
 async fn open_the_peer_connection(
     session: InitiatorSession,
     reg: Arc<Registration>,
+    routing: Routing,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<Connected> {
     // A *name*, never an address: it is the per-endpoint FQDN the peer's relay
@@ -697,7 +737,20 @@ async fn open_the_peer_connection(
     // it landed, this candidate said where we could be reached to a peer with
     // no address to send to. `crate::path` is what happens once a path
     // validates.
-    let candidate = wait_for_observed(&session, shutdown).await;
+    let candidate = match routing {
+        Routing::PreferDirect => wait_for_observed(&session, shutdown).await,
+        // **Not even waited for.** The wait is what the leg's observed-address
+        // report is for, and asking for it here would cost up to
+        // `OBSERVED_ADDRESS_WAIT` to arrive at the `None` this already knows.
+        Routing::RelayOnly => {
+            tracing::warn!(
+                "staying on the relay: no direct-path candidate is offered, so no direct \
+                 path will be probed. Every byte crosses the relay for the life of this \
+                 session",
+            );
+            None
+        }
+    };
 
     let peer = transport::connect(
         Some(reg),

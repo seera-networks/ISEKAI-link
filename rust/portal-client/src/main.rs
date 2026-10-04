@@ -202,6 +202,11 @@ struct Args {
     /// server's services
     #[argh(option, default = "std::net::IpAddr::from([127, 0, 0, 1])")]
     bind: std::net::IpAddr,
+    /// stay on the relay: offer no direct-path candidate, so no direct path is
+    /// probed and every byte crosses the relay. For reproducing what a session
+    /// behind two unpunchable NATs does, on a machine where punching works
+    #[argh(switch)]
+    relay_only: bool,
     /// register this Endpoint with an ENROLLMENT KEY instead of signing in.
     /// For a job with nobody at the keyboard. The key comes from
     /// ISEKAI_ENROLLMENT_KEY or --enrollment-key-file, never from an argument
@@ -789,7 +794,11 @@ async fn run(
     let terminate = terminate_signal();
     tokio::pin!(terminate);
 
-    let connected = portal_core::session::connect(&cfg, reach, &shutdown)
+    let routing = match args.relay_only {
+        true => portal_core::session::Routing::RelayOnly,
+        false => portal_core::session::Routing::PreferDirect,
+    };
+    let connected = portal_core::session::connect(&cfg, reach, routing, &shutdown)
         .await
         .context("connect to the portal server")?;
     println!("connection id: {}", connected.session.connection_id());

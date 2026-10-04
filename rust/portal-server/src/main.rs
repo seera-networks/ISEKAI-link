@@ -207,6 +207,12 @@ struct Args {
     /// name. See the note below, or --example-config
     #[argh(option, default = "PathBuf::from(\"portal-server.toml\")")]
     config: PathBuf,
+    /// stay on the relay: advertise no direct-path candidate, so no peer
+    /// probes this end and every byte crosses the relay. The client has the
+    /// same switch, and both ends need it -- one side advertising is enough to
+    /// get a direct path
+    #[argh(switch)]
+    relay_only: bool,
     /// print a starter catalogue on stdout and exit
     #[argh(switch)]
     example_config: bool,
@@ -1696,6 +1702,10 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
         &cert_key,
         catalogue,
         AcceptPolicy::AutoNotify,
+        match args.relay_only {
+            true => portal_core::session::Routing::RelayOnly,
+            false => portal_core::session::Routing::PreferDirect,
+        },
         shutdown.clone(),
     )
     .await
