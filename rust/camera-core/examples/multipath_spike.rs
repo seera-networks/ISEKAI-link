@@ -567,26 +567,19 @@ async fn multipath_round_trip(reg: &Arc<Registration>) -> anyhow::Result<()> {
     // remote alone selects. That is the only handle `portal_core::path` has on
     // a path it opened with port 0 and never saw a `PathAdded` for.
     //
-    // **What this does not answer, and the two attempts that failed to.** Read
-    // alone, the numbers below say four is a *lifetime* budget per connection,
-    // which would contradict P5 — a session there survived four to six relay
-    // restarts in a row, more added paths than there are slots. The two fit
-    // together only if a path that validated is reclaimed and one that never
-    // did is not, so the discriminator is to remove question 2's validated
-    // direct path and watch the count.
-    //
-    // Asked immediately after question 7's window, that wedged: the second
-    // `get_path_statistics` never returned, twice, and since the call queues an
-    // operation to msquic's connection worker and *blocks the calling thread*
-    // it took the runtime with it (900 seconds was not a timeout). Moved to the
-    // end of the question it completed — so removing the direct path is not
-    // what wedges, and what does is unexplained — but by then it had nothing to
-    // say: the removal is asynchronous and the count was already capped at four,
-    // so an unchanged count means nothing either way. **A step that measures
-    // nothing is worse than an absent one**, so it is gone rather than left to
-    // be misread, and §5-8 keeps that half of the question. `portal_core::path`
-    // makes both of those calls from one loop, which is reason enough to isolate
-    // the wedge on its own rather than inside a question about slots.
+    // **Four is a lifetime budget, and the discriminator for that is next door.**
+    // Whether a path that *did* validate is reclaimed cannot be asked here:
+    // put after question 7's window it wedged — the second
+    // `get_path_statistics` never returned, twice, and since that call queues an
+    // operation to msquic's connection worker and *blocks the calling thread* it
+    // took the runtime with it, 900 seconds being a wedge rather than a timeout.
+    // Moved to the end of the question it completed but had nothing to say,
+    // since the removal is asynchronous and the count was already capped. **A
+    // step that measures nothing is worse than an absent one**, so it is gone
+    // from here; `path_stats_wedge.rs` asks it on a connection of its own. What
+    // it reports is that a path which never validated keeps its slot past sixty
+    // seconds in three runs of three, and that a validated one goes both ways
+    // between runs — so the half measured below is the settled half.
     let wildcard = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
     let count = |what: &str| -> anyhow::Result<usize> {
         Ok(client
