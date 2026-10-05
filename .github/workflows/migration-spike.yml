@@ -130,12 +130,20 @@ jobs:
               if grep -q 'waiting for the client' "$srv"; then break; fi
               sleep 1
             done
-            local out
+            local out cli="$RUNNER_TEMP/spike-client-$port.log"
+            # `|| true`, and the client's stderr kept rather than dropped,
+            # because without both of them a case that produces no PASS/FAIL
+            # line reports *nothing*. GitHub runs this step under `bash -e`
+            # whatever `set -uo pipefail` says above, so `grep` matching
+            # nothing fails the pipeline, fails the assignment, and kills the
+            # step before the fallback below -- which is how a flake here came
+            # out as a bare "exit code 1" with the diagnostic it had prepared
+            # never printed.
             out=$(env "$@" SPIKE_CONTROL=127.0.0.1:$port \
-              cargo run -q -p camera-core --example migration_spike -- client 2>/dev/null \
-              | grep -E '^(PASS|FAIL)' | head -1)
+              cargo run -q -p camera-core --example migration_spike -- client 2>"$cli" \
+              | grep -E '^(PASS|FAIL)' | head -1) || true
             if [ -z "$out" ]; then
-              out="<no client output; server tail: $(tail -1 "$srv")>"
+              out="<no client output; server tail: $(tail -1 "$srv"); client tail: $(tail -3 "$cli" | tr '\n' ' ')>"
             fi
             echo "$label -> $out"
             case "$out" in PASS*) ;; *) fail=1 ;; esac
