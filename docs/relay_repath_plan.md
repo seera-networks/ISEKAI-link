@@ -1399,6 +1399,49 @@ if (PathID->Path == NULL) {
 いないので、「相手側のパスが既に無くなっていれば返らない」は**この機構からの
 予測であって測定ではない**。
 
+#### 直した（seera-networks/msquic#118）
+
+受け手側を直す案を採った — **`PathID->Path == NULL` でも放棄を返す。**
+そのために 3 つ必要だった。
+
+| | |
+| --- | --- |
+| `SendAbandon` を `QUIC_PATH` → `QUIC_PATHID` へ | パスを持たない path id こそが放棄を運ぶ側で、パス上には記録場所が無い |
+| `send.c` を `Connection->Paths` ではなく **path ID 集合の走査**に | パスを持たない path id はその配列に居ないので、放棄を持っているか訊かれてすらいなかった。既存の `QuicPathIDSetWriteNewConnectionIDFrame` と同じ型に揃えた |
+| 受信側で無視をやめて返す | `RemoteClose` などは立てられず、**立てる必要も無い** — その側は path id を持つだけで枠を持たないので回収するものが無い。フレームは相手のためのものである |
+
+`loss_detection.c` にガードが 2 つ増えた。パスを持たない path id のフレームが
+ack / lost ハンドラに届くようになり、どちらも `PathID->Path` を無条件に
+辿っていた（ack 側は `LocalCloseAcked` と PATH_REMOVED のアドレス、lost 側は
+再送判定）。
+
+**測定（各 3 回）:**
+
+| | 修正前 | 修正後 |
+| --- | --- | --- |
+| 一度も検証されないパスの枠 | 60 秒で戻らない 3/3 | **6.29 秒で戻る 3/3** |
+| 検証済みパスを `remove_path` | 251 ms / 戻らない回あり | 252 ms ×2、3.27 s ×1（戻らない回なし） |
+
+そしてトレースに、本節が探していた並びが出る:
+
+```
+35.993413  PATH_ABANDON  server TX     ← 返答（修正前は無かった）
+39.068992  ConnPathIDCloseTimerExpired  pathid 1
+39.068994  ConnPathIDRemove             pathid 1
+39.069414  ConnPathRemoved              Path[1]   ← QuicPathRemove が走った
+```
+
+`multipath_spike` の質問 8 も動いた — 放棄後のパス数が 3 → **2**、
+`remove_path` 後の枠の復帰が None → **3.27 秒**。回帰は無し（556 テスト、
+スパイク 8 問）。
+
+> **ひとつ、直せていないものが見えた。** スパイクの後段で
+> `get_path_statistics` が 2 を報告しているのに `add_path` が
+> `QUIC_STATUS_OUT_OF_MEMORY` を返す。このパラメータは `PathsCount` が縛るのと
+> **同じ配列の `InUse && PathID != NULL` だけ**を数えるので、上限そのものでは
+> なく**下限**である。残りを何が占めているかは追っていない（§5-11）。
+> 本書がこれまで「枠」として読んできた数は、この下限であることに注意。
+
 > **ユーザーの指示どおりの手順で、推論は 1 段で済んだ。** `QuicPathRemove` が
 > 呼ばれたかを `ConnPathRemoved` で見る、という見方を与えられた時点で、
 > 「枠が開かない」は「`QuicPathRemove` が呼ばれない」に、そこから
@@ -1449,6 +1492,10 @@ if (PathID->Path == NULL) {
    気づかないのかは測っていない。P5 は試行ごとに再起動 1 回なので当たっていない
 10. **§7.9 の wedge の原因。** プローブで再現しなかったので、分かっているのは
     「**何ではないか**」だけである
+11. **`get_path_statistics` が報告しない枠を何が占めているか**（§7.10 末尾）。
+    `add_path` が `OUT_OF_MEMORY` を返すのに報告は 2 — 報告値は
+    `InUse && PathID != NULL` の下限なので、`PathsCount` との差が残っている。
+    **本書の「枠」の数値はすべてこの下限で読んでいる**
 
 ---
 
