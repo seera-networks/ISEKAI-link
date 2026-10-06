@@ -117,9 +117,9 @@ impl Default for Auth0Config {
             organization: std::env::var(ORGANIZATION_VAR).ok().filter(|v| !v.is_empty()),
             // **Not read here.** A value that will not parse has to be
             // refused, and this function cannot refuse anything;
-            // `start_browser_login` reads it instead. Dropping a typo silently
-            // would hand back "any ephemeral port", and the operator's tunnel
-            // forwards the one they meant.
+            // `start_browser_login` reads it instead. `None` is also what lets
+            // the variable be read at all: this field is consulted first, so a
+            // port here would override the operator's.
             callback_port: None,
         }
     }
@@ -141,9 +141,23 @@ pub const CALLBACK_PORT_VAR: &str = "ISEKAI_AUTH0_CALLBACK_PORT";
 /// tenant does not have and the callback never comes back. A default that
 /// cannot complete a sign-in is worse than one that can collide.
 ///
-/// The collision is real and is the price: two sign-ins at once, or anything
-/// else already holding the port, now fail at the bind rather than quietly
-/// taking another port. [`CALLBACK_PORT_VAR`] moves it, and an explicit
+/// Two things are given up for that, and the comment this replaced was the only
+/// place either was written down.
+///
+/// **Collisions.** Two sign-ins at once, or anything else already holding the
+/// port, now fail at the bind rather than quietly taking another port — so one
+/// sign-in at a time per machine, which `docs/camera.md` now says. The bind
+/// also has to be rebindable straight after a sign-in, which is what
+/// [`respond`] is for.
+///
+/// **A port anything can wait on.** Any unprivileged local process can hold
+/// 38700 first and take the redirect. It cannot take the tokens: without the
+/// PKCE `code_verifier` and the random `state` this generates, the code it
+/// catches is unredeemable and a refusal it forges is rejected. So the exposure
+/// is a sign-in that cannot complete, not an account that can be stolen —
+/// which an ephemeral port did not have at all.
+///
+/// [`CALLBACK_PORT_VAR`] moves it, and an explicit
 /// `Auth0Config::callback_port` of `Some(0)` restores the ephemeral behaviour
 /// for a caller that does not need the URL to match anything.
 pub const DEFAULT_CALLBACK_PORT: u16 = 38700;
@@ -289,26 +303,25 @@ pub async fn start_browser_login(cfg: &Auth0Config) -> anyhow::Result<BrowserLog
     // an ephemeral one and only the listener knows which it got. Fixed because
     // the tenant lists exact callback URLs; see `DEFAULT_CALLBACK_PORT` for why
     // RFC 8252 §7.3's any-port reading does not survive that.
-    let pinned = match cfg.callback_port {
-        Some(port) => Some(port),
-        None => parse_pinned_port(std::env::var(CALLBACK_PORT_VAR).ok().as_deref())?,
-    };
-    let wanted = pinned.unwrap_or(DEFAULT_CALLBACK_PORT);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", wanted))
+    let callback = resolve_callback_port(
+        cfg.callback_port,
+        std::env::var(CALLBACK_PORT_VAR).ok().as_deref(),
+    )?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", callback.port()))
         .await
-        .with_context(|| match pinned {
+        .with_context(|| match callback {
             // **Named either way, because the port is never this process's own
             // choice any more.** "Address in use" used to be impossible here;
             // now it is the expected failure when something else holds the
             // port, and the message has to say which port and who chose it.
-            Some(port) => format!(
+            CallbackPort::Pinned(port) => format!(
                 "open 127.0.0.1:{port} for the sign-in to come back to \
                  ({CALLBACK_PORT_VAR} or the caller pins it; something else holds it)"
             ),
-            None => format!(
-                "open 127.0.0.1:{wanted} for the sign-in to come back to \
+            CallbackPort::Default(port) => format!(
+                "open 127.0.0.1:{port} for the sign-in to come back to \
                  (the default, which the tenant's callback URL has to match; \
-                 {CALLBACK_PORT_VAR} moves it)"
+                 one sign-in at a time, and {CALLBACK_PORT_VAR} moves it)"
             ),
         })?;
     let port = listener
@@ -346,12 +359,48 @@ pub async fn start_browser_login(cfg: &Auth0Config) -> anyhow::Result<BrowserLog
     })
 }
 
+/// Which loopback port to bind, and who chose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackPort {
+    /// Named by the caller or by [`CALLBACK_PORT_VAR`].
+    Pinned(u16),
+    /// [`DEFAULT_CALLBACK_PORT`], because nothing named one.
+    Default(u16),
+}
+
+impl CallbackPort {
+    fn port(self) -> u16 {
+        match self {
+            Self::Pinned(port) | Self::Default(port) => port,
+        }
+    }
+}
+
+/// Resolve the callback port from the caller's choice and the raw variable.
+///
+/// **A function so the precedence has a test.** Inline, the fallback to
+/// [`DEFAULT_CALLBACK_PORT`] could only be reached by a test that binds the
+/// real port — and every test goes through a fixture pinning `Some(0)` to avoid
+/// exactly that, so reverting the fallback left the suite green.
+fn resolve_callback_port(
+    from_caller: Option<u16>,
+    env_raw: Option<&str>,
+) -> anyhow::Result<CallbackPort> {
+    if let Some(port) = from_caller {
+        return Ok(CallbackPort::Pinned(port));
+    }
+    Ok(match parse_pinned_port(env_raw)? {
+        Some(port) => CallbackPort::Pinned(port),
+        None => CallbackPort::Default(DEFAULT_CALLBACK_PORT),
+    })
+}
+
 /// The pinned loopback port named by [`CALLBACK_PORT_VAR`], if any.
 ///
-/// **A value that will not parse is an error, not an absence.** "Any port" and
-/// "port 38700, mistyped" lead to different URLs, and only one of them matches
-/// the tunnel the operator set up — so a typo that quietly meant the first
-/// would fail in the browser with nothing pointing back at the variable.
+/// **A value that will not parse is an error, not an absence.** Dropping it
+/// would silently mean [`DEFAULT_CALLBACK_PORT`] — a different URL from the one
+/// the operator meant, and so a sign-in that fails in the browser with nothing
+/// pointing back at the variable they mistyped.
 ///
 /// **The raw value is a parameter**, so what is tested is the parsing rather
 /// than the process's environment: a test that set the variable would change
@@ -364,7 +413,11 @@ fn parse_pinned_port(raw: Option<&str>) -> anyhow::Result<Option<u16>> {
     let port: u16 = raw
         .parse()
         .map_err(|_| anyhow::anyhow!("{CALLBACK_PORT_VAR} is `{raw}`, which is not a port"))?;
-    anyhow::ensure!(port != 0, "{CALLBACK_PORT_VAR} is 0, which asks for any port");
+    anyhow::ensure!(
+        port != 0,
+        "{CALLBACK_PORT_VAR} is 0, and a tenant cannot list port 0 as a callback URL; \
+         unset it to get the default {DEFAULT_CALLBACK_PORT}"
+    );
     Ok(Some(port))
 }
 
@@ -449,7 +502,7 @@ async fn wait_for_the_redirect(login: &BrowserLogin) -> anyhow::Result<String> {
         // arrives on this same port, carries no query at all, and answering it
         // as an error would end the wait a moment before the real redirect.
         if code.is_none() && error.is_none() {
-            let _ = sock.write_all(&page("404 Not Found", "Nothing here.")).await;
+            respond(&mut sock, &page("404 Not Found", "Nothing here.")).await;
             continue;
         }
         // **`state` decides first, for a refusal as much as for a code.** It is
@@ -457,29 +510,67 @@ async fn wait_for_the_redirect(login: &BrowserLogin) -> anyhow::Result<String> {
         // code path leaves `?error=access_denied` as a way for anything on the
         // machine to end somebody else's sign-in before their browser arrives.
         if state.as_deref() != Some(login.state.as_str()) {
-            let _ = sock
-                .write_all(&page("400 Bad Request", "That sign-in did not start here."))
-                .await;
+            respond(
+                &mut sock,
+                &page("400 Bad Request", "That sign-in did not start here."),
+            )
+            .await;
             continue;
         }
         if let Some(error) = error {
-            let _ = sock
-                .write_all(&page("400 Bad Request", "Sign-in failed. You can close this tab."))
-                .await;
+            respond(
+                &mut sock,
+                &page("400 Bad Request", "Sign-in failed. You can close this tab."),
+            )
+            .await;
             anyhow::bail!("Auth0 refused the sign-in: {error}");
         }
-        let _ = sock
-            .write_all(&page("200 OK", "Signed in. You can close this tab."))
-            .await;
-        // Let the browser read the page before the socket goes away with the
-        // listener; without this the tab can show a connection error instead.
-        let _ = sock.flush().await;
+        // Also lets the browser read the page before the socket goes away with
+        // the listener; without that the tab can show a connection error.
+        respond(
+            &mut sock,
+            &page("200 OK", "Signed in. You can close this tab."),
+        )
+        .await;
         return Ok(code.unwrap_or_default());
     }
 }
 
 /// How long one connection has to produce a request line before it is dropped.
 const REQUEST_LINE_WAIT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the browser to close a connection this has answered.
+///
+/// Short because it is a loopback round trip to a browser that has already been
+/// told `Connection: close`, and because failing to wait is only as bad as not
+/// waiting at all. See [`respond`].
+const PEER_CLOSE_WAIT: Duration = Duration::from_secs(1);
+
+/// Answer one request, then let the browser be the side that closes.
+///
+/// **Whoever closes first holds the TIME_WAIT, and on a fixed callback port a
+/// server-side one blocks the next bind.** That is new with
+/// [`DEFAULT_CALLBACK_PORT`]: an ephemeral port never had to be rebound. It
+/// bites hardest on Windows, where `mio` deliberately does not set
+/// `SO_REUSEADDR` -- there it would permit socket hijacking rather than quick
+/// rebinding -- so a port with a TIME_WAIT entry cannot be bound for 2x MSL,
+/// two to four minutes. Setting the option anyway would trade a wait for the
+/// hazard `mio`'s own comment refuses, which is the wrong direction.
+///
+/// So this waits for the peer's close instead. `page` already sends
+/// `Connection: close`, so a browser closes as soon as it has the body. A
+/// browser that does not -- killed, or a tunnel that drops -- leaves the
+/// TIME_WAIT here after the deadline, which is exactly where it would have been
+/// without this, so the wait costs nothing when it fails.
+async fn respond(sock: &mut tokio::net::TcpStream, body: &[u8]) {
+    let _ = sock.write_all(body).await;
+    let _ = sock.flush().await;
+    let _ = tokio::time::timeout(PEER_CLOSE_WAIT, async {
+        let mut sink = [0u8; 256];
+        while matches!(sock.read(&mut sink).await, Ok(n) if n > 0) {}
+    })
+    .await;
+}
 
 /// Read just the request line. The headers and any body are not wanted, and
 /// the line comes first.
@@ -987,9 +1078,10 @@ struct SignIn {
     /// The sign-in in flight, so a new one can replace it.
     ///
     /// **Its listener goes when it does.** Abandoned, the task holds the
-    /// loopback port for the life of the process — and with
-    /// [`CALLBACK_PORT_VAR`] pinned, which is what an `ssh -L` operator does,
-    /// the next attempt cannot bind at all and no amount of retrying frees it.
+    /// loopback port for the life of the process, and the next attempt cannot
+    /// bind at all — no amount of retrying frees it. That used to need
+    /// [`CALLBACK_PORT_VAR`] to be set; since [`DEFAULT_CALLBACK_PORT`] the
+    /// port is always fixed, so it is the ordinary case. See `start`.
     task: Option<tokio::task::JoinHandle<()>>,
     /// Left by the task for the UI thread to pick up, since only the UI thread
     /// owns the place a token source is kept.
@@ -1048,8 +1140,22 @@ impl BrowserSignIn {
 
     /// Begin. Needs a tokio runtime, and persists to `store` when given one.
     pub fn start(&self, cfg: Auth0Config, store: Option<PathBuf>) {
+        // **Taken and aborted before the new task is spawned, and awaited
+        // inside it before anything binds.** `abort()` only schedules the
+        // cancellation; the listener goes when the task is actually dropped, so
+        // spawning first and aborting after left the two racing for a port that
+        // is now always the same one -- two `start` calls in quick succession
+        // would fail the second with "address in use". Awaiting the handle is
+        // the only way to know the old listener is gone.
+        let previous = self.0.lock().expect("sign-in lock poisoned").task.take();
+        if let Some(previous) = &previous {
+            previous.abort();
+        }
         let shared = self.0.clone();
         let task = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
             let set = |state| shared.lock().expect("sign-in lock poisoned").state = state;
             let started = match start_browser_login(&cfg).await {
                 Ok(started) => started,
@@ -1074,14 +1180,7 @@ impl BrowserSignIn {
                 Err(e) => set(SignInState::Failed(format!("{e:#}"))),
             }
         });
-        // **Whatever was running stops here.** A second press means the first
-        // attempt is not the one being waited on any more, and leaving it
-        // listening would keep its port — the one the next attempt needs when
-        // it is pinned.
-        let mut shared = self.0.lock().expect("sign-in lock poisoned");
-        if let Some(previous) = shared.task.replace(task) {
-            previous.abort();
-        }
+        self.0.lock().expect("sign-in lock poisoned").task = Some(task);
     }
 }
 
@@ -1682,7 +1781,41 @@ mod tests {
         quiet.abort();
     }
 
-    /// **Refused rather than dropped.** A typo that quietly meant "any port"
+    /// Nothing naming a port means [`DEFAULT_CALLBACK_PORT`], and the caller
+    /// outranks the variable.
+    ///
+    /// **The fallback is the whole of this change and had no test**: every
+    /// `start_browser_login` in the suite goes through a fixture that pins
+    /// `Some(0)`, so reverting it left all of them green. Asserting it through
+    /// a real sign-in would mean one test binding 38700 for real, racing the
+    /// others and anyone signed in on the machine; `resolve_callback_port`
+    /// exists so the precedence can be checked without a socket.
+    #[test]
+    fn nothing_named_means_the_default_and_the_caller_outranks_the_variable() {
+        assert_eq!(
+            resolve_callback_port(None, None).unwrap(),
+            CallbackPort::Default(DEFAULT_CALLBACK_PORT)
+        );
+        assert_eq!(
+            resolve_callback_port(None, Some("40000")).unwrap(),
+            CallbackPort::Pinned(40000)
+        );
+        assert_eq!(
+            resolve_callback_port(Some(40001), Some("40000")).unwrap(),
+            CallbackPort::Pinned(40001)
+        );
+        // `Some(0)` is how a caller asks for an ephemeral port on purpose, and
+        // it has to survive the resolution rather than fall through to the
+        // default -- the test fixture depends on it.
+        assert_eq!(
+            resolve_callback_port(Some(0), None).unwrap(),
+            CallbackPort::Pinned(0)
+        );
+        // An unparseable variable is refused even though a default exists.
+        assert!(resolve_callback_port(None, Some("nope")).is_err());
+    }
+
+    /// **Refused rather than dropped.** A typo that quietly meant the default
     /// sends the operator an authorize URL naming a port their tunnel does not
     /// carry, and the failure arrives in the browser with nothing pointing
     /// back at the variable.

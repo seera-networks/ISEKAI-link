@@ -87,6 +87,14 @@ key: `camera-server-auth0.json` beside `camera-server-endpoint.pem`, and
 `camera-client-auth0.json` beside `camera-client-endpoint.pem`. A machine
 running both signs in twice.
 
+> **One at a time, on a machine running both.** The sign-in comes back on a
+> fixed loopback port — 38700, which is what the Auth0 application lists as a
+> callback URL — so the second app to press `Sign in` while the first is still
+> waiting for its browser fails with `open 127.0.0.1:38700 … something else
+> holds it`. Finish one sign-in before starting the other. The first app holds
+> the port until its browser round-trip completes, so an abandoned tab means
+> pressing `Sign in` again on that app to release it.
+
 **This is what lets a camera be left running.** The Endpoint Token behind every
 proxy call lasts minutes and is reissued for the life of the session, and each
 reissue needs a current Auth0 token. A signed-in app refreshes its own; the
