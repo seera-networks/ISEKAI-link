@@ -249,14 +249,17 @@ the organization**:
 
 ```sh
 ssh -L 38700:127.0.0.1:38700 the-host          # from the machine with the browser
-ISEKAI_AUTH0_CALLBACK_PORT=38700 portal-server --login --organization org_…
+portal-server --login --organization org_…
 ```
 
 Open the printed URL locally; the redirect lands on your own `127.0.0.1:38700`
-and the tunnel carries it to the waiting process. `ISEKAI_AUTH0_CALLBACK_PORT`
-exists for this: the port has to be known in advance to be forwarded, and it is
-in the `redirect_uri` Auth0 checks, so it must also be among the application's
-Allowed Callback URLs.
+and the tunnel carries it to the waiting process. **38700 is the default**, so
+nothing has to be set for this to work — the port has to be known in advance to
+be forwarded, and it is in the `redirect_uri` Auth0 checks, so it must also be
+among the application's Allowed Callback URLs, which is the reason it is fixed
+rather than ephemeral. `ISEKAI_AUTH0_CALLBACK_PORT` moves it if 38700 is taken
+or if the tenant lists a different one; the forward and the Allowed Callback URL
+then have to agree with whatever it says.
 
 **`channel N: open failed: connect failed: Connection refused` after signing in
 is `ssh` saying the tunnel had nowhere to go** — the sign-in finished, the

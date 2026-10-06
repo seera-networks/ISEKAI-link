@@ -194,8 +194,8 @@ async fn device_code_sign_in(
         "an organization was named ({}), and --device-code cannot carry one: the device grant \
          has no way to name it, so the token comes back with no org_id and Identity files this \
          Endpoint personally. \
-         Over SSH, forward the callback instead -- `ssh -L 38700:127.0.0.1:38700 <host>` and \
-         `ISEKAI_AUTH0_CALLBACK_PORT=38700` -- and sign in in the browser you already have. \
+         Over SSH, forward the callback instead -- `ssh -L 38700:127.0.0.1:38700 <host>`, \
+         38700 being the default callback port -- and sign in in the browser you already have. \
          Or unset it and accept the individual tenant",
         cfg.organization.as_deref().unwrap_or_default(),
     );

@@ -88,14 +88,17 @@ pub struct Auth0Config {
     /// not, signs the person in personally. So `None` is "whatever Auth0
     /// decides", not "no organization".
     pub organization: Option<String>,
-    /// The loopback port to come back on, when it cannot be any port.
+    /// The loopback port to come back on.
     ///
-    /// **`None` asks the OS for a free one**, which is what RFC 8252 §7.3 tells
-    /// a redirect allow-list to accommodate — nothing on the machine can hold a
-    /// port this process did not ask for, and two sign-ins at once do not
-    /// collide. Set this where the Auth0 application lists an exact callback
-    /// URL and will not take an arbitrary port; the sign-in then fails if
-    /// something else already holds it, which is the honest outcome.
+    /// **`None` means [`DEFAULT_CALLBACK_PORT`]**, not "any port": the Auth0
+    /// application lists exact callback URLs, so a port nothing agreed on
+    /// produces a `redirect_uri` the tenant does not have and the callback
+    /// never arrives. [`CALLBACK_PORT_VAR`] overrides it, and this field
+    /// overrides that.
+    ///
+    /// `Some(0)` is how to ask for an ephemeral port on purpose — worth it only
+    /// where the URL does not have to match anything, which in practice means
+    /// a test.
     pub callback_port: Option<u16>,
 }
 
@@ -128,6 +131,22 @@ pub const ORGANIZATION_VAR: &str = "ISEKAI_AUTH0_ORGANIZATION";
 /// Pins the loopback port, for an Auth0 application that lists an exact
 /// callback URL.
 pub const CALLBACK_PORT_VAR: &str = "ISEKAI_AUTH0_CALLBACK_PORT";
+
+/// The loopback port the sign-in comes back on when nothing names one.
+///
+/// **Fixed, and it has to be.** RFC 8252 §7.3 asks a redirect allow-list to
+/// accept any port on `127.0.0.1`, and asking the OS for a free one was the
+/// right reading of that — but the Auth0 application this signs in to lists
+/// exact callback URLs, so an ephemeral port produces a `redirect_uri` the
+/// tenant does not have and the callback never comes back. A default that
+/// cannot complete a sign-in is worse than one that can collide.
+///
+/// The collision is real and is the price: two sign-ins at once, or anything
+/// else already holding the port, now fail at the bind rather than quietly
+/// taking another port. [`CALLBACK_PORT_VAR`] moves it, and an explicit
+/// `Auth0Config::callback_port` of `Some(0)` restores the ephemeral behaviour
+/// for a caller that does not need the URL to match anything.
+pub const DEFAULT_CALLBACK_PORT: u16 = 38700;
 
 impl Auth0Config {
     fn url(&self, path: &str) -> String {
@@ -266,25 +285,31 @@ pub struct BrowserLogin {
 /// Nothing is sent to Auth0 here: an authorize request *is* the browser
 /// navigating, so this only prepares what it navigates to.
 pub async fn start_browser_login(cfg: &Auth0Config) -> anyhow::Result<BrowserLogin> {
-    // **Port zero, and the port is read back.** A fixed port would collide with
-    // whatever else is on the machine and, worse, with a second sign-in; RFC
-    // 8252 §7.3 asks registered redirects to allow any port for exactly this.
+    // **A fixed port, and the port is still read back** -- `Some(0)` asks for
+    // an ephemeral one and only the listener knows which it got. Fixed because
+    // the tenant lists exact callback URLs; see `DEFAULT_CALLBACK_PORT` for why
+    // RFC 8252 §7.3's any-port reading does not survive that.
     let pinned = match cfg.callback_port {
         Some(port) => Some(port),
         None => parse_pinned_port(std::env::var(CALLBACK_PORT_VAR).ok().as_deref())?,
     };
-    let wanted = pinned.unwrap_or(0);
+    let wanted = pinned.unwrap_or(DEFAULT_CALLBACK_PORT);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", wanted))
         .await
         .with_context(|| match pinned {
-            // **Named, because a pinned port is somebody's decision.** "Address
-            // in use" on a port this process chose would be a bug; on one an
-            // operator pinned it is a fact about their machine.
+            // **Named either way, because the port is never this process's own
+            // choice any more.** "Address in use" used to be impossible here;
+            // now it is the expected failure when something else holds the
+            // port, and the message has to say which port and who chose it.
             Some(port) => format!(
                 "open 127.0.0.1:{port} for the sign-in to come back to \
-                 ({CALLBACK_PORT_VAR} pins it; something else holds it)"
+                 ({CALLBACK_PORT_VAR} or the caller pins it; something else holds it)"
             ),
-            None => "open a loopback port for the sign-in to come back to".to_owned(),
+            None => format!(
+                "open 127.0.0.1:{wanted} for the sign-in to come back to \
+                 (the default, which the tenant's callback URL has to match; \
+                 {CALLBACK_PORT_VAR} moves it)"
+            ),
         })?;
     let port = listener
         .local_addr()
@@ -1226,7 +1251,11 @@ mod tests {
             audience: "https://masque.seera-networks.com/".to_owned(),
             scope: "openid profile email offline_access".to_owned(),
             organization: None,
-            callback_port: None,
+            // **Ephemeral on purpose.** The default is a fixed port now, and
+            // these tests bind it for real: left as `None` they would collide
+            // with each other under the test runner's threads, and with a
+            // sign-in happening on the machine. None of them look at the port.
+            callback_port: Some(0),
         }
     }
 
