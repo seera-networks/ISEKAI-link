@@ -1399,23 +1399,37 @@ if (PathID->Path == NULL) {
 いないので、「相手側のパスが既に無くなっていれば返らない」は**この機構からの
 予測であって測定ではない**。
 
-#### 直した（seera-networks/msquic#118）
+#### 直した（seera-networks/msquic#119）
 
 受け手側を直す案を採った — **`PathID->Path == NULL` でも放棄を返す。**
-そのために 3 つ必要だった。
+そのために 3 つ必要で、#119 はこの 3 つをそのまま保っている。
 
 | | |
 | --- | --- |
 | `SendAbandon` を `QUIC_PATH` → `QUIC_PATHID` へ | パスを持たない path id こそが放棄を運ぶ側で、パス上には記録場所が無い |
 | `send.c` を `Connection->Paths` ではなく **path ID 集合の走査**に | パスを持たない path id はその配列に居ないので、放棄を持っているか訊かれてすらいなかった。既存の `QuicPathIDSetWriteNewConnectionIDFrame` と同じ型に揃えた |
-| 受信側で無視をやめて返す | `RemoteClose` などは立てられず、**立てる必要も無い** — その側は path id を持つだけで枠を持たないので回収するものが無い。フレームは相手のためのものである |
+| `QuicPathIDSetTryFreePathID` がパス無しを許容 | binding 解放と `QuicPathRemove` を飛ばし、`QuicPathIDFreeSourceCids` は無条件に実行（全 path id の CID が全 binding に載っているため） |
 
-`loss_detection.c` にガードが 2 つ増えた。パスを持たない path id のフレームが
-ack / lost ハンドラに届くようになり、どちらも `PathID->Path` を無条件に
-辿っていた（ack 側は `LocalCloseAcked` と PATH_REMOVED のアドレス、lost 側は
-再送判定）。
+> **ここは本書が最初に書いた版（#118）とは違う。** #118 はこの作業から出した
+> もので、クローズされて #119 が採られた。**訂正されたのは解放の時機である。**
+> #118 は「パスが無いのだから 3 PTO の close タイマーが守る対象は無い」として
+> 返答が ACK された時点で即解放したが、`draft-ietf-quic-multipath-21` §3.4 の
+> その窓は**相手に発行済みの connection ID と番号空間**のためにある。パスを
+> 持たない path id も `PATH_NEW_CONNECTION_ID` で CID を配っており番号空間も
+> 持つので、窓は等しく適用される — 認識されない遅延パケットは Stateless Reset
+> を誘発する。#119 は close タイマーに解放を任せ、draft が数える「受信から
+> 3 PTO」の位置でそれを張る。
+>
+> **#118 が足した `loss_detection.c` の 2 つのガードは落とされた。** #117 が
+> ack ハンドラをパス参照の引き直しと、内側条件の外での release に組み替えて
+> いたため不要になり、#118 の 2 コミット目が部分的にそのために存在していた
+> 参照リークも同時に消えた。#119 のレビューはさらに、close タイマーの飢餓
+> （`QuicConnTimerSetEx` が上書きするため最も早い期限から張り直す）、
+> detach 済み path id の stale な `PathID->Path` を読む再送ハンドラ、
+> 死にかけの path id にパスを付け得る `QuicConnGetPathForPeer`、そして #118 が
+> 入れた未チェックの `Path->PathID` を拾っている。
 
-**測定（各 3 回）:**
+**測定（#118 のビルドで各 3 回。出荷された #119 でも同じ値が出る）:**
 
 | | 修正前 | 修正後 |
 | --- | --- | --- |
@@ -1432,15 +1446,48 @@ ack / lost ハンドラに届くようになり、どちらも `PathID->Path` �
 ```
 
 `multipath_spike` の質問 8 も動いた — 放棄後のパス数が 3 → **2**、
-`remove_path` 後の枠の復帰が None → **3.27 秒**。回帰は無し（556 テスト、
-スパイク 8 問）。
+`remove_path` 後の枠の復帰が None → **3.27 秒**。回帰は無し（557 テスト、
+スパイク 8 問）。質問 7 の報告が `[2, 2, 2]` → **`[2]`** になったのは #117 で
+ある。
 
-> **ひとつ、直せていないものが見えた。** スパイクの後段で
-> `get_path_statistics` が 2 を報告しているのに `add_path` が
-> `QUIC_STATUS_OUT_OF_MEMORY` を返す。このパラメータは `PathsCount` が縛るのと
-> **同じ配列の `InUse && PathID != NULL` だけ**を数えるので、上限そのものでは
-> なく**下限**である。残りを何が占めているかは追っていない（§5-11）。
-> 本書がこれまで「枠」として読んできた数は、この下限であることに注意。
+#### そして修正が別の不具合を踏んだ（msquic#122 → #123）
+
+**close タイマーの飢餓を直したことで、以前は発火しなかった解放が走るように
+なり、debug ビルドが abort した。** `send.c:327` の
+`HasAckElicitingPacketsToAcknowledge` で、`QUIC_CONN_TIMER_PATH_CLOSE` →
+`QuicPathIDSetTryFreePathID` → `QuicLossDetectionReset` という経路である
+（`path_stats_wedge` で 5 回中 3 回、前リビジョンでは 3/3 クリーン）。
+
+> **本書が #122 で推定した機構は外れていた。** 327 行は `QuicSendValidate` の
+> 3 番目ではなく **2 番目**の分岐 — 遅延 ACK タイマーが張られているのに ACK
+> 対象が無い — で、bugcheck の `Expr` が否定されていないことがそれを示す。
+> 推定した「死にかけの path id がまだ数えられている」は起こり得ない:
+> `QuicPathIDSetTryFreePathID` は `QuicLossDetectionReset` より前にテーブルから
+> 外すので、その時点で既に数に入らない。**真因は、ACK 状態が接続全体のもので
+> ありながら、それが表すパケットは path id ごとに数えられていること**で、
+> 集合から path id を外すと答えが変わるのに突き合わせが無かった。#123 が
+> `QuicSendUpdateAckState` をその後に呼ぶ。**由来の記述（#119 の再アームが
+> 到達可能にした）は正しいと確認された。**
+
+#125 が ACK フレームの書き出しも `Connection->Paths` から path ID 集合の走査へ
+移し、#119 の PATH_ABANDON と同じ形に揃えている。
+
+#### 報告されない枠を占めていたのは path ID だった
+
+本節の初版は「スパイクの後段で `get_path_statistics` が 2 を報告しているのに
+`add_path` が `QUIC_STATUS_OUT_OF_MEMORY` を返す。残りを何が占めているかは
+追っていない」と書き、§5 の未確認項目に挙げた。その項目は解けたので外した。**占めていたのはパスではなく path ID である。**
+解放は `CurrentPathIDCount` を下げ、それが `MaxPathID` を上げて MAX_PATH_ID を
+送らせる。応答側が使用済み path ID を抱えたままだと相手の
+`QuicPathIDSetNewLocalPathID` が `QUIC_STATUS_PATHID_LIMIT_REACHED` を返し、
+**報告上はまだ空きがあるのに `add_path` が通らない。** 出荷された版では
+質問 8 の (c) と (d) がどちらも `add_path` 受理・枠は 6.28 秒で復帰・再度の
+`add_path` も受理を示す。
+
+**ただし計測の注意は残る。** `QUIC_PARAM_CONN_PATH_STATISTICS` が数えるのは
+`PathsCount` が縛るのと同じ配列の `InUse && PathID != NULL` だけなので、
+上限そのものではなく**下限**である。本書が「枠」として挙げた数値はすべて
+この下限で読んでいる。
 
 > **ユーザーの指示どおりの手順で、推論は 1 段で済んだ。** `QuicPathRemove` が
 > 呼ばれたかを `ConnPathRemoved` で見る、という見方を与えられた時点で、
@@ -1492,10 +1539,6 @@ ack / lost ハンドラに届くようになり、どちらも `PathID->Path` �
    気づかないのかは測っていない。P5 は試行ごとに再起動 1 回なので当たっていない
 10. **§7.9 の wedge の原因。** プローブで再現しなかったので、分かっているのは
     「**何ではないか**」だけである
-11. **`get_path_statistics` が報告しない枠を何が占めているか**（§7.10 末尾）。
-    `add_path` が `OUT_OF_MEMORY` を返すのに報告は 2 — 報告値は
-    `InUse && PathID != NULL` の下限なので、`PathsCount` との差が残っている。
-    **本書の「枠」の数値はすべてこの下限で読んでいる**
 
 ---
 
