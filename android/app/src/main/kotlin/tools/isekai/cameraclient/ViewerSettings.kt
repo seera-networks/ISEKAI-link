@@ -33,13 +33,27 @@ data class ViewerSettings(
     companion object {
         private const val PREFS_NAME = "viewer_settings"
 
+        /**
+         * The protocol identifier this app used to ask for.
+         *
+         * Changing the default alone would not have reached an existing
+         * install: [load] falls back to the default only when the key is
+         * absent, and [save] writes it on every commit of the connect screen.
+         * An upgraded viewer would keep asking for this one while cameras
+         * register under the new one, and the camera would simply never be
+         * listed -- the listener's protocol is what identifies it. So a stored
+         * copy of this value is rewritten on load.
+         */
+        private const val RETIRED_PROTOCOL_NAME = "isekai-validator-v1"
+
         fun load(context: Context): ViewerSettings {
             val prefs = prefs(context)
             val defaults = ViewerSettings()
             return ViewerSettings(
                 identityUrl = prefs.getString("identityUrl", defaults.identityUrl)!!,
                 proxyUrl = prefs.getString("proxyUrl", defaults.proxyUrl)!!,
-                protocolName = prefs.getString("protocolName", defaults.protocolName)!!,
+                protocolName = prefs.getString("protocolName", defaults.protocolName)!!
+                    .let { if (it == RETIRED_PROTOCOL_NAME) defaults.protocolName else it },
                 capability = prefs.getString("capability", defaults.capability)!!,
                 listenerId = prefs.getString("listenerId", defaults.listenerId)!!,
                 expectedEndpoint =

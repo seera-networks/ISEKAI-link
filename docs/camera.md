@@ -110,6 +110,16 @@ public deployment:
 | `Key path:` | `camera-server-endpoint.pem` |
 | `Protocol:` | `isekai-camera-v1` |
 
+> **`Protocol:` has to be in the tenant's allowed list, or nothing connects —
+> and it says so late.** The Identity API intersects what an endpoint asks for
+> with the tenant's ceiling and never widens it, so a tenant whose list does not
+> carry `isekai-camera-v1` still issues a token, with `200` and an empty
+> `protocols`. Nothing fails at sign-in; the listener create or the connect
+> fails afterwards, and from the viewer it looks like the camera is simply not
+> there. The server-side default is recorded in
+> `docs/portal_ci_enrollment_plan.md` (§ Narrowing) — organisation tenants
+> defaulted to `["isekai-validator-v1"]`, the name this field used to hold.
+
 Tick **`Register endpoint on open`** the first time, when the key is new — that
 is what introduces this device to the Identity API. Leave it off afterwards.
 

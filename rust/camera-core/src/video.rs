@@ -30,6 +30,18 @@ pub use isekai_p2p::peer::{AttestedPeer, Unpinnable};
 use crate::tls::{dev_cert, VideoCert};
 
 /// ALPN for the camera video protocol.
+///
+/// **Both halves have to move together.** This is the only value either side
+/// offers — `bind_video_listener` below and `peer::dial` — and there is no
+/// second accepted one and no negotiation, so an updated viewer against a
+/// camera still on `sample` (or the reverse) fails in the handshake on an ALPN
+/// mismatch and surfaces as a plain connect failure, saying nothing about skew.
+///
+/// Worth saying beside the `multipath: true` note below, which explains why
+/// *that* can ship on the camera first: it is offered unconditionally and a
+/// viewer that does not offer it back gets the connection it always got. This
+/// rename has no such property. Accepting both ALPNs for a release would give
+/// it one, and is a rollout decision rather than part of the rename.
 pub const VIDEO_ALPN: &str = "mjpeg";
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);

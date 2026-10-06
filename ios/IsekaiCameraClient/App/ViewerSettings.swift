@@ -4,6 +4,9 @@ import Foundation
 /// the keychain. Persisted so a dev round-trip does not mean retyping five
 /// fields; the defaults match the desktop `camera-client`.
 struct ViewerSettings: Codable, Equatable {
+    /// The protocol identifier this app used to ask for. See `init(from:)`.
+    static let retiredProtocolName = "isekai-validator-v1"
+
     var identityURL = "https://identity.isekai.tools:9443"
     var proxyURL = "https://link.isekai.tools:6443"
     var protocolName = "isekai-camera-v1"
@@ -49,7 +52,15 @@ extension ViewerSettings {
         let d = ViewerSettings()
         identityURL = try c.decodeIfPresent(String.self, forKey: .identityURL) ?? d.identityURL
         proxyURL = try c.decodeIfPresent(String.self, forKey: .proxyURL) ?? d.proxyURL
-        protocolName = try c.decodeIfPresent(String.self, forKey: .protocolName) ?? d.protocolName
+        // **The one field a blob is not allowed to keep.** The decoder below
+        // preserves whatever an older build wrote, which is right for every
+        // other field and wrong for this one: an upgraded viewer would go on
+        // asking for the retired protocol while cameras register under the new
+        // one, and the camera would never be listed, since the listener's
+        // protocol is what identifies it.
+        let storedProtocol =
+            try c.decodeIfPresent(String.self, forKey: .protocolName) ?? d.protocolName
+        protocolName = storedProtocol == Self.retiredProtocolName ? d.protocolName : storedProtocol
         capability = try c.decodeIfPresent(String.self, forKey: .capability) ?? d.capability
         listenerID = try c.decodeIfPresent(String.self, forKey: .listenerID) ?? d.listenerID
         expectedEndpoint =
