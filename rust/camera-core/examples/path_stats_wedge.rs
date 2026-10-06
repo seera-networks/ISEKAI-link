@@ -104,10 +104,44 @@ async fn main() -> anyhow::Result<()> {
 
     // And one that does validate, removed by hand. The listener's own address
     // validates, because the far side answers the challenge.
+    //
+    // **Also times `add_path` to `PathAdded`**, which
+    // `relay_repath_plan.md` §5-5 had only a lower bound for: its clock started
+    // after `add_path` returned and nothing was draining the event queue, so
+    // what it measured was partly how long until somebody looked. Both are
+    // fixed here -- a task is already polling before the call, and the clock
+    // starts immediately before it. The interval still includes the
+    // PATH_CHALLENGE round trip, because that is what `PathAdded` waits for;
+    // on loopback that part is microseconds.
     let server_addr = _listener.local_addr().context("the listener's address")?;
+    let watcher = {
+        let c = client.clone();
+        tokio::spawn(async move {
+            loop {
+                match poll_fn(|cx| c.poll_event(cx)).await {
+                    Ok(ConnectionEvent::PathAdded { path_id, .. }) => {
+                        return Some((Instant::now(), path_id))
+                    }
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        })
+    };
+    // Long enough for the watcher to reach its first poll and register, and
+    // outside the measurement either way.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let asked = Instant::now();
     client
         .add_path(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), server_addr)
         .context("opening a path that should validate")?;
+    match tokio::time::timeout(Duration::from_secs(5), watcher).await {
+        Ok(Ok(Some((at, path_id)))) => println!(
+            "ANSWER add_path -> PathAdded for path {path_id}: {:?}",
+            at - asked
+        ),
+        _ => println!("ANSWER add_path -> PathAdded: no event within 5s"),
+    }
     let events = watch_both(&client, &_server, Duration::from_secs(5)).await;
     let Some(Ok(with_valid)) = timed("3. the count with a validated path", {
         let c = client.clone();
