@@ -6,7 +6,7 @@ import Foundation
 struct ViewerSettings: Codable, Equatable {
     var identityURL = "https://identity.isekai.tools:9443"
     var proxyURL = "https://link.isekai.tools:6443"
-    var protocolName = "isekai-validator-v1"
+    var protocolName = "isekai-camera-v1"
     /// Issued by the camera server for this viewer's Endpoint ID.
     var capability = ""
     /// The camera server's "Listener ID".

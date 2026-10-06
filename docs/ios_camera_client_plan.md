@@ -4,6 +4,13 @@
 
 > 対象は **ビューア側**（camera-server が配信する映像をリレー経由で受信して表示する側）です。iOS 端末をカメラ配信元（server 側）にする話は本計画のスコープ外とします（AVFoundation でのキャプチャ＋JPEGエンコード＋listener が別途必要）。
 
+> **ALPN と protocol 識別子はその後改名されている。本書は旧名のまま。**
+> ALPN は `mjpeg`（`camera_core::VIDEO_ALPN`）、protocol 識別子は
+> `isekai-camera-v1`（`camera_core::CAMERA_PROTOCOL`）である。`sample` と
+> `isekai-validator-v1` は何を指すのか分からない名前だった。設計そのものは
+> 変わっていないので本文は計画の記録として残す — 以下の `sample` は `mjpeg`
+> と読み替えること。現行値を追っているのは `docs/camera-apps-spec.md`。
+
 ---
 
 ## 0. 現行 camera-client の要点（移植対象の把握）

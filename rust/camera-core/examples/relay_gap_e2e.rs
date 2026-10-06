@@ -76,7 +76,7 @@ async fn main() {
     let auth0 = std::env::var("AUTH0_TOKEN").expect("AUTH0_TOKEN is required");
     let identity = env_or("IDENTITY_URL", "https://127.0.0.1:9443");
     let proxy = env_or("PROXY_URL", "https://127.0.0.1:8443");
-    let protocol = env_or("PROTOCOL", "isekai-validator-v1");
+    let protocol = env_or("PROTOCOL", camera_core::CAMERA_PROTOCOL);
     let gap_secs: u64 = env_or("GAP_SECS", "12").parse().unwrap_or(12);
 
     let code = match run(&auth0, &identity, &proxy, &protocol, gap_secs).await {

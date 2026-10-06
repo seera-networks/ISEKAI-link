@@ -39,7 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-/// ALPN for the spike's QUIC connections. Deliberately not `sample`, so a stray
+/// ALPN for the spike's QUIC connections. Deliberately not `mjpeg`, so a stray
 /// camera app on the same machine cannot be dialed by accident.
 const ALPN: &str = "isekai-spike";
 

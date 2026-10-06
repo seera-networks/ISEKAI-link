@@ -50,7 +50,7 @@ async fn issue_token(State(s): State<Hits>, _h: HeaderMap, _b: Bytes) -> Json<Va
         "expires_in": 900,
         "endpoint_id": "ep:abc",
         "permissions": ["peer-connect:initiate"],
-        "protocols": ["isekai-validator-v1"],
+        "protocols": ["isekai-camera-v1"],
     }))
 }
 
@@ -60,7 +60,7 @@ fn config(identity_url: String, register: bool) -> P2pConfig {
         identity_http3: false,
         proxy_url: String::new(),
         credential: Credential::auth0("AUTH0_AT", None, register),
-        protocol: "isekai-validator-v1".into(),
+        protocol: "isekai-camera-v1".into(),
         device_name: Some("test-device".into()),
         token_ttl: Some(900),
         key: EndpointKey::generate(),

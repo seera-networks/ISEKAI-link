@@ -1,4 +1,4 @@
-//! The camera video transport over QUIC (`sample` ALPN): MJPEG frames, one per
+//! The camera video transport over QUIC (`mjpeg` ALPN): MJPEG frames, one per
 //! unidirectional stream. This is the same wire protocol the camera apps
 //! already use; here it is factored out so it works over any address — a public
 //! one (legacy) or the P2P relay's loopback address.
@@ -30,7 +30,7 @@ pub use isekai_p2p::peer::{AttestedPeer, Unpinnable};
 use crate::tls::{dev_cert, VideoCert};
 
 /// ALPN for the camera video protocol.
-pub const VIDEO_ALPN: &str = "sample";
+pub const VIDEO_ALPN: &str = "mjpeg";
 /// How often to sample the connection's RTT for [`VideoRecvOptions::rtt`].
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the heartbeat ticks. See [`spawn_heartbeat`].

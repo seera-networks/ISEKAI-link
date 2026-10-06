@@ -849,7 +849,7 @@ mod tests {
     #[test]
     fn a_listener_of_another_protocol_is_not_a_candidate() {
         let reachable = [
-            listener("ep:aaa", "sample", "pl_camera"),
+            listener("ep:aaa", "isekai-camera-v1", "pl_camera"),
             listener("ep:aaa", "isekai-portal-v1", "pl_portal"),
         ];
         let found = choose_listener(&reachable, "isekai-portal-v1", None).expect("the portal");
@@ -890,17 +890,17 @@ mod tests {
     /// run did not name will not stop being there.
     #[test]
     fn a_listener_that_does_not_answer_the_question_is_not_one() {
-        let reachable = [listener("ep:aaa", "sample", "pl_camera")];
+        let reachable = [listener("ep:aaa", "isekai-camera-v1", "pl_camera")];
         assert!(
             !matches(&reachable, "isekai-portal-v1", None),
             "a camera is not a portal, however long we wait",
         );
         assert!(
-            !matches(&reachable, "sample", Some("ep:bbb")),
+            !matches(&reachable, "isekai-camera-v1", Some("ep:bbb")),
             "the protocol is right and the peer is not",
         );
-        assert!(matches(&reachable, "sample", Some("ep:aaa")));
-        assert!(matches(&reachable, "sample", None));
+        assert!(matches(&reachable, "isekai-camera-v1", Some("ep:aaa")));
+        assert!(matches(&reachable, "isekai-camera-v1", None));
     }
 
     /// **The awkward cases are the whole reason this is a function.** Each one

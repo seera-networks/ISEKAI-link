@@ -326,6 +326,14 @@ be issued in tokens by the Identity API before any of this connects at all.
 side. Worth raising early: everything else here can be built and tested against
 `isekai-validator-v1` on a development proxy, but shipping needs the new one.
 
+> **The camera apps' identifier has since been renamed to `isekai-camera-v1`**
+> (`camera_core::CAMERA_PROTOCOL`), `isekai-validator-v1` having said nothing
+> about cameras. The paragraph above is left as written: it is the record of a
+> dependency as it stood, and the second mention is about what development ran
+> against at the time. The point it makes is unchanged — a protocol identifier
+> has to be in the Endpoint Token's `protocols` list before Peer Connect will
+> use it — and it now applies to the new name too.
+
 ## 5. Security, and what comes free
 
 | | |

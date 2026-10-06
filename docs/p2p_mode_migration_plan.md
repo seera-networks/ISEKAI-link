@@ -4,6 +4,13 @@
 
 対象コミット: `427d963 feat(camera): Direct-mode connection path migration (#59)` 時点の `main`。
 
+> **ALPN と protocol 識別子はその後改名されている。本書は旧名のまま。**
+> ALPN は `mjpeg`（`camera_core::VIDEO_ALPN`）、protocol 識別子は
+> `isekai-camera-v1`（`camera_core::CAMERA_PROTOCOL`）である。`sample` と
+> `isekai-validator-v1` は何を指すのか分からない名前だった。設計そのものは
+> 変わっていないので本文は計画の記録として残す — 以下の `sample` は `mjpeg`
+> と読み替えること。現行値を追っているのは `docs/camera-apps-spec.md`。
+
 ---
 
 ## 0. ゴールと非ゴール

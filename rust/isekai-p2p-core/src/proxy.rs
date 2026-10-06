@@ -2448,7 +2448,7 @@ mod tests {
     #[tokio::test]
     async fn peer_connect_reads_the_relay_ticket() {
         let resp = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
-            "protocol":"isekai-validator-v1","peer_endpoint":"ep:B",
+            "protocol":"isekai-camera-v1","peer_endpoint":"ep:B",
             "relay":{"masque_uri":"https://p/x/","session_id":"sess_1"},
             "ticket":{"ticket":"eyJ.JWT.sig","role":"initiator",
                       "expires_at":"2026-07-13T08:40:45Z",
@@ -2456,7 +2456,7 @@ mod tests {
             "peer_candidates":[],"created_at":"t","expires_at":"t"}"#;
         let (client, _key) = client(MockTransport::with_response(201, resp));
         let conn = client
-            .peer_connect("cap_x", "pl_1", "isekai-validator-v1", &[])
+            .peer_connect("cap_x", "pl_1", "isekai-camera-v1", &[])
             .await
             .unwrap();
         let ticket = conn.ticket.expect("a proxy with §8.14 sends one");
@@ -2471,12 +2471,12 @@ mod tests {
     #[tokio::test]
     async fn a_connect_response_without_a_ticket_still_parses() {
         let resp = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
-            "protocol":"isekai-validator-v1","peer_endpoint":"ep:B",
+            "protocol":"isekai-camera-v1","peer_endpoint":"ep:B",
             "relay":{"masque_uri":"https://p/x/","session_id":"sess_1"},
             "peer_candidates":[],"created_at":"t","expires_at":"t"}"#;
         let (client, _key) = client(MockTransport::with_response(201, resp));
         let conn = client
-            .peer_connect("cap_x", "pl_1", "isekai-validator-v1", &[])
+            .peer_connect("cap_x", "pl_1", "isekai-camera-v1", &[])
             .await
             .unwrap();
         assert!(conn.ticket.is_none());
@@ -2664,7 +2664,7 @@ mod tests {
     #[tokio::test]
     async fn peer_connect_signs_and_parses() {
         let resp = r#"{"connection_id":"conn_1","state":"relay","listener_id":"pl_1",
-            "protocol":"isekai-validator-v1","peer_endpoint":"ep:B",
+            "protocol":"isekai-camera-v1","peer_endpoint":"ep:B",
             "relay":{"masque_uri":"https://p/.well-known/masque/udp/relay/sess_1/","session_id":"sess_1"},
             "peer_candidates":[],"created_at":"t","expires_at":"t"}"#;
         let (client, key) = client(MockTransport::with_response(201, resp));
@@ -2675,7 +2675,7 @@ mod tests {
             port: 41000,
         }];
         let conn = client
-            .peer_connect("cap_x", "pl_1", "isekai-validator-v1", &candidates)
+            .peer_connect("cap_x", "pl_1", "isekai-camera-v1", &candidates)
             .await
             .unwrap();
         assert_eq!(conn.connection_id, "conn_1");
@@ -3146,7 +3146,7 @@ mod tests {
             "title":"Capability is invalid","status":403}"#;
         let (client, _key) = client(MockTransport::with_response(403, resp));
         let err = client
-            .peer_connect("bad", "pl_1", "isekai-validator-v1", &[])
+            .peer_connect("bad", "pl_1", "isekai-camera-v1", &[])
             .await
             .unwrap_err();
         match err {

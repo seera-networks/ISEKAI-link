@@ -59,7 +59,7 @@ async fn issue_token(State(s): State<Captured>, h: HeaderMap, b: Bytes) -> Json<
         "expires_in": 900,
         "endpoint_id": "ep:abc",
         "permissions": ["peer-connect:initiate"],
-        "protocols": ["isekai-validator-v1"],
+        "protocols": ["isekai-camera-v1"],
     }))
 }
 

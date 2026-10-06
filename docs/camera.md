@@ -108,7 +108,7 @@ public deployment:
 | `Identity URL:` | `https://identity.isekai.tools:9443` |
 | `Proxy URL:` | `https://link.isekai.tools:6443` |
 | `Key path:` | `camera-server-endpoint.pem` |
-| `Protocol:` | `isekai-validator-v1` |
+| `Protocol:` | `isekai-camera-v1` |
 
 Tick **`Register endpoint on open`** the first time, when the key is new — that
 is what introduces this device to the Identity API. Leave it off afterwards.

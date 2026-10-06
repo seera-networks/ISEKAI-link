@@ -4,7 +4,7 @@
 //! rendering; everything about moving frames over QUIC — directly or over the
 //! P2P relay — lives here so it builds and is tested on its own.
 //!
-//! * [`video`] — the `sample`-ALPN MJPEG-over-QUIC transport (server + client
+//! * [`video`] — the `mjpeg`-ALPN MJPEG-over-QUIC transport (server + client
 //!   halves), usable over any address.
 //! * [`server`] — server-side P2P orchestration ([`spawn_p2p_server`]): bind the
 //!   video listener, create a P2P `ListenerSession` relaying to it, and drive
@@ -23,6 +23,18 @@ pub mod server;
 pub mod shutdown;
 pub mod tls;
 pub mod video;
+
+/// The P2P protocol string the camera apps register and connect under.
+///
+/// **One copy, because the last name outlived its meaning.** This was
+/// `isekai-validator-v1` and said nothing about cameras; it was spelled out in
+/// both GUIs and in four of this crate's examples, which is six places for a
+/// rename to miss. The identity server keeps its own list of the protocols a
+/// tenant may use, so changing this needs that list to carry the new name too.
+///
+/// Distinct from [`VIDEO_ALPN`], which names the wire protocol the frames
+/// themselves travel over. This one names what the apps are, to the proxy.
+pub const CAMERA_PROTOCOL: &str = "isekai-camera-v1";
 
 pub use cameras::{connects_on_grant, display_name, one_per_camera};
 pub use isekai_p2p::agent::{

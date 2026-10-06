@@ -262,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("AUTH0_TOKEN").map_err(|_| anyhow::anyhow!("AUTH0_TOKEN is required"))?;
     let identity_url = env_or("IDENTITY_URL", "https://identity.isekai.tools:9443");
     let proxy_url = env_or("PROXY_URL", "https://link.isekai.tools:6443");
-    let protocol = env_or("PROTOCOL", "isekai-validator-v1");
+    let protocol = env_or("PROTOCOL", camera_core::CAMERA_PROTOCOL);
     let key_path = env_or("KEY_PATH", "synthetic-server-endpoint.pem");
     let fps: u64 = env_or("FPS", "10").parse().unwrap_or(10);
     let width: u16 = env_or("WIDTH", "640").parse().unwrap_or(640);

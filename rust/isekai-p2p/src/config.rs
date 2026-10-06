@@ -40,7 +40,7 @@ pub struct P2pConfig {
     /// **Never sent to the proxy**, whichever it is: the proxy sees only the
     /// Endpoint Token this obtains, and a PoP over each request.
     pub credential: Credential,
-    /// P2P protocol string, e.g. `isekai-validator-v1`.
+    /// P2P protocol string, e.g. `isekai-camera-v1`.
     pub protocol: String,
     /// Device display name recorded at registration.
     pub device_name: Option<String>,

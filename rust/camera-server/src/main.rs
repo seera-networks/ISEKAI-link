@@ -461,7 +461,7 @@ impl MyApp {
             // Filled in below from whatever a previous sign-in left behind.
             auth0_source: None,
             key_path: "camera-server-endpoint.pem".to_string(),
-            protocol: "isekai-validator-v1".to_string(),
+            protocol: camera_core::CAMERA_PROTOCOL.to_string(),
             register: true,
             client_endpoint_id: String::new(),
             client_connection_id: String::new(),

@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn sign_request_produces_verifiable_pop() {
         let key = EndpointKey::generate();
-        let body = br#"{"protocol":"isekai-validator-v1"}"#;
+        let body = br#"{"protocol":"isekai-camera-v1"}"#;
         let pop = sign_request(&key, "POST", "/v1/peer-listeners", body);
         assert_eq!(pop.endpoint_id, key.endpoint_id());
 

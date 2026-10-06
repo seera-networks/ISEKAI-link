@@ -1808,7 +1808,7 @@ mod tests {
     fn deserializes_token_response() {
         let json = r#"{"endpoint_token":"eyJ...","token_type":"Bearer","expires_in":900,
             "endpoint_id":"ep:abc","permissions":["peer-connect:initiate"],
-            "protocols":["isekai-validator-v1"]}"#;
+            "protocols":["isekai-camera-v1"]}"#;
         let tok: EndpointToken = serde_json::from_str(json).unwrap();
         assert_eq!(tok.endpoint_token, "eyJ...");
         assert_eq!(tok.expires_in, 900);

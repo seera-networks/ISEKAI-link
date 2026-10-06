@@ -48,7 +48,7 @@ pub mod shutdown;
 pub mod transport;
 pub mod udp;
 
-/// The ALPN this speaks. Distinct from the video's `sample`: a connection is
+/// The ALPN this speaks. Distinct from the video's `mjpeg`: a connection is
 /// one or the other, and a peer that offers neither should fail at the
 /// handshake rather than at the first frame.
 pub const PORTAL_ALPN: &str = "isekai-portal-v1";

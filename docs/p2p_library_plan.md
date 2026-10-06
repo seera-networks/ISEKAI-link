@@ -57,6 +57,14 @@ issues a per-user cert and a public address; **the client dials that public
 The **video transport** is independent of all that: MJPEG frames, one per QUIC
 **unidirectional stream**, ALPN `sample`.
 
+> **Both names below have since been renamed, and this document keeps the old
+> ones.** The ALPN is `mjpeg` (`camera_core::VIDEO_ALPN`) and the protocol
+> identifier is `isekai-camera-v1` (`camera_core::CAMERA_PROTOCOL`); `sample`
+> and `isekai-validator-v1` said nothing about what either was for. Nothing
+> about the design changed with them, so the text is left as the record of what
+> was planned — read `sample` as `mjpeg` throughout. `docs/camera-apps-spec.md`
+> is the document that tracks the current values.
+
 - `camera-server`: accepts on a `msquic_async::Listener` (ALPN `sample`) that
   sits behind the forward-MASQUE connection, and pushes each JPEG as a new uni
   stream (`main.rs`, the `run_isekai_connection` accept loop).
