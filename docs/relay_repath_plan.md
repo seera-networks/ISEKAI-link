@@ -1804,7 +1804,7 @@ LTTng で窓を狙う必要がある。狙いを確立からの経過で刻む h
 | 落ちたもの | 再送されるか | 根拠 |
 | --- | --- | --- |
 | server の PATH_CHALLENGE (170) | **される** | `loss_detection.c:951` が `Path->SendChallenge = TRUE` を立てる。実際 172 として届き、**server 側は検証された** |
-| server の PATH_RESPONSE (171) | **されない** | `loss_detection.c` に `QUIC_FRAME_PATH_RESPONSE` の case が無い（0 件）。RFC 9000 §8.2.3 の設計どおりで、回復は challenger 側に委ねられている |
+| server の PATH_RESPONSE (171) | **されない** | `loss_detection.c` に `QUIC_FRAME_PATH_RESPONSE` の case が無い（0 件）。応答の再送は RFC 9000 §8.2.2 が想定していない動作で、回復は challenger 側に委ねられている |
 | client の PATH_CHALLENGE (39) | **されない** | **server が ack した**（`.098` の PathAck）。損失検知から見れば届いているので再送する理由がない |
 
 残る望みは検証タイマーだが、`QuicConnProcessPathValidationTimerOperation` は
@@ -1816,8 +1816,9 @@ PTO は発火していて、client は +2.3 秒に `Ping` + Padding を送って
 > **これが「10 秒で検証されなかった」全部の正体である。** 片道の
 > PATH_RESPONSE を 1 発落とすだけで、challenger は 1 回しか challenge を
 > 送らず、responder は応答を再送せず、タイマーは諦めるだけなので、パスは
-> 死ぬ。RFC 9000 §8.2.1 は `An endpoint MAY send multiple PATH_CHALLENGE
-> frames to guard against packet loss` と、まさにこの備えを認めている。
+> 死ぬ。**RFC 9000 §8.2.1 は challenge を複数回送って損失に備えることを
+> 認めている**（原文は未照合 — rfc-editor / datatracker のどちらも §8.2 の
+> 手前で本文が切れて確認できなかったので、節番号つきの要約として読むこと）。
 
 **しかも非対称に死ぬ。** server は自分の方向を検証できているので、その
 パスを使う気でいる。client は検証できていないので捨てる。
@@ -1836,7 +1837,7 @@ PTO は発火していて、client は +2.3 秒に `Ping` + Padding を送って
 | | |
 | --- | --- |
 | **答えた** | 「検証されない」の機構。独立な 2 つの計器（msquic の ack とリレーのログ）が一致する |
-| **名前がついた欠陥 2 つ** | ①msquic は challenge を 1 回しか送らず、応答の損失から回復する経路が無い ②リレーは貼り直しのたびにデータグラムを捨てる |
+| **名前がついた欠陥 2 つ** | ①msquic は challenge を 1 回しか送らず、応答の損失から回復する経路が無い（**seera-msquic#129** に起票）②リレーは貼り直しのたびにデータグラムを捨てる |
 | **まだ答えていない** | 損失が**走行単位で固まる**こと。win2 0/3、d3 0/3 に対し dbg2 3/0、win1 3/0 で、1 回ごとの偶然なら出ない形である。§5-7 の窓も §5-11 もここに残っている |
 
 ---
