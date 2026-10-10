@@ -61,8 +61,22 @@ private const val PROXY_URL = "https://link.isekai.tools:6443"
 // constant to "isekai-portal-v1" without updating portal-server's flag to
 // match, then again the other way around.
 private const val PROTOCOL = "isekai-validator-v1"
-private const val SERVICE = "ollama"
-private const val MODEL = "qwen3.5:4b"
+
+/**
+ * Which LLM server on the Jetson the chat goes to. Each is its own entry in
+ * portal-server's catalogue (android-portal/demo-catalogue.toml), and a
+ * session forwards exactly one service, so switching means reconnecting --
+ * the picker is only enabled while disconnected. Pairing is per Endpoint, not
+ * per service, so one pairing covers both.
+ *
+ * Lemonade on the Jetson currently fronts the same Ollama as a "cloud"
+ * provider, hence the `ollama.` prefix on its model id -- same weights, but
+ * reached through Lemonade's OpenAI-style API instead of Ollama's own.
+ */
+private enum class Backend(val label: String, val service: String, val model: String) {
+    OLLAMA("Ollama", "ollama", "qwen3.5:4b"),
+    LEMONADE("Lemonade", "lemonade", "ollama.qwen3.5:4b"),
+}
 
 // How often the active session is asked whether it has closed on its own.
 // There is no push notification for this from the Rust side (PortalSession
@@ -214,7 +228,7 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
                 proxyUrl = PROXY_URL,
                 protocol = PROTOCOL,
                 auth0Token = "",
-                service = SERVICE,
+                service = Backend.OLLAMA.service,
                 expectedEndpoint = pairedEndpoint,
                 register = register,
             )
@@ -260,6 +274,8 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
      * way out of a retry is to kill the app.
      */
     var connecting by remember { mutableStateOf(false) }
+
+    var backend by remember { mutableStateOf(Backend.OLLAMA) }
 
     var prompt by remember { mutableStateOf("") }
     var chatLog by remember { mutableStateOf(listOf<Pair<String, String>>()) } // (who, text)
@@ -307,7 +323,7 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
             val stored = authStore.tokens.value
             val s = withContext(Dispatchers.IO) {
                 portalConnect(
-                    config = config.copy(auth0Token = token),
+                    config = config.copy(auth0Token = token, service = backend.service),
                     endpointKeyPem = endpointKeyPem,
                     refreshToken = stored?.refreshToken,
                     accessTokenExpiresAtUnix = ((stored?.expiresAt ?: 0L) / 1000).toULong(),
@@ -327,7 +343,7 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
             session = s
             localPort = s.localPort().toInt()
             statusIsError = false
-            status = "Connected -- forwarding to \"$SERVICE\" on 127.0.0.1:${localPort}"
+            status = "Connected -- forwarding to \"${backend.service}\" on 127.0.0.1:${localPort}"
             return Attempt.Connected
         } catch (e: CancellationException) {
             // Not a failure of the connect, and not the retry loop's business:
@@ -538,7 +554,22 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
         Text("Endpoint ID: $endpointId", style = MaterialTheme.typography.bodySmall)
 
         // --- Chat --------------------------------------------------------
-        Text("Chat (via Ollama, tunneled over the P2P portal)", style = MaterialTheme.typography.titleMedium)
+        Text("Chat (via ${backend.label}, tunneled over the P2P portal)", style = MaterialTheme.typography.titleMedium)
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (b in Backend.entries) {
+                FilterChip(
+                    selected = backend == b,
+                    onClick = { backend = b },
+                    label = { Text(b.label) },
+                    // One service per session: pick before Connect, or
+                    // Disconnect first to switch. `wanted`, not `session`:
+                    // between reconnect attempts there is no session, and a
+                    // switch then would quietly change what the retry dials.
+                    enabled = !wanted && !busy,
+                )
+            }
+        }
 
         for ((who, text) in chatLog) {
             Text(
@@ -573,19 +604,25 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
                     // long-silent-wait issue that killed non-streamed replies:
                     // stream:true means real bytes keep crossing the tunnel the
                     // whole time, rather than sitting quiet for a minute-plus.
-                    chatLog = chatLog + ("you" to userPrompt) + ("ollama" to "")
+                    val who = backend.service
+                    val target = backend
+                    chatLog = chatLog + ("you" to userPrompt) + (who to "")
                     prompt = ""
                     busy = true
                     scope.launch {
                         try {
-                            askOllamaChatStream(port, history, userPrompt, systemPrompt).collect { delta ->
+                            val stream = when (target) {
+                                Backend.OLLAMA -> askOllamaChatStream(port, target.model, history, userPrompt, systemPrompt)
+                                Backend.LEMONADE -> askLemonadeChatStream(port, target.model, history, userPrompt, systemPrompt)
+                            }
+                            stream.collect { delta ->
                                 val last = chatLog.last()
                                 chatLog = chatLog.dropLast(1) + (last.first to last.second + delta)
                             }
                         } catch (e: Exception) {
                             val last = chatLog.last()
-                            val soFar = if (last.first == "ollama") last.second else ""
-                            chatLog = chatLog.dropLast(1) + ("ollama" to soFar) + ("error" to (e.message ?: e.toString()))
+                            val soFar = if (last.first == who) last.second else ""
+                            chatLog = chatLog.dropLast(1) + (who to soFar) + ("error" to (e.message ?: e.toString()))
                         } finally {
                             busy = false
                         }
@@ -811,6 +848,7 @@ private fun LabeledField(
  */
 private fun askOllamaChatStream(
     port: Int,
+    model: String,
     history: List<Pair<String, String>>,
     prompt: String,
     systemPrompt: String,
@@ -832,20 +870,10 @@ private fun askOllamaChatStream(
     // not partial.
     conn.readTimeout = 90_000
 
-    val messages = JSONArray()
-        .put(JSONObject().put("role", "system").put("content", systemPrompt))
-    for ((who, text) in history) {
-        val role = when (who) {
-            "you" -> "user"
-            "ollama" -> "assistant"
-            else -> continue // "error" entries: not real conversation content
-        }
-        messages.put(JSONObject().put("role", role).put("content", text))
-    }
-    messages.put(JSONObject().put("role", "user").put("content", prompt))
+    val messages = chatMessages(history, prompt, systemPrompt)
 
     val body = JSONObject()
-        .put("model", MODEL)
+        .put("model", model)
         .put("messages", messages)
         .put("stream", true)
         .put("think", false)
@@ -866,6 +894,87 @@ private fun askOllamaChatStream(
             val fragment = obj.optJSONObject("message")?.optString("content", "") ?: ""
             if (fragment.isNotEmpty()) emit(fragment)
             if (obj.optBoolean("done", false)) break
+        }
+    }
+}.flowOn(Dispatchers.IO)
+
+/**
+ * The `messages` array both chat APIs take: system prompt, then the earlier
+ * turns, then this one. Replies from either backend count as "assistant", so
+ * history carries over when switching between them mid-conversation.
+ */
+private fun chatMessages(
+    history: List<Pair<String, String>>,
+    prompt: String,
+    systemPrompt: String,
+): JSONArray {
+    val messages = JSONArray()
+        .put(JSONObject().put("role", "system").put("content", systemPrompt))
+    for ((who, text) in history) {
+        val role = when (who) {
+            "you" -> "user"
+            "error" -> continue // not real conversation content
+            else -> "assistant" // a Backend.service: "ollama" or "lemonade"
+        }
+        messages.put(JSONObject().put("role", role).put("content", text))
+    }
+    messages.put(JSONObject().put("role", "user").put("content", prompt))
+    return messages
+}
+
+/**
+ * Lemonade's counterpart to [askOllamaChatStream]: its OpenAI-compatible
+ * `/api/v1/chat/completions`, streamed as server-sent events -- `data: {...}`
+ * lines carrying `choices[0].delta.content`, ending with `data: [DONE]`.
+ * Same read-timeout reasoning as the Ollama path (Lemonade forwards to the
+ * same Ollama, so the same cold-load wait applies).
+ *
+ * `reasoning_effort: "none"` is what turns qwen3.5's thinking off on this
+ * API; Ollama's own `think: false` isn't understood here. Without it the
+ * first minute or so of the stream is reasoning-only deltas with empty
+ * `content`.
+ */
+private fun askLemonadeChatStream(
+    port: Int,
+    model: String,
+    history: List<Pair<String, String>>,
+    prompt: String,
+    systemPrompt: String,
+): Flow<String> = flow {
+    val url = URL("http://127.0.0.1:$port/api/v1/chat/completions")
+    val conn = url.openConnection() as HttpURLConnection
+    conn.requestMethod = "POST"
+    conn.doOutput = true
+    conn.setRequestProperty("Content-Type", "application/json")
+    conn.setRequestProperty("Accept", "text/event-stream")
+    conn.connectTimeout = 10_000
+    conn.readTimeout = 90_000
+
+    val body = JSONObject()
+        .put("model", model)
+        .put("messages", chatMessages(history, prompt, systemPrompt))
+        .put("stream", true)
+        .put("reasoning_effort", "none")
+        .put("max_tokens", 500)
+        .toString()
+    conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+
+    val code = conn.responseCode
+    if (code !in 200..299) {
+        val text = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+        throw RuntimeException("HTTP $code: $text")
+    }
+
+    conn.inputStream.bufferedReader().useLines { lines ->
+        for (line in lines) {
+            if (!line.startsWith("data:")) continue
+            val data = line.removePrefix("data:").trim()
+            if (data == "[DONE]") break
+            val obj = JSONObject(data)
+            obj.optJSONObject("error")?.let { throw RuntimeException(it.optString("message", it.toString())) }
+            val fragment = obj.optJSONArray("choices")?.optJSONObject(0)
+                ?.optJSONObject("delta")?.optString("content", "") ?: ""
+            if (fragment.isNotEmpty()) emit(fragment)
         }
     }
 }.flowOn(Dispatchers.IO)
