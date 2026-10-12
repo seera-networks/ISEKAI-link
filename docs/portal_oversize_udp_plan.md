@@ -495,10 +495,14 @@ id で突き合わせる DNS のようなものは無害で、暗黙に順序を
 
 ## 6. フェーズ
 
-### S0 — `msquic-async` に送信フラグの道を作る（別リポジトリ）
+### S0 — `msquic-async` に送信フラグの道を作る（別リポジトリ）— **完了**
 
 **ここが先行する。** `msquic-async` は別リポジトリ
 （`masa-koz/msquic-async-rs`、サブモジュール）なので、上流への変更が要る。
+
+**msquic-async-rs#102 で入った**（`311ddba`、サブモジュールは `35d6eb0`）。
+計画した 12 本がそのまま生えている。**計画に無かった発見が 1 つあり、
+それが §2.3 と §8-4 を変える** — 下の「ローカル側は abort を知る必要がある」。
 
 `poll_write_generic`（`stream.rs:690`）に追加のフラグを渡す引数を足し、既存の
 入口はすべて `SendFlags::NONE` を渡す。その上で `_no_retrans` を付けた入口を
@@ -521,6 +525,34 @@ id で突き合わせる DNS のようなものは無害で、暗黙に順序を
 `StreamEvent::CancelOnLoss` の扱いも決める。いま `_` に落ちているので動作は
 壊れていないが、**error code を選べない**。相手に伝わる値なので、既定 0 のまま
 にするか、ストリームに設定できるようにするか。portal の用途では 0 で足りる。
+
+**→ 0 のままになった。** イベントの `error_code` は MsQuic が 0 に初期化する
+out パラメータで、ハンドラは複写で受けて書き戻さないので、abort は常に 0 を運び、
+相手は `ReadError::Reset(0)` を見る。setter は必要が出てからでよい。
+
+#### ローカル側は abort を知る必要がある（計画に無かった）
+
+**`CANCEL_ON_LOSS` の abort は自分のスタックが起こすので、放っておくと
+「自分で `fin` した」と区別できない。** `send_error_code` も `recv_error_code` も
+立たず、write は `WriteError::Finished`、`poll_finish_write` は `Ok(())` を返して
+しまう — つまり **§2.3 の送出タスクは、捨てられたデータグラムを成功と読む。**
+
+#102 はハンドラで teardown を記録し、**`ReadError::CancelledOnLoss` と
+`WriteError::CancelledOnLoss`** として出すようにした（どちらも
+`io::ErrorKind::ConnectionAborted`）。双方向ストリームなら読み側が
+clean EOF を返して未読データを捨てるという別の害もあった。
+
+**計画側への影響は 2 つ。**
+
+1. §2.3 の送出タスクは、`poll_finish_write`（レビューで足した段）が
+   `WriteError::CancelledOnLoss` を返したら**落ちたものとして数える**。
+   `fin` 済みの成功と区別がつく。
+2. §8-4 のカウンタに「再送を諦めて捨てた」が**自前の推測ではなく観測として**
+   入る。受信側の `ReadError::Reset` と対になる。
+
+`ReadError` / `WriteError` に変種が増えたので、**網羅 match を持つ利用側は
+影響を受ける**。このワークスペースは受けない（`cargo check --workspace` が
+通る）が、`h3-msquic-async` は 2 箇所に腕を足している。
 
 ### S1 — 枠組みと交渉（運ばない）
 
@@ -592,7 +624,9 @@ S0 で生えた API を、フォワード単位の選択として portal から�
    大きいものを何個分許すか」で決めるのが素直だが、何個が妥当かは測っていない。
 4. **カウンタの切り方**。いまの `oversize` は「アプリが大きすぎるものを送った」で、
    これからは「相手が受け取れない」「枠が尽きた」「上限を超えた」「ストリームが
-   途中で死んだ（`ReadError::Reset`）」が別の事象になる。`refused_too_big` と `oversize` を分けた
+   途中で死んだ（受信側は `ReadError::Reset`、送信側は
+   `WriteError::CancelledOnLoss`）」が別の事象になる。**最後のものは S0 の
+   おかげで観測であって推測ではない**（§6 の S0）。`refused_too_big` と `oversize` を分けた
    判断（`datagram.rs:168`、「数えて一緒にすると区別できず、2 つは違う場所へ
    導く」）と同じ基準で分ける。
 5. **契約 C を `docs/portal.md` でどう言うか**。「上限が無くなった」とだけ書くと
