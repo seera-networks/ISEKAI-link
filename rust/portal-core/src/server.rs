@@ -246,7 +246,22 @@ async fn forward_one(
 
     let session = match open {
         Open::Tcp { .. } => return forward_tcp(stream, &service, target).await,
-        Open::Udp { session, .. } => session,
+        Open::Udp {
+            session,
+            oversize_on_stream,
+            ..
+        } => {
+            // **The answerer's half of §5.2's negotiation.** The opener said
+            // whether it can receive oversize datagrams on streams by which
+            // kind it asked with, and this is the only place that hears it --
+            // not recording it would leave this end dropping oversize payloads
+            // against a peer that could have taken them.
+            //
+            // Answering at all is this end's half: a peer that does not know
+            // the kind never gets here, because `read_open` refuses it.
+            sessions.learn_peer_oversize(oversize_on_stream);
+            session
+        }
     };
     // From here the stream carries no bytes: it is the session's lifetime
     // handle and the payloads are datagrams.

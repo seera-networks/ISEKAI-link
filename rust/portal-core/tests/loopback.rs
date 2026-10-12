@@ -671,6 +671,7 @@ async fn a_reused_session_id_is_refused() {
         &frame::Open::Udp {
             service: "dns".to_owned(),
             session: 77,
+            oversize_on_stream: false,
         },
     )
     .await
@@ -780,6 +781,7 @@ async fn udp_status(halves: &Halves, service: &str, session: u32) -> frame::Stat
         &frame::Open::Udp {
             service: service.to_owned(),
             session,
+            oversize_on_stream: false,
         },
     )
     .await

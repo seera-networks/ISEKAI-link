@@ -48,7 +48,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -86,6 +86,74 @@ pub const IDLE: Duration = Duration::from_secs(60);
 /// default descriptor limit.
 pub const MAX_SESSIONS: usize = 1024;
 
+/// Whether a session this end opens asks to receive oversize datagrams on
+/// unidirectional streams.
+///
+/// **Off until the receive side exists**, and the plan was wrong to put the
+/// probe in the same phase as the wire format. [`Open::Udp`]'s
+/// `oversize_on_stream` says *"I can receive these"*, and a build that says so
+/// without the accept loop of S2 is lying — not to a 0.6.0 peer, which never
+/// asks, but to a **later release of this code** carrying the send side of S3.
+/// That peer would open unidirectional streams nobody accepts, and an
+/// unaccepted one sits in an unbounded queue
+/// (`docs/portal_oversize_udp_plan.md` §1.3).
+///
+/// So the negotiation lands first and switches on second. Everything around it
+/// — the kind, the field, the answerer's half, the memory on [`Sessions`] — is
+/// live, and S2 flips this.
+const PROBE_OVERSIZE_ON_STREAM: bool = false;
+
+/// What a peer said about receiving oversize datagrams on streams.
+///
+/// **Three states and not two**: "not asked yet" has to be distinct from "no",
+/// because the first is worth one round trip to resolve and the second must not
+/// be paid for again on every session of the connection.
+///
+/// Its own type so that the one rule worth stating — a `yes` is never
+/// overwritten by a `no` — has somewhere to be tested without a connection.
+#[derive(Debug, Default)]
+struct PeerOversize(AtomicU8);
+
+impl PeerOversize {
+    const UNKNOWN: u8 = 0;
+    const YES: u8 = 1;
+    const NO: u8 = 2;
+
+    fn get(&self) -> Option<bool> {
+        match self.0.load(Ordering::Relaxed) {
+            Self::YES => Some(true),
+            Self::NO => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Record what a session open found out.
+    ///
+    /// **A `yes` is never overwritten by a `no`.** The two answers do not have
+    /// equal standing: a `yes` is a peer that answered an open it understood,
+    /// while a `no` is inferred from a stream that died without a status — and
+    /// a stream can die for reasons that have nothing to do with the kind it
+    /// carried. Letting a lost connection downgrade a peer that had already
+    /// proven itself would turn one bad moment into a permanent loss of the
+    /// feature for that connection.
+    ///
+    /// Relaxed ordering. Two sessions opening at once may both probe and both
+    /// write the same answer, which costs a round trip and is otherwise
+    /// harmless.
+    fn learn(&self, takes: bool) {
+        if takes {
+            self.0.store(Self::YES, Ordering::Relaxed);
+        } else {
+            let _ = self.0.compare_exchange(
+                Self::UNKNOWN,
+                Self::NO,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
 /// Enough for the largest UDP payload there is (65507 bytes).
 ///
 /// **Deliberately larger than [`MAX_PAYLOAD`]**: `recv` on a UDP socket
@@ -110,6 +178,12 @@ pub struct Sessions {
     /// What was lost, and why. Read by anything that wants to report it; the
     /// pump logs a summary when the connection ends.
     pub drops: Drops,
+    /// Whether the peer receives oversize datagrams on unidirectional streams.
+    ///
+    /// **Per connection, not per session**, which is what keeps §5.2's fallback
+    /// to one round trip: the capability is a property of the peer's build, so
+    /// the first session that finds out pays and the rest read it.
+    peer_oversize: PeerOversize,
     /// Sessions that could not be opened — refused, unreachable, or a stream
     /// that failed.
     ///
@@ -167,6 +241,7 @@ impl Sessions {
             next: AtomicU32::new(1),
             idle,
             drops: Drops::default(),
+            peer_oversize: PeerOversize::default(),
             open_failures: AtomicU64::new(0),
         });
         tokio::spawn({
@@ -178,6 +253,17 @@ impl Sessions {
 
     fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Whether the peer takes oversize datagrams on unidirectional streams, or
+    /// `None` if no session has found out yet.
+    pub fn peer_takes_oversize(&self) -> Option<bool> {
+        self.peer_oversize.get()
+    }
+
+    /// Record what a session open found out. See [`PeerOversize::learn`].
+    pub(crate) fn learn_peer_oversize(&self, takes: bool) {
+        self.peer_oversize.learn(takes);
     }
 
     /// Receive datagrams and hand each to its session, until there are no more.
@@ -294,11 +380,21 @@ impl Sessions {
     /// loses exactly its large messages.
     fn oversize(&self, session: u32, len: usize) {
         if self.drops.oversize.fetch_add(1, Ordering::Relaxed) == 0 {
+            // **Says whose limit it is.** Once oversize payloads can travel on
+            // streams, "too large to forward" stops being one fact: it is
+            // either this build not carrying them yet, or the peer not taking
+            // them. An operator who reads the first and acts on the second
+            // changes the wrong end.
+            let why = match self.peer_takes_oversize() {
+                Some(false) => "the peer does not receive oversize datagrams on streams",
+                Some(true) => "this build does not send oversize datagrams on streams yet",
+                None => "oversize datagrams are not carried on this connection",
+            };
             tracing::warn!(
                 session,
                 len,
                 limit = MAX_PAYLOAD,
-                "a UDP payload is too large to forward and was dropped; \
+                "a UDP payload is too large to forward and was dropped: {why}; \
                  further ones on this connection are counted, not logged",
             );
         } else {
@@ -709,6 +805,113 @@ async fn session(
     }
 }
 
+/// Open one UDP session and come back with its lifetime stream.
+///
+/// **Asks for oversize-on-stream first, when this build has it to offer**, and
+/// falls back once. `docs/portal_oversize_udp_plan.md` §5.2: a peer that does
+/// not know [`KIND_UDP_BIG`](crate::frame) refuses that open alone and leaves
+/// the stream at a frame boundary, so the cost of asking is a round trip rather
+/// than a forward. A version bump would have cost every open on the connection,
+/// TCP included.
+async fn open_session(
+    sessions: &Arc<Sessions>,
+    id: u32,
+    service: &str,
+) -> anyhow::Result<msquic_async::Stream> {
+    // Only the first session on a connection probes; after that the answer is
+    // known and asking again would pay the round trip for nothing.
+    let probe = PROBE_OVERSIZE_ON_STREAM && sessions.peer_takes_oversize() != Some(false);
+    match try_open(sessions, id, service, probe).await {
+        Ok(stream) => {
+            if probe {
+                sessions.learn_peer_oversize(true);
+            }
+            Ok(stream)
+        }
+        // **Only a statusless failure is a reason to try again.** A status byte
+        // of any value proves the peer read the kind, so a `Refused` is about
+        // the service and asking differently would not change it -- and a retry
+        // there would hide a configuration mistake behind a second attempt.
+        Err(OpenFailed::NoStatus(e)) if probe => {
+            tracing::debug!(
+                service,
+                id,
+                "the peer did not answer an oversize-capable open ({e}); \
+                 asking again the plain way",
+            );
+            let stream = try_open(sessions, id, service, false).await?;
+            // Inferred, not told: the stream died without a status, and the
+            // kind is the likeliest reason but not the only one. See
+            // `learn_peer_oversize`.
+            sessions.learn_peer_oversize(false);
+            Ok(stream)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// How an open failed, split by **whether a status byte arrived** — which is
+/// the only evidence available about whether the peer understood the kind.
+///
+/// Not an `Error` type: it exists to be matched once and then unwrapped back
+/// into the `anyhow::Error` it carries, so the caller's error is the same one
+/// it would have reported before any of this existed.
+enum OpenFailed {
+    /// The stream never carried a status: it failed, ended, or timed out.
+    NoStatus(anyhow::Error),
+    /// A status arrived and said no.
+    Answered(anyhow::Error),
+}
+
+impl From<OpenFailed> for anyhow::Error {
+    fn from(e: OpenFailed) -> Self {
+        match e {
+            OpenFailed::NoStatus(e) | OpenFailed::Answered(e) => e,
+        }
+    }
+}
+
+async fn try_open(
+    sessions: &Arc<Sessions>,
+    id: u32,
+    service: &str,
+    oversize_on_stream: bool,
+) -> Result<msquic_async::Stream, OpenFailed> {
+    let mut stream = sessions
+        .connection()
+        .open_outbound_stream(StreamType::Bidirectional, false)
+        .await
+        .context("failed to open the session's stream")
+        .map_err(OpenFailed::NoStatus)?;
+    write_open(
+        &mut stream,
+        &Open::Udp {
+            service: service.to_owned(),
+            session: id,
+            oversize_on_stream,
+        },
+    )
+    .await
+    .map_err(OpenFailed::NoStatus)?;
+    // Waited for before any payload moves, as the TCP forward does: a session
+    // whose datagrams left before the status arrived would be sending into a
+    // connection whose far side has no socket for them.
+    let status = tokio::time::timeout(crate::client::STATUS_DEADLINE, read_status(&mut stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("`{service}` did not answer the open request in time"))
+        .and_then(|read| read)
+        .map_err(OpenFailed::NoStatus)?;
+    match status {
+        Status::Ready => Ok(stream),
+        Status::Refused => Err(OpenFailed::Answered(anyhow::anyhow!(
+            "the peer does not offer `{service}` over UDP"
+        ))),
+        Status::Unreachable => Err(OpenFailed::Answered(anyhow::anyhow!(
+            "the peer could not reach `{service}`"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     sessions: &Arc<Sessions>,
@@ -720,30 +923,7 @@ async fn run_session(
     outbound: &Queue,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let mut stream = sessions
-        .connection()
-        .open_outbound_stream(StreamType::Bidirectional, false)
-        .await
-        .context("failed to open the session's stream")?;
-    write_open(
-        &mut stream,
-        &Open::Udp {
-            service: service.to_owned(),
-            session: id,
-        },
-    )
-    .await?;
-    // Waited for before any payload moves, as the TCP forward does: a session
-    // whose datagrams left before the status arrived would be sending into a
-    // connection whose far side has no socket for them.
-    let status = tokio::time::timeout(crate::client::STATUS_DEADLINE, read_status(&mut stream))
-        .await
-        .map_err(|_| anyhow::anyhow!("`{service}` did not answer the open request in time"))??;
-    match status {
-        Status::Ready => {}
-        Status::Refused => anyhow::bail!("the peer does not offer `{service}` over UDP"),
-        Status::Unreachable => anyhow::bail!("the peer could not reach `{service}`"),
-    }
+    let mut stream = open_session(sessions, id, service).await?;
     tracing::debug!(%from, service, id, "a UDP session opened");
 
     let mut unexpected = [0_u8; 1];
@@ -775,4 +955,50 @@ async fn run_session(
     tracing::debug!(%from, service, id, "a UDP session closed: {ended}");
     let _ = stream.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_peer_is_unknown_until_a_session_finds_out() {
+        let seen = PeerOversize::default();
+        assert_eq!(seen.get(), None);
+    }
+
+    #[test]
+    fn either_answer_is_remembered() {
+        let yes = PeerOversize::default();
+        yes.learn(true);
+        assert_eq!(yes.get(), Some(true));
+
+        let no = PeerOversize::default();
+        no.learn(false);
+        assert_eq!(no.get(), Some(false));
+    }
+
+    /// **The one rule this type exists for.** A `no` is inferred from a stream
+    /// that died without a status, and a stream can die for reasons that have
+    /// nothing to do with the kind it carried -- so a peer that has already
+    /// answered an oversize-capable open must not be downgraded by one bad
+    /// moment for the rest of the connection.
+    #[test]
+    fn a_proven_peer_is_not_downgraded_by_a_dead_stream() {
+        let seen = PeerOversize::default();
+        seen.learn(true);
+        seen.learn(false);
+        assert_eq!(seen.get(), Some(true), "still yes");
+    }
+
+    /// The other direction does settle, because the first answer there was the
+    /// weaker one: a peer that turns out to understand the kind after all is
+    /// news worth taking.
+    #[test]
+    fn a_no_gives_way_to_a_yes() {
+        let seen = PeerOversize::default();
+        seen.learn(false);
+        seen.learn(true);
+        assert_eq!(seen.get(), Some(true));
+    }
 }
