@@ -104,6 +104,21 @@ struct BigSend {
     no_retrans: bool,
 }
 
+/// What to put in an open's options byte.
+///
+/// A free function so the fallback has somewhere to be tested: the states it
+/// turns on live on a [`Sessions`], which needs a connection to build.
+///
+/// **A refusal drops the option rather than the forward.** The operator is told
+/// once, loudly, that what they asked for is not happening — and the forward
+/// goes on carrying traffic the ordinary way, which is the lesser of the two
+/// losses. Keeping the option and failing would cost everything.
+fn options_to_send(no_retrans: bool, refused: bool) -> crate::frame::OversizeOptions {
+    crate::frame::OversizeOptions {
+        no_retrans: no_retrans && !refused,
+    }
+}
+
 /// The largest payload that can leave, given what is known about the peer.
 ///
 /// A free function so the decision has somewhere to be tested: the states it
@@ -229,6 +244,21 @@ pub struct Sessions {
     /// to one round trip: the capability is a property of the peer's build, so
     /// the first session that finds out pays and the rest read it.
     peer_oversize: PeerOversize,
+    /// Whether this peer has refused the oversize options a forward asked for.
+    ///
+    /// **Per connection, like the capability beside it**, and for the same
+    /// reason: which options a peer knows is a property of its build.
+    ///
+    /// Set by a `Status::Unsupported`, and it makes later opens drop the
+    /// options rather than keep asking. **Without it an answered refusal is
+    /// worse than the unanswered one it replaced**: `learn_takes` has already
+    /// recorded `YES`, which is sticky, so nothing stops the next session
+    /// asking the same way — and `session` has no negative caching, so the
+    /// forward would open a stream and be refused *per datagram*, carrying
+    /// nothing at all. Dropping the stream used to cost the capability and
+    /// leave a working plain-UDP forward; this has to cost less than that, not
+    /// more.
+    options_refused: std::sync::atomic::AtomicBool,
     /// Oversize datagrams waiting for a stream.
     ///
     /// **A channel because [`send`](Self::send) cannot wait.** Opening a stream
@@ -297,6 +327,7 @@ impl Sessions {
             idle,
             drops: Drops::default(),
             peer_oversize: PeerOversize::default(),
+            options_refused: std::sync::atomic::AtomicBool::new(false),
             big_sends,
             open_failures: AtomicU64::new(0),
         });
@@ -1295,7 +1326,12 @@ async fn open_session(
             session: id,
             // The capability and the choice travel together: the options are
             // meaningless without it, which is why the type nests them.
-            oversize: probe.then_some(crate::frame::OversizeOptions { no_retrans }),
+            oversize: probe.then(|| {
+                options_to_send(
+                    no_retrans,
+                    sessions.options_refused.load(Ordering::Relaxed),
+                )
+            }),
         },
     )
     .await?;
@@ -1333,15 +1369,27 @@ async fn open_session(
         Status::Ready => Ok(stream),
         Status::Refused => anyhow::bail!("the peer does not offer `{service}` over UDP"),
         Status::Unreachable => anyhow::bail!("the peer could not reach `{service}`"),
-        // **The operator asked for something this peer cannot do.** Only the
-        // options reach here, so the message names them rather than the
-        // service -- and `learn_takes` above has already run, which is the
-        // point of answering with a status at all: the peer does take oversize
+        // **The operator asked for something this peer cannot do**, and
+        // `learn_takes` above has already run: the peer does take oversize
         // datagrams, it just will not take them the way this forward asked.
-        Status::Unsupported => anyhow::bail!(
-            "the peer does not support this forward's oversize options for \
-             `{service}`; drop them from its --map or upgrade the peer"
-        ),
+        //
+        // So the option is given up and the forward is not. Remembered per
+        // connection, said once, and the next datagram opens a session without
+        // it -- the same shape §5.2 uses for the capability itself, because
+        // the open frame carries the caller's session id and a second attempt
+        // under it would meet `Accept::InUse`.
+        Status::Unsupported => {
+            if !sessions.options_refused.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    service,
+                    "the peer does not support this forward's oversize options; \
+                     carrying on without them, so oversize datagrams on it will \
+                     be retransmitted after all. Upgrade the peer or drop the \
+                     option from its --map",
+                );
+            }
+            anyhow::bail!("the peer refused this forward's oversize options for `{service}`")
+        }
     }
 }
 
@@ -1461,6 +1509,22 @@ mod tests {
         )
         .await
         .expect("the pump returned rather than parking");
+    }
+
+    /// **A refused option is dropped, not carried into every later open.**
+    /// Keeping it would fail every session for the life of the connection,
+    /// which is worse than the unanswered refusal it replaced: that one cost
+    /// the capability and left a working plain-UDP forward.
+    #[test]
+    fn a_refused_option_is_given_up_and_the_forward_is_not() {
+        assert!(options_to_send(true, false).no_retrans, "asked for");
+        assert!(
+            !options_to_send(true, true).no_retrans,
+            "asked for, refused once, and not asked again",
+        );
+        // And a forward that never asked is unaffected either way.
+        assert!(!options_to_send(false, false).no_retrans);
+        assert!(!options_to_send(false, true).no_retrans);
     }
 
     /// **Generous while the answer is unknown**, and the asymmetry is the

@@ -116,18 +116,19 @@ pub(crate) const KIND_BIG_DATAGRAM: u8 = 3;
 /// *answerer* acts on it: silently dropping one would leave an operator having
 /// asked for something that quietly did not happen.
 ///
-/// **The refusal costs more than adding a kind does, and an earlier version of
-/// this comment said it cost the same.** A refused open dies without a status,
-/// which the opener cannot tell from a peer that does not know the kind — so
-/// `open_session` infers `PeerOversize::NO`, and the second one latches it.
-/// The connection then loses oversize datagrams entirely, against a peer that
-/// supports them, and the operator's request has quietly not happened after
-/// all.
+/// **The refusal is answered, and getting that wrong twice is why it says so
+/// here.** The first version let the refusal kill the stream, which the opener
+/// cannot tell from a peer that does not know the kind — so it inferred
+/// `PeerOversize::NO` and the second one latched it, losing the capability for
+/// the connection's life. [`Status::Unsupported`] fixed that and then cost
+/// *more*: a status is sticky evidence that the kind was read, so the opener
+/// kept asking the same way and every session failed, forever, carrying
+/// nothing.
 ///
-/// **Nothing misbehaves today** — one bit, and both ends of a connection are
-/// the same build. §8-12 is what to settle before a second bit exists; a
-/// `Status` meaning "understood, and not as asked" is the likely shape, since a
-/// status of any value is already what tells the opener its kind was read.
+/// What it takes is both halves: an answer the opener can read, **and** the
+/// opener giving the option up on receiving one
+/// (`udp::Sessions::options_refused`). The option is lost, loudly, and the
+/// forward is not. Adding a second bit is safe in that shape and in no other.
 const OPTION_NO_RETRANS: u8 = 0x01;
 const KNOWN_OPTIONS: u8 = OPTION_NO_RETRANS;
 
@@ -692,6 +693,13 @@ mod tests {
         wire.push(0x80); // nothing defines this bit
         wire.extend_from_slice(b"after"); // and the stream goes on
 
+        if !RECEIVES_OVERSIZE_ON_STREAM {
+            // The gate refuses the kind before the options are ever read, and
+            // `the_big_kind_is_refused_while_this_build_cannot_receive` is what
+            // covers that. Guarded like its neighbours so flipping the constant
+            // back reports the gate rather than a confusing `expect`.
+            return;
+        }
         let mut cursor = std::io::Cursor::new(wire);
         let read = read_open(&mut cursor).await.expect("readable");
         let Request::NotAsAsked { service, detail } = read else {

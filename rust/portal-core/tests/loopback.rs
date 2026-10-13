@@ -731,9 +731,17 @@ async fn an_unknown_oversize_option_is_answered_rather_than_dropped() {
         "answered by name rather than by a dead stream",
     );
 
-    // And the connection is untouched: a plain session still opens, which is
-    // what would not be true if the refusal had been read as a capability.
-    assert_eq!(udp_status(&halves, "dns", 71).await, frame::Status::Ready);
+    // **No second assertion here, and that is deliberate.** The obvious one --
+    // "a plain session still opens" -- proves nothing: `udp_status` asks with
+    // `oversize: None`, and the answerer's capability bookkeeping governs only
+    // what *it* may send, never whether an open is accepted. It would pass
+    // whatever state anything was in.
+    //
+    // What this change protects is the opener's inference, and the opener here
+    // is a hand-written stream rather than `udp::Sessions`. That side is unit
+    // tested (`options_to_send`), and driving it end to end needs a peer that
+    // refuses an option this build knows -- which two ends of the same build
+    // cannot be. Open question 8's wall.
 
     drop(stream);
     drain(halves).await;
