@@ -98,8 +98,10 @@ const DIAL_BUDGET: Duration = Duration::from_secs(30);
 /// `MAX_PAYLOAD` and there is no send side yet, so it would be dropped and the
 /// test would fail for a reason it is not about. This reports the arrival
 /// instead.
-async fn recording_datagram_service(
-) -> (std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn recording_datagram_service() -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind the datagram service");
@@ -191,6 +193,8 @@ struct Halves {
     /// `Connection` clone, so [`drain`] has to let it go before it waits —
     /// exactly what `session::Connected::close` does in the real client.
     sessions: Option<Arc<Sessions>>,
+    /// Held so the hop outlives the connection that runs through it.
+    _hop: Option<isekai_p2p::agent::Hop>,
     /// The **server's** side of the connection, for the one test that has to
     /// send something the server never sends.
     ///
@@ -282,11 +286,34 @@ impl Halves {
 
 /// A portal server offering `catalogue`, and a connection to it.
 async fn connected(catalogue: Catalogue) -> Halves {
-    connected_with_idle(catalogue, udp::IDLE).await
+    connected_with(catalogue, udp::IDLE, None).await
 }
 
 /// [`connected`], with a UDP sweep this side of a minute.
 async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
+    connected_with(catalogue, idle, None).await
+}
+
+/// [`connected`], with every packet of the connection passing `hook`.
+///
+/// **The client dials a [`Hop`] rather than the listener**, so both directions
+/// cross one seam. There is no relay leg here and no candidate exchange, so
+/// nothing can migrate off it — but a test should not take that on trust:
+/// `a_hop_carries_the_whole_connection` asserts the hook actually saw traffic,
+/// which is the check that would have caught the one-sided `--relay-only`
+/// mistake the hook plan made (§1.4).
+async fn connected_through_hook(
+    catalogue: Catalogue,
+    hook: Arc<dyn isekai_p2p::agent::DatapathHook>,
+) -> Halves {
+    connected_with(catalogue, udp::IDLE, Some(hook)).await
+}
+
+async fn connected_with(
+    catalogue: Catalogue,
+    idle: Duration,
+    hook: Option<Arc<dyn isekai_p2p::agent::DatapathHook>>,
+) -> Halves {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -336,12 +363,31 @@ async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
     // that was an inference from three numbers that were all just the budget.
     // What the log says is only "longer than the budget". So: print it.
     let began = std::time::Instant::now();
+    // The hop goes between the dial and the listener, so the connection's
+    // packets have somewhere to be seen. Kept alive by `Halves` for the same
+    // reason its other handles are.
+    let hop = match hook {
+        None => None,
+        Some(hook) => Some(
+            isekai_p2p::agent::Hop::start(
+                format!("127.0.0.1:{}", bound.port()).parse().unwrap(),
+                hook,
+                shutdown.clone(),
+            )
+            .await
+            .expect("start a datapath hop"),
+        ),
+    };
+    let dial_port = hop
+        .as_ref()
+        .map_or_else(|| bound.port(), |h| h.addr().port());
+
     let session = tokio::time::timeout(
         DIAL_BUDGET,
         transport::connect(
             Some(reg.clone()),
             "127.0.0.1",
-            bound.port(),
+            dial_port,
             transport::ConnectOptions::default(),
             &shutdown,
         ),
@@ -357,6 +403,7 @@ async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
         // Arrives once the handshake the dial above completed is accepted, so
         // it is already there; a timeout rather than a `blocking` wait because
         // a failure here should say what it was.
+        _hop: hop,
         peer_side: tokio::time::timeout(DIAL_BUDGET, peer_rx)
             .await
             .expect("the listener accepted inside the dial budget")
@@ -631,7 +678,11 @@ async fn an_oversize_datagram_crosses_and_comes_back() {
             .unwrap_or_else(|_| panic!("{len} bytes came back within five seconds"))
             .expect("receive");
         assert_eq!(got, len, "the whole datagram, not a prefix");
-        assert_eq!(&reply[..got], vec![b'A'; len], "and it went through the service");
+        assert_eq!(
+            &reply[..got],
+            vec![b'A'; len],
+            "and it went through the service"
+        );
     }
 
     // Small ones still work afterwards, which is the thing to check when a
@@ -687,6 +738,88 @@ async fn the_openers_no_retrans_choice_crosses() {
         );
         drop(stream);
     }
+
+    drain(halves).await;
+}
+
+/// **A hop carries the whole connection, and the hook sees it.**
+///
+/// H1 of `docs/isekai_p2p_datapath_hook_plan.md`. The assertion that matters is
+/// the count: a seam the traffic does not cross is worth nothing, and a test
+/// that only checked the forward still worked would pass just as happily with
+/// the hop bypassed. That is the shape of the mistake the hook plan made about
+/// one-sided `--relay-only` (§1.4), caught here by asking the seam what it saw.
+#[tokio::test]
+async fn a_hop_carries_the_whole_connection() {
+    #[derive(Default)]
+    struct Counting {
+        out: std::sync::atomic::AtomicUsize,
+        in_: std::sync::atomic::AtomicUsize,
+    }
+    impl isekai_p2p::agent::DatapathHook for Counting {
+        fn outbound(&self, _p: &[u8]) -> isekai_p2p::agent::Verdict {
+            self.out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            isekai_p2p::agent::Verdict::Pass
+        }
+        fn inbound(&self, _p: &[u8]) -> isekai_p2p::agent::Verdict {
+            self.in_.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            isekai_p2p::agent::Verdict::Pass
+        }
+    }
+
+    let target = shouting_datagram_service().await;
+    let hook = Arc::new(Counting::default());
+    let halves = connected_through_hook(
+        Catalogue::new().with("dns", Protocol::Udp, target),
+        hook.clone(),
+    )
+    .await;
+
+    // The handshake alone has crossed it by now, which is the point: a hop is
+    // in the connection's path from the first packet, not from the first
+    // forward.
+    let after_handshake = (
+        hook.out.load(std::sync::atomic::Ordering::Relaxed),
+        hook.in_.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    assert!(
+        after_handshake.0 > 0 && after_handshake.1 > 0,
+        "the handshake crossed the hop in both directions: {after_handshake:?}",
+    );
+
+    // And the forward works through it, small and oversize alike -- the second
+    // being the one H2 will be dropping a packet of.
+    let local = udp::forward(
+        Arc::clone(halves.sessions()),
+        "127.0.0.1:0".parse().unwrap(),
+        "dns".to_owned(),
+        false,
+        halves.teardown.shutdown.clone(),
+    )
+    .await
+    .expect("forward a local UDP port");
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    client.connect(local).await.expect("connect");
+
+    assert_eq!(&say(&client, b"small").await, b"SMALL");
+
+    let big = vec![b'b'; MAX_PAYLOAD + 1];
+    client.send(&big).await.expect("send");
+    let mut reply = vec![0_u8; 70_000];
+    let got = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut reply))
+        .await
+        .expect("the oversize one came back within five seconds")
+        .expect("receive");
+    assert_eq!(got, big.len());
+
+    let after_traffic = (
+        hook.out.load(std::sync::atomic::Ordering::Relaxed),
+        hook.in_.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    assert!(
+        after_traffic.0 > after_handshake.0 && after_traffic.1 > after_handshake.1,
+        "and the forward's own packets crossed it too: {after_handshake:?} -> {after_traffic:?}",
+    );
 
     drain(halves).await;
 }
@@ -1069,7 +1202,8 @@ async fn a_stream_larger_than_a_datagram_can_be_is_dropped() {
 async fn a_stream_that_never_finishes_is_given_up_on() {
     let target = shouting_datagram_service().await;
     let idle = Duration::from_millis(300);
-    let halves = connected_with_idle(Catalogue::new().with("dns", Protocol::Udp, target), idle).await;
+    let halves =
+        connected_with_idle(Catalogue::new().with("dns", Protocol::Udp, target), idle).await;
 
     let mut stalled = halves
         .peer_side

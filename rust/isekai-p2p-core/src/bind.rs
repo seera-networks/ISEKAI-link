@@ -34,12 +34,9 @@ use channel_masque::{
 /// gets back, and one draining [`BindSession::events`] can match on them,
 /// without depending on the MASQUE crate directly.
 pub use channel_masque::{InboundActivity, MasqueClientEvent};
-// **Re-exported, so a caller never names `channel-masque`.** It is an optional
-// dependency behind this crate's `msquic` feature, and a test that had to
-// depend on it directly would be reaching past the abstraction the hook exists
-// to serve. `docs/isekai_p2p_datapath_hook_plan.md` §6-2 is where the feature
-// question still sits.
-pub use channel_masque::masque::connect_udp::{DatapathHook, Verdict};
+// The hook lives in [`crate::datapath`], beside the other carrier. Named here
+// because `RelayOptions` below holds one.
+use crate::datapath::DatapathHook;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use http::Uri;
@@ -93,7 +90,7 @@ pub struct RelayOptions {
     /// **Only the dialled leg has somewhere to put one.** A leg opened for
     /// listening runs `MasqueClientMode::Forward`, which does not go through
     /// the bridge this hooks — see the plan's §1.1.
-    pub datapath_hook: Option<Arc<dyn channel_masque::masque::connect_udp::DatapathHook>>,
+    pub datapath_hook: Option<Arc<dyn DatapathHook>>,
 }
 
 /// Where a relay leg is actually dialled.

@@ -41,3 +41,7 @@ pub mod bind;
 /// Observed-address reports from a relay leg (feature `msquic`).
 #[cfg(feature = "msquic")]
 pub mod observed;
+
+/// Interposing on an inner QUIC connection's packets (feature `msquic`).
+#[cfg(feature = "msquic")]
+pub mod datapath;
