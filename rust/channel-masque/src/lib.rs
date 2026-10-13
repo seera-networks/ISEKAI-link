@@ -746,11 +746,6 @@ where
         }
     }
 
-    /// Bound the sockets a forwarding session will keep (see
-    /// [`ForwardLimits`]).
-    ///
-    /// **For a session anyone can send to.** Its senders are not a known set,
-    /// so the sockets they cost have to have an end.
     /// Interpose on this leg's inner-QUIC packets.
     ///
     /// **For tests and for measuring a live relay**, and reachable only from
@@ -764,6 +759,11 @@ where
         self
     }
 
+    /// Bound the sockets a forwarding session will keep (see
+    /// [`ForwardLimits`]).
+    ///
+    /// **For a session anyone can send to.** Its senders are not a known set,
+    /// so the sockets they cost have to have an end.
     pub fn with_forward_limits(mut self, limits: ForwardLimits) -> Self {
         self.forward_limits = Some(limits);
         self
@@ -873,14 +873,8 @@ where
             let _req_body_tx = req_body_tx;
             let _resp = resp;
             if let Err(e) =
-                crate::masque::connect_udp::run_bridge(
-                    socket,
-                    tx,
-                    inbound_rx,
-                    hook,
-                    shutdown_token,
-                )
-                .await
+                crate::masque::connect_udp::run_bridge(socket, tx, inbound_rx, hook, shutdown_token)
+                    .await
             {
                 tracing::error!("connect-udp bridge exited with error: {e}");
             }

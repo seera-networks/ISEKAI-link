@@ -600,6 +600,19 @@ async fn open_bound_udp(
     if let BoundUdp::PublicAddress = kind {
         client = client.with_forward_limits(PUBLIC_FORWARD_LIMITS);
     }
+    // **Said rather than dropped silently.** A bound session forwards in
+    // `MasqueClientMode::Forward`, which never goes through the bridge a
+    // `DatapathHook` interposes on, so one set here does nothing at all. The
+    // field's own doc says so, but somebody setting it is not reading the
+    // field -- they are watching for packets to go missing, and would see
+    // traffic flow normally with nothing to explain why.
+    if opts.datapath_hook.is_some() {
+        tracing::warn!(
+            "a datapath hook was set on a leg opened for listening, where it \
+             has no effect: only a dialled leg goes through the bridge it \
+             interposes on"
+        );
+    }
     let inbound = client.inbound_activity();
     let task = tokio::spawn(async move {
         match client

@@ -488,7 +488,7 @@ async fn connect_on_a_grant(
             &[],
             "127.0.0.1:0".parse().expect("valid loopback addr"),
             RelayOptions {
-            datapath_hook: None,
+                datapath_hook: None,
                 unconnected: true,
                 registration: Some(reg),
             },

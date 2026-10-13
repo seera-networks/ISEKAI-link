@@ -262,13 +262,26 @@ mod tests {
                 ..Default::default()
             })
         }
+        /// **One decrement, not a load and a store.** `DatapathHook` is
+        /// `Send + Sync` and arrives as an `Arc`, so the obvious next use --
+        /// one hook on two legs -- would have two callers racing here, losing
+        /// or double-spending a decrement and dropping a different number of
+        /// packets than the test asked for. That shows up as a flaky
+        /// assertion rather than as an error, which is the worst way for a
+        /// test instrument to be wrong.
         fn spend(budget: &std::sync::atomic::AtomicUsize) -> Verdict {
-            let left = budget.load(std::sync::atomic::Ordering::Relaxed);
-            if left == 0 {
-                return Verdict::Pass;
+            let taken = budget
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok();
+            if taken {
+                Verdict::Drop
+            } else {
+                Verdict::Pass
             }
-            budget.store(left - 1, std::sync::atomic::Ordering::Relaxed);
-            Verdict::Drop
         }
     }
 
@@ -492,8 +505,13 @@ mod tests {
 
         let (in_tx, in_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
-        let handle =
-            tokio::spawn(run_bridge(sock.clone(), FailingTx, in_rx, None, shutdown.clone()));
+        let handle = tokio::spawn(run_bridge(
+            sock.clone(),
+            FailingTx,
+            in_rx,
+            None,
+            shutdown.clone(),
+        ));
 
         // Uplink whose send fails: it records the source, then the failing send
         // is dropped — the bridge must NOT tear down.
@@ -523,7 +541,13 @@ mod tests {
         let (up_tx, _up_rx) = mpsc::unbounded_channel();
         let (in_tx, in_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
-        let handle = tokio::spawn(run_bridge(sock, ChanTx(up_tx), in_rx, None, shutdown.clone()));
+        let handle = tokio::spawn(run_bridge(
+            sock,
+            ChanTx(up_tx),
+            in_rx,
+            None,
+            shutdown.clone(),
+        ));
 
         // No uplink has recorded a source, so this payload is dropped (no panic).
         in_tx.send(Bytes::from_static(b"orphan")).await.unwrap();
