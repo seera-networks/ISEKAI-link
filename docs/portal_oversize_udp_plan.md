@@ -959,10 +959,11 @@ S0 で生えた API をフォワード単位の選択にする段。**S3 と分�
    `KIND_UDP_BIG` の層にオプションバイトを足した。種別を増やす案を退けられたのは
    **この種別が未リリースだから**で、`KIND_UDP` の層は 0.6.0 にあるので
    同じことはできない。
-10. **`no-retrans` が実際に損失で諦めることをどう確かめるか**。MsQuic 側は
-   `QuicTestMultipathPathValidationRetry` がデータパスフックで落としている。
-   portal 側に同じ道具は無く、いまは「指定しても配送が壊れない」までしか
-   テストしていない。
+10. ~~**`no-retrans` が実際に損失で諦めることをどう確かめるか**~~ → 確かめた。
+   `docs/isekai_p2p_datapath_hook_plan.md` の H2。**同じ hop・同じ 1 パケットの
+   損失で、`no-retrans` ありは届かず（`stream_cancelled = 1`）、既定は届く**。
+   「portal 側に同じ道具は無い」が無くなったのが要点で、道具は
+   `isekai_p2p::agent::{DatapathHook, Hop}` である。
 12. ~~**オプションの拒否が能力の喪失になる**~~ → 直した（S6）。
    `Status::Unsupported` と、受けた側が**オプションを諦める**ことの両方。
    片方だけでは「能力の喪失」が「フォワードの死」に替わるだけだった。

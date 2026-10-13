@@ -750,6 +750,148 @@ async fn the_openers_no_retrans_choice_crosses() {
     drain(halves).await;
 }
 
+/// Drops the first large packet the dialling end sends, once armed.
+///
+/// **Size, not position.** An opaque hook cannot tell which stream a packet
+/// carries (`docs/isekai_p2p_datapath_hook_plan.md` §3.3), and counting from
+/// the arming point would land on whatever ACK happened to go next. A stream's
+/// data packets fill the MTU and an ACK does not, so size picks the one the
+/// test means — and the quiesce before arming is what keeps anything else
+/// large from being in flight.
+#[derive(Default)]
+struct DropOneBigOnce {
+    armed: std::sync::atomic::AtomicBool,
+    budget: std::sync::atomic::AtomicUsize,
+    dropped: std::sync::atomic::AtomicUsize,
+}
+
+impl DropOneBigOnce {
+    const BIG: usize = 1000;
+
+    fn arm(&self, how_many: usize) {
+        self.budget
+            .store(how_many, std::sync::atomic::Ordering::Relaxed);
+        self.armed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn dropped(&self) -> usize {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl isekai_p2p::agent::DatapathHook for DropOneBigOnce {
+    fn outbound(&self, packet: &[u8]) -> isekai_p2p::agent::Verdict {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.armed.load(Relaxed) || packet.len() < Self::BIG {
+            return isekai_p2p::agent::Verdict::Pass;
+        }
+        // One decrement, for the reason the hop's own helper gives.
+        if self
+            .budget
+            .fetch_update(Relaxed, Relaxed, |left| left.checked_sub(1))
+            .is_ok()
+        {
+            self.dropped.fetch_add(1, Relaxed);
+            isekai_p2p::agent::Verdict::Drop
+        } else {
+            isekai_p2p::agent::Verdict::Pass
+        }
+    }
+}
+
+/// The choreography open question 10 needs: a settled connection, one oversize
+/// datagram, and a packet of it lost.
+///
+/// Returns what came back, if anything, and how many packets the hook ate.
+async fn oversize_through_a_lossy_hop(no_retrans: bool) -> (Option<usize>, usize, u64) {
+    let target = shouting_datagram_service().await;
+    let hook = Arc::new(DropOneBigOnce::default());
+    let halves = connected_through_hook(
+        Catalogue::new().with("dns", Protocol::Udp, target),
+        hook.clone(),
+    )
+    .await;
+
+    let local = udp::forward(
+        Arc::clone(halves.sessions()),
+        "127.0.0.1:0".parse().unwrap(),
+        "dns".to_owned(),
+        no_retrans,
+        halves.teardown.shutdown.clone(),
+    )
+    .await
+    .expect("forward a local UDP port");
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    client.connect(local).await.expect("connect");
+
+    // **Settle first.** A small round trip opens the session, and then a pause
+    // lets its acknowledgements drain -- so that when the hook is armed, the
+    // next large packet out is the one this test is about.
+    assert_eq!(&say(&client, b"first").await, b"FIRST");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    hook.arm(1);
+    let big = vec![b'x'; 4096];
+    client.send(&big).await.expect("send");
+
+    // Either it comes back, or it does not within a budget generous enough
+    // that "it did not" is about the loss rather than about the machine.
+    let came_back = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut reply = vec![0_u8; 70_000];
+        client.recv(&mut reply).await.expect("receive")
+    })
+    .await
+    .ok();
+
+    let cancelled = halves
+        .sessions()
+        .drops
+        .stream_cancelled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ate = hook.dropped();
+    drain(halves).await;
+    (came_back, ate, cancelled)
+}
+
+/// **`no-retrans` gives up on the datagram**, which is open question 10 of
+/// `docs/portal_oversize_udp_plan.md` and the thing S3 could only assert the
+/// absence of: that asking for it still delivers.
+///
+/// Read with `an_oversize_datagram_survives_one_loss_by_default` below — **same
+/// hop, same single dropped packet, opposite outcomes.** One test alone would
+/// only show that a forward with a packet missing lost a datagram, which is
+/// unremarkable.
+#[tokio::test]
+async fn no_retrans_gives_up_on_an_oversize_datagram_that_loses_a_packet() {
+    let (came_back, ate, cancelled) = oversize_through_a_lossy_hop(true).await;
+
+    assert_eq!(ate, 1, "the hop dropped exactly one packet of it");
+    assert!(
+        came_back.is_none(),
+        "and the datagram was given up on rather than arriving late: {came_back:?}",
+    );
+    assert_eq!(
+        cancelled, 1,
+        "counted as asked-for rather than as a fault, which is what          `stream_cancelled` is for",
+    );
+}
+
+/// The control. **Retransmission is the default**, so the same loss costs
+/// latency instead of the datagram — which is what makes the test above about
+/// `no-retrans` and not about loss.
+#[tokio::test]
+async fn an_oversize_datagram_survives_one_loss_by_default() {
+    let (came_back, ate, cancelled) = oversize_through_a_lossy_hop(false).await;
+
+    assert_eq!(ate, 1, "the same one packet was dropped");
+    assert_eq!(
+        came_back,
+        Some(4096),
+        "and the whole datagram still arrived, retransmitted",
+    );
+    assert_eq!(cancelled, 0, "nothing was given up on");
+}
+
+/// **A hop carries the whole connection, and the hook sees it.**
 /// **A hop carries the whole connection, and the hook sees it.**
 ///
 /// H1 of `docs/isekai_p2p_datapath_hook_plan.md`. The assertion that matters is
