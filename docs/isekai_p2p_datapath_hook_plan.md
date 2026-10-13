@@ -76,7 +76,7 @@
 `--relay-only`（`portal-client/src/main.rs:219`、`portal-server/src/main.rs:215`、
 機構は `initiator.rs:637` の「`candidates` may be empty for relay-only use」）。
 
-**片側では足りない。** `session.rs:246` がそれを測って書いている:
+**片側では足りない。** `session.rs:249` がそれを測って書いている:
 
 > **Both ends have to stay quiet for a session to really be relay-only.** A
 > client that offers no candidate still gets a direct path if this side
@@ -250,13 +250,13 @@ isekai-p2p の仕組みにする」の具体形で、テストは hop を使い�
 - **feature の門は既にあり、しかも効いている。** `channel-masque` は
   `isekai-p2p-core` の**任意依存**で `msquic` feature の下にあり
   （`isekai-p2p-core/Cargo.toml:16`）、`bind`/`transport` も
-  `#[cfg(feature = "msquic")]` である（`lib.rs:33`）。つまりトレイトを
+  `#[cfg(feature = "msquic")]` である（`isekai-p2p-core/src/lib.rs:33` 以下）。つまりトレイトを
   `channel-masque` に置くと、**「ソケット 2 つとフックだけ」の hop が
   native msquic スタック込みでしか存在しない**ことになる。§6-2 はこれを
   踏まえて書き直した。
 - **再公開は 2 段ではなく 3 段である。** `portal-core` が依存しているのは
   `isekai-p2p` で `isekai-p2p-core` ではなく（`portal-core/Cargo.toml:20`）、
-  `isekai-p2p` は項目ごとに再公開している（`lib.rs:65`）。H1 はそこにも
+  `isekai-p2p` は項目ごとに再公開している（`isekai-p2p/src/lib.rs:65` 以下）。H1 はそこにも
   面を足す。
 
 ---
