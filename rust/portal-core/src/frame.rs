@@ -57,15 +57,38 @@ const VERSION: u8 = 2;
 /// happening by accident.
 const KIND_TCP: u8 = 0;
 const KIND_UDP: u8 = 1;
+/// Whether this build can **receive** oversize UDP datagrams on unidirectional
+/// streams.
+///
+/// **One constant for both halves of the negotiation**, and that is the point.
+/// The first attempt at this had two decisions — the opener did not ask, and
+/// the answerer answered anyway — so a later release of this code carrying the
+/// send side would have been told `Ready` for a [`KIND_UDP_BIG`] open, recorded
+/// the capability, and opened unidirectional streams nobody here accepts. An
+/// unaccepted one sits in an unbounded queue with its receive window already
+/// granted (`docs/portal_oversize_udp_plan.md` §1.3).
+///
+/// Asking and granting are the same claim, so they read the same flag:
+/// [`read_open`] refuses the kind while this is false, and `udp`'s opener does
+/// not ask. **S2 sets it when the accept loop exists**, and because there is
+/// one flag the two sides cannot drift apart.
+pub(crate) const RECEIVES_OVERSIZE_ON_STREAM: bool = false;
+
 /// A UDP session whose opener can also **receive** oversize datagrams on
 /// unidirectional streams.
 ///
 /// **The kind is the negotiation**, and `docs/portal_oversize_udp_plan.md` §5.2
 /// says why it is the kind rather than a version bump or a trailing byte: a
-/// peer that does not know this refuses the one open and leaves the stream at a
-/// frame boundary (see [`read_open`]), so the opener can ask again as
-/// [`KIND_UDP`] and lose a round trip rather than a forward. Raising [`VERSION`]
-/// instead would have failed every open on the connection, `KIND_TCP` included.
+/// peer that does not know this refuses **that one open**, so the opener loses
+/// a session rather than a forward. Raising [`VERSION`] instead would have
+/// failed every open on the connection, `KIND_TCP` included.
+///
+/// **The stream is not reusable after the refusal**, and an earlier version of
+/// this comment said it was. [`read_open`] checks the kind after the name but
+/// before the session id, so a refused UDP kind leaves four bytes unread — the
+/// boundary its own comment means is the end of the name, which is a frame
+/// boundary only for [`KIND_TCP`]. Nothing depends on reuse: the opener starts
+/// a new stream.
 const KIND_UDP_BIG: u8 = 2;
 /// One oversize UDP datagram, on a unidirectional stream of its own.
 ///
@@ -218,12 +241,23 @@ where
         .context("the stream ended inside the service name")?;
     let service = String::from_utf8(name).context("the service name is not UTF-8")?;
     // The kind is checked after the name is read rather than before, so an
-    // unknown one leaves the stream at a frame boundary. It is refused either
-    // way; what this buys is that the error says what was asked for.
+    // unknown one leaves the stream after the name rather than part-way through
+    // it. It is refused either way; what this buys is that the error says what
+    // was asked for.
+    //
+    // **Not the end of the frame for the UDP kinds**, whose session id is read
+    // inside the arm below — so a caller must not plan to reuse the stream.
     match head[1] {
         KIND_TCP => Ok(Open::Tcp { service }),
+        // **Refused exactly as an unknown kind is**, so that a peer asking
+        // this of a build that cannot receive sees what it would see from a
+        // 0.6.0 one. See `RECEIVES_OVERSIZE_ON_STREAM`.
+        KIND_UDP_BIG if !RECEIVES_OVERSIZE_ON_STREAM => anyhow::bail!(
+            "this build does not receive oversize datagrams on streams, \
+             asked for service `{service}`"
+        ),
         // **The two UDP kinds read the same**, which is the property that makes
-        // §5.2's negotiation cost one round trip instead of a protocol version:
+        // §5.2's negotiation cost one session instead of a protocol version:
         // the only difference is what the kind says about the opener.
         kind @ (KIND_UDP | KIND_UDP_BIG) => {
             let mut session = [0_u8; 4];
@@ -282,11 +316,6 @@ mod tests {
                 service: "dns".to_owned(),
                 session: 0xdead_beef,
                 oversize_on_stream: false,
-            },
-            Open::Udp {
-                service: "dns".to_owned(),
-                session: 0xdead_beef,
-                oversize_on_stream: true,
             },
         ] {
             let (mut a, mut b) = tokio::io::duplex(64);
@@ -352,12 +381,13 @@ mod tests {
         assert_eq!((a[1], b[1]), (KIND_UDP, KIND_UDP_BIG));
     }
 
-    /// **An unknown kind leaves the stream at a frame boundary**, which is what
-    /// `read_open`'s own comment promises and what §5.2 of the plan builds the
-    /// fallback on. Checked rather than assumed, because the fallback is only
-    /// cheap if the refusal is this tidy.
+    /// **An unknown kind is refused after the name and before the session
+    /// id**, which is less than a whole frame — so a caller must not plan to
+    /// reuse the stream. Checked rather than assumed, because the comment on
+    /// `read_open` used to say "frame boundary" and the arithmetic below is
+    /// what showed it does not.
     #[tokio::test]
-    async fn an_unknown_kind_is_refused_after_the_frame_is_consumed() {
+    async fn an_unknown_kind_is_refused_after_the_name_not_the_frame() {
         let mut wire = Vec::new();
         wire.push(VERSION);
         wire.push(KIND_BIG_DATAGRAM); // not an `Open` kind at all
@@ -374,10 +404,42 @@ mod tests {
             err.to_string().contains("unknown open kind"),
             "says what was asked for: {err}",
         );
-        // The `[u32]` was *not* consumed -- only `KIND_UDP*` reads it -- so the
-        // boundary the comment means is the end of the name.
+        // The `[u32]` was *not* consumed -- only `KIND_UDP*` reads it -- so
+        // four bytes of the frame are still there and the stream is not
+        // reusable. The opener starts a new one instead.
         let read = cursor.position() as usize;
         assert_eq!(read, 3 + 3, "stopped right after the name");
+    }
+
+    /// **A build that cannot receive oversize datagrams refuses to be asked
+    /// for them**, and that is the whole of the answerer's half of the gate.
+    ///
+    /// Granting the kind is the same claim as asking for it: a peer told
+    /// `Ready` records the capability "from having been answered at all", and
+    /// would then open unidirectional streams nobody here accepts. The first
+    /// version of this code refused to *ask* and answered anyway, which is the
+    /// same trap from the other side.
+    #[tokio::test]
+    async fn the_big_kind_is_refused_while_this_build_cannot_receive() {
+        let open = Open::Udp {
+            service: "dns".to_owned(),
+            session: 7,
+            oversize_on_stream: true,
+        };
+        let mut wire = Vec::new();
+        write_open(&mut wire, &open).await.expect("write");
+        assert_eq!(wire[1], KIND_UDP_BIG, "it is written");
+
+        let read = read_open(&mut std::io::Cursor::new(wire)).await;
+        if RECEIVES_OVERSIZE_ON_STREAM {
+            assert_eq!(read.expect("read"), open, "and read back once S2 lands");
+        } else {
+            let err = read.expect_err("refused");
+            assert!(
+                err.to_string().contains("does not receive oversize"),
+                "and says so: {err}",
+            );
+        }
     }
 
     /// A name arriving in pieces is the normal case on a real stream, and

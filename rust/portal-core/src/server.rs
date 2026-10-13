@@ -259,7 +259,7 @@ async fn forward_one(
             //
             // Answering at all is this end's half: a peer that does not know
             // the kind never gets here, because `read_open` refuses it.
-            sessions.learn_peer_oversize(oversize_on_stream);
+            sessions.learn_peer_told_oversize(oversize_on_stream);
             session
         }
     };
