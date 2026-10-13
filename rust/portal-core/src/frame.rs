@@ -91,9 +91,10 @@ pub(crate) const RECEIVES_OVERSIZE_ON_STREAM: bool = true;
 ///
 /// **The stream is not reusable after the refusal**, and an earlier version of
 /// this comment said it was. [`read_open`] checks the kind after the name but
-/// before the session id, so a refused UDP kind leaves four bytes unread — the
-/// boundary its own comment means is the end of the name, which is a frame
-/// boundary only for [`KIND_TCP`]. Nothing depends on reuse: the opener starts
+/// before the session id, so a refused UDP kind leaves the session id unread —
+/// **five bytes for this kind** since the options byte joined it, four for
+/// [`KIND_UDP`]. The boundary `read_open`'s own comment means is the end of the
+/// name, which is a frame boundary only for [`KIND_TCP`]. Nothing depends on reuse: the opener starts
 /// a new stream.
 const KIND_UDP_BIG: u8 = 2;
 /// One oversize UDP datagram, on a unidirectional stream of its own.
@@ -113,8 +114,20 @@ pub(crate) const KIND_BIG_DATAGRAM: u8 = 3;
 /// **Unknown bits are refused, not ignored.** A byte an implementation does not
 /// read is the hazard §5.1 names, and the point of an option here is that the
 /// *answerer* acts on it: silently dropping one would leave an operator having
-/// asked for something that quietly did not happen. The cost is that adding an
-/// option needs the same care as adding a kind.
+/// asked for something that quietly did not happen.
+///
+/// **The refusal costs more than adding a kind does, and an earlier version of
+/// this comment said it cost the same.** A refused open dies without a status,
+/// which the opener cannot tell from a peer that does not know the kind — so
+/// `open_session` infers `PeerOversize::NO`, and the second one latches it.
+/// The connection then loses oversize datagrams entirely, against a peer that
+/// supports them, and the operator's request has quietly not happened after
+/// all.
+///
+/// **Nothing misbehaves today** — one bit, and both ends of a connection are
+/// the same build. §8-12 is what to settle before a second bit exists; a
+/// `Status` meaning "understood, and not as asked" is the likely shape, since a
+/// status of any value is already what tells the opener its kind was read.
 const OPTION_NO_RETRANS: u8 = 0x01;
 const KNOWN_OPTIONS: u8 = OPTION_NO_RETRANS;
 
@@ -312,9 +325,14 @@ where
             "this build does not receive oversize datagrams on streams, \
              asked for service `{service}`"
         ),
-        // **The two UDP kinds read the same**, which is the property that makes
-        // §5.2's negotiation cost one session instead of a protocol version:
-        // the only difference is what the kind says about the opener.
+        // **The two UDP kinds read almost the same**, and that is the property
+        // making §5.2's negotiation cost one session rather than a protocol
+        // version: one layout, one extra byte on the newer kind, and the same
+        // request as far as the catalogue is concerned.
+        //
+        // They did read identically until the options byte. The test for this
+        // was rewritten when that changed and this comment was not, which is
+        // how a sentence outlives what it described.
         kind @ (KIND_UDP | KIND_UDP_BIG) => {
             let mut session = [0_u8; 4];
             stream
@@ -474,7 +492,7 @@ mod tests {
     }
 
     /// **What the catalogue sees is identical.** The two UDP kinds differ in
-    /// the kind byte, and since S3 the big one carries an options byte too —
+    /// the kind byte, and since S5 the big one carries an options byte too —
     /// but `protocol()` and `service()` agree, which is the property §4.3
     /// needs: a UDP service must not become reachable a second way by being
     /// asked for differently.

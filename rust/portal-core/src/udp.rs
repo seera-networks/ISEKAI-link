@@ -951,7 +951,6 @@ async fn bind_toward(target: SocketAddr) -> anyhow::Result<UdpSocket> {
 /// the table before `Ready` leaves, or the client's first datagram — which
 /// follows immediately — arrives for a session that does not exist yet and is
 /// counted as a drop on the very first packet of every forward.
-#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     sessions: Arc<Sessions>,
     id: u32,
