@@ -758,30 +758,54 @@ async fn the_openers_no_retrans_choice_crosses() {
 /// data packets fill the MTU and an ACK does not, so size picks the one the
 /// test means — and the quiesce before arming is what keeps anything else
 /// large from being in flight.
-#[derive(Default)]
 struct DropOneBigOnce {
+    /// Which end's packets to take, so both halves of a request and its answer
+    /// can be tested — the answer being the larger half in the case this is
+    /// about.
+    from: Sender,
     armed: std::sync::atomic::AtomicBool,
     budget: std::sync::atomic::AtomicUsize,
     dropped: std::sync::atomic::AtomicUsize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sender {
+    Dialler,
+    Listener,
+}
+
 impl DropOneBigOnce {
     const BIG: usize = 1000;
 
-    fn arm(&self, how_many: usize) {
-        self.budget
-            .store(how_many, std::sync::atomic::Ordering::Relaxed);
-        self.armed.store(true, std::sync::atomic::Ordering::Relaxed);
+    fn new(from: Sender) -> Arc<Self> {
+        Arc::new(Self {
+            from,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            budget: std::sync::atomic::AtomicUsize::new(0),
+            dropped: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
+
+    /// **`Release`, paired with the `Acquire` in `take`.** The budget and the
+    /// flag are two stores and the hook reads them from the hop's task, so two
+    /// `Relaxed` ones let a weakly ordered machine — aarch64, which this suite
+    /// runs on — see `armed` set and the budget still zero. The packet would
+    /// pass and the test would fail on its count, which is the flaky-instrument
+    /// failure `channel-masque`'s own helper warns about and avoids only by
+    /// being set before it is shared.
+    fn arm(&self, how_many: usize) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        self.budget.store(how_many, Relaxed);
+        self.armed.store(true, Release);
+    }
+
     fn dropped(&self) -> usize {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
-}
 
-impl isekai_p2p::agent::DatapathHook for DropOneBigOnce {
-    fn outbound(&self, packet: &[u8]) -> isekai_p2p::agent::Verdict {
-        use std::sync::atomic::Ordering::Relaxed;
-        if !self.armed.load(Relaxed) || packet.len() < Self::BIG {
+    fn take(&self, from: Sender, packet: &[u8]) -> isekai_p2p::agent::Verdict {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        if from != self.from || !self.armed.load(Acquire) || packet.len() < Self::BIG {
             return isekai_p2p::agent::Verdict::Pass;
         }
         // One decrement, for the reason the hop's own helper gives.
@@ -798,13 +822,25 @@ impl isekai_p2p::agent::DatapathHook for DropOneBigOnce {
     }
 }
 
+impl isekai_p2p::agent::DatapathHook for DropOneBigOnce {
+    fn outbound(&self, packet: &[u8]) -> isekai_p2p::agent::Verdict {
+        self.take(Sender::Dialler, packet)
+    }
+    fn inbound(&self, packet: &[u8]) -> isekai_p2p::agent::Verdict {
+        self.take(Sender::Listener, packet)
+    }
+}
+
 /// The choreography open question 10 needs: a settled connection, one oversize
 /// datagram, and a packet of it lost.
 ///
 /// Returns what came back, if anything, and how many packets the hook ate.
-async fn oversize_through_a_lossy_hop(no_retrans: bool) -> (Option<usize>, usize, u64) {
+async fn oversize_through_a_lossy_hop(
+    no_retrans: bool,
+    lose: Sender,
+) -> (Option<usize>, usize, u64) {
     let target = shouting_datagram_service().await;
-    let hook = Arc::new(DropOneBigOnce::default());
+    let hook = DropOneBigOnce::new(lose);
     let halves = connected_through_hook(
         Catalogue::new().with("dns", Protocol::Udp, target),
         hook.clone(),
@@ -862,7 +898,7 @@ async fn oversize_through_a_lossy_hop(no_retrans: bool) -> (Option<usize>, usize
 /// unremarkable.
 #[tokio::test]
 async fn no_retrans_gives_up_on_an_oversize_datagram_that_loses_a_packet() {
-    let (came_back, ate, cancelled) = oversize_through_a_lossy_hop(true).await;
+    let (came_back, ate, cancelled) = oversize_through_a_lossy_hop(true, Sender::Dialler).await;
 
     assert_eq!(ate, 1, "the hop dropped exactly one packet of it");
     assert!(
@@ -871,7 +907,8 @@ async fn no_retrans_gives_up_on_an_oversize_datagram_that_loses_a_packet() {
     );
     assert_eq!(
         cancelled, 1,
-        "counted as asked-for rather than as a fault, which is what          `stream_cancelled` is for",
+        "counted as asked-for rather than as a fault, which is what \
+         `stream_cancelled` is for",
     );
 }
 
@@ -880,7 +917,7 @@ async fn no_retrans_gives_up_on_an_oversize_datagram_that_loses_a_packet() {
 /// `no-retrans` and not about loss.
 #[tokio::test]
 async fn an_oversize_datagram_survives_one_loss_by_default() {
-    let (came_back, ate, cancelled) = oversize_through_a_lossy_hop(false).await;
+    let (came_back, ate, cancelled) = oversize_through_a_lossy_hop(false, Sender::Dialler).await;
 
     assert_eq!(ate, 1, "the same one packet was dropped");
     assert_eq!(
@@ -891,7 +928,40 @@ async fn an_oversize_datagram_survives_one_loss_by_default() {
     assert_eq!(cancelled, 0, "nothing was given up on");
 }
 
-/// **A hop carries the whole connection, and the hook sees it.**
+/// **The answering end honours it too**, which is the half that matters: the
+/// large part of a request and its answer is usually the answer, and the
+/// answerer has no `--map` — it acts on what the open frame carried (§S5).
+///
+/// The first version of this test dropped only the dialling end's packets and
+/// the plans then said question 10 was closed. It was closed for one direction.
+///
+/// **What cannot be asserted here is the server's counter**: its `Sessions` is
+/// not reachable from a test. So the observable is the outcome, which is the
+/// one the application sees anyway.
+#[tokio::test]
+async fn no_retrans_gives_up_on_the_answer_too() {
+    let (came_back, ate, _) = oversize_through_a_lossy_hop(true, Sender::Listener).await;
+
+    assert_eq!(ate, 1, "the hop dropped one packet of the reply");
+    assert!(
+        came_back.is_none(),
+        "and the answer was given up on rather than retransmitted: {came_back:?}",
+    );
+}
+
+/// The control for the direction above, for the reason the first pair has one.
+#[tokio::test]
+async fn an_answer_survives_one_loss_by_default() {
+    let (came_back, ate, _) = oversize_through_a_lossy_hop(false, Sender::Listener).await;
+
+    assert_eq!(ate, 1, "the same one packet of the reply was dropped");
+    assert_eq!(
+        came_back,
+        Some(4096),
+        "and the answer still arrived, retransmitted",
+    );
+}
+
 /// **A hop carries the whole connection, and the hook sees it.**
 ///
 /// H1 of `docs/isekai_p2p_datapath_hook_plan.md`. The assertion that matters is
