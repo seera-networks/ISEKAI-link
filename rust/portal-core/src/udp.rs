@@ -104,6 +104,18 @@ struct BigSend {
     no_retrans: bool,
 }
 
+/// The largest payload that can leave, given what is known about the peer.
+///
+/// A free function so the decision has somewhere to be tested: the states it
+/// turns on live on a [`Sessions`], which needs a connection to build.
+fn sendable_payload(peer_takes_oversize: Option<bool>) -> usize {
+    if peer_takes_oversize == Some(false) {
+        MAX_PAYLOAD
+    } else {
+        MAX_STREAM_PAYLOAD
+    }
+}
+
 /// What a peer said about receiving oversize datagrams on streams.
 ///
 /// **Three states and not two**: "not asked yet" has to be distinct from "no",
@@ -289,9 +301,17 @@ impl Sessions {
             open_failures: AtomicU64::new(0),
         });
         tokio::spawn({
-            let sessions = Arc::clone(&sessions);
+            // **`Arc::downgrade`, and the first version of this leaked for
+            // want of it.** The channel's only `Sender` is the `big_sends`
+            // field *inside* `Sessions`, so a pump holding a strong handle
+            // keeps alive the thing that keeps the channel open: `recv` could
+            // never return `None` and the task outlived every connection it
+            // was spawned for, each one holding a `Connection` clone. `serve`
+            // is handed the server-wide token, so cancellation does not come
+            // when one client leaves.
+            let sessions = Arc::downgrade(&sessions);
             let shutdown = shutdown.clone();
-            async move { sessions.pump_big_sends(big_waiting, shutdown).await }
+            async move { Sessions::pump_big_sends(sessions, big_waiting, shutdown).await }
         });
         tokio::spawn({
             let sessions = Arc::clone(&sessions);
@@ -322,11 +342,7 @@ impl Sessions {
     /// while the answer is unknown costs at most one dropped datagram, where
     /// being strict would refuse what the connection turns out to carry.
     pub fn sendable_payload(&self) -> usize {
-        if self.peer_takes_oversize() == Some(false) {
-            MAX_PAYLOAD
-        } else {
-            MAX_STREAM_PAYLOAD
-        }
+        sendable_payload(self.peer_takes_oversize())
     }
 
     /// Whether the peer takes oversize datagrams on unidirectional streams, or
@@ -378,6 +394,8 @@ impl Sessions {
                 stream_malformed = self.drops.stream_malformed.load(Ordering::Relaxed),
                 stream_too_big = self.drops.stream_too_big.load(Ordering::Relaxed),
                 stream_lost = self.drops.stream_lost.load(Ordering::Relaxed),
+                stream_blocked = self.drops.stream_blocked.load(Ordering::Relaxed),
+                stream_cancelled = self.drops.stream_cancelled.load(Ordering::Relaxed),
                 failed_opens,
                 "UDP forwarding lost traffic on this connection",
             );
@@ -438,7 +456,7 @@ impl Sessions {
     /// unordered with respect to each other, so a retransmit of one datagram
     /// never waits on another.
     async fn pump_big_sends(
-        self: Arc<Self>,
+        sessions: std::sync::Weak<Self>,
         mut waiting: tokio::sync::mpsc::Receiver<BigSend>,
         shutdown: CancellationToken,
     ) {
@@ -447,10 +465,15 @@ impl Sessions {
                 _ = shutdown.cancelled() => break,
                 next = waiting.recv() => next,
             };
-            // `None` once every `Sessions` handle has gone, which is how this
-            // ends when nothing cancelled it.
+            // `None` once every `Sessions` handle has gone, which drops the
+            // `Sender` this task deliberately does not hold — see the
+            // `downgrade` in `start_with_idle`. This is the ordinary end for a
+            // connection whose client left without the server shutting down.
             let Some(send) = next else { break };
-            let sessions = Arc::clone(&self);
+            // Taken for this datagram only. Gone already means the connection
+            // went between the queueing and here, and there is nothing to send
+            // it on.
+            let Some(sessions) = sessions.upgrade() else { break };
             let shutdown = shutdown.clone();
             tokio::spawn(async move { sessions.write_big_datagram(send, shutdown).await });
         }
@@ -775,27 +798,25 @@ impl Sessions {
     /// to be a bug, which is what `next` starting at 1 is for.
     fn oversize(&self, session: Option<u32>, len: usize) {
         if self.drops.oversize.fetch_add(1, Ordering::Relaxed) == 0 {
-            // **Says whose limit it is, and this end's comes first.** Once
-            // oversize payloads can travel on streams, "too large to forward"
-            // stops being one fact — but while this build cannot carry them at
-            // all, naming the peer would send an operator to upgrade the far
-            // end and watch the drops continue. The peer only becomes the
-            // answer once this end has run out of its own reasons.
-            let why = if !crate::frame::RECEIVES_OVERSIZE_ON_STREAM {
-                "this build does not carry oversize datagrams on streams"
-            } else {
-                match self.peer_takes_oversize() {
-                    Some(false) => "the peer does not receive oversize datagrams on streams",
-                    Some(true) => "this build does not send oversize datagrams on streams yet",
-                    None => "no session has found out whether the peer receives them",
-                }
-            };
+            // **One reason, now that there is only one.** This used to pick
+            // between three -- this build not carrying them, the peer not
+            // taking them, this build not sending them -- and S3 made two of
+            // those untrue. Both callers reach here only when
+            // `peer_takes_oversize()` is `Some(false)`: `send_on_stream`
+            // checks it, and `forward` compares against `sendable_payload`,
+            // which is `MAX_STREAM_PAYLOAD` in every other state and above
+            // what a local `recv` can produce.
+            //
+            // Keeping the dead arms would have left two sentences pointing an
+            // operator at the wrong end, beside a `limit` that was wrong for
+            // them as well.
             tracing::warn!(
                 ?session,
                 len,
                 limit = MAX_PAYLOAD,
-                "a UDP payload is too large to forward and was dropped: {why}; \
-                 further ones on this connection are counted, not logged",
+                "a UDP payload is too large to forward and was dropped: the peer does \
+                 not receive oversize datagrams on streams; further ones on this \
+                 connection are counted, not logged",
             );
         } else {
             tracing::debug!(?session, len, "another oversize UDP payload dropped");
@@ -1406,6 +1427,41 @@ mod tests {
         seen.learn_unanswered();
         seen.learn_unanswered();
         assert_eq!(seen.get(), Some(true), "still yes");
+    }
+
+    /// **The pump has to end without being cancelled.** `serve` is handed the
+    /// server-wide token, so a client leaving cancels nothing — the channel
+    /// closing is the only signal, and it only arrives because this task holds
+    /// a `Weak` rather than the `Arc` it was first written with. With a strong
+    /// handle it kept alive the `Sessions` that owns the only `Sender`, so
+    /// `recv` could never return `None` and one task plus one `Connection`
+    /// clone stayed for the life of the server, per connection.
+    #[tokio::test]
+    async fn the_send_pump_ends_when_the_sessions_go() {
+        let (big_sends, waiting) = tokio::sync::mpsc::channel(1);
+        // As dropping `Sessions` does, since the field is the only sender.
+        drop(big_sends);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            Sessions::pump_big_sends(std::sync::Weak::new(), waiting, CancellationToken::new()),
+        )
+        .await
+        .expect("the pump returned rather than parking");
+    }
+
+    /// **Generous while the answer is unknown**, and the asymmetry is the
+    /// point: the first session open settles it, so being generous costs at
+    /// most one dropped datagram, while being strict would refuse what the
+    /// connection turns out to carry for as long as nobody has asked.
+    #[test]
+    fn what_can_leave_depends_on_the_peer() {
+        assert_eq!(sendable_payload(Some(true)), MAX_STREAM_PAYLOAD);
+        assert_eq!(sendable_payload(None), MAX_STREAM_PAYLOAD, "generous");
+        assert_eq!(
+            sendable_payload(Some(false)),
+            MAX_PAYLOAD,
+            "a peer from before this existed takes the datagram carrier only",
+        );
     }
 
     /// The answerer's side is told rather than inferring, so both answers are

@@ -459,9 +459,16 @@ that silently loses, because the application cannot tell the difference.
 
 ```
   up to 1163      a datagram. May be lost; never late
-  1164 .. 65507   a stream of its own. Not lost; may be late
+  1164 .. 65507   a stream of its own. Late rather than lost -- unless this
+                  end is already behind, which is counted when it happens
   over 65507      refused -- larger than UDP itself carries
 ```
+
+"Already behind" is a real case rather than a hedge: a forward that offers more
+oversize datagrams at once than the connection can carry drops them instead of
+holding them, because waiting there would stop the port being read at all and
+lose the small ones too. The same is true of one that arrives in pieces slower
+than the forward will wait for.
 
 **Both ends have to be new enough.** The size a forward can carry is agreed when
 a session opens, and a peer from before this existed takes the datagram carrier

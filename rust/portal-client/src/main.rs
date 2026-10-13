@@ -1881,20 +1881,31 @@ struct Mapped {
 /// on the end: a service name is arbitrary UTF-8, so `5353:dns,no-retrans`
 /// would be ambiguous with a service actually called that. The first element is
 /// matched against a known set, which leaves no such question.
+/// Whether `head` is a protocol word, with its `+options` if it has any.
+///
+/// **The whole word, not a prefix of it.** An earlier version of the parser
+/// accepted anything starting `tcp` or `udp` as the protocol word and then fell
+/// back to TCP for what it did not recognise — so `udp6:5353:dns` and
+/// `udp-no-retrans:5353:dns`, the two likeliest typos, became silent **TCP**
+/// forwards of a service the catalogue offers over UDP. Before the option
+/// existed they failed with "`udp6` is not a port", and failing is the
+/// behaviour to keep.
+fn names_a_protocol(head: &str) -> bool {
+    matches!(head.split('+').next(), Some("tcp" | "udp"))
+}
+
 fn maps(maps: &[String], bind: std::net::IpAddr) -> anyhow::Result<Vec<Mapped>> {
     maps.iter()
         .map(|m| {
             let (head, rest) = match m.split_once(':') {
-                Some((head, rest)) if head.starts_with("tcp") || head.starts_with("udp") => {
-                    (head, rest)
-                }
+                Some((head, rest)) if names_a_protocol(head) => (head, rest),
                 _ => ("tcp", m.as_str()),
             };
             let mut words = head.split('+');
             let protocol = match words.next() {
                 Some("udp") => Protocol::Udp,
-                // Only reachable as `tcp`, since the split above is what chose
-                // this branch at all.
+                // `tcp` is the only other thing `names_a_protocol` lets
+                // through, and the no-prefix case arrives as the literal.
                 _ => Protocol::Tcp,
             };
             let mut no_retrans = false;
@@ -1994,6 +2005,19 @@ mod tests {
             format!("{err:#}").contains("no-retrans` is for UDP"),
             "{err:#}",
         );
+    }
+
+    /// **A mistyped protocol word fails rather than becoming TCP.** These two
+    /// are the typos the `+options` parser made silent, and the second is the
+    /// nastier one: a TCP forward of a UDP service, refused by the peer with
+    /// the same byte a missing service gets.
+    #[test]
+    fn a_mistyped_protocol_word_is_not_quietly_tcp() {
+        for m in ["udp6:5353:dns", "udp-no-retrans:5353:dns"] {
+            let err = one_map(m).expect_err(m);
+            let message = format!("{err:#}");
+            assert!(message.contains("is not a port"), "{m}: {message}");
+        }
     }
 
     #[test]
