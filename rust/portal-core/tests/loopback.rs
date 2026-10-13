@@ -691,6 +691,54 @@ async fn the_openers_no_retrans_choice_crosses() {
     drain(halves).await;
 }
 
+/// **An option the peer does not know is answered, not met with silence.**
+///
+/// This is open question 12's whole point. Dropping the stream was the obvious
+/// refusal and the expensive one: a dead stream is exactly how `open_session`
+/// learns that a peer does not know `KIND_UDP_BIG`, so a refused *option*
+/// would have been read as a missing *capability* and latched after the second
+/// one — costing the connection its oversize datagrams entirely, against a peer
+/// that supports them.
+///
+/// Written by hand because no build can ask for an option it does not have: the
+/// bit here is one nothing defines. That is also the limit of this test — it
+/// shows the answer arrives, while the inference it protects cannot be driven
+/// from one build (open question 8's wall).
+#[tokio::test]
+async fn an_unknown_oversize_option_is_answered_rather_than_dropped() {
+    let target = shouting_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    let mut stream = halves
+        .connection()
+        .open_outbound_stream(StreamType::Bidirectional, false)
+        .await
+        .expect("open a stream");
+    // The frame by hand: version, the big kind, the name, the session, and a
+    // bit no option claims.
+    let mut frame = vec![2_u8, 2, 3];
+    frame.extend_from_slice(b"dns");
+    frame.extend_from_slice(&70_u32.to_be_bytes());
+    frame.push(0x80);
+    stream.write_all(&frame).await.expect("write the open");
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut stream))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status"),
+        frame::Status::Unsupported,
+        "answered by name rather than by a dead stream",
+    );
+
+    // And the connection is untouched: a plain session still opens, which is
+    // what would not be true if the refusal had been read as a capability.
+    assert_eq!(udp_status(&halves, "dns", 71).await, frame::Status::Ready);
+
+    drop(stream);
+    drain(halves).await;
+}
+
 /// **`no-retrans` is wired, and costs nothing on a path that is not losing.**
 ///
 /// Whether the stream is actually abandoned on loss is MsQuic's to decide and

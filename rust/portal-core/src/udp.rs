@@ -1333,6 +1333,15 @@ async fn open_session(
         Status::Ready => Ok(stream),
         Status::Refused => anyhow::bail!("the peer does not offer `{service}` over UDP"),
         Status::Unreachable => anyhow::bail!("the peer could not reach `{service}`"),
+        // **The operator asked for something this peer cannot do.** Only the
+        // options reach here, so the message names them rather than the
+        // service -- and `learn_takes` above has already run, which is the
+        // point of answering with a status at all: the peer does take oversize
+        // datagrams, it just will not take them the way this forward asked.
+        Status::Unsupported => anyhow::bail!(
+            "the peer does not support this forward's oversize options for \
+             `{service}`; drop them from its --map or upgrade the peer"
+        ),
     }
 }
 

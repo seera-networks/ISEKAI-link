@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use tokio::io::AsyncWriteExt as _;
 
-use crate::frame::{read_open, write_status, Open, Status};
+use crate::frame::{read_open, write_status, Open, Request, Status};
 use crate::udp::Sessions;
 
 /// How long to wait for a target to accept before answering `Unreachable`.
@@ -210,7 +210,21 @@ async fn forward_one(
     sessions: Arc<Sessions>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let open = read_open(&mut stream).await?;
+    let open = match read_open(&mut stream).await? {
+        Request::Open(open) => open,
+        // **Answered, not dropped.** The frame was read and the stream is at a
+        // boundary, so the opener learns that its kind was understood and its
+        // request was not -- which is what keeps it from inferring that this
+        // end takes no oversize datagrams at all. `Status::Unsupported` has
+        // the reasoning.
+        Request::NotAsAsked { service, detail } => {
+            tracing::warn!(
+                ?service,
+                "an open could not be served as asked: {detail}; refusing it by name",
+            );
+            return refuse(stream, Status::Unsupported).await;
+        }
+    };
     let service = open.service().to_owned();
     // **The lookup is protocol-aware and both kinds come through it**, which is
     // what keeps a UDP service unreachable from a TCP request and the other way

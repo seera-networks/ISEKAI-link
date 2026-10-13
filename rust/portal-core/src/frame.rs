@@ -162,6 +162,21 @@ pub enum Status {
     /// TCP. What stays hidden is which *refused* names exist under another
     /// protocol — plan §4.3 states the boundary.
     Unreachable = 2,
+    /// The request was read and **cannot be served as asked** — an option on
+    /// it that this build does not know.
+    ///
+    /// **Distinct from `Refused`, and the difference is load-bearing.** That
+    /// one is about the service: no such name, wrong protocol, not yours. This
+    /// one is about the *request*, and says the kind was understood.
+    ///
+    /// Without it the answerer could only drop the stream, which the opener
+    /// cannot tell from a peer that does not know the kind at all — so
+    /// `udp::Sessions` would infer that the peer takes no oversize datagrams
+    /// and, on the second one, latch it for the life of the connection. **A
+    /// refusal that costs the capability is worse than the option not
+    /// happening**, and a status is what stops it: any status at all is already
+    /// the opener's evidence that its kind was read.
+    Unsupported = 3,
 }
 
 impl Status {
@@ -170,6 +185,7 @@ impl Status {
             0 => Ok(Self::Ready),
             1 => Ok(Self::Refused),
             2 => Ok(Self::Unreachable),
+            3 => Ok(Self::Unsupported),
             other => anyhow::bail!("unknown status {other} from the portal server"),
         }
     }
@@ -283,8 +299,24 @@ where
         .context("failed to send the open request")
 }
 
+/// What reading an [`Open`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    /// Something to look up and serve.
+    Open(Open),
+    /// Read as far as the kind, and **not serveable as asked**.
+    ///
+    /// **The frame is fully consumed**, which is what makes this different from
+    /// every other way [`read_open`] fails: the stream is at a boundary and the
+    /// service name is known, so the opener can be answered with
+    /// [`Status::Unsupported`] instead of being left to infer from a dead
+    /// stream. Everything else leaves the framing in doubt, where there is
+    /// nothing to say and nowhere to say it.
+    NotAsAsked { service: String, detail: String },
+}
+
 /// Read what [`write_open`] wrote.
-pub async fn read_open<R>(stream: &mut R) -> anyhow::Result<Open>
+pub async fn read_open<R>(stream: &mut R) -> anyhow::Result<Request>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -317,10 +349,13 @@ where
     // **Not the end of the frame for the UDP kinds**, whose session id is read
     // inside the arm below — so a caller must not plan to reuse the stream.
     match head[1] {
-        KIND_TCP => Ok(Open::Tcp { service }),
+        KIND_TCP => Ok(Request::Open(Open::Tcp { service })),
         // **Refused exactly as an unknown kind is**, so that a peer asking
         // this of a build that cannot receive sees what it would see from a
         // 0.6.0 one. See `RECEIVES_OVERSIZE_ON_STREAM`.
+        // **Not `NotAsAsked`**, deliberately: the session id is still unread,
+        // so the stream is not at a boundary and this must look like the
+        // unknown kind it effectively is. §5.2's fallback is what handles it.
         KIND_UDP_BIG if !RECEIVES_OVERSIZE_ON_STREAM => anyhow::bail!(
             "this build does not receive oversize datagrams on streams, \
              asked for service `{service}`"
@@ -345,22 +380,26 @@ where
                     .read_exact(&mut options)
                     .await
                     .context("the stream ended before the oversize options")?;
-                anyhow::ensure!(
-                    options[0] & !KNOWN_OPTIONS == 0,
-                    "unknown oversize options {:#04x} for service `{service}`",
-                    options[0],
-                );
+                // **Answered rather than refused by silence.** The frame ends
+                // here, so the opener can be told -- see `Status::Unsupported`
+                // for what dropping the stream instead would cost.
+                if options[0] & !KNOWN_OPTIONS != 0 {
+                    return Ok(Request::NotAsAsked {
+                        detail: format!("unknown oversize options {:#04x}", options[0]),
+                        service,
+                    });
+                }
                 Some(OversizeOptions {
                     no_retrans: options[0] & OPTION_NO_RETRANS != 0,
                 })
             } else {
                 None
             };
-            Ok(Open::Udp {
+            Ok(Request::Open(Open::Udp {
                 service,
                 session: u32::from_be_bytes(session),
                 oversize,
-            })
+            }))
         }
         other => anyhow::bail!("unknown open kind {other} for service `{service}`"),
     }
@@ -462,7 +501,7 @@ mod tests {
         ] {
             let (mut a, mut b) = tokio::io::duplex(64);
             write_open(&mut a, &open).await.expect("write");
-            assert_eq!(read_open(&mut b).await.expect("read"), open);
+            assert_eq!(read_open(&mut b).await.expect("read"), Request::Open(open));
         }
     }
 
@@ -581,7 +620,11 @@ mod tests {
 
         let read = read_open(&mut std::io::Cursor::new(wire)).await;
         if RECEIVES_OVERSIZE_ON_STREAM {
-            assert_eq!(read.expect("read"), open, "and read back once S2 lands");
+            assert_eq!(
+                read.expect("read"),
+                Request::Open(open),
+                "and read back once S2 lands",
+            );
         } else {
             let err = read.expect_err("refused");
             assert!(
@@ -613,7 +656,7 @@ mod tests {
                 let read = read_open(&mut std::io::Cursor::new(wire))
                     .await
                     .expect("read");
-                assert_eq!(read, open, "no_retrans={no_retrans}");
+                assert_eq!(read, Request::Open(open), "no_retrans={no_retrans}");
             }
         }
 
@@ -632,23 +675,51 @@ mod tests {
         assert_eq!(plain.len(), 3 + 3 + 4, "0.6.0's layout is untouched");
     }
 
-    /// **An option this build does not know is refused, not dropped.** The
+    /// **An option this build does not know is answerable, not fatal.** The
     /// answerer is what acts on these, so ignoring one would leave an operator
-    /// having asked for something that quietly did not happen — which is the
-    /// hazard that kept the capability off a trailing byte in the first place.
+    /// having asked for something that quietly did not happen — and *dropping
+    /// the stream* instead would cost the opener the whole capability, because
+    /// a dead stream is how it learns that a peer does not know the kind. See
+    /// [`Status::Unsupported`].
+    ///
+    /// **The frame being consumed is what makes answering possible**, so the
+    /// arithmetic is part of the assertion.
     #[tokio::test]
-    async fn an_unknown_oversize_option_is_refused() {
+    async fn an_unknown_oversize_option_can_be_answered() {
         let mut wire = vec![VERSION, KIND_UDP_BIG, 3];
         wire.extend_from_slice(b"dns");
         wire.extend_from_slice(&9_u32.to_be_bytes());
         wire.push(0x80); // nothing defines this bit
-        let err = read_open(&mut std::io::Cursor::new(wire))
-            .await
-            .expect_err("refused");
-        let message = format!("{err:#}");
+        wire.extend_from_slice(b"after"); // and the stream goes on
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let read = read_open(&mut cursor).await.expect("readable");
+        let Request::NotAsAsked { service, detail } = read else {
+            panic!("expected an answerable refusal, got {read:?}");
+        };
+        assert_eq!(service, "dns", "and the name is known, so it can be logged");
         assert!(
-            message.contains("unknown oversize options"),
-            "and says which: {message}",
+            detail.contains("unknown oversize options"),
+            "and says which: {detail}",
+        );
+        assert_eq!(
+            cursor.position() as usize,
+            3 + 3 + 4 + 1,
+            "the whole frame was read, so the stream is at a boundary",
+        );
+    }
+
+    /// The new status is on the wire like the others, which is what lets the
+    /// opener tell "understood and refused" from a stream that died.
+    #[tokio::test]
+    async fn the_unsupported_status_crosses() {
+        let (mut a, mut b) = tokio::io::duplex(8);
+        write_status(&mut a, Status::Unsupported)
+            .await
+            .expect("write");
+        assert_eq!(
+            read_status(&mut b).await.expect("read"),
+            Status::Unsupported,
         );
     }
 
@@ -668,11 +739,11 @@ mod tests {
         });
         assert_eq!(
             read_open(&mut b).await.expect("read"),
-            Open::Udp {
+            Request::Open(Open::Udp {
                 service: "dns".to_owned(),
                 session: 7,
                 oversize: None,
-            },
+            }),
         );
     }
 

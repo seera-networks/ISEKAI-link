@@ -108,6 +108,13 @@ async fn forward_one(conn: Connection, mut tcp: TcpStream, service: &str) -> any
         // what it would get if this were reported only in a log.
         Status::Refused => anyhow::bail!("the peer does not offer `{service}`"),
         Status::Unreachable => anyhow::bail!("the peer could not reach `{service}`"),
+        // Nothing on a TCP open carries an option, so reaching this means the
+        // peer is answering something this build did not ask. Said plainly
+        // rather than folded into `Refused`, which would send somebody to look
+        // at their catalogue.
+        Status::Unsupported => {
+            anyhow::bail!("the peer could not serve the request for `{service}` as asked")
+        }
     }
 
     let (from_local, to_local) = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await?;
