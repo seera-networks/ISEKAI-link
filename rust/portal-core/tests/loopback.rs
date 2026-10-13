@@ -193,7 +193,15 @@ struct Halves {
     /// `Connection` clone, so [`drain`] has to let it go before it waits —
     /// exactly what `session::Connected::close` does in the real client.
     sessions: Option<Arc<Sessions>>,
-    /// Held so the hop outlives the connection that runs through it.
+    /// Held because **dropping it stops the hop**, so the hop lasts as long as
+    /// the `Halves` that owns it.
+    ///
+    /// An earlier version of this said the opposite — "held so the hop
+    /// outlives the connection" — and it was wrong twice over: `Hop` had no
+    /// `Drop` at all, so holding the handle did nothing, and `drain` cancels
+    /// the shutdown token as its first statement, which stopped the hop
+    /// *before* the connection closed. `Hop` cancels on drop now, which is
+    /// what makes this field mean something.
     _hop: Option<isekai_p2p::agent::Hop>,
     /// The **server's** side of the connection, for the one test that has to
     /// send something the server never sends.
@@ -400,10 +408,10 @@ async fn connected_with(
     Halves {
         session: Some(session),
         sessions: Some(sessions),
+        _hop: hop,
         // Arrives once the handshake the dial above completed is accepted, so
         // it is already there; a timeout rather than a `blocking` wait because
         // a failure here should say what it was.
-        _hop: hop,
         peer_side: tokio::time::timeout(DIAL_BUDGET, peer_rx)
             .await
             .expect("the listener accepted inside the dial budget")

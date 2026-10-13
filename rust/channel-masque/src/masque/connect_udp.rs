@@ -42,20 +42,27 @@ pub enum Verdict {
     Drop,
 }
 
-/// Interposes on the inner-QUIC packets crossing a relay leg.
+/// Interposes on the inner-QUIC packets of a connection.
 ///
-/// **A test instrument, and it is reachable from code alone** — no
-/// configuration, flag or environment variable builds one. A production binary
-/// that could be told to drop packets is not a thing to have.
+/// **A test instrument.** No configuration, flag or environment variable builds
+/// one or points anything at one — there is no path from a config file to a
+/// dropped packet. The type is public, because a test in another crate has to
+/// name it; what is not public is any way for a deployment to ask for it.
 ///
-/// # What it sees, and what it does not
+/// # Two carriers, and this one is the narrower
 ///
-/// Only a **relay leg**, and only the leg of the end that dialled: a direct
-/// path never touches this function, and the listening peer's leg runs
-/// `MasqueClientMode::Forward`, which does not use [`run_bridge`] at all. The
-/// plan's §1.1 and §3.2 have the consequences; the short version is that this
-/// is a relay-leg hook and calling it a datapath hook invites being tried where
-/// no packet crosses.
+/// `isekai_p2p_core::datapath` has the other: a `Hop`, two sockets between two
+/// endpoints, which sees **everything that connection sends either way**.
+///
+/// [`run_bridge`] is the carrier for a **relay leg**, and only the leg of the
+/// end that dialled — the listening peer's leg runs `MasqueClientMode::Forward`
+/// and does not come through here, and a direct path never touches this
+/// function at all. That is the carrier to reach for against a **live relay**,
+/// and the plan's §1.1 and §3.2 have the consequences.
+///
+/// So: a hook written against this trait may be asked about packets that never
+/// crossed a relay leg. The direction names below are what keeps it meaning the
+/// same thing in both places.
 ///
 /// # Bytes, not frames
 ///
@@ -70,11 +77,17 @@ pub enum Verdict {
 /// whole of what this can do — see the plan's §3.3 for what that means for a
 /// test that wants one particular stream's packet.
 pub trait DatapathHook: Send + Sync {
-    /// A packet on its way out of this end.
+    /// A packet from the end that **dialled**.
+    ///
+    /// On a relay leg that is this end, since only the dialling end has this
+    /// seam. On a `Hop` it is the end that dialled through the hop.
     fn outbound(&self, _packet: &[u8]) -> Verdict {
         Verdict::Pass
     }
-    /// A packet arriving at this end.
+    /// A packet from the end that was **dialled**.
+    ///
+    /// On a relay leg that is a packet arriving at this end; on a `Hop`, one
+    /// from the listener.
     fn inbound(&self, _packet: &[u8]) -> Verdict {
         Verdict::Pass
     }
