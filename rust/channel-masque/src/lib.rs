@@ -613,6 +613,10 @@ where
     executor: SharedExec,
     inbound: InboundActivity,
     forward_limits: Option<ForwardLimits>,
+    /// Interposes on the relay leg's inner-QUIC packets. See
+    /// [`masque::connect_udp::DatapathHook`] — a test instrument, settable from
+    /// code and from nothing else.
+    datapath_hook: Option<std::sync::Arc<dyn masque::connect_udp::DatapathHook>>,
     phantom: std::marker::PhantomData<(RespBody, ReqBodyErr)>,
 }
 
@@ -737,6 +741,7 @@ where
             // many it may have is a limit on nothing. Bounding by default would
             // change those sessions to fix a problem they do not have.
             forward_limits: None,
+            datapath_hook: None,
             phantom: std::marker::PhantomData,
         }
     }
@@ -746,6 +751,19 @@ where
     ///
     /// **For a session anyone can send to.** Its senders are not a known set,
     /// so the sockets they cost have to have an end.
+    /// Interpose on this leg's inner-QUIC packets.
+    ///
+    /// **For tests and for measuring a live relay**, and reachable only from
+    /// code — see [`masque::connect_udp::DatapathHook`] for what it can see and
+    /// what it cannot.
+    pub fn with_datapath_hook(
+        mut self,
+        hook: std::sync::Arc<dyn masque::connect_udp::DatapathHook>,
+    ) -> Self {
+        self.datapath_hook = Some(hook);
+        self
+    }
+
     pub fn with_forward_limits(mut self, limits: ForwardLimits) -> Self {
         self.forward_limits = Some(limits);
         self
@@ -844,6 +862,9 @@ where
             .map_err(|e| anyhow::anyhow!("failed to register connect-udp stream: {e}"))?;
 
         let tx = crate::masque::connect_udp::QuicDatagramTx(datagram_sender);
+        // Cloned out before the spawn: `self` is borrowed mutably here and the
+        // task outlives the call.
+        let hook = self.datapath_hook.clone();
         let ended = CancellationToken::new();
         let ending = ended.clone();
         self.executor.execute(async move {
@@ -852,7 +873,14 @@ where
             let _req_body_tx = req_body_tx;
             let _resp = resp;
             if let Err(e) =
-                crate::masque::connect_udp::run_bridge(socket, tx, inbound_rx, shutdown_token).await
+                crate::masque::connect_udp::run_bridge(
+                    socket,
+                    tx,
+                    inbound_rx,
+                    hook,
+                    shutdown_token,
+                )
+                .await
             {
                 tracing::error!("connect-udp bridge exited with error: {e}");
             }

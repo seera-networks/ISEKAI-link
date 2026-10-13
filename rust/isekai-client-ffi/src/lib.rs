@@ -812,6 +812,7 @@ pub fn connect(
     // leg's binding, so without the shared, unconnected socket there is nothing
     // for a direct path to be opened from. They are switched together.
     let relay_options = RelayOptions {
+        datapath_hook: None,
         unconnected: config.enable_migration,
         registration: Some(Arc::clone(&registration)),
     };

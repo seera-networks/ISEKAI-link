@@ -64,6 +64,9 @@ pub mod relay_rtt;
 pub mod agent {
     pub use isekai_p2p_core::attestation::{attest, verify, Attestation, AttestationError};
     pub use isekai_p2p_core::bind::RelayOptions;
+    // The third step of the re-export, because `portal-core` and `camera-core`
+    // depend on this crate and not on `isekai-p2p-core`.
+    pub use isekai_p2p_core::bind::{DatapathHook, Verdict};
     // **The public address's own bind** (`docs/public_listener_client_plan.md`
     // P1). Reached from outside this crate, by the example P4 asks for.
     pub use isekai_p2p_core::bind::{open_public_bind_session, BindSession, MasqueClientEvent};

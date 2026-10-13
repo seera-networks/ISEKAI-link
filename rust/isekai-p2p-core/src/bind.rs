@@ -34,6 +34,12 @@ use channel_masque::{
 /// gets back, and one draining [`BindSession::events`] can match on them,
 /// without depending on the MASQUE crate directly.
 pub use channel_masque::{InboundActivity, MasqueClientEvent};
+// **Re-exported, so a caller never names `channel-masque`.** It is an optional
+// dependency behind this crate's `msquic` feature, and a test that had to
+// depend on it directly would be reaching past the abstraction the hook exists
+// to serve. `docs/isekai_p2p_datapath_hook_plan.md` §6-2 is where the feature
+// question still sits.
+pub use channel_masque::masque::connect_udp::{DatapathHook, Verdict};
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use h3_util::msquic_async::h3_msquic_async::msquic_async;
 use http::Uri;
@@ -74,6 +80,20 @@ pub struct RelayOptions {
     /// when the video connection has to share a binding with the leg — binding
     /// lookup is per-registration, so they must match.
     pub registration: Option<Arc<msquic_async::Registration>>,
+    /// Interpose on the inner-QUIC packets crossing this leg.
+    ///
+    /// **A test instrument, and nothing reads it from configuration** — there
+    /// is no flag, no TOML key and no environment variable that puts one here.
+    /// `docs/isekai_p2p_datapath_hook_plan.md` says why: a production binary
+    /// that can be told to drop packets is not a thing to have.
+    ///
+    /// It is on [`RelayOptions`] rather than passed separately because it is a
+    /// property of how this leg is set up, which is what this struct is for.
+    ///
+    /// **Only the dialled leg has somewhere to put one.** A leg opened for
+    /// listening runs `MasqueClientMode::Forward`, which does not go through
+    /// the bridge this hooks — see the plan's §1.1.
+    pub datapath_hook: Option<Arc<dyn channel_masque::masque::connect_udp::DatapathHook>>,
 }
 
 /// Where a relay leg is actually dialled.
@@ -809,11 +829,17 @@ pub async fn open_connect_relay(
         .context("failed to read local relay socket address")?;
 
     let session_shutdown = shutdown.clone();
+    // Moved out before the spawn, since `opts` is not `'static`-friendly as a
+    // whole and only this field is wanted inside.
+    let datapath_hook = opts.datapath_hook.clone();
     // Signals that `start_connect_udp` has established the leg (or failed to),
     // and hands back the token that says when it stopped.
     let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<CancellationToken>>();
     let task = tokio::spawn(async move {
         let mut client = MasqueClient::new(channel, None);
+        if let Some(hook) = datapath_hook {
+            client = client.with_datapath_hook(hook);
+        }
         match client
             .start_connect_udp(&target_path, Vec::new(), socket, session_shutdown.clone())
             .await

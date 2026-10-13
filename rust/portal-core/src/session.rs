@@ -214,6 +214,7 @@ pub async fn serve(
         portal_addr,
         None,
         RelayOptions {
+            datapath_hook: None,
             unconnected: true,
             registration: Some(reg.clone()),
         },
@@ -487,6 +488,7 @@ async fn connect_on_a_grant(
             &[],
             "127.0.0.1:0".parse().expect("valid loopback addr"),
             RelayOptions {
+            datapath_hook: None,
                 unconnected: true,
                 registration: Some(reg),
             },
@@ -685,6 +687,7 @@ async fn connect_on_a_capability(
         &[],
         "127.0.0.1:0".parse().expect("valid loopback addr"),
         RelayOptions {
+            datapath_hook: None,
             unconnected: true,
             registration: Some(reg),
         },

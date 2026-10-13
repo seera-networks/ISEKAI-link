@@ -23,6 +23,63 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// What to do with one inner-QUIC packet crossing the bridge.
+///
+/// **Two outcomes, not three.** `docs/isekai_p2p_datapath_hook_plan.md` §2.1
+/// also sketched a `Delay`, and it cannot be written against [`run_bridge`] as
+/// it stands: `tx: impl DatagramTx` is taken by value with no `'static` bound,
+/// and `DatagramTx` is neither `Sync` nor `Clone`, so a deferred send can
+/// neither borrow it nor move it out of the loop. Adding it means changing this
+/// function's signature, and nothing needs it yet — the plan's H2 and H3 both
+/// want a drop. Left out rather than left broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Carry it, as if nothing were here.
+    Pass,
+    /// Lose it. Nothing is returned to the sender — **that is what loss is**,
+    /// and it is the whole point: a QUIC endpoint must not be able to tell this
+    /// from a packet the network ate.
+    Drop,
+}
+
+/// Interposes on the inner-QUIC packets crossing a relay leg.
+///
+/// **A test instrument, and it is reachable from code alone** — no
+/// configuration, flag or environment variable builds one. A production binary
+/// that could be told to drop packets is not a thing to have.
+///
+/// # What it sees, and what it does not
+///
+/// Only a **relay leg**, and only the leg of the end that dialled: a direct
+/// path never touches this function, and the listening peer's leg runs
+/// `MasqueClientMode::Forward`, which does not use [`run_bridge`] at all. The
+/// plan's §1.1 and §3.2 have the consequences; the short version is that this
+/// is a relay-leg hook and calling it a datapath hook invites being tried where
+/// no packet crosses.
+///
+/// # Bytes, not frames
+///
+/// Both directions get the **inner-QUIC packet itself**: the uplink before the
+/// HTTP Datagram context id is prepended, the downlink after it has been
+/// stripped. A hook that looked at sizes would otherwise be a byte out in one
+/// direction and not the other. `&[u8]` rather than `&Bytes` because that is
+/// what both sides already have, so neither costs a copy.
+///
+/// The packets are encrypted, so there is nothing worth rewriting and no way to
+/// tell which stream one carries. Dropping by count, position or time is the
+/// whole of what this can do — see the plan's §3.3 for what that means for a
+/// test that wants one particular stream's packet.
+pub trait DatapathHook: Send + Sync {
+    /// A packet on its way out of this end.
+    fn outbound(&self, _packet: &[u8]) -> Verdict {
+        Verdict::Pass
+    }
+    /// A packet arriving at this end.
+    fn inbound(&self, _packet: &[u8]) -> Verdict {
+        Verdict::Pass
+    }
+}
+
 /// Sink for HTTP Datagram payloads destined for the CONNECT-UDP tunnel. The
 /// bytes already include the leading context id; the implementor forwards them
 /// to the QUIC datagram sender of an established CONNECT-UDP session.
@@ -79,6 +136,7 @@ pub async fn run_bridge(
     socket: Arc<UdpSocket>,
     mut tx: impl DatagramTx,
     mut inbound: mpsc::Receiver<Bytes>,
+    hook: Option<Arc<dyn DatapathHook>>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut last_src: Option<SocketAddr> = None;
@@ -87,7 +145,14 @@ pub async fn run_bridge(
     let mut up = 0u64;
     let mut up_dropped = 0u64;
     let mut down = 0u64;
-    let mut reported = (0u64, 0u64, 0u64);
+    // **Its own counter, because the three above have meanings.** `up_dropped`
+    // is documented as "the tunnel refused to carry it -- an oversized
+    // datagram is the usual reason", and a hook's drop counted there would be a
+    // false positive on that diagnostic every time this runs against a live
+    // relay. Counted separately, and only printed when it is not zero, so an
+    // ordinary leg's line is unchanged.
+    let mut hook_dropped = 0u64;
+    let mut reported = (0u64, 0u64, 0u64, 0u64);
     let mut report = tokio::time::interval(std::time::Duration::from_secs(1));
     report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -95,14 +160,36 @@ pub async fn run_bridge(
             _ = shutdown.cancelled() => break,
             _ = report.tick() => {
                 // Only when something moved, so an idle leg stays quiet.
-                if (up, up_dropped, down) != reported {
-                    reported = (up, up_dropped, down);
-                    tracing::debug!(up, up_dropped, down, "connect-udp bridge");
+                if (up, up_dropped, down, hook_dropped) != reported {
+                    reported = (up, up_dropped, down, hook_dropped);
+                    if hook_dropped == 0 {
+                        tracing::debug!(up, up_dropped, down, "connect-udp bridge");
+                    } else {
+                        tracing::debug!(
+                            up,
+                            up_dropped,
+                            down,
+                            hook_dropped,
+                            "connect-udp bridge, with a datapath hook",
+                        );
+                    }
                 }
             }
             r = socket.recv_from(&mut buf) => {
                 let (n, src) = r?;
+                // **Recorded before the hook can drop it**, and that is
+                // deliberate: a dropped packet stands for one lost on the wire,
+                // which left this end and was seen by this bridge. Making the
+                // drop also hide the source would be simulating something else.
                 last_src = Some(src);
+                if let Some(hook) = &hook {
+                    // The inner-QUIC packet as it is, before `frame_context0`
+                    // prepends the context id -- see `DatapathHook`.
+                    if hook.outbound(&buf[..n]) == Verdict::Drop {
+                        hook_dropped += 1;
+                        continue;
+                    }
+                }
                 // Drop this datagram and continue on a send error (symmetric
                 // with the downlink `send_to` below), instead of breaking the
                 // bridge — a single transient failure must not tear down the
@@ -125,6 +212,14 @@ pub async fn run_bridge(
                     tracing::debug!("connect-udp inbound channel closed");
                     break;
                 };
+                if let Some(hook) = &hook {
+                    // Already context-stripped, so this is the inner-QUIC
+                    // packet, symmetric with the uplink above.
+                    if hook.inbound(&payload) == Verdict::Drop {
+                        hook_dropped += 1;
+                        continue;
+                    }
+                }
                 match last_src {
                     Some(dst) => match socket.send_to(&payload, dst).await {
                         Ok(_) => down += 1,
@@ -144,6 +239,184 @@ pub async fn run_bridge(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Drops the first `n` packets it is asked about in each direction, and
+    /// records what it saw.
+    ///
+    /// Counting here rather than reading the bridge's own counter: a test wants
+    /// to know what was offered, which is not the same number as what the
+    /// bridge then dropped.
+    #[derive(Default)]
+    struct DropFirst {
+        up_budget: std::sync::atomic::AtomicUsize,
+        down_budget: std::sync::atomic::AtomicUsize,
+        up_sizes: std::sync::Mutex<Vec<usize>>,
+        down_sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl DropFirst {
+        fn new(up: usize, down: usize) -> Arc<Self> {
+            Arc::new(Self {
+                up_budget: std::sync::atomic::AtomicUsize::new(up),
+                down_budget: std::sync::atomic::AtomicUsize::new(down),
+                ..Default::default()
+            })
+        }
+        fn spend(budget: &std::sync::atomic::AtomicUsize) -> Verdict {
+            let left = budget.load(std::sync::atomic::Ordering::Relaxed);
+            if left == 0 {
+                return Verdict::Pass;
+            }
+            budget.store(left - 1, std::sync::atomic::Ordering::Relaxed);
+            Verdict::Drop
+        }
+    }
+
+    impl DatapathHook for DropFirst {
+        fn outbound(&self, packet: &[u8]) -> Verdict {
+            self.up_sizes.lock().unwrap().push(packet.len());
+            Self::spend(&self.up_budget)
+        }
+        fn inbound(&self, packet: &[u8]) -> Verdict {
+            self.down_sizes.lock().unwrap().push(packet.len());
+            Self::spend(&self.down_budget)
+        }
+    }
+
+    /// **The uplink hook sees the inner packet, not the framed one.** The
+    /// difference is the context-id varint `frame_context0` prepends, and a
+    /// hook that was shown the framed bytes would be a byte out in one
+    /// direction and not the other.
+    #[tokio::test]
+    async fn the_hook_sees_the_packet_and_can_drop_it_on_the_uplink() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_addr = sock.local_addr().unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (up_tx, mut up_rx) = mpsc::unbounded_channel();
+        let (_in_tx, in_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let hook = DropFirst::new(1, 0);
+        let handle = tokio::spawn(run_bridge(
+            sock.clone(),
+            ChanTx(up_tx),
+            in_rx,
+            Some(hook.clone()),
+            shutdown.clone(),
+        ));
+
+        // The first one is eaten.
+        app.send_to(b"lost", sock_addr).await.unwrap();
+        // The second gets through, which is how the first is known to be gone
+        // rather than merely slow.
+        app.send_to(b"kept", sock_addr).await.unwrap();
+
+        let framed = tokio::time::timeout(Duration::from_secs(1), up_rx.recv())
+            .await
+            .expect("something crossed")
+            .expect("a datagram");
+        assert_eq!(&framed[..], &[0x00, b'k', b'e', b'p', b't'][..]);
+        assert!(
+            up_rx.try_recv().is_err(),
+            "and only the one: the first was dropped, not queued",
+        );
+
+        assert_eq!(
+            *hook.up_sizes.lock().unwrap(),
+            vec![4, 4],
+            "both were offered, at the inner packet's length -- not 5, which is \
+             what the framed bytes would measure",
+        );
+
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// The other direction, where the payload arrives already stripped of its
+    /// context id — so the hook sees the same thing it sees going out.
+    #[tokio::test]
+    async fn the_hook_can_drop_on_the_downlink() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_addr = sock.local_addr().unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (up_tx, mut up_rx) = mpsc::unbounded_channel();
+        let (in_tx, in_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let hook = DropFirst::new(0, 1);
+        let handle = tokio::spawn(run_bridge(
+            sock.clone(),
+            ChanTx(up_tx),
+            in_rx,
+            Some(hook.clone()),
+            shutdown.clone(),
+        ));
+
+        // One uplink first, because the downlink has nowhere to go until the
+        // bridge has seen a source -- which the hook does not change.
+        app.send_to(b"hello", sock_addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), up_rx.recv())
+            .await
+            .expect("uplink crossed")
+            .expect("a datagram");
+
+        in_tx.send(Bytes::from_static(b"lost")).await.unwrap();
+        in_tx.send(Bytes::from_static(b"kept")).await.unwrap();
+
+        let mut got = [0_u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), app.recv_from(&mut got))
+            .await
+            .expect("something came back")
+            .expect("recv");
+        assert_eq!(&got[..n], b"kept", "the first never arrived");
+        assert_eq!(*hook.down_sizes.lock().unwrap(), vec![4, 4]);
+
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// **A hook that passes everything changes nothing**, which is what the
+    /// `None` case has to be indistinguishable from: the branch is in the
+    /// production path.
+    #[tokio::test]
+    async fn a_passing_hook_is_the_same_as_no_hook() {
+        struct PassAll;
+        impl DatapathHook for PassAll {}
+
+        for hook in [None, Some(Arc::new(PassAll) as Arc<dyn DatapathHook>)] {
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let sock_addr = sock.local_addr().unwrap();
+            let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (up_tx, mut up_rx) = mpsc::unbounded_channel();
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let shutdown = CancellationToken::new();
+            let handle = tokio::spawn(run_bridge(
+                sock.clone(),
+                ChanTx(up_tx),
+                in_rx,
+                hook,
+                shutdown.clone(),
+            ));
+
+            app.send_to(b"up", sock_addr).await.unwrap();
+            let framed = tokio::time::timeout(Duration::from_secs(1), up_rx.recv())
+                .await
+                .expect("uplink")
+                .expect("a datagram");
+            assert_eq!(&framed[..], &[0x00, b'u', b'p'][..]);
+
+            in_tx.send(Bytes::from_static(b"down")).await.unwrap();
+            let mut got = [0_u8; 64];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(1), app.recv_from(&mut got))
+                .await
+                .expect("downlink")
+                .expect("recv");
+            assert_eq!(&got[..n], b"down");
+
+            shutdown.cancel();
+            handle.await.unwrap().unwrap();
+        }
+    }
 
     struct ChanTx(mpsc::UnboundedSender<Bytes>);
     impl DatagramTx for ChanTx {
@@ -174,6 +447,7 @@ mod tests {
             sock.clone(),
             ChanTx(up_tx),
             in_rx,
+            None,
             shutdown.clone(),
         ));
 
@@ -218,7 +492,8 @@ mod tests {
 
         let (in_tx, in_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
-        let handle = tokio::spawn(run_bridge(sock.clone(), FailingTx, in_rx, shutdown.clone()));
+        let handle =
+            tokio::spawn(run_bridge(sock.clone(), FailingTx, in_rx, None, shutdown.clone()));
 
         // Uplink whose send fails: it records the source, then the failing send
         // is dropped — the bridge must NOT tear down.
@@ -248,7 +523,7 @@ mod tests {
         let (up_tx, _up_rx) = mpsc::unbounded_channel();
         let (in_tx, in_rx) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
-        let handle = tokio::spawn(run_bridge(sock, ChanTx(up_tx), in_rx, shutdown.clone()));
+        let handle = tokio::spawn(run_bridge(sock, ChanTx(up_tx), in_rx, None, shutdown.clone()));
 
         // No uplink has recorded a source, so this payload is dropped (no panic).
         in_tx.send(Bytes::from_static(b"orphan")).await.unwrap();

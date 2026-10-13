@@ -130,6 +130,7 @@ pub async fn spawn_p2p_server(
         video_addr,
         None,
         RelayOptions {
+            datapath_hook: None,
             unconnected: true,
             registration: Some(video_reg.clone()),
         },

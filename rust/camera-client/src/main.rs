@@ -311,6 +311,7 @@ impl MyApp {
             // registration so the video connection can share it.
             let local_bind = "127.0.0.1:0".parse().expect("valid loopback addr");
             let relay_options = RelayOptions {
+                datapath_hook: None,
                 unconnected: true,
                 registration: Some(Arc::clone(&reg)),
             };
