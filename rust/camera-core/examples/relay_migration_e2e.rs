@@ -165,6 +165,7 @@ async fn run(auth0: &str, identity: &str, proxy: &str, protocol: &str) -> anyhow
         RelayOptions {
             unconnected: true,
             registration: Some(reg.clone()),
+            datapath_hook: None,
         },
     )
     .await?;
