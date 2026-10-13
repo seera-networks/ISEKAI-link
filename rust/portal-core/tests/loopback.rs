@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use msquic_async::StreamType;
 use msquic_async::{msquic, Registration};
-use portal_core::datagram::MAX_PAYLOAD;
+use portal_core::datagram::{MAX_PAYLOAD, MAX_STREAM_PAYLOAD};
 use portal_core::server::{Catalogue, Protocol};
 use portal_core::udp::Sessions;
 use portal_core::{client, frame, server, transport, udp};
@@ -90,6 +90,35 @@ const DIAL_BUDGET: Duration = Duration::from_secs(30);
 /// were crossed, two sources would still both get uppercase back, so the tests
 /// check *which* reply reaches which local socket rather than merely that one
 /// arrives.
+/// A datagram service that hands back **what it received** rather than an
+/// answer.
+///
+/// [`shouting_datagram_service`] proves a round trip, which is the wrong
+/// instrument for the oversize receive path: the reply would be larger than
+/// `MAX_PAYLOAD` and there is no send side yet, so it would be dropped and the
+/// test would fail for a reason it is not about. This reports the arrival
+/// instead.
+async fn recording_datagram_service(
+) -> (std::net::SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the datagram service");
+    let addr = socket.local_addr().expect("service address");
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buf = vec![0_u8; 70_000];
+        loop {
+            let Ok((n, _from)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            if tx.send(buf[..n].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    (addr, rx)
+}
+
 async fn shouting_datagram_service() -> std::net::SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -690,6 +719,120 @@ async fn a_reused_session_id_is_refused() {
     assert_eq!(udp_status(&halves, "dns", 78).await, frame::Status::Ready);
 
     drop(first);
+    drain(halves).await;
+}
+
+/// **The oversize receive path, end to end.** A payload larger than
+/// `MAX_PAYLOAD` crosses on a unidirectional stream of its own and reaches the
+/// service — which is the whole of S2, and the first time anything larger than
+/// 1163 bytes has gone through a forward.
+///
+/// There is no send side yet, so the stream is written by hand with
+/// `frame::big_datagram_head`: the real writer, not bytes spelled out here,
+/// because a test that hand-rolls the header stops testing the format the
+/// moment the format moves.
+#[tokio::test]
+async fn an_oversize_datagram_arrives_on_a_stream_of_its_own() {
+    let (target, mut arrived) = recording_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    // Opening with the big kind is also the assertion that this build grants
+    // it: before S2 `read_open` refused the kind and this would be a dead
+    // stream rather than a `Ready`.
+    let mut session = halves
+        .connection()
+        .open_outbound_stream(StreamType::Bidirectional, false)
+        .await
+        .expect("open a stream");
+    frame::write_open(
+        &mut session,
+        &frame::Open::Udp {
+            service: "dns".to_owned(),
+            session: 42,
+            oversize_on_stream: true,
+        },
+    )
+    .await
+    .expect("write the open");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut session))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status"),
+        frame::Status::Ready,
+        "the big kind is granted now that there is an accept loop behind it",
+    );
+
+    // Four kilobytes: comfortably past `MAX_PAYLOAD`, and the size a large DNS
+    // answer actually is.
+    let payload = vec![0xa5_u8; 4096];
+    let mut stream = halves
+        .connection()
+        .open_outbound_stream(StreamType::Unidirectional, false)
+        .await
+        .expect("open a unidirectional stream");
+    stream
+        .write_all(&frame::big_datagram_head(42))
+        .await
+        .expect("write the head");
+    stream.write_all(&payload).await.expect("write the payload");
+    // **Finished, not dropped.** Closing a stream that has not finished aborts
+    // it and the datagram never lands -- `camera_core::video::push_one` and
+    // `server::refuse` both say so, and S3's send path will do the same.
+    std::future::poll_fn(|cx| stream.poll_finish_write(cx))
+        .await
+        .expect("finish the stream");
+
+    let got = tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .expect("the service heard something within five seconds")
+        .expect("a datagram");
+    assert_eq!(got.len(), payload.len(), "the whole datagram, not a prefix");
+    assert_eq!(got, payload);
+
+    // Both, before the drain: a finished stream is still a handle the
+    // registration waits on, which `drain` is the one thing that notices.
+    drop(stream);
+    drop(session);
+    drain(halves).await;
+}
+
+/// **A stream claiming more than UDP can carry is refused, not assembled.**
+/// Nothing this protocol sends is that large, so the only way to see one is a
+/// peer choosing how much memory this end should take.
+#[tokio::test]
+async fn a_stream_larger_than_a_datagram_can_be_is_dropped() {
+    let (target, mut arrived) = recording_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+    assert_eq!(udp_status(&halves, "dns", 43).await, frame::Status::Ready);
+
+    let mut stream = halves
+        .connection()
+        .open_outbound_stream(StreamType::Unidirectional, false)
+        .await
+        .expect("open a unidirectional stream");
+    stream
+        .write_all(&frame::big_datagram_head(43))
+        .await
+        .expect("write the head");
+    stream
+        .write_all(&vec![0_u8; MAX_STREAM_PAYLOAD + 1])
+        .await
+        .expect("write one byte too many");
+    std::future::poll_fn(|cx| stream.poll_finish_write(cx))
+        .await
+        .expect("finish the stream");
+
+    // Nothing reaches the service. A small one after it still does, so what was
+    // refused was the size and not the session.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), arrived.recv())
+            .await
+            .is_err(),
+        "the oversize stream delivered nothing",
+    );
+
+    drop(stream);
     drain(halves).await;
 }
 

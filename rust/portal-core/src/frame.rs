@@ -70,9 +70,15 @@ const KIND_UDP: u8 = 1;
 ///
 /// Asking and granting are the same claim, so they read the same flag:
 /// [`read_open`] refuses the kind while this is false, and `udp`'s opener does
-/// not ask. **S2 sets it when the accept loop exists**, and because there is
-/// one flag the two sides cannot drift apart.
-pub(crate) const RECEIVES_OVERSIZE_ON_STREAM: bool = false;
+/// not ask. Because there is one flag the two sides cannot drift apart.
+///
+/// **True since S2**, which is `Sessions::pump_streams` and
+/// `Sessions::read_big_datagram` — the accept loop this claim is about. Sending
+/// them is S3 and does not exist yet, which is why this says *receive*: a
+/// forward can be told what the peer would take long before it has anything to
+/// put on a stream, and advertising the half that works is what lets the other
+/// end's S3 be useful the day it lands.
+pub(crate) const RECEIVES_OVERSIZE_ON_STREAM: bool = true;
 
 /// A UDP session whose opener can also **receive** oversize datagrams on
 /// unidirectional streams.
@@ -92,11 +98,18 @@ pub(crate) const RECEIVES_OVERSIZE_ON_STREAM: bool = false;
 const KIND_UDP_BIG: u8 = 2;
 /// One oversize UDP datagram, on a unidirectional stream of its own.
 ///
-/// Defined here with the others and **not yet written by anything**: the
-/// carriage is phase S2/S3 of the plan. It is here now so that the numbering is
-/// settled before two things need it.
-#[allow(dead_code)]
+/// **Read by [`read_big_datagram_head`] and written by nothing yet**: S2
+/// receives these and S3 sends them. Being able to receive before being able
+/// to send is the honest order — see [`RECEIVES_OVERSIZE_ON_STREAM`].
 pub(crate) const KIND_BIG_DATAGRAM: u8 = 3;
+
+/// Bytes of header on an oversize-datagram stream: version, kind, session id.
+///
+/// **Six, not seven.** An [`Open`]'s head is three bytes because its third is
+/// the name length; there is no name here, so copying the shape would have left
+/// a reserved byte nobody reads — and a byte nobody reads is a byte two
+/// implementations can disagree about.
+pub const BIG_DATAGRAM_HEAD: usize = 2 + 4;
 
 /// The longest a service name may be. Names are configuration, not user input,
 /// and a bound here means the read below cannot be made to allocate.
@@ -273,6 +286,57 @@ where
         }
         other => anyhow::bail!("unknown open kind {other} for service `{service}`"),
     }
+}
+
+/// Read the head of an oversize-datagram stream and return its session id.
+///
+/// The rest of the stream is the payload, and **the FIN is its length** — which
+/// is why nothing here is a length prefix. See
+/// `docs/portal_oversize_udp_plan.md` §2.1.
+///
+/// Three bytes of head rather than two: the version is here for the same reason
+/// it is on an [`Open`], and the session id matches [`crate::datagram`]'s
+/// header in meaning and width so the assembled payload can join the same
+/// queue.
+pub(crate) async fn read_big_datagram_head<R>(stream: &mut R) -> anyhow::Result<u32>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut head = [0_u8; BIG_DATAGRAM_HEAD];
+    stream
+        .read_exact(&mut head)
+        .await
+        .context("the stream ended inside an oversize datagram's head")?;
+    anyhow::ensure!(
+        head[0] == VERSION,
+        "unsupported portal protocol version {} on an oversize datagram",
+        head[0],
+    );
+    // **One kind numbering, and this stream carries exactly one of them.**
+    // Anything else here is a peer sending something this protocol does not
+    // have.
+    anyhow::ensure!(
+        head[1] == KIND_BIG_DATAGRAM,
+        "kind {} is not an oversize datagram",
+        head[1],
+    );
+    Ok(u32::from_be_bytes(
+        head[2..].try_into().expect("four bytes"),
+    ))
+}
+
+/// Write the head [`read_big_datagram_head`] reads.
+///
+/// **No sender uses it yet** — S3 is the send side. It is here so both halves
+/// of the format are written together, and public so a test can put a real
+/// oversize datagram on the wire without hand-rolling bytes that would quietly
+/// drift from this.
+pub fn big_datagram_head(session: u32) -> [u8; BIG_DATAGRAM_HEAD] {
+    let mut head = [0_u8; BIG_DATAGRAM_HEAD];
+    head[0] = VERSION;
+    head[1] = KIND_BIG_DATAGRAM;
+    head[2..].copy_from_slice(&session.to_be_bytes());
+    head
 }
 
 /// Answer an open request.

@@ -127,6 +127,39 @@ pub const MAX_PAYLOAD: usize = isekai_p2p::peer::GUARANTEED_DATAGRAM - HEADER;
 /// a dead path.
 pub const QUEUE_DEPTH: usize = 64;
 
+/// How many **bytes** a session may hold before the oldest is dropped.
+///
+/// **[`QUEUE_DEPTH`] alone stopped bounding memory** the moment a queued
+/// datagram could be larger than [`MAX_PAYLOAD`]. Sixty-four entries was
+/// chosen when an entry was at most 1163 bytes — 74 KB a session — and
+/// 64 × 65507 is 4.19 MB, which at [`crate::udp::MAX_SESSIONS`] puts one
+/// connection's table near 4.3 GB. A count is not a memory bound once the
+/// items vary by fifty-six times.
+///
+/// 128 KB, which is a little over the 74 KB the depth already allowed, so
+/// nothing that works today starts dropping — and 131 MB rather than 4.3 GB
+/// for a full table. At the maximum datagram size the effective depth is
+/// **two**, which is the right shape: this queue exists so a burst survives a
+/// slow reader, not so a session can bank megabytes.
+pub const QUEUE_BYTES: usize = 128 * 1024;
+
+/// The largest UDP payload a unidirectional stream will carry: the largest
+/// there is.
+///
+/// **No portal-specific limit.** Cutting it at 8 or 16 KB would replace
+/// "portal carries 1163 bytes" with "portal carries 16384", which is the same
+/// conversation a second time. Memory is bounded by [`QUEUE_BYTES`] and by how
+/// many streams the transport allows at once, both of which hold whatever the
+/// size is.
+pub const MAX_STREAM_PAYLOAD: usize = 65_507;
+
+/// One datagram must always fit after the queue is emptied, or [`Queue::push`]
+/// would evict everything and still exceed the bound.
+///
+/// Checked here rather than guarded at runtime: it is a property of two
+/// constants, so a build that breaks it should not compile.
+const _: () = assert!(MAX_STREAM_PAYLOAD <= QUEUE_BYTES);
+
 /// Frame `payload` for `session`, or `None` if it will not fit.
 ///
 /// `None` rather than a truncated datagram, and the caller counts it — see the
@@ -207,6 +240,28 @@ pub struct Drops {
     /// forward has stopped accepting new sources, which is the difference
     /// between a summary an operator can skip and one they cannot.
     pub sessions_full: AtomicU64,
+    /// Oversize datagrams whose stream carried a head this protocol does not
+    /// have — a wrong version, a wrong kind, or one that ended inside it.
+    ///
+    /// Separate from [`malformed`](Self::malformed), which is the same fault on
+    /// a datagram: the two arrive by different routes and a forward misbehaving
+    /// on one is not misbehaving on the other.
+    pub stream_malformed: AtomicU64,
+    /// Oversize datagrams whose stream carried more than
+    /// [`MAX_STREAM_PAYLOAD`].
+    ///
+    /// **The peer's doing, not a path's.** Nothing this protocol can send is
+    /// that large, so a stream over the cap is a peer sending what UDP itself
+    /// cannot carry — refused rather than assembled, because the alternative is
+    /// letting a peer choose how much memory to take.
+    pub stream_too_big: AtomicU64,
+    /// Oversize datagrams whose stream ended before its FIN.
+    ///
+    /// **The ordinary way a cancelled one looks.** A sender that asked not to
+    /// have its data retransmitted gets the stream aborted on the first
+    /// detected loss, and this end sees a reset part-way through — so this
+    /// counter is the receiving half of that choice as much as it is a fault.
+    pub stream_lost: AtomicU64,
 }
 
 impl Drops {
@@ -231,6 +286,9 @@ impl Drops {
             malformed,
             unsent,
             sessions_full,
+            stream_malformed,
+            stream_too_big,
+            stream_lost,
         } = self;
         [
             oversize,
@@ -240,6 +298,9 @@ impl Drops {
             malformed,
             unsent,
             sessions_full,
+            stream_malformed,
+            stream_too_big,
+            stream_lost,
         ]
         .into_iter()
         .map(|counter| counter.load(Ordering::Relaxed))
@@ -252,8 +313,14 @@ impl Drops {
 pub enum Push {
     /// Taken, and the reader will see it.
     Queued,
-    /// Taken, and the oldest was dropped to make room — count it.
-    Evicted,
+    /// Taken, and this many of the oldest were dropped to make room — count
+    /// them.
+    ///
+    /// **A number rather than a flag**, because one arrival can now displace
+    /// several: a 64 KB datagram makes room by evicting however many small ones
+    /// are in front of it, and a caller that counted one loss per push would
+    /// under-report by exactly the amount that matters.
+    Evicted(usize),
     /// Refused: the session has ended. Count it; the payload is gone either
     /// way, and the difference from `Queued` is the whole point of saying so.
     Closed,
@@ -265,15 +332,28 @@ pub enum Push {
 /// cannot reach the item that has been waiting longest.
 #[derive(Debug)]
 pub struct Queue {
-    waiting: Mutex<VecDeque<Bytes>>,
+    waiting: Mutex<Waiting>,
     arrived: Notify,
     closed: std::sync::atomic::AtomicBool,
+}
+
+/// The queue and its size, under one lock.
+///
+/// Together rather than beside each other: the byte total is only useful if it
+/// cannot disagree with what is in the queue, and two locks is how that starts.
+#[derive(Debug)]
+struct Waiting {
+    queue: VecDeque<Bytes>,
+    bytes: usize,
 }
 
 impl Default for Queue {
     fn default() -> Self {
         Self {
-            waiting: Mutex::new(VecDeque::with_capacity(QUEUE_DEPTH)),
+            waiting: Mutex::new(Waiting {
+                queue: VecDeque::with_capacity(QUEUE_DEPTH),
+                bytes: 0,
+            }),
             arrived: Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -285,7 +365,11 @@ impl Queue {
         Arc::new(Self::default())
     }
 
-    /// Add `payload`, dropping the oldest if the queue is full.
+    /// Add `payload`, dropping the oldest until it fits.
+    ///
+    /// **Full means either bound**: [`QUEUE_DEPTH`] entries or [`QUEUE_BYTES`]
+    /// bytes. The second is what keeps a queue of oversize datagrams from being
+    /// a memory bound in name only.
     ///
     /// The answer says which of the three things happened, because two of them
     /// are losses and a caller that cannot tell them apart cannot count them —
@@ -299,13 +383,28 @@ impl Queue {
             // counted: it sits there until the last `Arc` drops.
             if self.closed.load(Ordering::Acquire) {
                 Push::Closed
-            } else if waiting.len() >= QUEUE_DEPTH {
-                waiting.pop_front();
-                waiting.push_back(payload);
-                Push::Evicted
             } else {
-                waiting.push_back(payload);
-                Push::Queued
+                let mut dropped = 0;
+                // The `pop_front` is what ends this: the depth bound needs at
+                // most one pass and the byte bound at most the whole queue,
+                // and one datagram always fits into an empty one -- the
+                // `assert!` on `MAX_STREAM_PAYLOAD` above is that promise.
+                while waiting.queue.len() >= QUEUE_DEPTH
+                    || waiting.bytes + payload.len() > QUEUE_BYTES
+                {
+                    let Some(oldest) = waiting.queue.pop_front() else {
+                        break;
+                    };
+                    waiting.bytes -= oldest.len();
+                    dropped += 1;
+                }
+                waiting.bytes += payload.len();
+                waiting.queue.push_back(payload);
+                if dropped == 0 {
+                    Push::Queued
+                } else {
+                    Push::Evicted(dropped)
+                }
             }
         };
         if outcome != Push::Closed {
@@ -326,13 +425,12 @@ impl Queue {
             let arrived = self.arrived.notified();
             tokio::pin!(arrived);
             arrived.as_mut().enable();
-            if let Some(payload) = self
-                .waiting
-                .lock()
-                .expect("datagram queue lock poisoned")
-                .pop_front()
             {
-                return Some(payload);
+                let mut waiting = self.waiting.lock().expect("datagram queue lock poisoned");
+                if let Some(payload) = waiting.queue.pop_front() {
+                    waiting.bytes -= payload.len();
+                    return Some(payload);
+                }
             }
             if self.closed.load(Ordering::Acquire) {
                 return None;
@@ -364,8 +462,9 @@ impl Queue {
         self.closed.store(true, Ordering::Release);
         let discarded = {
             let mut waiting = self.waiting.lock().expect("datagram queue lock poisoned");
-            let discarded = waiting.len();
-            waiting.clear();
+            let discarded = waiting.queue.len();
+            waiting.queue.clear();
+            waiting.bytes = 0;
             discarded
         };
         self.arrived.notify_waiters();
@@ -445,8 +544,8 @@ mod tests {
         }
         assert_eq!(
             queue.push(Bytes::from_static(b"newest")),
-            Push::Evicted,
-            "the queue is full, so something had to go",
+            Push::Evicted(1),
+            "the queue is full, so something had to go -- one of it",
         );
 
         let first = queue.pop().await.expect("a datagram");
@@ -519,5 +618,55 @@ mod tests {
             .expect("the reader woke within five seconds")
             .expect("the reader did not panic");
         assert_eq!(got.as_deref(), Some(&b"wake up"[..]));
+    }
+
+    /// **The byte bound, which the depth alone does not give.** Sixty-four
+    /// entries of 65507 bytes is 4.19 MB a session; the point of `QUEUE_BYTES`
+    /// is that the count stopped being a memory bound once entries could vary
+    /// by fifty-six times.
+    #[tokio::test]
+    async fn the_queue_is_bounded_in_bytes_as_well_as_entries() {
+        let queue = Queue::new();
+        let big = Bytes::from(vec![0_u8; MAX_STREAM_PAYLOAD]);
+        // Two of these fit (131014 of 131072) and the third cannot.
+        assert_eq!(queue.push(big.clone()), Push::Queued);
+        assert_eq!(queue.push(big.clone()), Push::Queued);
+        assert_eq!(
+            queue.push(big.clone()),
+            Push::Evicted(1),
+            "well under QUEUE_DEPTH, and still full",
+        );
+    }
+
+    /// **One arrival can displace several, and the count has to say how many.**
+    /// A caller that added one to `overflow` per push would under-report by
+    /// exactly the amount that matters.
+    #[tokio::test]
+    async fn one_large_arrival_evicts_as_many_as_it_needs_and_reports_them() {
+        let queue = Queue::new();
+        // Eight small ones, then something that needs most of the budget.
+        for _ in 0..8 {
+            assert_eq!(queue.push(Bytes::from(vec![0_u8; 8 * 1024])), Push::Queued);
+        }
+        let dropped = match queue.push(Bytes::from(vec![0_u8; 100 * 1024])) {
+            Push::Evicted(dropped) => dropped,
+            other => panic!("expected an eviction, got {other:?}"),
+        };
+        // 8 x 8 KB = 64 KB waiting, and 100 KB needs all but 28 KB of the
+        // budget -- so five of the eight have to go, not one.
+        assert_eq!(dropped, 5);
+    }
+
+    /// Popping gives the bytes back, or a queue that has been busy would
+    /// slowly refuse everything.
+    #[tokio::test]
+    async fn draining_restores_the_budget() {
+        let queue = Queue::new();
+        let big = Bytes::from(vec![0_u8; MAX_STREAM_PAYLOAD]);
+        assert_eq!(queue.push(big.clone()), Push::Queued);
+        assert_eq!(queue.push(big.clone()), Push::Queued);
+        queue.pop().await.expect("one back");
+        queue.pop().await.expect("the other");
+        assert_eq!(queue.push(big), Push::Queued, "and there is room again");
     }
 }
