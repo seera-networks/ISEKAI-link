@@ -52,6 +52,15 @@ the prefix. Repeatable, and the port is yours to choose:
   --map 15432:db          the same service on a port that is free
   --map udp:5353:dns      reach `dns` at 127.0.0.1:5353
 
+A UDP forward can carry datagrams larger than 1163 bytes, on a stream of their
+own, when the peer is new enough to receive them. Those are retransmitted if
+they are lost, which is right for a large DNS answer and wrong for anything
+stale once it is late:
+
+  --map udp+no-retrans:5353:dns   give up on a lost one instead
+
+That applies to what this end sends. Replies always retransmit.
+
 The protocol has to be said and cannot be guessed: the server looks a name up
 under a protocol, so asking for `dns` over TCP is refused with the same answer
 as a name that does not exist.
@@ -194,7 +203,8 @@ struct Args {
     #[argh(option)]
     capability: Option<String>,
     /// a local port to map onto a service, as `port:name` or
-    /// `udp:port:name`. TCP without the prefix. Repeatable
+    /// `udp:port:name`. TCP without the prefix. `udp+no-retrans:` gives up on
+    /// a lost oversize datagram instead of retransmitting it. Repeatable
     #[argh(option)]
     map: Vec<String>,
     /// the address to bind mapped ports on. Loopback by default, because a
@@ -1254,10 +1264,16 @@ fn check_ticket(args: &Args, ticket: &str) -> anyhow::Result<isekai_p2p::agent::
 /// Separate so the caller can close the session when one fails; see there.
 async fn start_forwards(
     connected: &portal_core::session::Connected,
-    maps: Vec<(Protocol, SocketAddr, String)>,
+    maps: Vec<Mapped>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
-    for (protocol, local, service) in maps {
+    for Mapped {
+        protocol,
+        local,
+        service,
+        no_retrans,
+    } in maps
+    {
         let forwarding = match protocol {
             Protocol::Tcp => {
                 portal_core::client::forward(
@@ -1276,6 +1292,7 @@ async fn start_forwards(
                     std::sync::Arc::clone(&connected.sessions),
                     local,
                     service.clone(),
+                    no_retrans,
                     shutdown.clone(),
                 )
                 .await
@@ -1832,6 +1849,21 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
     }
 }
 
+/// One `--map`, parsed.
+///
+/// A struct rather than a wider tuple: the fourth thing is an option rather
+/// than another coordinate, and `(Protocol, SocketAddr, String, bool)` at four
+/// call sites is how a `bool` ends up in the wrong position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mapped {
+    protocol: Protocol,
+    local: SocketAddr,
+    service: String,
+    /// `udp+no-retrans:`. Oversize datagrams on this forward are given up on
+    /// at the first detected loss rather than retransmitted.
+    no_retrans: bool,
+}
+
 /// Parse `port:name` or `udp:port:name` into what to bind and what to ask for.
 ///
 /// The address is assembled rather than formatted and re-parsed, which is what
@@ -1844,24 +1876,56 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
 /// reported as "the peer does not offer it". The prefix is optional only because
 /// TCP is the common case; it is never ambiguous, since `udp` and `tcp` are not
 /// port numbers.
-fn maps(
-    maps: &[String],
-    bind: std::net::IpAddr,
-) -> anyhow::Result<Vec<(Protocol, SocketAddr, String)>> {
+///
+/// **Options ride on the protocol word, as `udp+no-retrans:`.** They cannot go
+/// on the end: a service name is arbitrary UTF-8, so `5353:dns,no-retrans`
+/// would be ambiguous with a service actually called that. The first element is
+/// matched against a known set, which leaves no such question.
+fn maps(maps: &[String], bind: std::net::IpAddr) -> anyhow::Result<Vec<Mapped>> {
     maps.iter()
         .map(|m| {
-            let (protocol, rest) = match m.split_once(':') {
-                Some(("tcp", rest)) => (Protocol::Tcp, rest),
-                Some(("udp", rest)) => (Protocol::Udp, rest),
-                _ => (Protocol::Tcp, m.as_str()),
+            let (head, rest) = match m.split_once(':') {
+                Some((head, rest)) if head.starts_with("tcp") || head.starts_with("udp") => {
+                    (head, rest)
+                }
+                _ => ("tcp", m.as_str()),
             };
+            let mut words = head.split('+');
+            let protocol = match words.next() {
+                Some("udp") => Protocol::Udp,
+                // Only reachable as `tcp`, since the split above is what chose
+                // this branch at all.
+                _ => Protocol::Tcp,
+            };
+            let mut no_retrans = false;
+            for word in words {
+                match word {
+                    "no-retrans" => {
+                        // **Refused rather than ignored on TCP.** A stream is
+                        // reliable by nature and there is nothing here to opt
+                        // out of, so accepting the word would promise something
+                        // this does not do.
+                        anyhow::ensure!(
+                            protocol == Protocol::Udp,
+                            "`no-retrans` is for UDP forwards, in --map `{m}`",
+                        );
+                        no_retrans = true;
+                    }
+                    other => anyhow::bail!("unknown --map option `{other}`, in `{m}`"),
+                }
+            }
             let (port, service) = rest.split_once(':').with_context(|| {
                 format!("--map wants `port:service` or `udp:port:service`, got `{m}`")
             })?;
             let port: u16 = port
                 .parse()
                 .with_context(|| format!("`{port}` is not a port, in --map `{m}`"))?;
-            Ok((protocol, SocketAddr::new(bind, port), service.to_owned()))
+            Ok(Mapped {
+                protocol,
+                local: SocketAddr::new(bind, port),
+                service: service.to_owned(),
+                no_retrans,
+            })
         })
         .collect()
 }
@@ -1876,6 +1940,69 @@ mod tests {
         args.revoke_endpoint = Some("ep:abc".to_owned());
         args.reason = reason.map(str::to_owned);
         args
+    }
+
+    fn one_map(m: &str) -> anyhow::Result<Mapped> {
+        let mut parsed = maps(&[m.to_owned()], "127.0.0.1".parse().unwrap())?;
+        Ok(parsed.pop().expect("one"))
+    }
+
+    /// The shapes that worked before `no-retrans` existed still mean what they
+    /// meant, which is the part a new option is most likely to break.
+    #[test]
+    fn the_shapes_that_worked_before_still_do() {
+        let tcp = one_map("5432:db").expect("tcp by default");
+        assert_eq!((tcp.protocol, tcp.no_retrans), (Protocol::Tcp, false));
+        assert_eq!(tcp.local.port(), 5432);
+        assert_eq!(tcp.service, "db");
+
+        for m in ["tcp:5432:db", "udp:5353:dns"] {
+            let parsed = one_map(m).unwrap_or_else(|e| panic!("{m}: {e:#}"));
+            assert!(!parsed.no_retrans, "{m} did not ask for it");
+        }
+        assert_eq!(one_map("udp:5353:dns").expect("udp").protocol, Protocol::Udp);
+    }
+
+    /// **The option rides on the protocol word.** On the end it would be
+    /// ambiguous with a service called `no-retrans`, since a service name is
+    /// arbitrary UTF-8.
+    #[test]
+    fn no_retrans_is_asked_for_on_the_protocol_word() {
+        let parsed = one_map("udp+no-retrans:5353:dns").expect("parse");
+        assert_eq!(parsed.protocol, Protocol::Udp);
+        assert!(parsed.no_retrans);
+        assert_eq!(parsed.service, "dns", "and the service is untouched");
+        assert_eq!(parsed.local.port(), 5353);
+    }
+
+    /// A service may legitimately be called this, and saying so must not turn
+    /// into asking for the option.
+    #[test]
+    fn a_service_called_no_retrans_is_just_a_service() {
+        let parsed = one_map("udp:5353:no-retrans").expect("parse");
+        assert_eq!(parsed.service, "no-retrans");
+        assert!(!parsed.no_retrans, "it named a service, it did not ask");
+    }
+
+    /// **Refused rather than ignored.** A stream is reliable by nature, so
+    /// there is nothing on a TCP forward to opt out of, and accepting the word
+    /// would promise something that does not happen.
+    #[test]
+    fn no_retrans_on_a_tcp_forward_is_refused() {
+        let err = one_map("tcp+no-retrans:5432:db").expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("no-retrans` is for UDP"),
+            "{err:#}",
+        );
+    }
+
+    #[test]
+    fn an_unknown_map_option_says_so() {
+        let err = one_map("udp+nonsense:5353:dns").expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("unknown --map option"),
+            "{err:#}",
+        );
     }
 
     #[test]

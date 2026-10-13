@@ -448,13 +448,50 @@ with has a database with no password — a tunnel makes the *transport*
 private, and says nothing about what is at the end of it. Put the same
 authentication on a forwarded service that you would put on an exposed one.
 
-**UDP payloads over 1163 bytes are dropped**, counted, and never split. A
-datagram service that silently splits is worse than one that silently loses,
-because the application cannot tell the difference.
+**UDP payloads over 1163 bytes travel differently**, and the difference is
+visible. Up to 1163 bytes a payload rides a QUIC datagram: it arrives at once
+or not at all, which is what UDP means. Over that it gets a QUIC stream of its
+own, which is **retransmitted if it is lost** — so it arrives late rather than
+not at all.
 
-That number is not a setting. It is what a QUIC datagram has left after the
-connection's 1248-byte MTU has paid for IPv6 and UDP headers, the QUIC packet
-and DATAGRAM frame, and the four bytes portal spends naming the session:
+Nothing is ever split. A datagram service that silently splits is worse than one
+that silently loses, because the application cannot tell the difference.
+
+```
+  up to 1163      a datagram. May be lost; never late
+  1164 .. 65507   a stream of its own. Not lost; may be late
+  over 65507      refused -- larger than UDP itself carries
+```
+
+**Both ends have to be new enough.** The size a forward can carry is agreed when
+a session opens, and a peer from before this existed takes the datagram carrier
+only — against one of those, **payloads over 1163 bytes are dropped and
+counted**, as they were everywhere before. Nothing has to be configured for the
+larger sizes; they are used when both ends have them.
+
+**If late is worse than lost, say so:**
+
+```sh
+portal-client --map udp+no-retrans:5353:dns
+```
+
+Oversize datagrams on that forward are given up on at the first sign of loss
+instead of being retransmitted — UDP's own semantics, at the cost of the
+datagram. It applies to what the client sends; replies always retransmit. A
+large DNS answer wants the default; a protocol whose data is stale once it is
+late wants this.
+
+> One number worth knowing before choosing: a datagram spread over N packets
+> with no retransmission is lost at roughly N times a single packet's rate. A
+> 4 KB answer is four packets and change. That is the fragility IP
+> fragmentation always had, which is faithful to UDP and not what a resolver
+> wants.
+
+### Where 1163 comes from
+
+It is not a setting. It is what a QUIC datagram has left after the connection's
+1248-byte MTU has paid for IPv6 and UDP headers, the QUIC packet and DATAGRAM
+frame, and the four bytes portal spends naming the session:
 
 ```
   1248  the peer connection's MTU, which msquic will not go under
@@ -475,12 +512,16 @@ short everywhere.
 > accepted here and refused by the connection. None were, because every relayed
 > path is IPv4, where 20 more bytes fit; the gap was only ever reachable on an
 > IPv6 direct path.
+>
+> And this page then said payloads over 1163 were dropped, full stop, which was
+> true until they were not. The limit is where the carrier changes now, not
+> where the forward gives up.
 
 The case to know is DNS: EDNS0 commonly advertises a 1232-byte buffer, so a
-large response can exceed this — and it is dropped with no truncation bit and no
-ICMP, which leaves a stub resolver waiting out a timeout rather than retrying
-over TCP. Ordinary queries are well under it. A resolver configured for a
-smaller buffer is fine.
+large response is over the datagram limit — and now crosses on a stream rather
+than being dropped. Against a peer from before this existed it is still
+dropped, with no truncation bit and no ICMP, which leaves a stub resolver
+waiting out a timeout rather than retrying over TCP.
 
 **One peer at a time per client.** The session model supports more; the
 command line does not, yet. `--peer` chooses which of several paired servers to

@@ -153,20 +153,10 @@ pub const QUEUE_BYTES: usize = 128 * 1024;
 /// size is.
 pub const MAX_STREAM_PAYLOAD: usize = 65_507;
 
-/// The largest payload this build can actually put on the wire.
-///
-/// **[`MAX_PAYLOAD`] until S3**, which adds the stream carrier and makes this
-/// [`MAX_STREAM_PAYLOAD`]. One name for it, because two places need the same
-/// answer and they would otherwise drift: the queue refuses what cannot leave,
-/// and the send path counts what it was handed anyway.
-///
-/// It exists because of what the byte bound changed. A payload over this is
-/// dropped at [`crate::udp::Sessions::send`] whatever happens, and queueing one
-/// first used to cost a 64th of the depth; under [`QUEUE_BYTES`] a 64 KB
-/// payload that can never leave takes **half the session's budget** and evicts
-/// the small datagrams behind it. So the refusal moved to where the size is
-/// first known.
-pub const SENDABLE_PAYLOAD: usize = MAX_PAYLOAD;
+// Was `SENDABLE_PAYLOAD`, a constant, while [`MAX_PAYLOAD`] was the only size
+// that could leave. S3 made the answer depend on the peer, so it is
+// [`crate::udp::Sessions::sendable_payload`] now — the reason for refusing
+// early is unchanged and written there.
 
 /// One datagram must always fit after the queue is emptied, or [`Queue::push`]
 /// would evict everything and still exceed the bound.
@@ -279,6 +269,25 @@ pub struct Drops {
     /// cannot carry — refused rather than assembled, because the alternative is
     /// letting a peer choose how much memory to take.
     pub stream_too_big: AtomicU64,
+    /// Oversize datagrams this end could not get a stream for.
+    ///
+    /// **Both ways of being backed up, deliberately together.** Either the
+    /// queue of datagrams waiting for a stream was full, or the transport would
+    /// not open another ([`fail_on_blocked`] rather than waiting, so that a
+    /// send never stalls the loop reading the local socket). They differ in
+    /// which side of this end is behind and lead to the same place: more
+    /// oversize datagrams at once than the connection can carry.
+    ///
+    /// [`fail_on_blocked`]: msquic_async::Connection::open_outbound_stream
+    pub stream_blocked: AtomicU64,
+    /// Oversize datagrams given up on rather than retransmitted.
+    ///
+    /// **Asked for, not a fault.** Only a forward configured `no-retrans` can
+    /// reach this: its stream is aborted on the first detected loss, which is
+    /// UDP's own semantics restored at the cost of the datagram. Counted
+    /// because "asked for" and "unnoticed" are different things, and a forward
+    /// losing more than its operator expected is worth being able to see.
+    pub stream_cancelled: AtomicU64,
     /// Oversize datagrams whose stream ended before its FIN.
     ///
     /// **The ordinary way a cancelled one looks.** A sender that asked not to
@@ -313,6 +322,8 @@ impl Drops {
             stream_malformed,
             stream_too_big,
             stream_lost,
+            stream_blocked,
+            stream_cancelled,
         } = self;
         [
             oversize,
@@ -325,6 +336,8 @@ impl Drops {
             stream_malformed,
             stream_too_big,
             stream_lost,
+            stream_blocked,
+            stream_cancelled,
         ]
         .into_iter()
         .map(|counter| counter.load(Ordering::Relaxed))

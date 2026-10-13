@@ -59,9 +59,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use crate::datagram::{
-    decode, encode, Drops, Push, Queue, MAX_PAYLOAD, MAX_STREAM_PAYLOAD, SENDABLE_PAYLOAD,
-};
+use crate::datagram::{decode, encode, Drops, Push, Queue, MAX_PAYLOAD, MAX_STREAM_PAYLOAD};
 use crate::frame::{read_status, write_open, write_status, Open, Status};
 
 /// How long a session may go without traffic in either direction before it is
@@ -87,6 +85,24 @@ pub const IDLE: Duration = Duration::from_secs(60);
 /// stub resolver has a handful of source ports in flight — and far below any
 /// default descriptor limit.
 pub const MAX_SESSIONS: usize = 1024;
+
+/// How many oversize datagrams may be waiting for a stream of their own.
+///
+/// **Small on purpose.** Each one already has a whole payload in memory, the
+/// transport allows a hundred streams at once, and anything that queues here is
+/// something the connection is already behind on. A deeper queue would hold
+/// megabytes to deliver datagrams later than the application would have liked
+/// anyway; `datagram::QUEUE_BYTES` is where waiting belongs.
+const BIG_SENDS_WAITING: usize = 16;
+
+/// One oversize datagram on its way to a stream of its own.
+struct BigSend {
+    session: u32,
+    payload: Bytes,
+    /// From the forward's `--map`: abort the stream on the first detected loss
+    /// rather than retransmitting.
+    no_retrans: bool,
+}
 
 /// What a peer said about receiving oversize datagrams on streams.
 ///
@@ -201,6 +217,15 @@ pub struct Sessions {
     /// to one round trip: the capability is a property of the peer's build, so
     /// the first session that finds out pays and the rest read it.
     peer_oversize: PeerOversize,
+    /// Oversize datagrams waiting for a stream.
+    ///
+    /// **A channel because [`send`](Self::send) cannot wait.** Opening a stream
+    /// is `async` and `send` is called from the loop reading a local socket: a
+    /// send that waited would stop that loop, the kernel's buffer would
+    /// overflow, and **the small datagrams would be lost by the machinery for
+    /// carrying large ones**. So the handoff is a `try_send` and a full channel
+    /// is a counted drop.
+    big_sends: tokio::sync::mpsc::Sender<BigSend>,
     /// Sessions that could not be opened — refused, unreachable, or a stream
     /// that failed.
     ///
@@ -250,6 +275,7 @@ impl Sessions {
         shutdown: CancellationToken,
         idle: Duration,
     ) -> Arc<Self> {
+        let (big_sends, big_waiting) = tokio::sync::mpsc::channel(BIG_SENDS_WAITING);
         let sessions = Arc::new(Self {
             conn,
             table: Mutex::new(HashMap::new()),
@@ -259,7 +285,13 @@ impl Sessions {
             idle,
             drops: Drops::default(),
             peer_oversize: PeerOversize::default(),
+            big_sends,
             open_failures: AtomicU64::new(0),
+        });
+        tokio::spawn({
+            let sessions = Arc::clone(&sessions);
+            let shutdown = shutdown.clone();
+            async move { sessions.pump_big_sends(big_waiting, shutdown).await }
         });
         tokio::spawn({
             let sessions = Arc::clone(&sessions);
@@ -275,6 +307,26 @@ impl Sessions {
 
     fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// The largest payload that can leave on *this* connection.
+    ///
+    /// **Asked before anything is queued**, because the byte bound made
+    /// queueing the unsendable expensive: a payload over this is dropped
+    /// whatever happens, and under `datagram::QUEUE_BYTES` a 64 KB one takes
+    /// half a session's budget on the way to being dropped, evicting the small
+    /// datagrams waiting behind it.
+    ///
+    /// `None` from [`peer_takes_oversize`](Self::peer_takes_oversize) is
+    /// treated as yes. The first session open settles it, and being generous
+    /// while the answer is unknown costs at most one dropped datagram, where
+    /// being strict would refuse what the connection turns out to carry.
+    pub fn sendable_payload(&self) -> usize {
+        if self.peer_takes_oversize() == Some(false) {
+            MAX_PAYLOAD
+        } else {
+            MAX_STREAM_PAYLOAD
+        }
     }
 
     /// Whether the peer takes oversize datagrams on unidirectional streams, or
@@ -374,6 +426,113 @@ impl Sessions {
                     tracing::debug!("no longer accepting portal streams: {e}");
                     break;
                 }
+            }
+        }
+    }
+
+    /// Give each waiting oversize datagram a stream of its own.
+    ///
+    /// **One task per datagram**, so a slow stream does not hold up the ones
+    /// behind it. That is the price of "one datagram per stream", paid here;
+    /// what it buys is the thing the whole design rests on — streams are
+    /// unordered with respect to each other, so a retransmit of one datagram
+    /// never waits on another.
+    async fn pump_big_sends(
+        self: Arc<Self>,
+        mut waiting: tokio::sync::mpsc::Receiver<BigSend>,
+        shutdown: CancellationToken,
+    ) {
+        loop {
+            let next = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                next = waiting.recv() => next,
+            };
+            // `None` once every `Sessions` handle has gone, which is how this
+            // ends when nothing cancelled it.
+            let Some(send) = next else { break };
+            let sessions = Arc::clone(&self);
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move { sessions.write_big_datagram(send, shutdown).await });
+        }
+    }
+
+    /// Put one oversize datagram on a unidirectional stream.
+    async fn write_big_datagram(&self, send: BigSend, shutdown: CancellationToken) {
+        let BigSend {
+            session,
+            payload,
+            no_retrans,
+        } = send;
+        // **`fail_on_blocked`, so this never waits for a stream.** The
+        // transport allows a hundred at once; past that, dropping and counting
+        // is the same answer the queue gives when it is full, and waiting here
+        // would hold a payload indefinitely for a datagram the application has
+        // long since given up on.
+        let opening = self
+            .conn
+            .open_outbound_stream(msquic_async::StreamType::Unidirectional, true);
+        let mut stream = match tokio::select! {
+            _ = shutdown.cancelled() => return,
+            opened = opening => opened,
+        } {
+            Ok(stream) => stream,
+            Err(e) => {
+                if self.drops.stream_blocked.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        session,
+                        "no stream was available for an oversize datagram: {e}; \
+                         further ones on this connection are counted, not logged",
+                    );
+                } else {
+                    tracing::debug!(session, "another oversize datagram found no stream: {e}");
+                }
+                return;
+            }
+        };
+
+        // Two chunks and one call: the head and the payload go out together,
+        // with the FIN, and nothing is copied to join them.
+        let chunks = [
+            Bytes::copy_from_slice(&crate::frame::big_datagram_head(session)),
+            payload,
+        ];
+        let written = if no_retrans {
+            stream.write_chunks_no_retrans(&chunks, true).await
+        } else {
+            stream.write_chunks(&chunks, true).await
+        };
+        if let Err(e) = written {
+            self.drops.unsent.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(session, "an oversize datagram was not written: {e}");
+            return;
+        }
+
+        // **The write returning is not the datagram leaving.** MsQuic resolves
+        // it when it accepts the request, and dropping a stream short of
+        // `ShutdownComplete` aborts it -- so ending here would reset almost
+        // every oversize datagram. `camera_core::video::push_one` and
+        // `server::refuse` both say the same thing about their own writes.
+        let finished = tokio::select! {
+            // Cancellation is a teardown, not a loss: the connection is going
+            // and the counters are about to be reported.
+            _ = shutdown.cancelled() => return,
+            finished = std::future::poll_fn(|cx| stream.poll_finish_write(cx)) => finished,
+        };
+        match finished {
+            Ok(()) => {}
+            // **What `no-retrans` asked for.** The stream met loss and was
+            // abandoned rather than retransmitted, which is only reachable for
+            // a forward that chose it.
+            Err(msquic_async::WriteError::CancelledOnLoss) => {
+                self.drops.stream_cancelled.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    session,
+                    "an oversize datagram was given up on rather than retransmitted",
+                );
+            }
+            Err(e) => {
+                self.drops.unsent.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(session, "an oversize datagram did not finish: {e}");
             }
         }
     }
@@ -523,11 +682,17 @@ impl Sessions {
     ///
     /// `false` means it was dropped, and by then it has been counted. Not
     /// `async`: msquic takes a datagram without waiting, because there is
-    /// nothing for a datagram to wait for.
-    fn send(&self, session: u32, payload: &[u8]) -> bool {
+    /// nothing for a datagram to wait for — and **the stream carrier keeps that
+    /// property** by handing over to a task rather than opening a stream here.
+    ///
+    /// `no_retrans` comes from the forward's `--map` and only reaches the
+    /// stream carrier; a DATAGRAM frame is never retransmitted anyway.
+    fn send(&self, session: u32, payload: &[u8], no_retrans: bool) -> bool {
         let Some(framed) = encode(session, payload) else {
-            self.oversize(Some(session), payload.len());
-            return false;
+            // **Too large for a datagram is no longer the end of it.** Over
+            // `MAX_PAYLOAD` goes on a stream of its own if the peer takes them,
+            // and is dropped as before if it does not.
+            return self.send_on_stream(session, payload, no_retrans);
         };
         match self.conn.send_datagram(&framed) {
             Ok(()) => true,
@@ -556,6 +721,43 @@ impl Sessions {
                     );
                 } else {
                     tracing::debug!(session, "a datagram was not sent: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    /// Hand an oversize payload to the stream carrier.
+    ///
+    /// **A `try_send` and nothing else.** Everything that could wait — opening
+    /// the stream, writing it, waiting for the FIN to be acknowledged — happens
+    /// in `pump_big_sends`, because the caller is a loop reading a local socket
+    /// and a send that waits there loses the small datagrams too.
+    fn send_on_stream(&self, session: u32, payload: &[u8], no_retrans: bool) -> bool {
+        if self.peer_takes_oversize() == Some(false) {
+            self.oversize(Some(session), payload.len());
+            return false;
+        }
+        let send = BigSend {
+            session,
+            payload: Bytes::copy_from_slice(payload),
+            no_retrans,
+        };
+        match self.big_sends.try_send(send) {
+            Ok(()) => true,
+            Err(_) => {
+                // Full, or the pump has gone with the connection. Either way
+                // this one is not going out, and the counter says which kind of
+                // behind this end is.
+                if self.drops.stream_blocked.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        session,
+                        waiting = BIG_SENDS_WAITING,
+                        "too many oversize datagrams at once; one was dropped. \
+                         Further ones on this connection are counted, not logged",
+                    );
+                } else {
+                    tracing::debug!(session, "another oversize datagram found no room");
                 }
                 false
             }
@@ -793,7 +995,13 @@ pub async fn serve(
             },
             // From the target, back to the peer.
             read = socket.recv(&mut buf) => match read {
-                Ok(n) => { sessions.send(id, &buf[..n]); }
+                // **`false`: the server's replies always retransmit.** The
+                // choice lives on the client's `--map` and this end has no map
+                // -- it has a catalogue. Retransmitting is never wrong, only
+                // sometimes late, so the safe half is the one that is not
+                // configurable here. Carrying the choice across would need the
+                // session open to say so, which is its own step.
+                Ok(n) => { sessions.send(id, &buf[..n], false); }
                 // **Ends the session rather than continuing.** On Linux a
                 // connected UDP socket reports the target's ICMP port
                 // unreachable here, and a target that is not listening is one
@@ -841,6 +1049,7 @@ pub async fn forward(
     sessions: Arc<Sessions>,
     local: SocketAddr,
     service: String,
+    no_retrans: bool,
     shutdown: CancellationToken,
 ) -> anyhow::Result<SocketAddr> {
     let socket = Arc::new(
@@ -869,13 +1078,17 @@ pub async fn forward(
                 }
             };
             // **Refused here rather than at the send.** A payload over
-            // `SENDABLE_PAYLOAD` is dropped whatever happens, and queueing one
+            // `sendable_payload` is dropped whatever happens, and queueing one
             // first used to cost a 64th of the depth -- under `QUEUE_BYTES` a
             // 64 KB payload that can never leave takes half the session's
             // budget and evicts the small datagrams waiting behind it. The
             // counter is the same one `Sessions::send` would have reached;
             // what changes is that the budget stays for traffic that can go.
-            if n > SENDABLE_PAYLOAD {
+            // **Asked of the connection, not of a constant.** What can leave
+            // depends on whether the peer takes oversize datagrams on streams,
+            // and refusing here is what keeps a payload that cannot leave from
+            // spending a session's byte budget on the way to being dropped.
+            if n > sessions.sendable_payload() {
                 sessions.oversize(None, n);
                 continue;
             }
@@ -933,6 +1146,7 @@ pub async fn forward(
                 Arc::clone(&sessions),
                 id,
                 service.clone(),
+                no_retrans,
                 from,
                 Arc::clone(&socket),
                 inbound,
@@ -960,6 +1174,7 @@ async fn session(
     sessions: Arc<Sessions>,
     id: u32,
     service: String,
+    no_retrans: bool,
     from: SocketAddr,
     socket: Arc<UdpSocket>,
     inbound: Arc<Queue>,
@@ -968,7 +1183,7 @@ async fn session(
     shutdown: CancellationToken,
 ) {
     if let Err(e) = run_session(
-        &sessions, id, &service, from, &socket, &inbound, &outbound, &shutdown,
+        &sessions, id, &service, no_retrans, from, &socket, &inbound, &outbound, &shutdown,
     )
     .await
     {
@@ -1100,6 +1315,7 @@ async fn run_session(
     sessions: &Arc<Sessions>,
     id: u32,
     service: &str,
+    no_retrans: bool,
     from: SocketAddr,
     socket: &UdpSocket,
     inbound: &Queue,
@@ -1115,7 +1331,7 @@ async fn run_session(
             _ = shutdown.cancelled() => break "the client is leaving".to_owned(),
             // From the application, out to the peer.
             payload = outbound.pop() => match payload {
-                Some(payload) => { sessions.send(id, &payload); }
+                Some(payload) => { sessions.send(id, &payload, no_retrans); }
                 None => break "the forwarded port closed".to_owned(),
             },
             // From the peer, back to the application. `send_to` and not `send`:

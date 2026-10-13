@@ -519,6 +519,7 @@ async fn datagrams_reach_the_service_and_come_back() {
         Arc::clone(halves.sessions()),
         "127.0.0.1:0".parse().unwrap(),
         "dns".to_owned(),
+        false,
         halves.teardown.shutdown.clone(),
     )
     .await
@@ -568,6 +569,7 @@ async fn two_sources_get_their_own_replies() {
         Arc::clone(halves.sessions()),
         "127.0.0.1:0".parse().unwrap(),
         "dns".to_owned(),
+        false,
         halves.teardown.shutdown.clone(),
     )
     .await
@@ -590,12 +592,18 @@ async fn two_sources_get_their_own_replies() {
     drain(halves).await;
 }
 
-/// **A payload over the limit is dropped and counted, not truncated.** The unit
-/// test in `datagram` checks that `encode` refuses one; this checks that the
-/// refusal is where the traffic actually is — nothing reaches the service, the
-/// session survives it, and the counter says so.
+/// **A payload over the datagram limit now crosses, and comes back.** This test
+/// used to assert the opposite — that 1164 bytes reached nobody — and S3 is
+/// what changed the answer. It failing is how the round trip was first
+/// observed working.
+///
+/// **Both directions, through the real send path.** The hand-written stream in
+/// `an_oversize_datagram_arrives_on_a_stream_of_its_own` pins the wire format
+/// independently of our own sender; this one goes through `Sessions::send`,
+/// which is the code an application actually reaches — and the reply proves the
+/// server's half, where no `--map` reaches and the default is what runs.
 #[tokio::test]
-async fn an_oversize_datagram_is_dropped_and_counted() {
+async fn an_oversize_datagram_crosses_and_comes_back() {
     let target = shouting_datagram_service().await;
     let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
 
@@ -603,6 +611,7 @@ async fn an_oversize_datagram_is_dropped_and_counted() {
         Arc::clone(halves.sessions()),
         "127.0.0.1:0".parse().unwrap(),
         "dns".to_owned(),
+        false,
         halves.teardown.shutdown.clone(),
     )
     .await
@@ -611,30 +620,78 @@ async fn an_oversize_datagram_is_dropped_and_counted() {
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
     client.connect(local).await.expect("connect");
 
-    // One byte over, so nothing but the limit itself decides this.
-    client
-        .send(&vec![b'a'; MAX_PAYLOAD + 1])
-        .await
-        .expect("send");
-    let mut reply = vec![0_u8; 70_000];
-    let answered = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut reply)).await;
-    assert!(
-        answered.is_err(),
-        "a payload that will not fit must not arrive in pieces: {answered:?}",
+    // One byte over the datagram limit, so nothing but the limit itself decides
+    // which carrier this takes; and then something a large DNS answer's size,
+    // so the test is not only about the boundary.
+    for len in [MAX_PAYLOAD + 1, 4096] {
+        client.send(&vec![b'a'; len]).await.expect("send");
+        let mut reply = vec![0_u8; 70_000];
+        let got = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("{len} bytes came back within five seconds"))
+            .expect("receive");
+        assert_eq!(got, len, "the whole datagram, not a prefix");
+        assert_eq!(&reply[..got], vec![b'A'; len], "and it went through the service");
+    }
+
+    // Small ones still work afterwards, which is the thing to check when a
+    // second carrier appears: the first one is what everything else uses.
+    assert_eq!(&say(&client, b"after").await, b"AFTER");
+
+    assert_eq!(
+        halves.sessions().drops.total(),
+        0,
+        "and nothing was lost on the way",
     );
+
+    drain(halves).await;
+}
+
+/// **`no-retrans` is wired, and costs nothing on a path that is not losing.**
+///
+/// Whether the stream is actually abandoned on loss is MsQuic's to decide and
+/// needs loss to show — `QuicTestMultipathPathValidationRetry` is the shape
+/// that would take, with a datapath hook. What can be checked here is the half
+/// that would break silently: that asking for it still delivers. A flag that
+/// quietly stopped a forward working would otherwise be found by whoever set
+/// it.
+#[tokio::test]
+async fn a_no_retrans_forward_still_delivers() {
+    let target = shouting_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    let local = udp::forward(
+        Arc::clone(halves.sessions()),
+        "127.0.0.1:0".parse().unwrap(),
+        "dns".to_owned(),
+        true,
+        halves.teardown.shutdown.clone(),
+    )
+    .await
+    .expect("forward a local UDP port");
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    client.connect(local).await.expect("connect");
+
+    let len = MAX_PAYLOAD + 1;
+    client.send(&vec![b'z'; len]).await.expect("send");
+    let mut reply = vec![0_u8; 70_000];
+    let got = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut reply))
+        .await
+        .expect("it came back within five seconds")
+        .expect("receive");
+    assert_eq!(got, len);
+    assert_eq!(&reply[..got], vec![b'Z'; len]);
+
+    // Nothing was given up on, because nothing was lost.
     assert_eq!(
         halves
             .sessions()
             .drops
-            .oversize
+            .stream_cancelled
             .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "and the drop is counted where an operator can see it",
+        0,
     );
-
-    // The session is still usable, which is the difference between dropping a
-    // datagram and failing a forward.
-    assert_eq!(&say(&client, b"after").await, b"AFTER");
 
     drain(halves).await;
 }
@@ -668,6 +725,7 @@ async fn a_quiet_session_is_swept_and_the_next_datagram_opens_another() {
         Arc::clone(halves.sessions()),
         "127.0.0.1:0".parse().unwrap(),
         "dns".to_owned(),
+        false,
         halves.teardown.shutdown.clone(),
     )
     .await
