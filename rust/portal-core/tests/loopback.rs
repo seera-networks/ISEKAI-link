@@ -647,6 +647,50 @@ async fn an_oversize_datagram_crosses_and_comes_back() {
     drain(halves).await;
 }
 
+/// **The opener's `no-retrans` reaches the answerer.** The flag is on the
+/// client's `--map` and the server has only a catalogue, so the open frame is
+/// the only way a reply can honour what was asked for — and the large half of a
+/// request/response pair is usually the reply.
+///
+/// Read on the wire rather than through a forward, because what the server does
+/// with it is invisible from here: the observable difference needs loss, which
+/// is open question 10. What this pins is that the bit travels, and that
+/// `None` and `Some(default)` are not confused for each other.
+#[tokio::test]
+async fn the_openers_no_retrans_choice_crosses() {
+    let target = shouting_datagram_service().await;
+    let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
+
+    for (session, no_retrans) in [(60, false), (61, true)] {
+        let mut stream = halves
+            .connection()
+            .open_outbound_stream(StreamType::Bidirectional, false)
+            .await
+            .expect("open a stream");
+        frame::write_open(
+            &mut stream,
+            &frame::Open::Udp {
+                service: "dns".to_owned(),
+                session,
+                oversize: Some(frame::OversizeOptions { no_retrans }),
+            },
+        )
+        .await
+        .expect("write the open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut stream))
+                .await
+                .expect("the peer answered within five seconds")
+                .expect("read the status"),
+            frame::Status::Ready,
+            "no_retrans={no_retrans} was accepted",
+        );
+        drop(stream);
+    }
+
+    drain(halves).await;
+}
+
 /// **`no-retrans` is wired, and costs nothing on a path that is not losing.**
 ///
 /// Whether the stream is actually abandoned on loss is MsQuic's to decide and
@@ -779,7 +823,7 @@ async fn a_reused_session_id_is_refused() {
         &frame::Open::Udp {
             service: "dns".to_owned(),
             session: 77,
-            oversize_on_stream: false,
+            oversize: None,
         },
     )
     .await
@@ -858,7 +902,7 @@ async fn an_oversize_datagram_arrives_on_a_stream_of_its_own() {
         &frame::Open::Udp {
             service: "dns".to_owned(),
             session: 42,
-            oversize_on_stream: true,
+            oversize: Some(frame::OversizeOptions::default()),
         },
     )
     .await
@@ -917,7 +961,7 @@ async fn a_stream_larger_than_a_datagram_can_be_is_dropped() {
         &frame::Open::Udp {
             service: "dns".to_owned(),
             session: 43,
-            oversize_on_stream: true,
+            oversize: Some(frame::OversizeOptions::default()),
         },
     )
     .await
@@ -1090,7 +1134,7 @@ async fn udp_status(halves: &Halves, service: &str, session: u32) -> frame::Stat
         &frame::Open::Udp {
             service: service.to_owned(),
             session,
-            oversize_on_stream: false,
+            oversize: None,
         },
     )
     .await

@@ -951,10 +951,14 @@ async fn bind_toward(target: SocketAddr) -> anyhow::Result<UdpSocket> {
 /// the table before `Ready` leaves, or the client's first datagram — which
 /// follows immediately — arrives for a session that does not exist yet and is
 /// counted as a drop on the very first packet of every forward.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     sessions: Arc<Sessions>,
     id: u32,
     service: &str,
+    // From the opener's `--map`, carried on the open frame, for every reply on
+    // this session.
+    no_retrans: bool,
     target: SocketAddr,
     mut stream: msquic_async::Stream,
     shutdown: CancellationToken,
@@ -1016,13 +1020,12 @@ pub async fn serve(
             },
             // From the target, back to the peer.
             read = socket.recv(&mut buf) => match read {
-                // **`false`: the server's replies always retransmit.** The
-                // choice lives on the client's `--map` and this end has no map
-                // -- it has a catalogue. Retransmitting is never wrong, only
-                // sometimes late, so the safe half is the one that is not
-                // configurable here. Carrying the choice across would need the
-                // session open to say so, which is its own step.
-                Ok(n) => { sessions.send(id, &buf[..n], false); }
+                // **The opener's choice, carried on the open frame.** This end
+                // has no `--map` -- it has a catalogue -- so the only way for a
+                // reply to honour what was asked for is for the request to have
+                // said it. Before that it always retransmitted, which did half
+                // of what `no-retrans` means.
+                Ok(n) => { sessions.send(id, &buf[..n], no_retrans); }
                 // **Ends the session rather than continuing.** On Linux a
                 // connected UDP socket reports the target's ICMP port
                 // unreachable here, and a target that is not listening is one
@@ -1274,6 +1277,7 @@ async fn open_session(
     sessions: &Arc<Sessions>,
     id: u32,
     service: &str,
+    no_retrans: bool,
 ) -> anyhow::Result<msquic_async::Stream> {
     let probe = crate::frame::RECEIVES_OVERSIZE_ON_STREAM && sessions.peer_oversize.should_probe();
     let mut stream = sessions
@@ -1290,7 +1294,9 @@ async fn open_session(
         &Open::Udp {
             service: service.to_owned(),
             session: id,
-            oversize_on_stream: probe,
+            // The capability and the choice travel together: the options are
+            // meaningless without it, which is why the type nests them.
+            oversize: probe.then_some(crate::frame::OversizeOptions { no_retrans }),
         },
     )
     .await?;
@@ -1343,7 +1349,7 @@ async fn run_session(
     outbound: &Queue,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let mut stream = open_session(sessions, id, service).await?;
+    let mut stream = open_session(sessions, id, service, no_retrans).await?;
     tracing::debug!(%from, service, id, "a UDP session opened");
 
     let mut unexpected = [0_u8; 1];

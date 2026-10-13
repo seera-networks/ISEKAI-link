@@ -103,6 +103,21 @@ const KIND_UDP_BIG: u8 = 2;
 /// to send is the honest order — see [`RECEIVES_OVERSIZE_ON_STREAM`].
 pub(crate) const KIND_BIG_DATAGRAM: u8 = 3;
 
+/// Options on a [`KIND_UDP_BIG`] open, as a bit set.
+///
+/// **One byte on that kind's frame and no other.** [`KIND_UDP`]'s layout is in
+/// 0.6.0 and cannot grow; `KIND_UDP_BIG` has never shipped, so adding to it
+/// costs nobody a migration — which is why this is a byte rather than the
+/// third and fourth UDP kinds a product of options would have needed.
+///
+/// **Unknown bits are refused, not ignored.** A byte an implementation does not
+/// read is the hazard §5.1 names, and the point of an option here is that the
+/// *answerer* acts on it: silently dropping one would leave an operator having
+/// asked for something that quietly did not happen. The cost is that adding an
+/// option needs the same care as adding a kind.
+const OPTION_NO_RETRANS: u8 = 0x01;
+const KNOWN_OPTIONS: u8 = OPTION_NO_RETRANS;
+
 /// Bytes of header on an oversize-datagram stream: version, kind, session id.
 ///
 /// **Six, not seven.** An [`Open`]'s head is three bytes because its third is
@@ -158,9 +173,9 @@ pub enum Open {
     Udp {
         service: String,
         session: u32,
-        /// Whether the **opener** can receive oversize datagrams on
-        /// unidirectional streams, which is what picks [`KIND_UDP_BIG`] over
-        /// [`KIND_UDP`] on the wire.
+        /// `None` when the **opener** cannot receive oversize datagrams on
+        /// unidirectional streams, which is what picks [`KIND_UDP`] over
+        /// [`KIND_UDP_BIG`] on the wire.
         ///
         /// **It says what the opener can receive, not what it wants to send**,
         /// and one exchange settles both directions: the answerer learns from
@@ -170,8 +185,28 @@ pub enum Open {
         /// Reading this is what records the peer's half — ignore it and a
         /// forward will go on dropping oversize payloads against a peer that
         /// could have taken them.
-        oversize_on_stream: bool,
+        ///
+        /// `Some` carries the opener's choices for the session. An `Option`
+        /// rather than two booleans because the options are meaningless
+        /// without the capability, and the type is the place to say so once.
+        oversize: Option<OversizeOptions>,
     },
+}
+
+/// What the opener asked for, for oversize datagrams on this session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OversizeOptions {
+    /// **Neither end retransmits them**, in either direction.
+    ///
+    /// From the opener's `--map udp+no-retrans:`. It travels because the
+    /// choice is about the conversation rather than about one end's sends: the
+    /// large half of a request/response pair is usually the response, and a
+    /// forward whose answers were retransmitted while its questions were not
+    /// would have honoured half of what was asked for.
+    ///
+    /// The answerer holds it for the session's life and applies it to every
+    /// reply.
+    pub no_retrans: bool,
 }
 
 impl Open {
@@ -206,19 +241,27 @@ where
     bytes.push(VERSION);
     bytes.push(match open {
         Open::Tcp { .. } => KIND_TCP,
+        Open::Udp { oversize: None, .. } => KIND_UDP,
         Open::Udp {
-            oversize_on_stream: false,
-            ..
-        } => KIND_UDP,
-        Open::Udp {
-            oversize_on_stream: true,
-            ..
+            oversize: Some(_), ..
         } => KIND_UDP_BIG,
     });
     bytes.push(service.len() as u8);
     bytes.extend_from_slice(service.as_bytes());
-    if let Open::Udp { session, .. } = open {
+    if let Open::Udp {
+        session, oversize, ..
+    } = open
+    {
         bytes.extend_from_slice(&session.to_be_bytes());
+        // Only on the big kind, whose layout has never shipped. `KIND_UDP`'s
+        // is in 0.6.0 and ends at the session id.
+        if let Some(options) = oversize {
+            let mut byte = 0;
+            if options.no_retrans {
+                byte |= OPTION_NO_RETRANS;
+            }
+            bytes.push(byte);
+        }
     }
     // One write, so the whole request lands in one QUIC frame where it fits.
     stream
@@ -278,10 +321,27 @@ where
                 .read_exact(&mut session)
                 .await
                 .context("the stream ended before the UDP session id")?;
+            let oversize = if kind == KIND_UDP_BIG {
+                let mut options = [0_u8; 1];
+                stream
+                    .read_exact(&mut options)
+                    .await
+                    .context("the stream ended before the oversize options")?;
+                anyhow::ensure!(
+                    options[0] & !KNOWN_OPTIONS == 0,
+                    "unknown oversize options {:#04x} for service `{service}`",
+                    options[0],
+                );
+                Some(OversizeOptions {
+                    no_retrans: options[0] & OPTION_NO_RETRANS != 0,
+                })
+            } else {
+                None
+            };
             Ok(Open::Udp {
                 service,
                 session: u32::from_be_bytes(session),
-                oversize_on_stream: kind == KIND_UDP_BIG,
+                oversize,
             })
         }
         other => anyhow::bail!("unknown open kind {other} for service `{service}`"),
@@ -379,7 +439,7 @@ mod tests {
             Open::Udp {
                 service: "dns".to_owned(),
                 session: 0xdead_beef,
-                oversize_on_stream: false,
+                oversize: None,
             },
         ] {
             let (mut a, mut b) = tokio::io::duplex(64);
@@ -401,7 +461,7 @@ mod tests {
         let udp = Open::Udp {
             service: "dns".to_owned(),
             session: 1,
-            oversize_on_stream: false,
+            oversize: None,
         };
         assert_eq!(tcp.protocol(), Protocol::Tcp);
         assert_eq!(udp.protocol(), Protocol::Udp);
@@ -413,25 +473,28 @@ mod tests {
         assert_ne!(wire, other, "and they are different bytes");
     }
 
-    /// **The capability rides on the kind byte and nothing else.** Both UDP
-    /// kinds look the same under the catalogue and differ in one byte, which is
-    /// what lets a peer that does not know the second one refuse that open
-    /// alone.
+    /// **What the catalogue sees is identical.** The two UDP kinds differ in
+    /// the kind byte, and since S3 the big one carries an options byte too —
+    /// but `protocol()` and `service()` agree, which is the property §4.3
+    /// needs: a UDP service must not become reachable a second way by being
+    /// asked for differently.
+    ///
+    /// This test used to assert the frames differed in exactly one byte. That
+    /// was true until the options byte, and the claim it was protecting is the
+    /// one below rather than the arithmetic.
     #[tokio::test]
-    async fn the_two_udp_kinds_differ_in_one_byte_and_agree_on_everything_else() {
+    async fn the_two_udp_kinds_are_the_same_request_to_the_catalogue() {
         let plain = Open::Udp {
             service: "dns".to_owned(),
             session: 7,
-            oversize_on_stream: false,
+            oversize: None,
         };
         let big = Open::Udp {
             service: "dns".to_owned(),
             session: 7,
-            oversize_on_stream: true,
+            oversize: Some(OversizeOptions::default()),
         };
 
-        // The same protocol, so the catalogue cannot tell them apart -- a UDP
-        // service must not become reachable a second way by asking differently.
         assert_eq!(plain.protocol(), big.protocol());
         assert_eq!(plain.service(), big.service());
 
@@ -439,10 +502,14 @@ mod tests {
         write_open(&mut a, &plain).await.expect("write");
         let mut b = Vec::new();
         write_open(&mut b, &big).await.expect("write");
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a[0], b[0], "the same version");
-        assert_eq!(a[2..], b[2..], "and the same everything after the kind");
-        assert_eq!((a[1], b[1]), (KIND_UDP, KIND_UDP_BIG));
+        assert_eq!((a[1], b[1]), (KIND_UDP, KIND_UDP_BIG), "the kind differs");
+        assert_eq!(a[0], b[0], "the version does not");
+        assert_eq!(
+            a[2..],
+            b[2..a.len()],
+            "and everything up to the plain kind's end is the same",
+        );
+        assert_eq!(b.len(), a.len() + 1, "the big one adds its options byte");
     }
 
     /// **An unknown kind is refused after the name and before the session
@@ -488,7 +555,7 @@ mod tests {
         let open = Open::Udp {
             service: "dns".to_owned(),
             session: 7,
-            oversize_on_stream: true,
+            oversize: Some(OversizeOptions::default()),
         };
         let mut wire = Vec::new();
         write_open(&mut wire, &open).await.expect("write");
@@ -504,6 +571,67 @@ mod tests {
                 "and says so: {err}",
             );
         }
+    }
+
+    /// **The options byte rides on the big kind and nowhere else.** `KIND_UDP`'s
+    /// layout is in 0.6.0 and ends at the session id; this kind has never
+    /// shipped, which is what makes a byte cheaper than the third and fourth
+    /// UDP kinds a product of options would have needed.
+    #[tokio::test]
+    async fn the_oversize_options_survive_the_round_trip() {
+        for no_retrans in [false, true] {
+            let open = Open::Udp {
+                service: "dns".to_owned(),
+                session: 9,
+                oversize: Some(OversizeOptions { no_retrans }),
+            };
+            let mut wire = Vec::new();
+            write_open(&mut wire, &open).await.expect("write");
+            assert_eq!(wire[1], KIND_UDP_BIG);
+            // The session id and then one byte, which `KIND_UDP` does not have.
+            assert_eq!(wire.len(), 3 + 3 + 4 + 1);
+
+            if RECEIVES_OVERSIZE_ON_STREAM {
+                let read = read_open(&mut std::io::Cursor::new(wire))
+                    .await
+                    .expect("read");
+                assert_eq!(read, open, "no_retrans={no_retrans}");
+            }
+        }
+
+        // And the plain kind is exactly as long as it was.
+        let mut plain = Vec::new();
+        write_open(
+            &mut plain,
+            &Open::Udp {
+                service: "dns".to_owned(),
+                session: 9,
+                oversize: None,
+            },
+        )
+        .await
+        .expect("write");
+        assert_eq!(plain.len(), 3 + 3 + 4, "0.6.0's layout is untouched");
+    }
+
+    /// **An option this build does not know is refused, not dropped.** The
+    /// answerer is what acts on these, so ignoring one would leave an operator
+    /// having asked for something that quietly did not happen — which is the
+    /// hazard that kept the capability off a trailing byte in the first place.
+    #[tokio::test]
+    async fn an_unknown_oversize_option_is_refused() {
+        let mut wire = vec![VERSION, KIND_UDP_BIG, 3];
+        wire.extend_from_slice(b"dns");
+        wire.extend_from_slice(&9_u32.to_be_bytes());
+        wire.push(0x80); // nothing defines this bit
+        let err = read_open(&mut std::io::Cursor::new(wire))
+            .await
+            .expect_err("refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("unknown oversize options"),
+            "and says which: {message}",
+        );
     }
 
     /// A name arriving in pieces is the normal case on a real stream, and
@@ -525,7 +653,7 @@ mod tests {
             Open::Udp {
                 service: "dns".to_owned(),
                 session: 7,
-                oversize_on_stream: false,
+                oversize: None,
             },
         );
     }

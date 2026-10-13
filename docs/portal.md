@@ -484,9 +484,10 @@ portal-client --map udp+no-retrans:5353:dns
 
 Oversize datagrams on that forward are given up on at the first sign of loss
 instead of being retransmitted — UDP's own semantics, at the cost of the
-datagram. It applies to what the client sends; replies always retransmit. A
-large DNS answer wants the default; a protocol whose data is stale once it is
-late wants this.
+datagram. **It covers both directions**: the choice goes out with the session,
+so the server's replies honour it too. That matters because the large half of a
+request and its answer is usually the answer. A large DNS answer wants the
+default; a protocol whose data is stale once it is late wants this.
 
 > One number worth knowing before choosing: a datagram spread over N packets
 > with no retransmission is lost at roughly N times a single packet's rate. A

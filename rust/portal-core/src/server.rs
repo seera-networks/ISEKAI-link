@@ -244,12 +244,14 @@ async fn forward_one(
         }
     };
 
-    let session = match open {
+    // **The opener's choice, for this session's replies.** Carried on the open
+    // frame rather than inferred: the large half of a request/response pair is
+    // usually the response, so honouring `no-retrans` only for the opener's own
+    // sends would have done half of what was asked for.
+    let (session, no_retrans) = match open {
         Open::Tcp { .. } => return forward_tcp(stream, &service, target).await,
         Open::Udp {
-            session,
-            oversize_on_stream,
-            ..
+            session, oversize, ..
         } => {
             // **The answerer's half of §5.2's negotiation.** The opener said
             // whether it can receive oversize datagrams on streams by which
@@ -259,13 +261,16 @@ async fn forward_one(
             //
             // Answering at all is this end's half: a peer that does not know
             // the kind never gets here, because `read_open` refuses it.
-            sessions.learn_peer_told_oversize(oversize_on_stream);
-            session
+            sessions.learn_peer_told_oversize(oversize.is_some());
+            (session, oversize.is_some_and(|o| o.no_retrans))
         }
     };
     // From here the stream carries no bytes: it is the session's lifetime
     // handle and the payloads are datagrams.
-    crate::udp::serve(sessions, session, &service, target, stream, shutdown).await
+    crate::udp::serve(
+        sessions, session, &service, no_retrans, target, stream, shutdown,
+    )
+    .await
 }
 
 /// One forwarded TCP connection, from the status byte to the last byte copied.
