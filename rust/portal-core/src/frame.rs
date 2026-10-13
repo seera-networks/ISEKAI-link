@@ -294,10 +294,10 @@ where
 /// is why nothing here is a length prefix. See
 /// `docs/portal_oversize_udp_plan.md` §2.1.
 ///
-/// Three bytes of head rather than two: the version is here for the same reason
-/// it is on an [`Open`], and the session id matches [`crate::datagram`]'s
-/// header in meaning and width so the assembled payload can join the same
-/// queue.
+/// The version is here for the same reason it is on an [`Open`], and the
+/// session id matches [`crate::datagram`]'s header in meaning and width so the
+/// assembled payload can join the same queue. Six bytes in all — see
+/// [`BIG_DATAGRAM_HEAD`], which says why not seven.
 pub(crate) async fn read_big_datagram_head<R>(stream: &mut R) -> anyhow::Result<u32>
 where
     R: AsyncReadExt + Unpin,

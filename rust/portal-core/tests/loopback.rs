@@ -191,6 +191,15 @@ struct Halves {
     /// `Connection` clone, so [`drain`] has to let it go before it waits —
     /// exactly what `session::Connected::close` does in the real client.
     sessions: Option<Arc<Sessions>>,
+    /// The **server's** side of the connection, for the one test that has to
+    /// send something the server never sends.
+    ///
+    /// Everything else in this file drives the server through the client, which
+    /// is the right way round. A unidirectional stream towards the client is
+    /// the exception: S3 does not exist, so nothing on the server opens one,
+    /// and the client's receive bounds would otherwise have no way to be
+    /// observed — its `Sessions` is the only one a test can read counters from.
+    peer_side: Option<msquic_async::Connection>,
     teardown: Teardown,
 }
 
@@ -294,11 +303,16 @@ async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
     };
 
     let serving = shutdown.clone();
+    let (peer_tx, peer_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         tokio::select! {
             _ = serving.cancelled() => {}
             accepted = listener.accept() => {
                 if let Ok(conn) = accepted {
+                    // Cloned before `serve` takes it. A clone is a handle, so
+                    // `drain` has to see it dropped -- which is why `Halves`
+                    // holds it in an `Option` like the two beside it.
+                    let _ = peer_tx.send(conn.clone());
                     let _ = server::serve(conn, catalogue, serving.clone()).await;
                 }
             }
@@ -340,6 +354,13 @@ async fn connected_with_idle(catalogue: Catalogue, idle: Duration) -> Halves {
     Halves {
         session: Some(session),
         sessions: Some(sessions),
+        // Arrives once the handshake the dial above completed is accepted, so
+        // it is already there; a timeout rather than a `blocking` wait because
+        // a failure here should say what it was.
+        peer_side: tokio::time::timeout(DIAL_BUDGET, peer_rx)
+            .await
+            .expect("the listener accepted inside the dial budget")
+            .ok(),
         teardown,
     }
 }
@@ -722,6 +743,36 @@ async fn a_reused_session_id_is_refused() {
     drain(halves).await;
 }
 
+/// Put one oversize datagram on a unidirectional stream of its own.
+///
+/// Returns the stream, because **the caller has to keep it until the drain**: a
+/// finished stream is still a handle the registration waits on, and dropping it
+/// early is what made the first version of these tests fail with every
+/// assertion passing.
+///
+/// The head comes from `frame::big_datagram_head` — the real writer — because a
+/// test that spells out bytes stops testing the format the moment the format
+/// moves.
+async fn send_big_datagram(halves: &Halves, session: u32, payload: &[u8]) -> msquic_async::Stream {
+    let mut stream = halves
+        .connection()
+        .open_outbound_stream(StreamType::Unidirectional, false)
+        .await
+        .expect("open a unidirectional stream");
+    stream
+        .write_all(&frame::big_datagram_head(session))
+        .await
+        .expect("write the head");
+    stream.write_all(payload).await.expect("write the payload");
+    // **Finished, not dropped.** Closing a stream that has not finished aborts
+    // it and the datagram never lands -- `camera_core::video::push_one` and
+    // `server::refuse` both say so, and S3's send path will do the same.
+    std::future::poll_fn(|cx| stream.poll_finish_write(cx))
+        .await
+        .expect("finish the stream");
+    stream
+}
+
 /// **The oversize receive path, end to end.** A payload larger than
 /// `MAX_PAYLOAD` crosses on a unidirectional stream of its own and reaches the
 /// service — which is the whole of S2, and the first time anything larger than
@@ -766,22 +817,7 @@ async fn an_oversize_datagram_arrives_on_a_stream_of_its_own() {
     // Four kilobytes: comfortably past `MAX_PAYLOAD`, and the size a large DNS
     // answer actually is.
     let payload = vec![0xa5_u8; 4096];
-    let mut stream = halves
-        .connection()
-        .open_outbound_stream(StreamType::Unidirectional, false)
-        .await
-        .expect("open a unidirectional stream");
-    stream
-        .write_all(&frame::big_datagram_head(42))
-        .await
-        .expect("write the head");
-    stream.write_all(&payload).await.expect("write the payload");
-    // **Finished, not dropped.** Closing a stream that has not finished aborts
-    // it and the datagram never lands -- `camera_core::video::push_one` and
-    // `server::refuse` both say so, and S3's send path will do the same.
-    std::future::poll_fn(|cx| stream.poll_finish_write(cx))
-        .await
-        .expect("finish the stream");
+    let stream = send_big_datagram(&halves, 42, &payload).await;
 
     let got = tokio::time::timeout(Duration::from_secs(5), arrived.recv())
         .await
@@ -800,39 +836,111 @@ async fn an_oversize_datagram_arrives_on_a_stream_of_its_own() {
 /// **A stream claiming more than UDP can carry is refused, not assembled.**
 /// Nothing this protocol sends is that large, so the only way to see one is a
 /// peer choosing how much memory this end should take.
+///
+/// **The session is held open throughout**, and the first version of this test
+/// was worthless for not doing that: `udp_status` drops the lifetime stream
+/// when it returns, so the server tore the session down before the oversize
+/// stream was read and "the service heard nothing" would have passed with the
+/// size check deleted — the delivery would simply have landed on
+/// `unknown_session` instead. A good oversize datagram afterwards is what
+/// separates "the size was refused" from "there was nothing to deliver to".
 #[tokio::test]
 async fn a_stream_larger_than_a_datagram_can_be_is_dropped() {
     let (target, mut arrived) = recording_datagram_service().await;
     let halves = connected(Catalogue::new().with("dns", Protocol::Udp, target)).await;
-    assert_eq!(udp_status(&halves, "dns", 43).await, frame::Status::Ready);
 
-    let mut stream = halves
+    let mut session = halves
         .connection()
-        .open_outbound_stream(StreamType::Unidirectional, false)
+        .open_outbound_stream(StreamType::Bidirectional, false)
         .await
-        .expect("open a unidirectional stream");
-    stream
-        .write_all(&frame::big_datagram_head(43))
-        .await
-        .expect("write the head");
-    stream
-        .write_all(&vec![0_u8; MAX_STREAM_PAYLOAD + 1])
-        .await
-        .expect("write one byte too many");
-    std::future::poll_fn(|cx| stream.poll_finish_write(cx))
-        .await
-        .expect("finish the stream");
+        .expect("open a stream");
+    frame::write_open(
+        &mut session,
+        &frame::Open::Udp {
+            service: "dns".to_owned(),
+            session: 43,
+            oversize_on_stream: true,
+        },
+    )
+    .await
+    .expect("write the open");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), frame::read_status(&mut session))
+            .await
+            .expect("the peer answered within five seconds")
+            .expect("read the status"),
+        frame::Status::Ready,
+    );
 
-    // Nothing reaches the service. A small one after it still does, so what was
-    // refused was the size and not the session.
+    let too_big = send_big_datagram(&halves, 43, &vec![0_u8; MAX_STREAM_PAYLOAD + 1]).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(500), arrived.recv())
             .await
             .is_err(),
-        "the oversize stream delivered nothing",
+        "one byte over what UDP can carry delivered nothing",
     );
 
-    drop(stream);
+    // The session is still there and still works, so what was refused was the
+    // size rather than the destination.
+    let fine = vec![0x5a_u8; 4096];
+    let good = send_big_datagram(&halves, 43, &fine).await;
+    let got = tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .expect("the service heard the good one within five seconds")
+        .expect("a datagram");
+    assert_eq!(got, fine);
+
+    drop(too_big);
+    drop(good);
+    drop(session);
+    drain(halves).await;
+}
+
+/// **A stream that never finishes is given up on, and counted.** The reader
+/// holds an `Arc<Sessions>`, and so a `Connection` clone — a handle
+/// `RegistrationClose` blocks on, which is the hazard
+/// `Sessions::start_with_idle` and `session::Connected::close` both describe.
+/// Without a bound, a peer that writes the six-byte head and stops keeps that
+/// task parked until the connection dies, and the transport lets it do so a
+/// hundred times over.
+///
+/// Measured on the **client's** `Sessions`, because its counters are the only
+/// ones a test can read — hence `Halves::peer_side`, since nothing on the
+/// server opens a unidirectional stream until S3.
+#[tokio::test]
+async fn a_stream_that_never_finishes_is_given_up_on() {
+    let target = shouting_datagram_service().await;
+    let idle = Duration::from_millis(300);
+    let halves = connected_with_idle(Catalogue::new().with("dns", Protocol::Udp, target), idle).await;
+
+    let mut stalled = halves
+        .peer_side
+        .as_ref()
+        .expect("the server side of the connection")
+        .open_outbound_stream(StreamType::Unidirectional, false)
+        .await
+        .expect("open a unidirectional stream towards the client");
+    stalled
+        .write_all(&frame::big_datagram_head(45))
+        .await
+        .expect("write the head");
+    // And now nothing: no payload, no FIN. Held rather than dropped, because
+    // dropping resets the stream and the reader would finish for that reason
+    // instead of for the one this test is about.
+
+    // Generously past the deadline, which is `idle` above.
+    tokio::time::sleep(idle * 3).await;
+    assert_eq!(
+        halves
+            .sessions()
+            .drops
+            .stream_lost
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the reader gave up on it rather than waiting for the connection to end",
+    );
+
+    drop(stalled);
     drain(halves).await;
 }
 
@@ -981,8 +1089,9 @@ async fn exchange(client: &mut TcpStream, message: &[u8; 5]) -> [u8; 5] {
 async fn drain(mut halves: Halves) {
     halves.teardown.shutdown.cancel();
     let session = halves.session.take().expect("drained once");
-    // Before the wait, not during it: see the field's own comment.
+    // Before the wait, not during it: see the fields' own comments.
     drop(halves.sessions.take());
+    drop(halves.peer_side.take());
     drop(halves);
     let drained = session.drain(Duration::from_secs(5)).await;
     assert!(drained, "the registration still had live handles after 5s");

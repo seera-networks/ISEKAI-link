@@ -153,12 +153,36 @@ pub const QUEUE_BYTES: usize = 128 * 1024;
 /// size is.
 pub const MAX_STREAM_PAYLOAD: usize = 65_507;
 
+/// The largest payload this build can actually put on the wire.
+///
+/// **[`MAX_PAYLOAD`] until S3**, which adds the stream carrier and makes this
+/// [`MAX_STREAM_PAYLOAD`]. One name for it, because two places need the same
+/// answer and they would otherwise drift: the queue refuses what cannot leave,
+/// and the send path counts what it was handed anyway.
+///
+/// It exists because of what the byte bound changed. A payload over this is
+/// dropped at [`crate::udp::Sessions::send`] whatever happens, and queueing one
+/// first used to cost a 64th of the depth; under [`QUEUE_BYTES`] a 64 KB
+/// payload that can never leave takes **half the session's budget** and evicts
+/// the small datagrams behind it. So the refusal moved to where the size is
+/// first known.
+pub const SENDABLE_PAYLOAD: usize = MAX_PAYLOAD;
+
 /// One datagram must always fit after the queue is emptied, or [`Queue::push`]
 /// would evict everything and still exceed the bound.
 ///
-/// Checked here rather than guarded at runtime: it is a property of two
-/// constants, so a build that breaks it should not compile.
+/// Checked here rather than guarded at runtime: it is a property of constants,
+/// so a build that breaks it should not compile.
+///
+/// **Both carriers, and the first version of this named only one.** The largest
+/// thing [`Queue::push`] can be handed is not [`MAX_STREAM_PAYLOAD`]: a local
+/// socket read fills [`crate::udp::RECV_BUFFER`] bytes (65536, twenty-nine more
+/// than UDP's own maximum, because a read that truncates says nothing about
+/// it). Asserting the smaller of the two held only because both are far under
+/// 128 KB — a `QUEUE_BYTES` between them would have compiled with the promise
+/// above false.
 const _: () = assert!(MAX_STREAM_PAYLOAD <= QUEUE_BYTES);
+const _: () = assert!(crate::udp::RECV_BUFFER <= QUEUE_BYTES);
 
 /// Frame `payload` for `session`, or `None` if it will not fit.
 ///
