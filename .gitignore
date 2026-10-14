@@ -15,7 +15,13 @@
 # of them and reached a pull request.
 *.pem
 # The one PEM that is meant to be here: a public CA bundle, no key in it.
+# **One line per app.** The rule above is by shape, so each app that ships the
+# bundle needs its own exception; android-portal's was missing, and the app
+# reached main unable to complete a single TLS handshake -- quictls had no
+# roots, so every connection died as "connection lost" before pairing could
+# even be attempted.
 !android/app/src/main/assets/cacert.pem
+!android-portal/app/src/main/assets/cacert.pem
 
 # Auth0 tokens the camera apps store after a device sign-in. The refresh token
 # in here mints access tokens for the signed-in account until it is revoked, so

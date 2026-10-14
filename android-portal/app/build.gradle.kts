@@ -33,20 +33,51 @@ val generateUniFfiBindings by tasks.registering(Exec::class) {
     )
 }
 
+/**
+ * Which ABIs to cross-compile for.
+ *
+ * **`arm64-v8a` alone is what a phone needs, and what every release should
+ * carry.** An emulator on an x86_64 host needs `x86_64` as well, and an arm64
+ * system image is not an answer there: there is no hardware acceleration for
+ * it, so the image falls back to full instruction emulation. Running this app
+ * against an emulator -- which is the only way to exercise it without a phone
+ * in hand, and the only way to drive a network change on demand -- therefore
+ * means building a second ABI:
+ *
+ *     ./gradlew -PportalAbis=arm64-v8a,x86_64 assembleDebug
+ *
+ * A property rather than a second hardcoded entry, because each ABI is a full
+ * native build of msquic and quictls: paying for both on every phone build
+ * would be minutes for nothing.
+ */
+val portalAbis: List<String> =
+    (findProperty("portalAbis") as String? ?: "arm64-v8a").split(",").map { it.trim() }
+
+/** cargo's target triple for each Android ABI name. */
+val rustTargetOf = mapOf(
+    "arm64-v8a" to "aarch64-linux-android",
+    "x86_64" to "x86_64-linux-android",
+    "armeabi-v7a" to "armv7-linux-androideabi",
+    "x86" to "i686-linux-android",
+)
+
 val generateJniLibs by tasks.registering(Exec::class) {
     group = "build"
     description = "Cross-compile portal-client-ffi into app/src/main/jniLibs"
     workingDir = file("$rustDir/portal-client-ffi")
     commandLine(
-        "cargo", "ndk",
-        "-t", "arm64-v8a",
-        // Same floor as the camera app, same reason: seera-msquic's
-        // selfsign_openssl.c needs glob()/globfree(), bionic only declares
-        // those from API 28, and the whole native cross-compile targets 29
-        // for consistency with quictls's own hardcoded sub-build API level.
-        "--platform", "29",
-        "-o", file("src/main/jniLibs").absolutePath,
-        "build",
+        listOf("cargo", "ndk") +
+            portalAbis.flatMap { listOf("-t", it) } +
+            listOf(
+                // Same floor as the camera app, same reason: seera-msquic's
+                // selfsign_openssl.c needs glob()/globfree(), bionic only
+                // declares those from API 28, and the whole native
+                // cross-compile targets 29 for consistency with quictls's own
+                // hardcoded sub-build API level.
+                "--platform", "29",
+                "-o", file("src/main/jniLibs").absolutePath,
+                "build",
+            ),
     )
     doLast {
         // cargo-ndk only copies portal-client-ffi's own cdylib. As of the
@@ -58,15 +89,23 @@ val generateJniLibs by tasks.registering(Exec::class) {
         // swallowed at startup by endpointIdOf's runCatching, so the app
         // looked fine until Pair/Connect crashed the process outright). Copy
         // it in by hand alongside the crate's own .so.
-        val libmsquic = fileTree("$rustDir/portal-client-ffi/target/aarch64-linux-android/debug/build") {
-            include("**/out/lib/libmsquic.so")
-        }.files.maxByOrNull { it.lastModified() }
-            ?: throw GradleException(
-                "libmsquic.so not found under portal-client-ffi's aarch64-linux-android build output"
-            )
-        copy {
-            from(libmsquic)
-            into(file("src/main/jniLibs/arm64-v8a"))
+        //
+        // **Per ABI.** Each one builds its own msquic, and a .so from the
+        // wrong architecture in a jniLibs directory is an install-time
+        // failure rather than a build one.
+        for (abi in portalAbis) {
+            val triple = rustTargetOf[abi]
+                ?: throw GradleException("no cargo target known for ABI $abi")
+            val libmsquic = fileTree("$rustDir/portal-client-ffi/target/$triple/debug/build") {
+                include("**/out/lib/libmsquic.so")
+            }.files.maxByOrNull { it.lastModified() }
+                ?: throw GradleException(
+                    "libmsquic.so not found under portal-client-ffi's $triple build output"
+                )
+            copy {
+                from(libmsquic)
+                into(file("src/main/jniLibs/$abi"))
+            }
         }
     }
 }
