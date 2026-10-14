@@ -223,7 +223,15 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
     var paired by remember { mutableStateOf(pairedEndpoint.isNotEmpty()) }
     var session by remember { mutableStateOf<PortalSession?>(null) }
     var localPort by remember { mutableStateOf<Int?>(null) }
-    var status by remember { mutableStateOf("") }
+    // Says who the remembered pairing is with, at launch. Without it the only
+    // visible difference a restored pairing makes is that Connect is enabled,
+    // and a *stale* one -- `portal-server` reinstalled with a new key -- looks
+    // identical to a good one until the connect fails. Naming the Endpoint is
+    // what makes "this is not the server I am looking at" something a person
+    // can notice, and re-pairing the obvious next move.
+    var status by remember {
+        mutableStateOf(if (pairedEndpoint.isEmpty()) "" else "Paired with $pairedEndpoint")
+    }
     var statusIsError by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
 
@@ -407,6 +415,15 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
                 snapshotFlow { wakeRetry }.first { it != waking }
             }
         }
+    }
+
+    // **A token arriving is a wake.** `connectSession` parks the redialer on
+    // an `AuthError` rather than returning, precisely so a sign-in can start
+    // it again -- but nothing was telling it one had happened, so the park
+    // only ever ended on a tap or a network change. Signing in, or pasting a
+    // token, now says so.
+    LaunchedEffect(canAuthenticate) {
+        if (canAuthenticate) wakeRetry++
     }
 
     // Notice when the OS moves the default network out from under a session
@@ -619,14 +636,22 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
                             // Written here rather than at connect time: this
                             // is the one moment the Endpoint ID is known to
                             // be the one a Grant was just made for.
-                            runCatching {
+                            //
+                            // A failure is said out loud rather than
+                            // swallowed. The Grant is real either way -- it is
+                            // the control plane's, not this file's -- but a
+                            // silent failure would promise that the next
+                            // launch remembers, and then quietly want a
+                            // pairing code again with nothing explaining why.
+                            val kept = runCatching {
                                 pairedFile.writeText(updated.expectedEndpoint)
-                            }
+                            }.isSuccess
                             statusIsError = false
                             // A standing grant now -- no listener id to show;
                             // the server's Endpoint ID is what a restart
                             // cannot invalidate.
-                            status = "Paired with ${updated.expectedEndpoint}"
+                            status = "Paired with ${updated.expectedEndpoint}" +
+                                if (kept) "" else " (could not be saved -- this app will ask to pair again next launch)"
                         } catch (e: Exception) {
                             statusIsError = true
                             status = "Pair failed: ${e.message}"
@@ -650,7 +675,15 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
                     wanted = true
                     wakeRetry++
                 },
-                enabled = !busy && !connecting && paired && session == null,
+                // **`canAuthenticate` is new here, and it is not new in
+                // spirit.** `paired` could previously only become true by way
+                // of a successful Pair, which is gated on it -- so Connect was
+                // unreachable while signed out without anyone saying so. A
+                // remembered pairing removes that accident: without this the
+                // button would be live on a signed-out launch, spend an
+                // attempt, and park on an auth error.
+                enabled = !busy && !connecting && paired && canAuthenticate &&
+                    session == null,
             ) { Text("Connect") }
 
             Button(
