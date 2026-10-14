@@ -420,9 +420,20 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
     // **A token arriving is a wake.** `connectSession` parks the redialer on
     // an `AuthError` rather than returning, precisely so a sign-in can start
     // it again -- but nothing was telling it one had happened, so the park
-    // only ever ended on a tap or a network change. Signing in, or pasting a
-    // token, now says so.
-    LaunchedEffect(canAuthenticate) {
+    // only ever ended on a tap or a network change.
+    //
+    // **Keyed on the tokens, not on `canAuthenticate`.** That boolean is an
+    // OR, and the case this exists for hides inside it: with a token left in
+    // the fallback field *and* an Auth0 session, an access token that expires
+    // with no refresh token (this app asks for no `offline_access`, so that
+    // is the ordinary ending) makes `AuthStore` sign out and throw
+    // `SessionExpired`. The redialer parks -- and `canAuthenticate` never
+    // moved, because the stale manual token still counts. Signing in again
+    // would not move it either, so the one event this is here to notice would
+    // be the one it slept through. `manualToken` by its blankness rather than
+    // its text, or every keystroke while pasting a token would cut a backoff
+    // short.
+    LaunchedEffect(authTokens, manualToken.isNotBlank()) {
         if (canAuthenticate) wakeRetry++
     }
 
@@ -633,6 +644,16 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
                             config = updated
                             register = false
                             paired = true
+                            // **Re-pairing is the documented recovery from a
+                            // stale pairing, so make it land.** The redialer
+                            // may be mid-backoff against the Endpoint that
+                            // just got replaced; without this it waits out the
+                            // rest of it and then tries the old config once
+                            // more, and the "Paired with ..." below is
+                            // overwritten by its countdown within a second --
+                            // so a re-pair that worked reads on screen as a
+                            // continuing failure.
+                            wakeRetry++
                             // Written here rather than at connect time: this
                             // is the one moment the Endpoint ID is known to
                             // be the one a Grant was just made for.
@@ -646,6 +667,18 @@ fun PortalScreen(keyFile: File, pairedFile: File) {
                             val kept = runCatching {
                                 pairedFile.writeText(updated.expectedEndpoint)
                             }.isSuccess
+                            if (!kept) {
+                                // `writeText` truncates when it opens, so a
+                                // failure part-way through leaves an empty
+                                // file and the message below is true. A
+                                // failure to open at all leaves the *previous*
+                                // Endpoint sitting there -- so the next launch
+                                // would restore a pairing this one replaced,
+                                // name it on screen, and offer Connect against
+                                // a server that may no longer exist. Remove it
+                                // rather than let the message be a lie.
+                                runCatching { pairedFile.delete() }
+                            }
                             statusIsError = false
                             // A standing grant now -- no listener id to show;
                             // the server's Endpoint ID is what a restart
