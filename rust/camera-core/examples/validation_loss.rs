@@ -53,17 +53,36 @@ use tokio_util::sync::CancellationToken;
 
 const ALPN: &str = "validation-loss";
 
-/// When the path is given up on: `max(3 × PTO, 6 × InitialRtt)` on a path that
-/// has no RTT sample yet.
+/// Below this a path validated on its own; above it, a timer did it.
 ///
-/// A fresh path starts at `SmoothedRtt = InitialRtt = 333 ms` and
-/// `RttVariance = SmoothedRtt / 2` (`path.c:38`), so
-/// `PTO = 333 + 4 × 166.5 + 25 = 1024 ms` — the 25 is the peer's default
-/// `max_ack_delay` — and three of those is 3.072 s, above the `6 × 333 ms`
-/// floor. **`PathAdded` later than this is not #130's retry**: the path would
-/// already have been abandoned, so a late arrival means something else is going
-/// on and must not be read as the fix working.
-const DEADLINE: Duration = Duration::from_millis(3_072);
+/// **The discriminator is absolute, not relative.** The earliest a retry can
+/// land is `Timeout / 3`, and the smallest `Timeout` in play is the
+/// `6 × InitialRtt` floor of 1.998 s, so no retry arrives before ~666 ms, while
+/// every ordinary validation measured here is 2.6–17 ms. A multiplier on the
+/// control cannot separate those: a control at the fast end of that range sets
+/// a bar of ~12 ms, which a lossy run that *missed* the response and validated
+/// normally at ~13 ms would clear — and then print the one conclusion this
+/// file exists to avoid printing by accident.
+const RETRY_FLOOR: Duration = Duration::from_millis(500);
+
+/// The smallest the abandonment deadline gets, and so the latest a `PathAdded`
+/// can be and still be plainly a retry.
+///
+/// The deadline is `PathValidationStartTime + max(3 × PTO, 6 × InitialRtt)`,
+/// recomputed every time the timer is armed. Once the challenge has been acked
+/// — which it is, within microseconds, and which is §7.13's whole point — the
+/// path has an RTT sample, `3 × PTO` collapses, and the `6 × 333 ms` floor is
+/// what remains.
+const SAMPLED_DEADLINE: Duration = Duration::from_millis(1_998);
+
+/// The largest the deadline gets: a path that never got an RTT sample keeps
+/// `SmoothedRtt = InitialRtt = 333 ms` and `RttVariance = SmoothedRtt / 2`
+/// (`path.c:38`), so `PTO = 333 + 4 × 166.5 + 25 = 1024 ms` — the 25 being the
+/// peer's default `max_ack_delay` — and `3 × PTO = 3.072 s` wins.
+///
+/// Between the two the answer depends on which regime the path was in, so the
+/// verdicts between them say "look", not "the fix worked".
+const UNSAMPLED_DEADLINE: Duration = Duration::from_millis(3_072);
 
 /// The padded PATH_CHALLENGE fills the MTU; a PATH_RESPONSE does not.
 const BIG: usize = 1000;
@@ -139,10 +158,12 @@ async fn main() -> anyhow::Result<()> {
 
     // **Two, measured.** One is not enough: a single drop still validates in
     // ~2.6 ms, so the response is not the first packet back -- something else
-    // (the answerer's ack, or its own challenge) is ahead of it. Three and four
-    // both land at 1.334 s, which is *not* the second retry boundary the code
-    // predicts (`2 * Timeout / 3`, about 2.05 s); that one is untraced, so the
-    // claim here stops at the first retry.
+    // (the answerer's ack, or its own challenge) is ahead of it.
+    //
+    // Three and four both land at 1.334 s, which is the *second* boundary, and
+    // placing it is what turned up the recomputed `Timeout` the two constants
+    // above are about: `2 x 1.998/3 = 1.332 s` once the path has an RTT sample,
+    // not the `2 x 3.072/3 = 2.048 s` a constant `Timeout` would predict.
     let lossy = one_run(&reg, 2).await?;
     report("the answer lost", &lossy);
 
@@ -163,6 +184,10 @@ async fn main() -> anyhow::Result<()> {
             "INCONCLUSIVE: the lossy connection ended rather than running out of \
              window, so the absence of PathAdded says nothing about the path",
         ),
+        Outcome::Unwatched => println!(
+            "INCONCLUSIVE: the watcher failed, so this run observed nothing -- \
+             the connection and the path are both unmeasured",
+        ),
         _ if lossy.ate == 0 => println!(
             "INCONCLUSIVE: nothing was dropped -- the challenge detector never \
              tripped, so this was a second control, not a lossy run",
@@ -171,19 +196,27 @@ async fn main() -> anyhow::Result<()> {
             "BEFORE #130: a lost PATH_RESPONSE still costs the path -- the \
              challenge is not being re-sent",
         ),
-        Outcome::Added(slow) if slow >= DEADLINE => println!(
-            "UNEXPECTED: validated in {slow:?}, past the {DEADLINE:?} deadline, so \
-             this is not the retry -- the path should have been abandoned by then",
+        Outcome::Added(slow) if slow < RETRY_FLOOR => println!(
+            "UNEXPECTED: validated in {slow:?} against a {fast:?} control, with \
+             {} packet(s) dropped. Below the {RETRY_FLOOR:?} floor, so no timer \
+             was involved -- look at whether the drop hit the response",
+            lossy.ate,
         ),
-        Outcome::Added(slow) if slow > fast * 4 => println!(
-            "AFTER #130: the path came up anyway, and {slow:?} against {fast:?} \
-             is the retry doing it rather than the drop having missed",
+        Outcome::Added(slow) if slow < SAMPLED_DEADLINE => println!(
+            "AFTER #130: the path came up anyway, and {slow:?} -- past the \
+             {RETRY_FLOOR:?} floor against a {fast:?} control -- is the retry \
+             doing it rather than the drop having missed",
+        ),
+        Outcome::Added(slow) if slow < UNSAMPLED_DEADLINE => println!(
+            "LOOK: validated in {slow:?}, which is past the {SAMPLED_DEADLINE:?} \
+             deadline a path with an RTT sample has. Only a path that never got \
+             one can still be validating here, so say which before calling this \
+             the retry",
         ),
         Outcome::Added(slow) => println!(
-            "UNEXPECTED: validated in {slow:?} against a {fast:?} control, with \
-             {} packet(s) dropped. Too quick to be the retry -- look at whether \
-             the drop hit the response",
-            lossy.ate,
+            "UNEXPECTED: validated in {slow:?}, past the {UNSAMPLED_DEADLINE:?} \
+             deadline in every regime -- the path should have been abandoned, so \
+             this is not #130's retry",
         ),
     }
     Ok(())
@@ -194,11 +227,12 @@ struct Run {
     ate: usize,
 }
 
-/// **Three outcomes, not two.** "No `PathAdded`" has two causes that mean
-/// opposite things — the path was abandoned at its deadline, which is the
-/// result this example exists to see, or the connection itself ended, which
-/// says nothing about the path. Conflating them would let a connection failure
-/// print the strongest conclusion in the file.
+/// **Not two outcomes.** "No `PathAdded`" has several causes that mean
+/// different things — the path was abandoned at its deadline, which is the
+/// result this example exists to see; the connection itself ended, which says
+/// nothing about the path; or the watcher died, which says nothing about
+/// either. Conflating them would let a failure elsewhere print a conclusion
+/// about the path, or point the diagnosis at the wrong subsystem.
 enum Outcome {
     /// How long `add_path` took to produce `PathAdded`.
     Added(Duration),
@@ -206,6 +240,8 @@ enum Outcome {
     Abandoned,
     /// The connection ended first.
     Closed,
+    /// The watching task itself failed, so nothing was observed.
+    Unwatched,
 }
 
 fn report(what: &str, run: &Run) {
@@ -213,6 +249,7 @@ fn report(what: &str, run: &Run) {
         Outcome::Added(took) => format!("PathAdded after {took:?}"),
         Outcome::Abandoned => "no PathAdded within the window".to_owned(),
         Outcome::Closed => "the connection ended before any PathAdded".to_owned(),
+        Outcome::Unwatched => "nothing was watching -- the watcher failed".to_owned(),
     };
     println!("{what:>16}: {said} ({} dropped)", run.ate);
 }
@@ -257,8 +294,10 @@ async fn one_run(reg: &Arc<Registration>, eat: usize) -> anyhow::Result<Run> {
         Ok(Ok(Some(at))) => Outcome::Added(at - began),
         // `poll_event` returned an error, which is the connection ending.
         Ok(Ok(None)) => Outcome::Closed,
-        // The watcher itself died; nothing was observed, so claim nothing.
-        Ok(Err(_)) => Outcome::Closed,
+        // The watcher panicked. Nothing was observed, and in particular this
+        // is not the connection ending -- saying so would blame the wrong
+        // thing and bury the panic.
+        Ok(Err(_)) => Outcome::Unwatched,
         Err(_) => {
             watcher.abort();
             Outcome::Abandoned
