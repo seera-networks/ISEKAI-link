@@ -103,7 +103,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    PortalScreen(keyFile = File(filesDir, "endpoint_key.pem"))
+                    PortalScreen(
+                        keyFile = File(filesDir, "endpoint_key.pem"),
+                        pairedFile = File(filesDir, "paired_endpoint"),
+                    )
                 }
             }
         }
@@ -147,7 +150,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun PortalScreen(keyFile: File) {
+fun PortalScreen(keyFile: File, pairedFile: File) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val authStore = remember { AuthStore(context.applicationContext) }
@@ -179,6 +182,31 @@ fun PortalScreen(keyFile: File) {
     var manualToken by remember { mutableStateOf("") }
 
     var pairingCode by remember { mutableStateOf("") }
+
+    /**
+     * The Endpoint this key is paired with, remembered across launches.
+     *
+     * **A Grant survives a restart; this is what it takes for the app to act
+     * like it.** Pairing produces a standing Grant held by the control plane,
+     * keyed on `(server, client, protocol)` with no listener id — which is
+     * exactly why `portal-server` can restart without anyone re-pairing. The
+     * app had no record of it: `config.expectedEndpoint` started empty and
+     * `paired` started false on every launch, so Connect was disabled and the
+     * only way forward was to pair again, for a Grant already held. The
+     * comment on the pairing success path has said "the server's Endpoint ID
+     * is what a restart cannot invalidate" the whole time; the value was
+     * being thrown away one launch later.
+     *
+     * Plain internal storage beside `endpoint_key.pem`, not `SecureStore`:
+     * the peer's Endpoint ID is an identifier, not a credential — the app
+     * prints its own on screen — and `SecureStore` is scoped to the Auth0
+     * session on purpose. The Grant itself is not here to be stolen; it lives
+     * with the control plane and is bound to the key next to this file.
+     */
+    val pairedEndpoint = remember {
+        runCatching { if (pairedFile.exists()) pairedFile.readText().trim() else "" }
+            .getOrDefault("")
+    }
     var config by remember {
         mutableStateOf(
             PortalConfig(
@@ -187,12 +215,12 @@ fun PortalScreen(keyFile: File) {
                 protocol = PROTOCOL,
                 auth0Token = "",
                 service = SERVICE,
-                expectedEndpoint = "",
+                expectedEndpoint = pairedEndpoint,
                 register = register,
             )
         )
     }
-    var paired by remember { mutableStateOf(false) }
+    var paired by remember { mutableStateOf(pairedEndpoint.isNotEmpty()) }
     var session by remember { mutableStateOf<PortalSession?>(null) }
     var localPort by remember { mutableStateOf<Int?>(null) }
     var status by remember { mutableStateOf("") }
@@ -588,6 +616,12 @@ fun PortalScreen(keyFile: File) {
                             config = updated
                             register = false
                             paired = true
+                            // Written here rather than at connect time: this
+                            // is the one moment the Endpoint ID is known to
+                            // be the one a Grant was just made for.
+                            runCatching {
+                                pairedFile.writeText(updated.expectedEndpoint)
+                            }
                             statusIsError = false
                             // A standing grant now -- no listener id to show;
                             // the server's Endpoint ID is what a restart
