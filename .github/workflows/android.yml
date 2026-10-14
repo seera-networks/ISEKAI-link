@@ -5,10 +5,20 @@ name: Android client
 # Apple ones, so without this the first thing to notice a broken Android build
 # is a person.
 #
-# Two jobs, split by what they need. `bindings` needs only a host toolchain and
-# proves the Kotlin bindings still generate from the Rust interface — the check
-# that replaces having them committed. `app` adds the NDK, cross-compiles the
-# core and assembles the APK, and is the slower half.
+# Three jobs, split by what they need. `bindings` needs only a host toolchain
+# and proves the Kotlin bindings still generate from the Rust interface — the
+# check that replaces having them committed. `app` adds the NDK, cross-compiles
+# the core and assembles the APK, and is the slower half. `portal-app` does the
+# same for the second Android client.
+#
+# **`android-portal` reached `main` with nothing in CI building it at all.**
+# The paths below listed `android/**` and the camera FFI's crates only, so a
+# pull request adding a whole second Android app ran these jobs — against the
+# camera app — and went green. What that hid: a `cacert.pem` the app opens at
+# startup was never committed (`.gitignore`'s `*.pem` with a per-app exception
+# that did not name it), so every build from a clean checkout could not
+# complete a single TLS handshake. #288 added a tree-level check for the file
+# and this job for the rest.
 
 on:
   push:
@@ -34,6 +44,13 @@ on:
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'android/**'
+      # The second Android client and the crates only it pulls in. `portal-core`
+      # and `portal-client-ffi` are not in the camera app's graph, and
+      # `portal-client-ffi` is its own workspace with its own lockfile, so
+      # `cargo check --workspace` never builds it either.
+      - 'android-portal/**'
+      - 'rust/portal-core/**'
+      - 'rust/portal-client-ffi/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/android.yml'
   pull_request:
@@ -59,6 +76,13 @@ on:
       - 'rust/Cargo.toml'
       - '.cargo/config.toml'
       - 'android/**'
+      # The second Android client and the crates only it pulls in. `portal-core`
+      # and `portal-client-ffi` are not in the camera app's graph, and
+      # `portal-client-ffi` is its own workspace with its own lockfile, so
+      # `cargo check --workspace` never builds it either.
+      - 'android-portal/**'
+      - 'rust/portal-core/**'
+      - 'rust/portal-client-ffi/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/android.yml'
   workflow_dispatch:
@@ -151,3 +175,59 @@ jobs:
         with:
           name: IsekaiCameraClient-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
+
+  portal-app:
+    name: Build the portal app
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/submodules
+      - name: Prepare machine for seera-msquic
+        run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
+        shell: pwsh
+        working-directory: submodules/msquic-async-rs/seera-msquic
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      # **This job does install an NDK, unlike `app` above, and for the reason
+      # that one gives for not installing one.** The hazard there is two NDKs,
+      # with cargo-ndk compiling against one while quictls configures against
+      # the other. `android-portal` pins `ndkVersion = 29.0.14206865` -- it has
+      # to, or AGP has no `llvm-strip` and packages a ~200MB unstripped `.so`
+      # -- so AGP will use that one whatever the runner ships. Installing it
+      # and pointing both NDK variables at it is what makes the two halves
+      # agree; leaving the runner's default in place is what would split them.
+      - name: Install the NDK this app pins
+        run: |
+          ndk=$(sed -nE 's/.*ndkVersion = "([^"]+)".*/\1/p' android-portal/app/build.gradle.kts)
+          test -n "$ndk" || { echo "::error::no ndkVersion in android-portal/app/build.gradle.kts"; exit 1; }
+          echo "pinned NDK: $ndk"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk"
+          # Both names: cargo-ndk reads ANDROID_NDK_HOME, seera-msquic's build
+          # script and AGP read ANDROID_NDK_ROOT.
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      # `arm64-v8a` only, which is what `portalAbis` defaults to and what a
+      # phone needs. The x86_64 an emulator wants is a `-PportalAbis` away and
+      # doubles a full native build of msquic and quictls, which is not worth
+      # paying for on every push.
+      - name: Cross-compile the core
+        run: ./gradlew --no-daemon :app:generateJniLibs
+        working-directory: android-portal
+      # Assembling runs `generateUniFfiBindings` on the way, so a Kotlin file
+      # that no longer matches the Rust interface fails here rather than on a
+      # phone.
+      - name: Assemble
+        run: ./gradlew --no-daemon assembleDebug
+        working-directory: android-portal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IsekaiPortalClient-debug-apk
+          path: android-portal/app/build/outputs/apk/debug/*.apk
