@@ -51,6 +51,15 @@ on:
       - 'android-portal/**'
       - 'rust/portal-core/**'
       - 'rust/portal-client-ffi/**'
+      # `isekai-privacy`, which **both** apps reach -- `portal-core` and
+      # `camera-core` each depend on it -- and which this list missed in both
+      # directions until it was resolved against the FFI's actual closure
+      # rather than read off the imports. A change confined to it still runs
+      # `camera-apps.yml` and `mutants.yml`, whose filters are a plain
+      # `rust/**`, so it is not unwatched; what it does not run is either
+      # cross-compile, which is where a dependency that will not build for the
+      # NDK shows up and nowhere else.
+      - 'rust/privacy/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/android.yml'
   pull_request:
@@ -83,6 +92,15 @@ on:
       - 'android-portal/**'
       - 'rust/portal-core/**'
       - 'rust/portal-client-ffi/**'
+      # `isekai-privacy`, which **both** apps reach -- `portal-core` and
+      # `camera-core` each depend on it -- and which this list missed in both
+      # directions until it was resolved against the FFI's actual closure
+      # rather than read off the imports. A change confined to it still runs
+      # `camera-apps.yml` and `mutants.yml`, whose filters are a plain
+      # `rust/**`, so it is not unwatched; what it does not run is either
+      # cross-compile, which is where a dependency that will not build for the
+      # NDK shows up and nowhere else.
+      - 'rust/privacy/**'
       - 'submodules/msquic-async-rs'
       - '.github/workflows/android.yml'
   workflow_dispatch:
@@ -204,9 +222,18 @@ jobs:
           ndk=$(sed -nE 's/.*ndkVersion = "([^"]+)".*/\1/p' android-portal/app/build.gradle.kts)
           test -n "$ndk" || { echo "::error::no ndkVersion in android-portal/app/build.gradle.kts"; exit 1; }
           echo "pinned NDK: $ndk"
+          # No --channel: 29.0.14206865 is the stable r29, and sdkmanager's
+          # default channel has it. The r29 rc builds are the *lower* version
+          # numbers (…13113456 rc1 through …14033849 rc4), so a glance at the
+          # number is misleading -- checked against `sdkmanager --list`.
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk"
-          # Both names: cargo-ndk reads ANDROID_NDK_HOME, seera-msquic's build
-          # script and AGP read ANDROID_NDK_ROOT.
+          # Both names, because the readers do not split the way it is
+          # tempting to write down. seera-msquic's build script tries
+          # ANDROID_NDK_HOME, then ANDROID_NDK_ROOT, then
+          # ANDROID_NDK_LATEST_HOME (`scripts/build.rs`), cargo-ndk reads
+          # ANDROID_NDK_HOME, and AGP reads neither -- it resolves the pinned
+          # `ndkVersion` under $ANDROID_HOME/ndk. Setting both to the same
+          # path is what makes that agree; neither is redundant.
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
