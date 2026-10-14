@@ -22,6 +22,16 @@
 # even be attempted.
 !android/app/src/main/assets/cacert.pem
 !android-portal/app/src/main/assets/cacert.pem
+#
+# **Nobody has written down where the bundle came from or as of when.** Both
+# copies are byte-identical (sha256 6d84ab71cb72...); the first arrived with
+# the Android camera client in #133 on 2026-08-18, with no source recorded.
+# As of 2026-10-14 it holds 146 roots, two of them already past notAfter
+# (SECOM Security Communication RootCA1, 2023-09-30; Baltimore CyberTrust
+# Root, 2025-05-12) -- harmless, since an expired root is simply not trusted,
+# but there is no signal for when the store itself needs refreshing. A stale
+# trust store fails exactly as opaquely as the missing file did: "connection
+# lost", with nothing naming the certificate.
 
 # Auth0 tokens the camera apps store after a device sign-in. The refresh token
 # in here mints access tokens for the signed-in account until it is revoked, so

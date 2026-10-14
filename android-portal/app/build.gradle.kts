@@ -33,6 +33,14 @@ val generateUniFfiBindings by tasks.registering(Exec::class) {
     )
 }
 
+/** cargo's target triple for each Android ABI name. */
+val rustTargetOf = mapOf(
+    "arm64-v8a" to "aarch64-linux-android",
+    "x86_64" to "x86_64-linux-android",
+    "armeabi-v7a" to "armv7-linux-androideabi",
+    "x86" to "i686-linux-android",
+)
+
 /**
  * Which ABIs to cross-compile for.
  *
@@ -50,21 +58,53 @@ val generateUniFfiBindings by tasks.registering(Exec::class) {
  * native build of msquic and quictls: paying for both on every phone build
  * would be minutes for nothing.
  */
-val portalAbis: List<String> =
-    (findProperty("portalAbis") as String? ?: "arm64-v8a").split(",").map { it.trim() }
-
-/** cargo's target triple for each Android ABI name. */
-val rustTargetOf = mapOf(
-    "arm64-v8a" to "aarch64-linux-android",
-    "x86_64" to "x86_64-linux-android",
-    "armeabi-v7a" to "armv7-linux-androideabi",
-    "x86" to "i686-linux-android",
-)
+val portalAbis: List<String> = run {
+    // `-PportalAbis=` and a trailing comma both yield an empty element, which
+    // would reach `cargo ndk -t "" build`. A bare `-PportalAbis=` is a
+    // non-null empty string, so a `?:` on the property alone does not catch
+    // it; the default has to be applied after the blanks are gone.
+    val asked = (findProperty("portalAbis") as String? ?: "")
+        .split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    val abis = asked.ifEmpty { listOf("arm64-v8a") }
+    // **Checked here, not in `doLast`.** cargo-ndk's `-t` takes an ABI name or
+    // a target triple, so `-PportalAbis=aarch64-linux-android` builds happily
+    // for minutes before the triple lookup below fails. Configuration time
+    // costs a second.
+    val unknown = abis.filter { it !in rustTargetOf }
+    if (unknown.isNotEmpty()) {
+        throw GradleException(
+            "unknown ABI(s) ${unknown.joinToString(", ")} in -PportalAbis. " +
+                "Known: ${rustTargetOf.keys.joinToString(", ")}"
+        )
+    }
+    abis
+}
 
 val generateJniLibs by tasks.registering(Exec::class) {
     group = "build"
     description = "Cross-compile portal-client-ffi into app/src/main/jniLibs"
     workingDir = file("$rustDir/portal-client-ffi")
+    doFirst {
+        // **Sweep the ABIs we are not building.** `src/main/jniLibs` is a
+        // source directory: cargo-ndk and the copy below only ever write into
+        // it, and nothing cleans it, so a `.so` from an earlier build with a
+        // different `-PportalAbis` simply stays and gets packaged.
+        //
+        // That is not cosmetic. Build both ABIs for an emulator, change the
+        // Rust, then run a plain `./gradlew installDebug` (default
+        // `arm64-v8a`): the x86_64 pair is left untouched, AGP packages it,
+        // and on an x86_64 emulator the loader prefers it -- so the emulator
+        // runs the **previous** native build while reporting success. A
+        // wrong-architecture `.so` fails loudly at install; a stale
+        // right-architecture one is the quiet kind of wrong this file's other
+        // comments are all about.
+        file("src/main/jniLibs").listFiles()
+            ?.filter { it.isDirectory && it.name !in portalAbis }
+            ?.forEach {
+                logger.lifecycle("generateJniLibs: removing stale ${it.name} libraries")
+                it.deleteRecursively()
+            }
+    }
     commandLine(
         listOf("cargo", "ndk") +
             portalAbis.flatMap { listOf("-t", it) } +
@@ -94,8 +134,8 @@ val generateJniLibs by tasks.registering(Exec::class) {
         // wrong architecture in a jniLibs directory is an install-time
         // failure rather than a build one.
         for (abi in portalAbis) {
-            val triple = rustTargetOf[abi]
-                ?: throw GradleException("no cargo target known for ABI $abi")
+            // Non-null: `portalAbis` is validated against this map above.
+            val triple = rustTargetOf.getValue(abi)
             val libmsquic = fileTree("$rustDir/portal-client-ffi/target/$triple/debug/build") {
                 include("**/out/lib/libmsquic.so")
             }.files.maxByOrNull { it.lastModified() }
