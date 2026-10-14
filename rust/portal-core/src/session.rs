@@ -350,6 +350,20 @@ impl Connected {
         // cost a bug report rather than a bisect.
         tracing::debug!("closing: cancelling the forwards");
         shutdown.cancel();
+        // **Before anything releases the peer connection.** Doing that kills
+        // the relay leg underneath it, and a supervisor that has not been told
+        // why reads a dead leg as the relay failing: it asks the control plane
+        // for a new connection to stand a replacement on, backs off, and asks
+        // again. The far listener binds a leg for each of those rows and
+        // unbinds it moments later, so a plain disconnect arrives at the other
+        // end as a burst of connections -- measured at two per disconnect,
+        // five and eight seconds after the tap, with the session already gone.
+        //
+        // Not `session.close()`, which is still last and still has to be:
+        // that cancels the supervisor's `shutdown`, which retires the
+        // attachment immediately, and the peer connection below is still
+        // draining through that leg. This says only "stop replacing it".
+        session.stop_replacing_the_leg();
         // **Dropped before the wait, not after it.** `Sessions` holds a
         // `Connection` clone of its own, and the drain below is a wait for
         // msquic to have no live handles left — one held by a value still in

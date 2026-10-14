@@ -55,6 +55,9 @@ pub struct InitiatorSession {
     /// [`close`](Self::close) and by `Drop`, so a session nobody closed still
     /// stops claiming.
     shutdown: CancellationToken,
+    /// Asks the supervisor to stop *replacing* a lost leg, without taking the
+    /// one it has down — see [`stop_replacing_the_leg`](Self::stop_replacing_the_leg).
+    no_replacing: CancellationToken,
     /// Answered once the supervisor has reported the connection closed and the
     /// leg has wound down. Taken by [`close`](Self::close), which is the only
     /// thing that waits for it.
@@ -850,6 +853,7 @@ impl InitiatorSession {
         let (facts, watching) = watch::channel(Facts::of(&attachment));
         let (leg, leg_at) = watch::channel(Some(attachment.relay.local_addr));
         let shutdown = CancellationToken::new();
+        let no_replacing = CancellationToken::new();
         let (reported, closed) = oneshot::channel();
         // **The supervisor owns the attachment from here on.** It is the one
         // thing that both replaces a lost leg and takes the last one down, and
@@ -869,6 +873,7 @@ impl InitiatorSession {
             Published { facts, leg },
             ended.clone(),
             shutdown.clone(),
+            no_replacing.clone(),
             reported,
         ));
         Ok(Self {
@@ -876,6 +881,7 @@ impl InitiatorSession {
             leg: leg_at,
             ended,
             shutdown,
+            no_replacing,
             closed: Some(closed),
             _renewal: renewal,
         })
@@ -954,6 +960,26 @@ impl InitiatorSession {
     /// certificates disabled (dial `127.0.0.1` unvalidated instead).
     pub fn video_host(&self) -> Option<String> {
         self.facts.borrow().connection.video_host.clone()
+    }
+
+    /// Stop replacing the leg, without taking the one there is down.
+    ///
+    /// **For a caller that is about to close the peer connection.** Releasing
+    /// it kills the leg underneath, and a supervisor that has not been told
+    /// why reads that as the relay failing and asks the control plane for a
+    /// new connection to stand a replacement on -- several times, backing off,
+    /// while everything it is repairing is on its way out. Each attempt leaves
+    /// a connection row the far listener dutifully binds a leg for and then
+    /// unbinds, so a plain disconnect shows up at the other end as a short
+    /// burst of arrivals.
+    ///
+    /// Deliberately **not** [`close`](Self::close), which is what the ordering
+    /// in `portal_core::session::Connected::close` is careful about: cancelling
+    /// `shutdown` makes the supervisor retire the attachment at once, and the
+    /// peer connection is still draining through that leg. This says only
+    /// "whatever happens to the leg now, let it go" and leaves the leg up.
+    pub fn stop_replacing_the_leg(&self) {
+        self.no_replacing.cancel();
     }
 
     /// Report the connection closed and take the relay connect leg down.
@@ -1187,6 +1213,7 @@ async fn supervise(
     published: Published,
     ended: CancellationToken,
     shutdown: CancellationToken,
+    no_replacing: CancellationToken,
     reported: oneshot::Sender<()>,
 ) {
     let mut current = Some(first);
@@ -1208,6 +1235,17 @@ async fn supervise(
         // direct path, and it would have been left believing a dead relay was
         // there to fall back to.
         published.leg_is_gone();
+        if no_replacing.is_cancelled() {
+            // **The caller is closing, and took the leg out by doing it.** The
+            // peer connection is being released, which is what killed this
+            // leg; standing another one up would spend connection rows the far
+            // listener binds and unbinds for a session that is already going.
+            // Same shape as "nothing replaced it" below: keep the attachment
+            // so the row stays claimed, and let `close` retire it.
+            shutdown.cancelled().await;
+            current = Some(attachment);
+            break;
+        }
         if ended.is_cancelled() {
             // **The Endpoint was refused, not the relay.** What cancelled the
             // leg is the lease that was told so, and it has already said it at
