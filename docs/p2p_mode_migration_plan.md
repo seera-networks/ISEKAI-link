@@ -330,11 +330,38 @@ activated:   192.168.1.59:46316 -> 192.168.1.59:47220 … 切替後さらに 5 �
 （ICE の host candidate + server-reflexive candidate に相当）:
 
 - クライアント: `add_candidate_addr(local, observed)` に加えて `add_candidate_addr(local, local)`
-- サーバ: `add_observed_addr(local, observed)` に加えて `add_observed_addr(local, local)`
+- サーバ: ~~`add_observed_addr(local, observed)` に加えて `add_observed_addr(local, local)`~~
+  — **撤回した。下記を読まずに戻さないこと。**
 
 `local == observed`（NAT 無し）のときは重複するので追加しない。
-インターネット越しではホスト候補は検証に失敗し、観測アドレス側が採用されるだけなので、
-**この追加に不利益はなく、同一 LAN では最短経路が取れる**という利点だけがある。
+~~インターネット越しではホスト候補は検証に失敗し、観測アドレス側が採用されるだけなので、
+**この追加に不利益はなく、同一 LAN では最短経路が取れる**という利点だけがある。~~
+
+> **「不利益はなく」は誤りだった（2026-10-15）。** 二つの msquic パラメータは
+> 似ているだけで意味論が違う。
+>
+> | | 動作 |
+> | --- | --- |
+> | `ADD_CANDIDATE_ADDRESS` | `(host, observed)` ごとにリスト要素を確保して**追加**する |
+> | `ADD_OBSERVED_ADDRESS` | bound エントリの単一の `ObservedAddress` を `CxPlatCopyMemory` で**上書き**する |
+>
+> したがってサーバ側の 2 回目は、観測アドレスをホストアドレスで**破壊していた**。
+> 相手に届く ADD_ADDRESS は私設アドレスだけになり、**インターネット越しでは
+> 直接経路が一度も成立しなかった。** AWS 上のサーバー相手に LTTng で確認:
+> ADD_ADDRESS は `172.31.12.127` 1 件のみ、PATH_CHALLENGE 5 回、PATH_RESPONSE
+> 0 回、`ConnPathValidationTimeout` で放棄。サーバー側を直すと、同じ
+> クライアントが `remote=18.116.91.75` の直接経路に移る。
+>
+> **クライアント側の 2 回目は、消してはいないが効いていない。** 両方の候補が
+> 同じ `Address`（`local`）を持ち、本スタックが使う `NatTraversal` モードでは
+> msquic が `CandidateAddresses.Flink` の 1 件目しか見ない
+> （`QuicConnProcessAddAddress` に `TODO - Use the correct local address based
+> on the observed address` がある）。PUNCH_ME_NOW の組み立ても `Address` 一致で
+> 先頭に当たる。
+>
+> **よって「同一 LAN で最短経路」はサーバ側の上書きだけが支えていた**ので、
+> この撤回でその能力は失われる。壊れていたのは普通のケースの方だったため、
+> それを受け入れた。両立させるなら「2 回呼ぶ」以外の方法が要る。
 
 ##### この実測が示していないこと
 

@@ -96,11 +96,25 @@ pub fn prepare(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<
     // same NAT can never find each other. Across the internet this candidate
     // simply fails to validate and the observed one wins.
     //
-    // **Offering two here is sound, and the same shape in [`apply`] was not.**
-    // `QUIC_PARAM_CONN_ADD_CANDIDATE_ADDRESS` allocates a list entry per
-    // `(host, observed)` pair — it refuses only an exact duplicate, with
-    // `ADDRESS_IN_USE` — so both candidates coexist. The observed-address
-    // parameter `apply` uses overwrites instead; see the note there.
+    // **Both entries survive here, unlike in [`apply`] — and the second one is
+    // still never used.** `QUIC_PARAM_CONN_ADD_CANDIDATE_ADDRESS` allocates a
+    // list entry per `(host, observed)` pair, refusing only an exact duplicate
+    // with `ADDRESS_IN_USE`, so adding a second does not destroy the first the
+    // way the observed-address parameter does (see the note in `apply`). But
+    // both entries carry the *same* `Address` — `candidate.local` — and in
+    // `QUIC_ADD_ADDRESS_NAT_TRAVERSAL`, which is the mode this stack sets
+    // (`peer.rs`), msquic only ever looks at one of them:
+    // `QuicConnProcessAddAddress` takes `CandidateAddresses.Flink` for the new
+    // path's local address under its own `TODO - Use the correct local address
+    // based on the observed address`, and the PUNCH_ME_NOW builder scans the
+    // list and breaks at the first entry matching the path's local address
+    // (`send.c`). The first entry is the `(local, observed)` one, so that is
+    // what is always sent.
+    //
+    // Kept rather than deleted: it costs nothing, it is what the parameter is
+    // for, and it starts working the day that TODO is addressed. It is not
+    // load-bearing today, and the comment above says so rather than letting
+    // the next reader assume the LAN case is covered from this side.
     if candidate.local != candidate.observed {
         if let Err(e) = conn.add_candidate_addr(candidate.local, candidate.local) {
             tracing::debug!("could not offer the host candidate: {e}");
@@ -253,10 +267,19 @@ fn apply(conn: &Connection, address: ObservedAddress) {
     // path removed, session back on the relay. The public address the server
     // had advertised appeared nowhere in the trace.
     //
-    // What that costs: two peers behind one NAT that does not hairpin can no
-    // longer find each other from this side, which is what the overwriting
-    // call was for. One bound address holds one observed address, so serving
-    // both wants something other than calling this twice.
+    // What that costs, stated fully: **two peers behind one NAT that does not
+    // hairpin can no longer find each other at all.** It is tempting to say
+    // "from this side, and the initiator's host candidate still covers it" —
+    // it does not. Both of `prepare`'s candidate entries share one host
+    // address, and in this stack's `NatTraversal` mode msquic reads only the
+    // first of them, so the host candidate it adds is inert (the note there
+    // has the detail). The same-LAN capability came from the overwriting call
+    // removed here and nowhere else.
+    //
+    // Taken anyway, because the case it was breaking is the ordinary one: no
+    // direct path at all for any peer not on the same LAN. One bound address
+    // holds one observed address, so serving both wants something other than
+    // calling this twice.
     tracing::info!(
         local = %address.local,
         observed = %address.observed,
