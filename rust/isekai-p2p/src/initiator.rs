@@ -1290,7 +1290,8 @@ async fn supervise(
         // against whatever an Endpoint may hold at once, and would cost both
         // of those for as long as the relay stayed down: if it never came
         // back, for the rest of the session.
-        let Some(replacement) = stand_up_again(&inputs, &proxy, &ended, &shutdown, age).await
+        let Some(replacement) =
+            stand_up_again(&inputs, &proxy, &ended, &shutdown, &no_replacing, age).await
         else {
             // Nothing replaced it, or the session is being closed. Either way
             // this is where P1 left things: running on whatever path it has,
@@ -1332,6 +1333,7 @@ async fn stand_up_again(
     proxy: &ProxyClient<MasqueH3Transport>,
     ended: &CancellationToken,
     shutdown: &CancellationToken,
+    no_replacing: &CancellationToken,
     age: Duration,
 ) -> Option<Attachment> {
     // **Held rather than raised at each attempt.** A relay that is restarting
@@ -1343,6 +1345,14 @@ async fn stand_up_again(
     for attempt in 0..REATTACH_ATTEMPTS {
         tokio::select! {
             _ = shutdown.cancelled() => return None,
+            // **Here as well as at the caller's one-time check.** A close that
+            // lands while this loop is already backing off -- the relay really
+            // did fail, the peer connection carried on over a direct path, and
+            // only then did the application disconnect -- would otherwise go
+            // unseen until `shutdown`, which `Connected::close` does not
+            // cancel until after its drain. An `attach` fired in that window
+            // makes exactly the connection row this is here to stop making.
+            _ = no_replacing.cancelled() => return None,
             _ = ended.cancelled() => {
                 // The Endpoint is refused, not the relay. A new connection id
                 // would be refused as well, and saying so belongs to whoever
@@ -1370,6 +1380,7 @@ async fn stand_up_again(
         // that was killed.
         let made = tokio::select! {
             _ = shutdown.cancelled() => return None,
+            _ = no_replacing.cancelled() => return None,
             made = attach(
                 &inputs.cfg,
                 proxy,

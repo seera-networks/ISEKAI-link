@@ -359,10 +359,28 @@ impl Connected {
         // end as a burst of connections -- measured at two per disconnect,
         // five and eight seconds after the tap, with the session already gone.
         //
-        // Not `session.close()`, which is still last and still has to be:
-        // that cancels the supervisor's `shutdown`, which retires the
-        // attachment immediately, and the peer connection below is still
-        // draining through that leg. This says only "stop replacing it".
+        // Not `session.close()`, which is still last: that cancels the
+        // supervisor's `shutdown`, which retires the attachment at once. This
+        // says only "stop replacing it" and leaves the leg where it is.
+        //
+        // **The reason it is last is not the reason this comment first gave.**
+        // It said the peer connection was still draining *through* the leg.
+        // The drain is what kills the leg: `peer.drain` is
+        // `reg.shutdown(); reg.wait_idle()`, and the leg's own QUIC connection
+        // is on that same registration (this file hands it over in
+        // `RelayOptions`). Worse, `wait_idle` then waits for a handle the leg
+        // will not release until `retire`, which `session.close()` below only
+        // reaches afterwards -- so the drain cannot succeed. Measured: seven
+        // consecutive disconnects, every one of them 5.00s from "waiting for
+        // msquic" to `msquic still had live handles after 5s`, which is
+        // `PeerSession::drain`'s failure branch and its
+        // `mem::forget(registration)`. **One leaked registration per
+        // connect/disconnect cycle**, which is the leak
+        // `portal-client-ffi`'s own doc says it is trying to avoid.
+        //
+        // Not fixed here. Reporting the leg closed has to happen before or
+        // alongside the drain, which is a different change from this one and
+        // wants its own measurement.
         session.stop_replacing_the_leg();
         // **Dropped before the wait, not after it.** `Sessions` holds a
         // `Connection` clone of its own, and the drain below is a wait for
