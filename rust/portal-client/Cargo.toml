@@ -5,6 +5,7 @@ edition = "2021"
 
 # The side with the local ports (plan §4.2). Phase 1c-iii-c-ii.
 [dependencies]
+isekai-link-utils = { workspace = true }
 portal-core = { workspace = true }
 isekai-p2p = { workspace = true }
 # Watching the peer connection for its own end (`closed`).

@@ -1048,6 +1048,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_plot",
+ "isekai-link-utils",
  "msquic-async",
  "opencv",
  "tokio",
@@ -1092,6 +1093,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "isekai-link-utils",
  "msquic-async",
  "opencv",
  "qrcode",
@@ -4392,6 +4394,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "argh",
+ "isekai-link-utils",
  "isekai-p2p",
  "msquic-async",
  "portal-core",
@@ -4428,6 +4431,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "argh",
+ "isekai-link-utils",
  "isekai-p2p",
  "portal-core",
  "tokio",

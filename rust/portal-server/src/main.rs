@@ -136,6 +136,15 @@ ISEKAI_PROVISIONING_KEY -- see 'Letting a CI job in' in docs/portal.md, and note
 that the job also needs an Enrollment Key from the Identity side."
 )]
 struct Args {
+    /// print the version and exit
+    ///
+    /// Answered before argh ever runs — see `version_if_asked!` — so it works
+    /// whatever else is on the command line, and before this binary does
+    /// anything with a side effect. Declared here only so `--help` lists it,
+    /// which is why nothing reads it.
+    #[argh(switch)]
+    #[allow(dead_code)]
+    version: bool,
     /// agree to the privacy policy and carry on. It is recorded, so this is
     /// asked once rather than on every run -- and again when the policy changes
     #[argh(switch)]
@@ -1421,6 +1430,7 @@ async fn grant_admin(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    isekai_link_utils::version_if_asked!();
     // **stderr, and `info` unless `RUST_LOG` says otherwise.**
     //
     // Two fixes in one. `fmt()` writes to *stdout* by default, which puts log

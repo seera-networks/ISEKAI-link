@@ -7,6 +7,7 @@ edition = "2021"
 # real, and the catalogue is still built from arguments rather than the file
 # phase 2 adds.
 [dependencies]
+isekai-link-utils = { workspace = true }
 portal-core = { workspace = true }
 isekai-p2p = { workspace = true }
 anyhow = { workspace = true }

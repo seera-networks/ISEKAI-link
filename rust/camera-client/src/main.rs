@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
+    isekai_link_utils::version_if_asked!();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)

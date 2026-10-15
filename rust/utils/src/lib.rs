@@ -630,3 +630,35 @@ pub async fn create_forward_masque_connection(
     });
     Ok(())
 }
+
+/// Print `name version` and exit, if this invocation asked for it.
+///
+/// **Called before anything else a `main` does**, which is the whole point.
+/// `portal-client` run with no arguments generates an Endpoint key on its way
+/// to telling you what it wanted instead; a `--version` that did that would
+/// leave a file behind for answering a question. Asking argh after it parses
+/// would be tidier to read and would still come after whatever the binary
+/// does first, so this reads the arguments itself.
+///
+/// Here rather than four times over: the four shipped binaries print the one
+/// string people paste into a bug report, and four copies is how they come to
+/// disagree. The argh binaries also declare a `--version` switch so `--help`
+/// lists it; this is what actually answers.
+pub fn print_version_if_asked(name: &str, version: &str) {
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{name} {version}");
+        std::process::exit(0);
+    }
+}
+
+/// [`print_version_if_asked`] for the calling crate, which is what every
+/// caller wants: `CARGO_PKG_*` are expanded where the macro is used, not here.
+#[macro_export]
+macro_rules! version_if_asked {
+    () => {
+        $crate::print_version_if_asked(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    };
+}

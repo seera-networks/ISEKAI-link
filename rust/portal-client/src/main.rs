@@ -96,6 +96,15 @@ role beside it -- which needs the sign-in, and waits up to ten seconds. The
 Endpoint ID is printed either way, and it is the only thing on stdout."
 )]
 struct Args {
+    /// print the version and exit
+    ///
+    /// Answered before argh ever runs — see `version_if_asked!` — so it works
+    /// whatever else is on the command line, and before this binary does
+    /// anything with a side effect. Declared here only so `--help` lists it,
+    /// which is why nothing reads it.
+    #[argh(switch)]
+    #[allow(dead_code)]
+    version: bool,
     /// agree to the privacy policy and carry on. It is recorded, so this is
     /// asked once rather than on every run -- and again when the policy changes
     #[argh(switch)]
@@ -343,6 +352,7 @@ const PROXY_AUDIENCE: &str = "isekai-proxy";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    isekai_link_utils::version_if_asked!();
     // **stderr, and `info` unless `RUST_LOG` says otherwise.**
     //
     // Two fixes in one. `fmt()` writes to *stdout* by default, which puts log
