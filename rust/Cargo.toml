@@ -8,6 +8,14 @@ package.edition = "2021"
 # single tag, so fourteen manifests each carrying their own number was an
 # invitation to bump thirteen of them. Members inherit with
 # `version.workspace = true`.
+#
+# **`portal-client-ffi` is outside this and has to be bumped by hand.** It is
+# its own workspace root, so inheritance cannot reach it, and it has its own
+# tracked `Cargo.lock` that records this workspace's crates by version -- so a
+# bump here leaves that lock stale until it is regenerated, and
+# `cargo build --locked` in that directory fails on the tag. Both were missed
+# at 0.7.0 and caught in review; it is written down here so the next bump does
+# not rediscover it.
 package.version = "0.7.0"
 
 [workspace.dependencies]
