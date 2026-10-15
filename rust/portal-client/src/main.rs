@@ -96,12 +96,15 @@ role beside it -- which needs the sign-in, and waits up to ten seconds. The
 Endpoint ID is printed either way, and it is the only thing on stdout."
 )]
 struct Args {
-    /// print the version and exit
-    ///
-    /// Answered before argh ever runs — see `version_if_asked!` — so it works
-    /// whatever else is on the command line, and before this binary does
-    /// anything with a side effect. Declared here only so `--help` lists it,
-    /// which is why nothing reads it.
+    // **A `//` comment, not a `///` one.** argh_derive joins every doc line
+    // into the description it prints, so a rationale written above this field
+    // as documentation ends up in `--help` as a paragraph about a macro the
+    // reader cannot see. This file learned that the hard way.
+    //
+    // `version_if_asked!` at the top of `main` is what answers, before argh
+    // runs and before anything with a side effect. The switch is declared here
+    // only so `--help` lists it, which is why nothing reads it.
+    /// print the version and exit. Must be the first argument; -V also works
     #[argh(switch)]
     #[allow(dead_code)]
     version: bool,
