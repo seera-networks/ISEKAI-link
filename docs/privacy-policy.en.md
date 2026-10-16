@@ -1,6 +1,6 @@
 # ISEKAI link Privacy Policy
 
-Version: 2026-09-24
+Version: 2026-10-16
 
 ## 1. Who we are
 
@@ -256,17 +256,21 @@ reasons.
   them where needed.
 - **Personnel**: those who handle personal data are informed of what handling
   it requires of them.
-- **Where the servers are**: our Identity API runs in Japan (Ishikari) and our
-  relay servers in Japan (Tokyo), on equipment operated by cloud providers.
-  Those providers do not handle our personal data.
+- **Where the servers are**: our Identity API runs in Japan (Ishikari), the
+  server that sets up connections in Japan (Tokyo), and our relay servers in
+  Japan (Tokyo) and the United States (San Jose, California), on equipment
+  operated by cloud providers. Those providers do not handle our personal data.
+  A connection that goes through a relay uses the one the service assigns to
+  it, which may be in either country.
 - **Countries in which personal data is handled**: the information in sections
-  3.2 to 3.5 is handled in Japan. The account information in section 3.1 is
-  held primarily in the Japan region by our authentication provider, and may
-  also be handled in **the United States, Germany and Romania** through its
-  sub-processors. Some processing, by the nature of content delivery networks,
-  is in a country that cannot be identified in advance. We have informed
-  ourselves of the data-protection regimes of these countries and take the
-  measures necessary and appropriate to manage security.
+  3.2 to 3.5 is handled in Japan and, for connections that go through our relay
+  in the United States, in **the United States**. The account information in
+  section 3.1 is held primarily in the Japan region by our authentication
+  provider, and may also be handled in **the United States, Germany and
+  Romania** through its sub-processors. Some processing, by the nature of
+  content delivery networks, is in a country that cannot be identified in
+  advance. We have informed ourselves of the data-protection regimes of these
+  countries and take the measures necessary and appropriate to manage security.
 
 ## 11. Minors
 

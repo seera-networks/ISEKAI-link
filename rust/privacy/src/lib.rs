@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump it whenever the documents change in a way a person would want to know
 /// about. A test keeps it in step with what the documents themselves say.
-pub const VERSION: &str = "2026-09-24";
+pub const VERSION: &str = "2026-10-16";
 
 /// Where the authoritative copy of the Japanese text lives.
 ///
