@@ -3,9 +3,13 @@ package tools.isekai.portalclient
 import android.app.Application
 import android.system.Os
 import android.util.Log
+import uniffi.portal_client_ffi.initLogging
 import java.io.File
 
 private const val TAG = "PortalFFI"
+
+/** `EnvFilter` syntax, e.g. "info,isekai_p2p=debug" to see more of one crate. */
+private const val RUST_LOG_FILTER = "info"
 
 /**
  * Sets up `SSL_CERT_FILE` and `XDG_CONFIG_HOME` before anything else in the
@@ -32,6 +36,14 @@ class PortalApplication : Application() {
             Os.setenv("XDG_CONFIG_HOME", filesDir.absolutePath, true)
         } catch (e: Exception) {
             Log.e(TAG, "failed to set XDG_CONFIG_HOME", e)
+        }
+        // Before anything calls into Rust: without it, everything the Rust
+        // side logs (pairing, connect, relay, path switches, its warnings) is
+        // dropped. Read it with `adb logcat -s PortalFFI PortalRust`.
+        try {
+            initLogging(RUST_LOG_FILTER)
+        } catch (e: Throwable) {
+            Log.e(TAG, "failed to start Rust logging", e)
         }
     }
 
