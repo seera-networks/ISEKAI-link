@@ -31,6 +31,9 @@ use tokio_util::sync::CancellationToken;
 
 uniffi::setup_scaffolding!();
 
+mod logging;
+pub use logging::init_logging;
+
 #[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum PortalError {
     #[error("invalid key: {0}")]
