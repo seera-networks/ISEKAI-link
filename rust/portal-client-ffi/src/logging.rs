@@ -13,7 +13,7 @@
 //! can be wedged or gone when it does. Off Android (host builds and tests) the
 //! same lines go to stderr.
 
-use std::sync::{Mutex, Once};
+use std::sync::OnceLock;
 
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
@@ -31,22 +31,25 @@ pub const DEFAULT_FILTER: &str = "info";
 /// counts the tag and header too.
 const CHUNK: usize = 3000;
 
-static INIT: Once = Once::new();
-/// Applies a new filter to the installed subscriber — see [`init_logging`].
-#[allow(clippy::type_complexity)]
-static RELOAD: Mutex<Option<Box<dyn Fn(&str) -> Result<(), String> + Send>>> = Mutex::new(None);
+/// What the first call settled, for every later call to report: the filter in
+/// effect, or why no bridge could be installed.
+static INSTALLED: OnceLock<Result<String, String>> = OnceLock::new();
 
 /// Start sending Rust logs to logcat, with an `EnvFilter`-style `filter`
 /// (e.g. `"info"`, `"info,isekai_p2p=debug"`). Empty means [`DEFAULT_FILTER`].
 ///
-/// Safe to call more than once. The first call installs the subscriber and a
-/// panic hook; later calls only change the filter, so the app can turn detail
-/// up for one reproduction without being restarted. `tracing` allows a single
-/// global subscriber per process, which is why the subscriber itself cannot be
-/// replaced.
+/// Call it once, before anything else calls into Rust. The first call installs
+/// the subscriber and a panic hook, and **its filter holds for the life of the
+/// process**: `tracing` allows one global subscriber, and nothing in the app
+/// changes the filter while it runs, so there is no reload path to carry.
 ///
-/// Returns an error only for a filter that does not parse; logging stays on
-/// the previous filter in that case.
+/// Errors, so that nothing is reported as working when it isn't:
+/// - a filter that does not parse;
+/// - a later call asking for a different filter than the one in effect (the
+///   same filter again is fine and does nothing);
+/// - a bridge that could not be installed because something else in the
+///   process already owns the global subscriber. Every later call reports that
+///   too, so a dead bridge is never mistaken for a working one.
 #[uniffi::export]
 pub fn init_logging(filter: String) -> Result<(), crate::PortalError> {
     let filter = if filter.trim().is_empty() {
@@ -57,61 +60,61 @@ pub fn init_logging(filter: String) -> Result<(), crate::PortalError> {
     let parsed = tracing_subscriber::EnvFilter::try_new(&filter)
         .map_err(|e| crate::PortalError::Runtime(format!("bad log filter {filter:?}: {e}")))?;
 
-    let mut first = false;
-    INIT.call_once(|| {
-        first = true;
-        install(parsed);
-    });
-    if !first {
-        if let Some(reload) = RELOAD.lock().expect("log reload mutex poisoned").as_ref() {
-            reload(&filter).map_err(crate::PortalError::Runtime)?;
-        }
+    match INSTALLED.get_or_init(|| install(parsed, &filter)) {
+        Err(e) => Err(crate::PortalError::Runtime(format!(
+            "Rust logs are not reaching logcat: {e}"
+        ))),
+        Ok(active) if *active != filter => Err(crate::PortalError::Runtime(format!(
+            "the log filter is {active:?} for the life of this process; {filter:?} was not applied"
+        ))),
+        Ok(_) => Ok(()),
     }
-    tracing::info!(filter = %filter, "Rust logging to logcat");
-    Ok(())
 }
 
-fn install(filter: tracing_subscriber::EnvFilter) {
+/// Installs the subscriber and the panic hook. `Ok` holds the filter in effect.
+fn install(filter: tracing_subscriber::EnvFilter, text: &str) -> Result<String, String> {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
-    let (filter_layer, handle) = tracing_subscriber::reload::Layer::new(filter);
     // `try_init` also bridges the `log` crate into `tracing` (the
     // `tracing-log` feature), so dependencies that log through `log` show up
     // here too instead of going nowhere.
     let installed = tracing_subscriber::registry()
-        .with(filter_layer)
+        .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(Logcat)
                 .with_ansi(false)
                 // logcat stamps every line itself, and its level column says
-                // what the level would.
+                // what the level would (off Android, `sys::write` prefixes
+                // the level instead).
                 .without_time()
                 .with_level(false)
                 .with_target(true),
         )
         .try_init();
-    match installed {
-        Ok(()) => {
-            *RELOAD.lock().expect("log reload mutex poisoned") = Some(Box::new(move |f: &str| {
-                let parsed = tracing_subscriber::EnvFilter::try_new(f)
-                    .map_err(|e| format!("bad log filter {f:?}: {e}"))?;
-                handle.reload(parsed).map_err(|e| e.to_string())
-            }));
-        }
-        // Somebody else in the process got there first; their subscriber gets
-        // the events. Say so where it can be seen.
-        Err(e) => write_line(Priority::Warn, &format!("could not install the log bridge: {e}")),
-    }
-
     // A panic on a background task would otherwise end the session with
-    // nothing in logcat but the Kotlin side noticing it closed.
+    // nothing in logcat but the Kotlin side noticing it closed. Written
+    // straight to logcat, so it is installed even if the subscriber wasn't.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         write_line(Priority::Error, &format!("panic: {info}"));
         previous(info);
     }));
+
+    match installed {
+        Ok(()) => {
+            tracing::info!(filter = %text, "Rust logging to logcat");
+            Ok(text.to_owned())
+        }
+        // Somebody else in the process got there first; their subscriber gets
+        // the events. Say so where it can be seen, and to every caller.
+        Err(e) => {
+            let msg = format!("could not install the log bridge: {e}");
+            write_line(Priority::Warn, &msg);
+            Err(msg)
+        }
+    }
 }
 
 /// logcat's priorities, as `android/log.h` numbers them.
@@ -192,9 +195,17 @@ impl Drop for LineWriter {
     }
 }
 
-/// Write `text` as one or more logcat entries, splitting long ones on
-/// character boundaries.
+/// Write `text` as one or more logcat entries.
 fn write_line(priority: Priority, text: &str) {
+    for chunk in chunks(text) {
+        sys::write(priority, chunk);
+    }
+}
+
+/// `text` in pieces of at most [`CHUNK`] bytes, each ending on a character
+/// boundary: `split_at` panics anywhere else.
+fn chunks(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
         let mut end = rest.len().min(CHUNK);
@@ -202,9 +213,10 @@ fn write_line(priority: Priority, text: &str) {
             end -= 1;
         }
         let (chunk, tail) = rest.split_at(end);
-        sys::write(priority as i32, chunk);
+        out.push(chunk);
         rest = tail;
     }
+    out
 }
 
 #[cfg(target_os = "android")]
@@ -216,7 +228,7 @@ mod sys {
         fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
     }
 
-    pub fn write(priority: i32, text: &str) {
+    pub fn write(priority: super::Priority, text: &str) {
         // An interior NUL would end the entry early in C; it cannot be a
         // character anyone meant, so it is shown rather than obeyed.
         let text = CString::new(text.replace('\0', "\\0")).expect("NULs were replaced");
@@ -224,15 +236,26 @@ mod sys {
         // SAFETY: both pointers are valid NUL-terminated strings for the
         // duration of the call, which is all liblog asks.
         unsafe {
-            __android_log_write(priority, tag.as_ptr(), text.as_ptr());
+            __android_log_write(priority as c_int, tag.as_ptr(), text.as_ptr());
         }
     }
 }
 
 #[cfg(not(target_os = "android"))]
 mod sys {
-    pub fn write(_priority: i32, text: &str) {
-        eprintln!("{}: {text}", super::TAG);
+    use super::Priority;
+
+    /// stderr has no level column, so the level goes in the line, the way
+    /// `adb logcat -v brief` shows it (`W/PortalRust: ...`).
+    pub fn write(priority: Priority, text: &str) {
+        let level = match priority {
+            Priority::Verbose => 'V',
+            Priority::Debug => 'D',
+            Priority::Info => 'I',
+            Priority::Warn => 'W',
+            Priority::Error => 'E',
+        };
+        eprintln!("{level}/{}: {text}", super::TAG);
     }
 }
 
@@ -241,18 +264,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_bad_filter_is_refused_and_a_good_one_can_follow_it() {
+    fn the_first_filter_holds_and_a_different_one_is_refused() {
         assert!(init_logging("not a [valid filter".to_owned()).is_err());
-        init_logging(String::new()).expect("the default filter parses");
-        // Calling again only reloads the filter.
-        init_logging("debug,portal_client_ffi=trace".to_owned()).expect("reload works");
-        tracing::debug!("visible after the reload");
+        init_logging(String::new()).expect("the default filter parses and installs");
+        // The same filter again (empty means the default) does nothing.
+        init_logging(DEFAULT_FILTER.to_owned()).expect("same filter again");
+        // A different one is refused rather than reported as applied.
+        let err = init_logging("debug".to_owned()).expect_err("a different filter");
+        assert!(err.to_string().contains("was not applied"), "{err}");
     }
 
+    /// A character that straddles CHUNK, for each UTF-8 width that can: the
+    /// cut has to move back to where the character starts.
     #[test]
     fn long_lines_split_on_character_boundaries() {
-        // Three-byte characters straddling CHUNK must not panic.
-        let line = "日".repeat(CHUNK);
-        write_line(Priority::Info, &line);
+        for ch in ["é", "日", "😀"] {
+            let line = "a".repeat(CHUNK - 1) + &ch.repeat(10);
+            let pieces = chunks(&line);
+            assert_eq!(pieces[0].len(), CHUNK - 1, "cut before {ch:?}, not inside it");
+            assert!(pieces.iter().all(|p| p.len() <= CHUNK));
+            assert_eq!(pieces.concat(), line);
+            write_line(Priority::Info, &line);
+        }
     }
 }
