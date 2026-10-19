@@ -147,6 +147,21 @@ pub enum SignalingEvent {
     /// The proxy had more connections waiting than it would list. Whoever is
     /// beyond the cut cannot be seen from here (spec §8.5.3).
     Truncated,
+    /// Nothing has reached the control plane for [`UNREACHABLE_AFTER`], so this
+    /// session has stopped. **The last event any session sends.**
+    ///
+    /// Everything here retries, so this is not "a request failed" — it is
+    /// "nothing has worked for long enough that retrying is no longer a plan".
+    /// A server that receives this should stop with a failure rather than carry
+    /// on: it is still listed as a listener, and it can no longer bind anyone
+    /// who arrives.
+    Unreachable {
+        /// How long since the last call that worked.
+        unreachable_for: Duration,
+        /// The most recent failure, which is rarely the interesting one but is
+        /// the only one still to hand.
+        error: String,
+    },
 }
 
 /// What [`ListenerSession::poll_signaling`] remembers between polls.
@@ -1063,6 +1078,39 @@ const RESUBSCRIBE_DELAY: Duration = Duration::from_secs(3);
 /// nonce on the proxy for each attempt — the store those go in is capped. So
 /// the gap grows until it reaches this, and drops back the moment one succeeds.
 const RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(300);
+/// How long the control plane may be unreachable before the session gives up.
+///
+/// **Retrying forever was the old answer, and it is the wrong one for a
+/// server.** Every call this loop makes retries on its own schedule, so a blip
+/// costs latency and nothing else — that part is right and is unchanged. What
+/// was missing is an end: with the control plane gone, the Endpoint Token
+/// eventually lapses, every proxy call starts failing, `config.rs`'s renewal
+/// loop says so once and then goes quiet, and the process sits there listed as
+/// a listener that answers nothing. Its own comment names the outcome: "a
+/// restart the only way back". Nothing in the process can restart it, so it has
+/// to stop and let whatever started it decide.
+///
+/// Measured from the last call that *worked*, not from the first that failed,
+/// so a proxy answering every other request is reachable and this never fires.
+///
+/// Nothing counts under [`AcceptPolicy::Manual`], and nothing should: both arms
+/// that reach the control plane are disabled there, so the loop is not serving
+/// anyone automatically and has no contact to lose. The operator's own
+/// commands reach the proxy, and each reports its failure to whoever asked.
+///
+/// Five minutes spans many attempts at whichever rate is running: a hundred
+/// polls without a stream ([`SIGNALING_POLL_INTERVAL`] is 3s), five with one
+/// ([`RECONCILE_INTERVAL`] is 60s). It is *equal* to
+/// [`RESUBSCRIBE_MAX_DELAY`] rather than longer than it, which would matter if
+/// opening a stream counted as contact — it does not, deliberately — and
+/// comfortably past the renewal's own 240s cap. Short enough, meanwhile, that
+/// a supervisor is restarting rather than an operator noticing.
+///
+/// An Endpoint Token lives about fifteen minutes, so identity being down is
+/// caught by its own clock first: the server keeps forwarding on the token it
+/// holds until that expires, which is the answer `config.rs` argues for, and
+/// only then does this one start counting.
+const UNREACHABLE_AFTER: Duration = Duration::from_secs(300);
 /// What a caller asks a running [`ListenerSession`] to do. Each carries a
 /// reply channel.
 ///
@@ -1098,6 +1146,34 @@ pub enum ListenerCommand {
         grant_id: String,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
+}
+/// Has the control plane been unreachable long enough to stop?
+///
+/// Called only from a failed call, and answers from `last_contact` rather than
+/// from this failure: one failure says nothing, because every call here retries
+/// and a proxy answering every other request is reachable. Sends
+/// [`SignalingEvent::Unreachable`] when it answers `true`, so the caller's only
+/// job is to stop the loop.
+fn unreachable_for_too_long(
+    events: &broadcast::Sender<SignalingEvent>,
+    last_contact: tokio::time::Instant,
+    error: &str,
+) -> bool {
+    let unreachable_for = last_contact.elapsed();
+    if unreachable_for < UNREACHABLE_AFTER {
+        return false;
+    }
+    // `error!`, where every attempt before it was `warn!`/`debug!`: this is the
+    // line that explains why the process stopped.
+    tracing::error!(
+        "control plane unreachable for {}s, giving up: {error}",
+        unreachable_for.as_secs()
+    );
+    let _ = events.send(SignalingEvent::Unreachable {
+        unreachable_for,
+        error: error.to_string(),
+    });
+    true
 }
 /// Drive a [`ListenerSession`] until `shutdown`.
 ///
@@ -1141,6 +1217,10 @@ pub async fn run(
     // (see `RESUBSCRIBE_MAX_DELAY`). The proxy sends keepalives, so a stream
     // that is up says so.
     let mut stream_delivered = false;
+    // The last time anything reached the control plane, which is what
+    // `UNREACHABLE_AFTER` is measured from. Starts now rather than at zero:
+    // a listener whose first poll has not come round yet is not unreachable.
+    let mut last_contact = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -1169,6 +1249,21 @@ pub async fn run(
                         tracing::debug!(
                             "no event stream, polling instead (retrying in {resubscribe_delay:?}): {e:#}"
                         );
+                        // A second sentinel, not the one that fires: whenever
+                        // this arm is enabled the poll is too, and it runs
+                        // every few seconds against this arm's growing backoff,
+                        // so the poll is what notices. Checked anyway because
+                        // which call carries the window should not depend on
+                        // the two arms' relative rates. Note what is *not*
+                        // here: success does not touch `last_contact`.
+                        // Accepting a subscribe is not evidence it works --
+                        // see `stream_delivered` above -- and treating it as
+                        // contact would restart the window on every reconnect
+                        // of a proxy that accepts and then closes at once,
+                        // deferring the give-up a backoff cycle at a time.
+                        if unreachable_for_too_long(&events, last_contact, &format!("{e:#}")) {
+                            break;
+                        }
                         resubscribe_delay = (resubscribe_delay * 2).min(RESUBSCRIBE_MAX_DELAY);
                         resubscribe_at = tokio::time::Instant::now() + resubscribe_delay;
                     }
@@ -1181,9 +1276,17 @@ pub async fn run(
             event = async { stream.as_mut().expect("guarded").recv().await },
                     if stream.is_some() => {
                 match event {
-                    Some(ListenerEvent::Keepalive) => stream_delivered = true,
+                    // Contact, keepalive included -- that is what a keepalive
+                    // is for. Without this a proxy whose stream is healthy
+                    // while its listing endpoint returns 5xx would be called
+                    // unreachable while it was demonstrably answering.
+                    Some(ListenerEvent::Keepalive) => {
+                        stream_delivered = true;
+                        last_contact = tokio::time::Instant::now();
+                    }
                     Some(_) => {
                         stream_delivered = true;
+                        last_contact = tokio::time::Instant::now();
                         poll.reset_immediately();
                     }
                     None => {
@@ -1230,6 +1333,9 @@ pub async fn run(
             _ = poll.tick(), if policy != AcceptPolicy::Manual => {
                 match session.poll_signaling(&mut signaling, policy).await {
                     Ok(found) => {
+                        // Reached it. An empty answer counts: "nobody is
+                        // waiting" is a working proxy saying so.
+                        last_contact = tokio::time::Instant::now();
                         for event in found {
                             tracing::info!("signaling: {event:?}");
                             // No subscribers is not a failure — the application
@@ -1238,8 +1344,15 @@ pub async fn run(
                         }
                     }
                     // The proxy being briefly unreachable is not a reason to
-                    // stop serving; the next tick tries again.
-                    Err(e) => tracing::warn!("signaling poll failed: {e:#}"),
+                    // stop serving; the next tick tries again. Being
+                    // unreachable for `UNREACHABLE_AFTER` is, because by then
+                    // the next tick has already tried, many times.
+                    Err(e) => {
+                        tracing::warn!("signaling poll failed: {e:#}");
+                        if unreachable_for_too_long(&events, last_contact, &format!("{e:#}")) {
+                            break;
+                        }
+                    }
                 }
             }
             cmd = cmd_rx.recv() => match cmd {
@@ -1600,5 +1713,122 @@ mod tests {
 
         leg.inbound.record();
         assert!(leg.carried_traffic(), "and it recovers if the peer returns");
+    }
+
+    /// One failed call is the normal case and must decide nothing: the proxy is
+    /// reached again on the next tick far more often than not.
+    #[tokio::test(start_paused = true)]
+    async fn one_failure_is_not_giving_up() {
+        let (events, mut watching) = broadcast::channel(8);
+        let last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+
+        assert!(!unreachable_for_too_long(
+            &events,
+            last_contact,
+            "connection refused"
+        ));
+        assert!(
+            watching.try_recv().is_err(),
+            "and it says nothing while it is still only a failure"
+        );
+    }
+
+    /// The window has to be spent in full. Anything shorter turns a proxy
+    /// restart -- or a backoff that has climbed to its own cap, which is
+    /// shorter than this by design -- into a stopped server.
+    #[tokio::test(start_paused = true)]
+    async fn giving_up_takes_the_whole_window() {
+        let (events, _watching) = broadcast::channel(8);
+        let last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER - Duration::from_secs(1)).await;
+        assert!(
+            !unreachable_for_too_long(&events, last_contact, "connection refused"),
+            "a second short of the window is still retrying"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(unreachable_for_too_long(
+            &events,
+            last_contact,
+            "connection refused"
+        ));
+    }
+
+    /// **The whole point of measuring from the last success.** A proxy that
+    /// answers one call in ten is reachable, and a listener that stopped
+    /// because failures had merely accumulated would stop on a flaky network it
+    /// was still working over.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_works_puts_the_window_back() {
+        let (events, _watching) = broadcast::channel(8);
+        let mut last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER - Duration::from_secs(1)).await;
+        assert!(!unreachable_for_too_long(
+            &events,
+            last_contact,
+            "timed out"
+        ));
+
+        // One poll gets through, which is all the loop does with a success.
+        last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER - Duration::from_secs(1)).await;
+        assert!(
+            !unreachable_for_too_long(&events, last_contact, "timed out"),
+            "the window restarted at the call that worked"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            unreachable_for_too_long(&events, last_contact, "timed out"),
+            "and runs out from there"
+        );
+    }
+
+    /// The event carries the two things an operator reading the exit needs: how
+    /// long nothing worked, and what the last attempt said.
+    #[tokio::test(start_paused = true)]
+    async fn giving_up_says_how_long_and_why() {
+        let (events, mut watching) = broadcast::channel(8);
+        let last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER + Duration::from_secs(42)).await;
+        assert!(unreachable_for_too_long(
+            &events,
+            last_contact,
+            "503 Service Unavailable"
+        ));
+
+        match watching.try_recv().expect("the reason is published") {
+            SignalingEvent::Unreachable {
+                unreachable_for,
+                error,
+            } => {
+                assert_eq!(unreachable_for, UNREACHABLE_AFTER + Duration::from_secs(42));
+                assert_eq!(error, "503 Service Unavailable");
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    /// Nobody listening does not make the control plane reachable. The send is
+    /// deliberately ignored -- a listener serves whether or not a UI is
+    /// watching -- so the answer must not come from whether it landed.
+    #[tokio::test(start_paused = true)]
+    async fn giving_up_does_not_depend_on_anyone_listening() {
+        let (events, watching) = broadcast::channel(8);
+        drop(watching);
+        let last_contact = tokio::time::Instant::now();
+
+        tokio::time::advance(UNREACHABLE_AFTER + Duration::from_secs(1)).await;
+        assert!(unreachable_for_too_long(
+            &events,
+            last_contact,
+            "connection refused"
+        ));
     }
 }

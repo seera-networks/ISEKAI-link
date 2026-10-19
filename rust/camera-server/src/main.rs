@@ -280,6 +280,18 @@ fn describe(event: &SignalingEvent) -> String {
             format!("could not keep a peer's connection alive: {error}")
         }
         SignalingEvent::Truncated => "more peers are waiting than the proxy will list".to_string(),
+        // Said on screen rather than acted on, which is the opposite of what
+        // `portal-server` does with it -- and deliberately. There is an
+        // operator in front of this one: exiting out from under them would
+        // take the window, and the explanation with it, off the screen. So the
+        // line stays, plainly enough to act on.
+        SignalingEvent::Unreachable {
+            unreachable_for,
+            error,
+        } => format!(
+            "lost the control plane {}s ago and gave up — restart to reconnect: {error}",
+            unreachable_for.as_secs()
+        ),
     }
 }
 
@@ -624,6 +636,20 @@ impl MyApp {
                                         s.activity.push_back(describe(&event));
                                         while s.activity.len() > ACTIVITY_LINES {
                                             s.activity.pop_front();
+                                        }
+                                        // **The status line has to move too.**
+                                        // It is the authoritative one on
+                                        // screen, and left at "listener ...
+                                        // ready" it tells an operator the
+                                        // opposite of the line just added: the
+                                        // session has ended, the Peer Listener
+                                        // is withdrawn, and pairing, grants and
+                                        // bind all fail from here. The activity
+                                        // line says what happened; this says
+                                        // what is true now.
+                                        if matches!(event, SignalingEvent::Unreachable { .. }) {
+                                            s.status = "P2P: control plane unreachable;                                                  the listener has stopped — restart to reconnect"
+                                                .to_string();
                                         }
                                     }
                                     // A peer that just bound may have paired a

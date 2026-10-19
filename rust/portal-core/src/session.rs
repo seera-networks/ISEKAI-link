@@ -74,6 +74,17 @@ pub struct ServerHandle {
     commands: mpsc::Sender<ListenerCommand>,
     /// Bindings and departures, for anything that wants to report them.
     pub signaling: broadcast::Sender<SignalingEvent>,
+    /// Cancelled when the task below has ended, however it ended.
+    ///
+    /// **`signaling` cannot carry this.** This struct holds the sender, so a
+    /// caller's `recv()` never reports the channel closed while the server is
+    /// alive: a session that stopped without getting a last event out — a
+    /// panic, a closed command channel, a `Lagged` gap swallowing the one
+    /// `Unreachable` the loop sends — left that caller waiting on a channel
+    /// nobody would ever send on, with the process up and still listed as a
+    /// listener it was no longer running. A token cannot be missed or
+    /// overtaken, and it is cancelled by a drop guard, so unwinding counts too.
+    pub stopped: CancellationToken,
     running: tokio::task::JoinHandle<()>,
     shutdown: CancellationToken,
     reg: Arc<Registration>,
@@ -280,18 +291,25 @@ pub async fn serve(
 
     let (commands, cmd_rx) = mpsc::channel(8);
     let (signaling, _) = broadcast::channel(32);
-    let running = tokio::spawn(run(
-        session,
-        cmd_rx,
-        policy,
-        signaling.clone(),
-        shutdown.clone(),
-    ));
+    let stopped = CancellationToken::new();
+    let running = tokio::spawn({
+        // A guard rather than a `cancel()` after the await: that line would be
+        // skipped by a panic in `run`, which is one of the endings this exists
+        // to report. Dropping is the one thing that happens either way.
+        let ended = stopped.clone().drop_guard();
+        let signaling = signaling.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            run(session, cmd_rx, policy, signaling, shutdown).await;
+            drop(ended);
+        }
+    });
 
     Ok(ServerHandle {
         info,
         commands,
         signaling,
+        stopped,
         running,
         shutdown,
         reg,
@@ -978,5 +996,30 @@ mod tests {
             err.contains("--peer") && err.contains("ep:aaa") && err.contains("ep:bbb"),
             "lists what to choose between: {err}",
         );
+    }
+
+    /// **Why `stopped` is a drop guard and not a `cancel()` after the await.**
+    ///
+    /// A panic in the session loop is one of the endings the token exists to
+    /// report -- `portal-server` waits on it to decide whether to keep running
+    /// -- and a line placed after the await is exactly the line a panic skips.
+    /// Unwinding drops, so a guard covers it; this is the assertion that says
+    /// the distinction is real and not a guess about tokio.
+    #[tokio::test]
+    async fn a_session_that_panics_still_reports_that_it_stopped() {
+        let stopped = tokio_util::sync::CancellationToken::new();
+        let ended = stopped.clone().drop_guard();
+        let panicked = tokio::spawn(async move {
+            let _ended = ended;
+            panic!("the session loop came apart");
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), stopped.cancelled())
+                .await
+                .is_ok(),
+            "a caller waiting on `stopped` would have waited forever"
+        );
+        assert!(panicked.await.is_err(), "and it really did panic");
     }
 }

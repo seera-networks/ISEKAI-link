@@ -1771,14 +1771,78 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // stream breaks, and turning a user's *first* press into a hard exit there
     // would skip withdrawing the Peer Listener — the one thing the comment
     // below says must not be skipped.
+    /// One wording for the reason, wherever it is picked up from.
+    fn unreachable_reason(unreachable_for: Duration, error: &str) -> String {
+        format!(
+            "the control plane was unreachable for {}s: {error}",
+            unreachable_for.as_secs()
+        )
+    }
+    /// The reason an already-stopped session managed to publish, if any.
+    ///
+    /// Drained, never awaited: the session has ended, so nothing further is
+    /// coming, and `recv()` would wait forever on a channel whose sender
+    /// `ServerHandle` still holds.
+    fn published_reason(
+        events: &mut tokio::sync::broadcast::Receiver<isekai_p2p::SignalingEvent>,
+    ) -> Option<String> {
+        loop {
+            match events.try_recv() {
+                Ok(isekai_p2p::SignalingEvent::Unreachable {
+                    unreachable_for,
+                    error,
+                }) => return Some(unreachable_reason(unreachable_for, &error)),
+                Ok(_) => continue,
+                // A gap may have swallowed it; whatever is left is still worth
+                // looking through, and `try_recv` reports a gap once.
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
     let mut interrupted = false;
+    // Why the session stopped, when it stopped on its own. `None` once the loop
+    // ends means a signal ended it, which is a success; anything here is the
+    // error this process exits with.
+    let mut gave_up: Option<String> = None;
     loop {
         tokio::select! {
             _ = &mut signalled => { interrupted = true; break }
             _ = &mut terminate => { interrupted = true; break }
+            // **The guarantee; the event below is only the detail.** Waiting
+            // on the event alone left this loop parked forever whenever the
+            // session stopped without one arriving -- see `ServerHandle::
+            // stopped`, which cannot be missed or overtaken.
+            _ = server.stopped.cancelled() => {
+                // The loop may have published `Unreachable` immediately before
+                // it ended, with this arm winning the race to wake; so look
+                // before settling for the reason that says nothing.
+                gave_up = Some(
+                    published_reason(&mut events)
+                        .unwrap_or_else(|| "the signaling session ended".to_string()),
+                );
+                break;
+            }
             event = events.recv() => match event {
                 Ok(event) => {
                     tracing::info!("signaling: {event:?}");
+                    // **The last event a session sends, and the one thing here
+                    // that ends the process.** The session has already retried
+                    // for `UNREACHABLE_AFTER`; there is nothing left for this
+                    // loop to wait for. Exiting with an error is the point: a
+                    // listener that cannot reach the control plane is still
+                    // listed as one and binds nobody who arrives, so the useful
+                    // move is to let whatever started it start it again.
+                    // Breaking here skips the gateway bookkeeping below, which
+                    // is right: this event names no connection to count.
+                    if let isekai_p2p::SignalingEvent::Unreachable {
+                        unreachable_for,
+                        error,
+                    } = &event
+                    {
+                        gave_up = Some(unreachable_reason(*unreachable_for, error));
+                        break;
+                    }
                     // **Recorded, never refused.** Enforcement is a later
                     // phase; what this buys now is that a deployment can see
                     // how many connections *would* be turned away before that
@@ -1800,7 +1864,15 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
                     tracing::warn!(missed = n, "missed signaling events; restarting the count");
                     live.clear();
                 }
-                Err(_) => break,
+                // Not the path a stopped session takes -- `ServerHandle`
+                // holds the sender, so this cannot fire while `server` is
+                // alive; the `stopped` arm above is what covers that. Kept
+                // because the match needs it, and it exits the same way: a
+                // closed channel here would still mean no events are coming.
+                Err(_) => {
+                    gave_up = Some("the signaling session ended".to_string());
+                    break;
+                }
             },
         }
     }
@@ -1811,6 +1883,11 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // the session withdraws the Peer Listener on its way out. Cancel-and-return
     // leaves it listed for its whole lease, pointing at a process that is gone.
     server.close().await;
+    // After `close`, not instead of it: the withdrawal is what keeps a dead
+    // process from staying listed, and it is needed most on exactly this path.
+    if let Some(reason) = gave_up {
+        anyhow::bail!("portal-server stopped: {reason}");
+    }
     Ok(())
 }
 
