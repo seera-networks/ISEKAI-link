@@ -1,0 +1,57 @@
+name: Workflow paths
+
+# **A `paths:` filter decides whether a job runs at all, so a gap in one is a
+# job that silently did not.** This checks that every filter is closed: watch
+# a crate, and you watch everything it is built and tested from, down to the
+# manifest and lockfile its dependency versions are resolved through.
+#
+# #302 is why it exists. `portal.yml` named `isekai-p2p-core` but not
+# `channel-masque`, the H3 transport underneath it, so a fix to nothing but
+# that crate ran no portal job at all — not Compile on any platform, not
+# "Forward a service", not the binary build. The pull request was green, and
+# the thing it was green about had not been tested. `rust/privacy` had been
+# missing from two filters for longer, `submodules/tonic-h3` from three, and
+# `migration-spike.yml` watched six crates without watching the workspace
+# manifest they all take their versions from.
+#
+# It had already been noticed twice and fixed by hand twice. Remembering a
+# list is what keeps failing, so the list is derived instead.
+#
+# **No path filter on this one**, for the reason `secrets.yml` gives about its
+# own: a rule that a pull request can be shaped to skip is worth nothing, and
+# this one is specifically about pull requests being shaped that way.
+#
+# What it does not decide is which crates a workflow *should* watch — that is
+# the author's call, and a deliberately narrow filter stays narrow. It only
+# says that whatever is watched is watched completely.
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  closed:
+    name: Every workflow watches what it builds on
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # The graph comes from `cargo metadata`, which needs the submodules'
+      # manifests present: `h3-util` and `msquic-async` are path dependencies,
+      # and reaching them is half of what this checks the filters do.
+      - uses: ./.github/actions/submodules
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # Installed rather than assumed. The workflows are read as YAML and not
+      # with a regex, because hand-matching `- '...'` lines missed every other
+      # legal spelling -- double quotes, a bare scalar, an inline list -- and a
+      # filter the check could not read came out empty, which read as closed.
+      # A guard that misses the form somebody happens to write is worse than
+      # none: it reads green over exactly what it is for.
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet --disable-pip-version-check pyyaml
+      - name: Check
+        run: .github/scripts/check-workflow-paths.py

@@ -64,6 +64,20 @@ on:
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
+      # The rest of that same graph. These were missing, and #302 is what it
+      # cost: a fix to nothing but `channel-masque` -- the H3 transport every
+      # crate above dials the control plane through -- matched no path here, so
+      # Compile, "Forward a service" and the binary build all sat out the
+      # change, on a transport this workflow exists to test. `tonic-h3` is
+      # where that crate's `h3-util` comes from, bare because a submodule is
+      # one gitlink entry and a `/**` glob never matches the pointer moving.
+      # `privacy` is the consent gate both binaries call before anything else.
+      #
+      # Remembering this list is what failed twice. It is checked now:
+      # `.github/scripts/check-workflow-paths.py`.
+      - 'rust/channel-masque/**'
+      - 'rust/privacy/**'
+      - 'submodules/tonic-h3'
       # **The manifest and the lock.** A release is cut from a commit that
       # moves `package.version` and nothing else, so without these a tag on it
       # matches no path and the release job never runs -- the bundles are not
@@ -92,6 +106,20 @@ on:
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
+      # The rest of that same graph. These were missing, and #302 is what it
+      # cost: a fix to nothing but `channel-masque` -- the H3 transport every
+      # crate above dials the control plane through -- matched no path here, so
+      # Compile, "Forward a service" and the binary build all sat out the
+      # change, on a transport this workflow exists to test. `tonic-h3` is
+      # where that crate's `h3-util` comes from, bare because a submodule is
+      # one gitlink entry and a `/**` glob never matches the pointer moving.
+      # `privacy` is the consent gate both binaries call before anything else.
+      #
+      # Remembering this list is what failed twice. It is checked now:
+      # `.github/scripts/check-workflow-paths.py`.
+      - 'rust/channel-masque/**'
+      - 'rust/privacy/**'
+      - 'submodules/tonic-h3'
       # **The manifest and the lock.** A release is cut from a commit that
       # moves `package.version` and nothing else, so without these a tag on it
       # matches no path and the release job never runs -- the bundles are not

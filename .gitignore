@@ -80,3 +80,8 @@ quic.txt
 # camera-apps workflow, which runs it). Hundreds of megabytes of copied
 # libraries; regenerated from a build.
 /dist
+
+# Python bytecode. `.github/scripts/` is the first Python in this tree, and
+# importing one of those scripts -- which is how you test it rather than just
+# run it -- leaves a `__pycache__` beside it.
+__pycache__/

@@ -38,6 +38,26 @@ on:
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
+      # The bottom of that same stack, which the list above stopped one edge
+      # short of: `isekai-link-utils` and `isekai-p2p-core` both reach the
+      # proxy through `channel-masque`, which takes `h3-util` from
+      # `submodules/tonic-h3` -- bare, because a submodule is one gitlink entry
+      # and a `/**` glob never matches the pointer moving. `privacy` is in
+      # `camera-core`'s own graph. Checked now rather than remembered:
+      # `.github/scripts/check-workflow-paths.py`.
+      - 'rust/channel-masque/**'
+      - 'rust/privacy/**'
+      - 'submodules/tonic-h3'
+      # **Where those crates' dependency versions actually come from.** Every
+      # one of them inherits from `[workspace.dependencies]` -- `privacy`'s
+      # manifest is nothing but `workspace = true` lines -- so a bumped
+      # dependency, or a `cargo update` touching only the lockfile, changed
+      # what these tests compile against and matched no path here. This file's
+      # own header says this step is the only coverage camera-core's
+      # real-connection tests have in CI. The other workflows that name crates
+      # one by one already list both; this was the one that did not.
+      - 'rust/Cargo.toml'
+      - 'rust/Cargo.lock'
       - '.github/workflows/migration-spike.yml'
   pull_request:
     paths:
@@ -56,6 +76,26 @@ on:
       - 'rust/isekai-p2p-core/**'
       - 'rust/utils/**'
       - 'submodules/msquic-async-rs'
+      # The bottom of that same stack, which the list above stopped one edge
+      # short of: `isekai-link-utils` and `isekai-p2p-core` both reach the
+      # proxy through `channel-masque`, which takes `h3-util` from
+      # `submodules/tonic-h3` -- bare, because a submodule is one gitlink entry
+      # and a `/**` glob never matches the pointer moving. `privacy` is in
+      # `camera-core`'s own graph. Checked now rather than remembered:
+      # `.github/scripts/check-workflow-paths.py`.
+      - 'rust/channel-masque/**'
+      - 'rust/privacy/**'
+      - 'submodules/tonic-h3'
+      # **Where those crates' dependency versions actually come from.** Every
+      # one of them inherits from `[workspace.dependencies]` -- `privacy`'s
+      # manifest is nothing but `workspace = true` lines -- so a bumped
+      # dependency, or a `cargo update` touching only the lockfile, changed
+      # what these tests compile against and matched no path here. This file's
+      # own header says this step is the only coverage camera-core's
+      # real-connection tests have in CI. The other workflows that name crates
+      # one by one already list both; this was the one that did not.
+      - 'rust/Cargo.toml'
+      - 'rust/Cargo.lock'
       - '.github/workflows/migration-spike.yml'
   workflow_dispatch:
 

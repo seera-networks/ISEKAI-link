@@ -15,6 +15,12 @@ on:
   pull_request:
     paths:
       - 'rust/**'
+      # Every crate above is built from these, and a mutant run is a build:
+      # a submodule bump changes what survives, so it is a change this should
+      # ask about. Bare, not `/**`, because a submodule is one gitlink entry
+      # here and a glob never matches the pointer moving.
+      - 'submodules/msquic-async-rs'
+      - 'submodules/tonic-h3'
       - '.github/workflows/mutants.yml'
   workflow_dispatch:
     inputs:
