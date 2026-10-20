@@ -12,7 +12,7 @@ use std::{
 use bytes::{Buf, BytesMut};
 
 use futures::{
-    future::{BoxFuture, FutureExt},
+    future::{BoxFuture, Either, FutureExt},
     stream::StreamExt,
 };
 use hyper::{
@@ -103,6 +103,106 @@ pub fn encode_var_int(mut v: u64) -> Vec<u8> {
     buf
 }
 
+/// Reports a readiness failure as the next request's error, not the service's.
+///
+/// **This is what keeps a [`Buffer`] from latching.** In tower, an error out of
+/// `poll_ready` means the service is finished -- and `tower::Buffer` takes it
+/// at its word: `Worker::failed` stores the error behind a shared handle,
+/// closes the request channel and returns, after which every clone of the
+/// buffer answers every later `poll_ready` with that same stored error,
+/// forever. A service underneath that can reconnect never gets polled again,
+/// so one failed attempt costs the whole channel. That is exactly what a
+/// control plane restarting for thirty seconds used to cost: every call after
+/// it failed with `buffered service failed: connection lost`, and only
+/// restarting the process brought it back.
+///
+/// So nothing under a `Buffer` may report a *recoverable* failure through
+/// `poll_ready`. A failed connection attempt is recoverable -- the next attempt
+/// is a fresh one -- and belongs to a request rather than to the service. This
+/// moves it there: readiness always succeeds, and the stored error is handed to
+/// the next `call` instead.
+///
+/// The inner service is still asked on every pass, so retrying is its own
+/// business and its own schedule; this only changes who is told about a
+/// failure. Nothing is hidden: the caller still sees the error, once per
+/// attempt.
+///
+/// **"The next `call`" is usually the request that provoked the attempt, and
+/// not always.** A caller that drops its response future mid-attempt leaves
+/// the attempt behind -- `tower`'s worker discards a cancelled message without
+/// asking readiness again (`Worker::poll_next_msg`) -- and the next request
+/// along is handed that result instead of making its own. The service cannot
+/// see that its caller went away, so no exact fix lives at this layer; see
+/// `MasqueRequestSender::connect_failure` for what the consequence is and is
+/// not.
+pub struct FailRequestNotService<S, Req>
+where
+    S: Service<Req>,
+{
+    inner: S,
+    /// The readiness failure the next `call` will report, if there is one.
+    ///
+    /// Cleared the moment readiness succeeds, so a stale failure cannot be
+    /// handed to a request that would have worked.
+    failed: Option<S::Error>,
+    _req: std::marker::PhantomData<fn(Req)>,
+}
+impl<S, Req> FailRequestNotService<S, Req>
+where
+    S: Service<Req>,
+{
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            failed: None,
+            _req: std::marker::PhantomData,
+        }
+    }
+}
+impl<S, Req> Service<Req> for FailRequestNotService<S, Req>
+where
+    S: Service<Req>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Either<S::Future, std::future::Ready<Result<S::Response, S::Error>>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.inner.poll_ready(cx) {
+            // Still working on it. Reporting ready here would hand `call` a
+            // service that has nothing to send with.
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                self.failed = None;
+                Poll::Ready(Ok(()))
+            }
+            // The whole point: ready, with the failure kept for the request.
+            Poll::Ready(Err(e)) => {
+                self.failed = Some(e);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    fn call(&mut self, req: Req) -> Self::Future {
+        match self.failed.take() {
+            Some(e) => Either::Right(std::future::ready(Err(e))),
+            None => Either::Left(self.inner.call(req)),
+        }
+    }
+}
+/// What [`H3Channel`] buffers: a response from the connection, or the readiness
+/// failure [`FailRequestNotService`] reports in its place.
+#[allow(clippy::type_complexity)]
+type H3ChannelFuture<C> = Either<
+    BoxFuture<
+        'static,
+        Result<Response<H3IncomingClient<<C as H3Connector>::RS, Bytes>>, h3_util::Error>,
+    >,
+    std::future::Ready<
+        Result<Response<H3IncomingClient<<C as H3Connector>::RS, Bytes>>, h3_util::Error>,
+    >,
+>;
 /// Cloneable http3 client channel, which can be used to enable multiplexing requests.
 pub struct H3Channel<C, B>
 where
@@ -111,11 +211,7 @@ where
     B::Data: Send,
     B::Error: Into<h3_util::Error> + Send,
 {
-    #[allow(clippy::type_complexity)]
-    svc: Buffer<
-        Request<B>,
-        BoxFuture<'static, Result<Response<H3IncomingClient<C::RS, Bytes>>, h3_util::Error>>,
-    >,
+    svc: Buffer<Request<B>, H3ChannelFuture<C>>,
 }
 
 impl<C, B> Clone for H3Channel<C, B>
@@ -136,10 +232,7 @@ pub struct ResponseFuture<C>
 where
     C: H3Connector,
 {
-    #[allow(clippy::type_complexity)]
-    inner: BufferResponseFuture<
-        BoxFuture<'static, Result<Response<H3IncomingClient<C::RS, Bytes>>, h3_util::Error>>,
-    >,
+    inner: BufferResponseFuture<H3ChannelFuture<C>>,
 }
 
 impl<C, B> H3Channel<C, B>
@@ -156,6 +249,11 @@ where
     pub fn new(connector: C, uri: Uri, executor: Option<SharedExec>) -> Self {
         let executor = executor.unwrap_or_else(SharedExec::tokio);
         let svc = H3Connection::new(connector, uri, Some(executor.clone()));
+        // **Between the connection and the buffer, deliberately.** See
+        // `FailRequestNotService`: without it one failed connection attempt
+        // latches the buffer and no later request can ever reach the proxy
+        // again, however healthy it becomes.
+        let svc = FailRequestNotService::new(svc);
         let (svc, worker) = Buffer::pair(svc, DEFAULT_BUFFER_SIZE);
         executor.execute(worker);
         Self { svc }
@@ -402,6 +500,32 @@ pub struct MasqueRequestSender<CONN: H3Connector> {
             >,
         >,
     >,
+    /// A connection attempt that failed, waiting for the request it belongs to.
+    ///
+    /// **Not reported through `poll_ready`, on purpose.** This service
+    /// reconnects: `poll_ready` drops the attempt's future on failure so the
+    /// next pass starts a fresh one, which makes the failure recoverable, and
+    /// in tower a recoverable failure must not come out of `poll_ready` --
+    /// that channel means the service is finished, and callers believe it.
+    /// `tower::Buffer` is the one that believes it hardest, latching the error
+    /// and never polling this service again. See
+    /// [`FailRequestNotService`], which guards the same invariant one layer up
+    /// for anything else that ends up under the buffer.
+    ///
+    /// **An attempt can outlive the request that started it**, and then this
+    /// is handed to whichever request comes next. A caller that drops its
+    /// response future mid-handshake -- a sibling arm of a `select!` winning,
+    /// which the listener loop does -- leaves the attempt suspended here, and
+    /// the next request resumes it and is failed by it without an attempt of
+    /// its own. That is one spurious failure: the attempt is cleared with it,
+    /// so the request after that gets a fresh one. It does not accumulate, and
+    /// it cannot push a watchdog measuring from the last *success* toward
+    /// giving up, because the next success resets that clock. Bounding it
+    /// would take a staleness timer, and a guessed timer here would be a
+    /// second retry policy fighting the one the callers already have. Note
+    /// which way this changed: the same stale error used to reach
+    /// `poll_ready` and end the channel for good.
+    connect_failure: Option<h3_util::Error>,
     uri: Uri,
     executor: SharedExec,
 }
@@ -419,6 +543,7 @@ where
             datagram_sender_rx: None,
             driver_rx: None,
             make_send_request_fut: None,
+            connect_failure: None,
             uri,
             executor,
         }
@@ -530,17 +655,31 @@ where
                     self.datagram_sender_rx = Some(datagram_sender_rx);
                     self.driver_rx = Some(rx);
                     self.make_send_request_fut = None;
+                    // Nothing stale may outlive the attempt that worked.
+                    self.connect_failure = None;
                     Ok(())
                 }
+                // **`Ok`, holding the error.** Dropping the future above is
+                // what makes the next pass a fresh attempt, so this failure is
+                // one attempt's and not this service's; `connect_failure` says
+                // why that must not be said through `poll_ready`, and which
+                // request ends up hearing it.
                 Err(e) => {
                     self.make_send_request_fut = None;
-                    Err(e)
+                    self.connect_failure = Some(e);
+                    Ok(())
                 }
             })
     }
 
     /// Gets the send_request from the cache and send the request.
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        // The most recent failed attempt, if there is one -- usually this
+        // request's own; see `connect_failure` for when it is not. Taken, so a
+        // later request that connects is not told about an outage that is over.
+        if let Some(e) = self.connect_failure.take() {
+            return Box::pin(async move { Err(e) });
+        }
         let (
             Some(send_request),
             Some(from_quic_to_udp_tx),
@@ -1420,4 +1559,137 @@ fn build_seera_mapped_addr_capsule(mapped_addr: SocketAddr) -> Bytes {
         }
     }
     build_raw_capsule(0x40, &payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tower::ServiceExt;
+
+    /// A service that refuses to become ready a fixed number of times, then
+    /// works — which is what a connection attempt against a control plane that
+    /// is restarting looks like from above.
+    struct FlakyReadiness {
+        remaining_failures: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<&'static str> for FlakyReadiness {
+        type Response = &'static str;
+        type Error = tower::BoxError;
+        type Future = std::future::Ready<Result<&'static str, tower::BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                return Poll::Ready(Err("connection lost".into()));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: &'static str) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(req))
+        }
+    }
+
+    /// **The bug this guards against, stated as behaviour.**
+    ///
+    /// Not a test of our code: a test of `tower::Buffer`, kept because the
+    /// whole design of [`FailRequestNotService`] rests on it and because it is
+    /// the thing nobody believes until they read `Worker::failed`. One
+    /// readiness failure ends the buffer permanently, even though the service
+    /// underneath is willing from the very next pass.
+    #[tokio::test]
+    async fn a_buffer_latches_one_readiness_failure_forever() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let flaky = FlakyReadiness {
+            remaining_failures: 1,
+            calls: Arc::clone(&calls),
+        };
+        let (mut svc, worker) = Buffer::pair(flaky, 8);
+        tokio::spawn(worker);
+
+        let first = svc.ready().await.expect("a slot").call("one").await;
+        assert!(first.is_err(), "the attempt that failed");
+
+        // The service would work now. The buffer will not ask it.
+        let again = svc.ready().await;
+        assert!(
+            again.is_err(),
+            "tower::Buffer is finished with it, for good"
+        );
+        assert!(
+            format!("{}", again.unwrap_err()).contains("buffered service failed"),
+            "and this is the message an operator was left with"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "nothing ever reached the service"
+        );
+    }
+
+    /// The same service, the same buffer, with the adapter in between: the
+    /// failed attempt is still reported — to the request that provoked it —
+    /// and the next request connects.
+    #[tokio::test]
+    async fn the_adapter_lets_a_reconnecting_service_recover() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let flaky = FlakyReadiness {
+            remaining_failures: 1,
+            calls: Arc::clone(&calls),
+        };
+        let (mut svc, worker) = Buffer::pair(FailRequestNotService::new(flaky), 8);
+        tokio::spawn(worker);
+
+        let first = svc.ready().await.expect("a slot").call("one").await;
+        let message = format!(
+            "{}",
+            first.expect_err("the failed attempt is still reported")
+        );
+        assert!(
+            message.contains("connection lost"),
+            "and it is the failure itself, not a buffer's epitaph: {message}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "that request never reached the service"
+        );
+
+        let second = svc.ready().await.expect("still usable").call("two").await;
+        assert_eq!(second.expect("recovered"), "two");
+        // A third, because the failure must not be kept and handed to a
+        // request that would have worked.
+        let third = svc.ready().await.expect("still usable").call("three").await;
+        assert_eq!(third.expect("still working"), "three");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Readiness asked twice with no request in between, which is the only way
+    /// to reach the line that clears a kept failure.
+    ///
+    /// A `Buffer` never does this -- it calls as soon as readiness returns, and
+    /// `take` does the clearing -- so without this the clear is untested and a
+    /// direct caller would be handed an outage that was already over.
+    #[tokio::test]
+    async fn a_kept_failure_does_not_outlive_the_attempt_that_worked() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut svc = FailRequestNotService::new(FlakyReadiness {
+            remaining_failures: 1,
+            calls: Arc::clone(&calls),
+        });
+
+        futures::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .expect("a failed attempt is not the service's failure");
+        futures::future::poll_fn(|cx| svc.poll_ready(cx))
+            .await
+            .expect("and the next attempt works");
+
+        assert_eq!(svc.call("one").await.expect("not the stale failure"), "one");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }
