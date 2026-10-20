@@ -354,6 +354,49 @@ path below needs it by hand.
 `portal-server.pem`: a new key is a new Endpoint ID, and every grant made
 against the old one stops applying.
 
+### Leaving it running, under systemd
+
+[`packaging/systemd/portal-server.service`](../packaging/systemd/portal-server.service)
+is a unit to copy and edit. A few things in it are worth knowing before you
+write your own instead.
+
+**Sign in as the service's user, once, before enabling it** — and pass
+`--accept-privacy-policy` to *that* command too. The agreement is recorded per
+user, a fresh service account has no record, and without the flag `--login`
+refuses before it ever prints a sign-in URL. The Endpoint key and the Auth0
+tokens then live together, and the tokens are what keep a long-running server
+working: an `--auth0-token` cannot be refreshed and takes the session with it
+when it expires. A host with no browser forwards the callback port, as in
+[Signing in over SSH](#signing-in-over-ssh).
+
+**Pass `--accept-privacy-policy` on every start.** The agreement is recorded,
+but it is asked again whenever the policy is revised — so a service that leans
+on the record stops starting the day that happens, refusing with a non-zero
+exit after printing the whole policy into the journal, once per restart
+attempt. The flag means the person who installed the unit agreed, which is who
+would have been asked anyway.
+
+**`Restart=on-failure` is the other half of the five-minute rule.** The server
+stops with an error when nothing has reached the control plane for five minutes:
+it is still listed as a Peer Listener while it can bind nobody who arrives, and
+nothing inside the process can mend that, so it exits and leaves the decision to
+whatever started it. Without a restart line that is just a server that stopped.
+A `systemctl stop` exits cleanly and stays stopped.
+
+**Do not pair it with a start-rate limit**, which is the obvious next line and
+the one that will leave you with a dead server. A failure to *start* is not
+slow — an unreachable control plane refuses the request and the process is gone
+in about a hundredth of a second, with no retry of its own, because the
+five-minute tolerance belongs to a session that was already established. So any
+burst is spent in seconds, and a network that turns up three minutes after a
+reboot exhausts it and stays down until somebody notices. Back the restarts off
+instead.
+
+Give it `TimeoutStopSec` in the twenties, too. Stopping withdraws the Peer
+Listener and then waits for msquic to let go — about ten seconds at worst — and
+a listener killed before that stays listed for its whole lease, pointing at a
+process that is gone.
+
 ## 3. Show a pairing code
 
 ```sh
