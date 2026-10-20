@@ -24,7 +24,8 @@
 #   <bundle-name>/
 #   ├── <app>              launcher, one per app
 #   ├── bin/               the binaries
-#   └── lib/               libmsquic and whatever else they pull in
+#   ├── lib/               libmsquic and whatever else they pull in
+#   └── systemd/           on Linux, a unit for any app that has one
 #
 # **Two families are deliberately left out.** The C runtime, because mixing a
 # bundled glibc with the host's loader is what breaks tarballs like this one.
@@ -41,6 +42,9 @@ shift 3
 [ $# -gt 0 ] || { echo "${usage}" >&2; echo "name at least one app to bundle" >&2; exit 1; }
 apps=("$@")
 stage="${out_dir}/${name}"
+# Resolved from this script's own location, not the working directory: the
+# callers are workflow steps whose cwd is incidental.
+units="$(cd "$(dirname "$0")/.." && pwd)/packaging/systemd"
 rm -rf "${stage}"
 mkdir -p "${stage}/bin" "${stage}/lib"
 
@@ -138,6 +142,23 @@ exec env LD_LIBRARY_PATH="\${here}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
     "\${here}/bin/${app}" "\$@"
 LAUNCHER
         chmod 0755 "${stage}/${app}"
+    done
+
+    # **The unit ships with the thing it starts.** Leaving an operator to find
+    # it in the repository means the two drift: the unit names paths inside
+    # this bundle, so the copy that matches an archive is the one that came in
+    # it.
+    #
+    # Linux only -- a `.service` is systemd's, and the macOS branch would want
+    # launchd, which nothing here writes. Found by name, so adding
+    # `packaging/systemd/<app>.service` for another binary ships it without
+    # touching this script.
+    #
+    for app in "${apps[@]}"; do
+        [ -f "${units}/${app}.service" ] || continue
+        mkdir -p "${stage}/systemd"
+        cp -a "${units}/${app}.service" "${stage}/systemd/"
+        echo "shipping ${app}.service"
     done
     ;;
 
@@ -274,6 +295,29 @@ Linux)
     if [ "${missing}" -ne 0 ]; then
         echo "the bundle does not carry what it needs; it would fail to start elsewhere" >&2
         exit 1
+    fi
+
+    # The unit is part of what the bundle promises, so it is checked like the
+    # libraries are, rather than trusted to a `cp` nobody watches.
+    #
+    # **Say when there is nothing to check.** This is vacuous for every camera
+    # bundle, because no camera app has a unit -- and `camera-apps.yml` is the
+    # only workflow that runs this script on an ordinary push. So the branch
+    # that copies is first exercised by a tag or a `workflow_dispatch`, and a
+    # silent pass here would read as coverage it is not.
+    shipped=0
+    for app in "${apps[@]}"; do
+        [ -f "${units}/${app}.service" ] || continue
+        if [ ! -f "${stage}/systemd/${app}.service" ]; then
+            echo "missing from the bundle: systemd/${app}.service" >&2
+            exit 1
+        fi
+        shipped=$((shipped + 1))
+    done
+    if [ "${shipped}" -gt 0 ]; then
+        echo "verified: ${shipped} systemd unit(s) shipped"
+    else
+        echo "no systemd unit for any of these apps, so none was expected"
     fi
     ;;
 Darwin)

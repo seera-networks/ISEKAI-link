@@ -68,6 +68,9 @@ nothing installs — so it runs on a machine that has never built this. On Linux
 and macOS the two names at the top level are launchers that point the loader at
 the bundled `lib/`; on Windows the DLLs sit beside the executables.
 
+The Linux archive also carries `systemd/portal-server.service`, for
+[leaving the server running](#leaving-it-running-under-systemd).
+
 ### Or build it
 
 ```sh
@@ -356,9 +359,31 @@ against the old one stops applying.
 
 ### Leaving it running, under systemd
 
-[`packaging/systemd/portal-server.service`](../packaging/systemd/portal-server.service)
-is a unit to copy and edit. A few things in it are worth knowing before you
-write your own instead.
+The Linux archive ships the unit it needs, at
+`portal-ubuntu-latest/systemd/portal-server.service` — the same file as
+[`packaging/systemd/portal-server.service`](../packaging/systemd/portal-server.service),
+and the copy that matches the binaries beside it. Put the unpacked directory
+where it will stay and install from there:
+
+```sh
+unzip portal-ubuntu-latest.zip
+sudo mv portal-ubuntu-latest /usr/local/portal
+sudo chown -R root:root /usr/local/portal       # unzip ran as you; mv kept that
+sudo chmod -R go-w /usr/local/portal
+sudo cp /usr/local/portal/systemd/portal-server.service /etc/systemd/system/
+```
+
+The `chown` matters: without it the binary a system service executes stays
+writable by the account that unpacked the archive.
+
+`ExecStart` then runs `/usr/local/portal/portal-server`, which is the
+launcher — it finds its own directory, points the loader at the bundled `lib/`,
+and `exec`s the real binary, so the service's main process is `portal-server`
+itself and a stop signal reaches it rather than a wrapper. Nothing about the
+library path has to be set.
+
+The unit's own comments carry the rest. A few things in it are worth knowing
+before you write your own instead.
 
 **Sign in as the service's user, once, before enabling it** — and pass
 `--accept-privacy-policy` to *that* command too. The agreement is recorded per

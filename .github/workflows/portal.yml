@@ -88,6 +88,16 @@ on:
       # now that could break it and stay green.
       - 'rust/Cargo.toml'
       - 'rust/Cargo.lock'
+      # **What goes into the archive, besides the binaries.** The bundle now
+      # carries `packaging/systemd/portal-server.service`, and the machinery
+      # that puts it there is `scripts/bundle-apps.*`. Without these a tag cut
+      # on a commit that changed only the unit matches no path, this workflow
+      # does not start, and the release gets no bundles at all -- the same hole
+      # the header describes for a `docs/`-only commit. `workflow-paths.yml`
+      # cannot police this one: it closes crate graphs, and neither a shell
+      # script nor a unit file is a crate.
+      - 'packaging/**'
+      - 'scripts/**'
       - '.github/workflows/portal.yml'
   pull_request:
     paths:
@@ -130,6 +140,16 @@ on:
       # now that could break it and stay green.
       - 'rust/Cargo.toml'
       - 'rust/Cargo.lock'
+      # **What goes into the archive, besides the binaries.** The bundle now
+      # carries `packaging/systemd/portal-server.service`, and the machinery
+      # that puts it there is `scripts/bundle-apps.*`. Without these a tag cut
+      # on a commit that changed only the unit matches no path, this workflow
+      # does not start, and the release gets no bundles at all -- the same hole
+      # the header describes for a `docs/`-only commit. `workflow-paths.yml`
+      # cannot police this one: it closes crate graphs, and neither a shell
+      # script nor a unit file is a crate.
+      - 'packaging/**'
+      - 'scripts/**'
       - '.github/workflows/portal.yml'
   workflow_dispatch:
 

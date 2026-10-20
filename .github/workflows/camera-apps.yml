@@ -30,11 +30,25 @@ on:
     paths:
       - 'rust/**'
       - 'submodules/**'
+      # **The bundling machinery, which only this workflow exercises.**
+      # `portal.yml` bundles on a tag and says so, resting on "both halves are
+      # `scripts/bundle-apps.*` and `camera-apps.yml` runs them on every push".
+      # That was not true of a change to the scripts themselves: nothing
+      # watched `scripts/`, so editing the bundler ran no bundle at all and the
+      # first exercise of it was a release.
+      - 'scripts/**'
       - '.github/workflows/camera-apps.yml'
   pull_request:
     paths:
       - 'rust/**'
       - 'submodules/**'
+      # **The bundling machinery, which only this workflow exercises.**
+      # `portal.yml` bundles on a tag and says so, resting on "both halves are
+      # `scripts/bundle-apps.*` and `camera-apps.yml` runs them on every push".
+      # That was not true of a change to the scripts themselves: nothing
+      # watched `scripts/`, so editing the bundler ran no bundle at all and the
+      # first exercise of it was a release.
+      - 'scripts/**'
       - '.github/workflows/camera-apps.yml'
   workflow_dispatch:
 
