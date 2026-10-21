@@ -164,6 +164,17 @@ fn relay_connector(
     liveness: Liveness,
 ) -> anyhow::Result<(H3MsQuicAsyncConnector, ObservedAddressWatch)> {
     let (registration, config) = make_client_config(opts.registration.clone(), false, liveness)?;
+    // **The second configuration is how a leg reaches a relay where UDP does
+    // not pass, and it is the only thing that makes that work.** `connect()`
+    // tries QUIC first and, if `start` fails and a QMUX configuration was
+    // given, dials the *same host and port* over TCP with ALPN `h3qx-01`
+    // instead. A relay serving QMUX on its own port is therefore reached with
+    // nothing to configure here and nothing to advertise: the fallback is the
+    // address it already has.
+    //
+    // So passing `None` -- which reads like tidying away a transport nothing
+    // mentions -- silently takes UDP-less deployments with it, and the symptom
+    // is a leg that will not bind on exactly the networks that needed it.
     let (registration, config_qmux) = make_client_config(Some(registration), true, liveness)?;
     // The leg goes to the same proxy the control plane does, and gets the same
     // check: the certificate has to name the host dialled (#134).

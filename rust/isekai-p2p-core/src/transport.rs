@@ -80,6 +80,11 @@ impl MasqueH3Transport {
     pub fn connect(target: &str) -> anyhow::Result<Self> {
         let uri: Uri = target.parse().context("invalid proxy target URI")?;
         let (registration, config) = make_client_config(None, false, Liveness::ControlPlane)?;
+        // **The TCP fallback, and why it is not optional.** See
+        // `bind::relay_connector` for the mechanism; here it is what lets a
+        // host whose egress drops UDP reach the control plane at all -- a
+        // control plane serving QMUX on its TCP port is dialled at the same
+        // address, so there is nothing to choose and nothing to pass.
         let (registration, config_qmux) =
             make_client_config(Some(registration), true, Liveness::ControlPlane)?;
         // The certificate has to name the host we dialled, and that is checked

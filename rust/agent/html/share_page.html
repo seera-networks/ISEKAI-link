@@ -77,9 +77,13 @@ const set = (id, value) => {
 };
 
 // ======== WebSocket ========
-const ws = new WebSocket(
-  `wss://masque.seera-networks.com:8443/sessions/${sessionId}/ws`
-);
+// Substituted by the agent that serves this page (`share_page_html`). It used
+// to name a deployment outright, which meant an agent run against anything
+// else served a page that dialled somewhere it was not talking to -- and a
+// control plane that moves its browser-facing listener to another port, as
+// `--bootstrap-listen` does, could not be followed without editing this file.
+const signalingOrigin = "__SIGNALING_ORIGIN__";
+const ws = new WebSocket(`${signalingOrigin}/sessions/${sessionId}/ws`);
 
 function sendWS(msg) {
   if (ws.readyState === WebSocket.OPEN) {

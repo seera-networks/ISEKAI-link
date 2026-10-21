@@ -648,7 +648,7 @@ impl MyApp {
                                         // line says what happened; this says
                                         // what is true now.
                                         if matches!(event, SignalingEvent::Unreachable { .. }) {
-                                            s.status = "P2P: control plane unreachable;                                                  the listener has stopped — restart to reconnect"
+                                            s.status = "P2P: control plane unreachable; the listener has stopped — restart to reconnect"
                                                 .to_string();
                                         }
                                     }
