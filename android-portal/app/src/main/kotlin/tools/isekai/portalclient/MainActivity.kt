@@ -103,10 +103,22 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    PortalScreen(
-                        keyFile = File(filesDir, "endpoint_key.pem"),
-                        pairedFile = File(filesDir, "paired_endpoint"),
-                    )
+                    val context = LocalContext.current
+                    val consent = remember { PrivacyConsentStore(context) }
+                    // Over the top, and not dismissable -- using the service
+                    // means an account and personal information, so this is
+                    // what a new install sees first and the only thing it can
+                    // act on. Nothing behind it runs until then: no sign-in,
+                    // no Endpoint key, no connect. Same gate as the camera
+                    // app's MainActivity.
+                    if (consent.needsAgreement) {
+                        PrivacyConsentScreen(consent)
+                    } else {
+                        PortalScreen(
+                            keyFile = File(filesDir, "endpoint_key.pem"),
+                            pairedFile = File(filesDir, "paired_endpoint"),
+                        )
+                    }
                 }
             }
         }
