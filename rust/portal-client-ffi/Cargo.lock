@@ -1842,6 +1842,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "isekai-p2p",
+ "isekai-privacy",
  "msquic-async",
  "portal-core",
  "thiserror 2.0.20",

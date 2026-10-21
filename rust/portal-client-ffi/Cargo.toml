@@ -30,4 +30,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 msquic-async = { path = "../../submodules/msquic-async-rs/msquic-async", default-features = false, features = ["tokio", "msquic-seera"] }
 isekai-p2p = { path = "../isekai-p2p" }
 portal-core = { path = "../portal-core" }
+# The privacy policy the app asks agreement to before anything else, shared
+# with the camera apps and the CLIs so they all show the same text.
+isekai-privacy = { path = "../privacy" }
 uniffi = { version = "0.28", features = ["cli"] }
