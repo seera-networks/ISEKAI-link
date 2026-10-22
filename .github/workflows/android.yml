@@ -61,6 +61,13 @@ on:
       # NDK shows up and nowhere else.
       - 'rust/privacy/**'
       - 'submodules/msquic-async-rs'
+      # **The composite action these steps call.** `submodules` decides what a
+      # job fetches, and it was not watched, so a change to it would have run
+      # no workflow that uses it. The same hole as `scripts/**` and for the
+      # same reason: a path filter has to cover the inputs, not just the file
+      # it is written in. (This workflow caches no cargo build at all, so
+      # `rust-cache` is not among its inputs.)
+      - '.github/actions/**'
       - '.github/workflows/android.yml'
   pull_request:
     paths:
@@ -102,6 +109,13 @@ on:
       # NDK shows up and nowhere else.
       - 'rust/privacy/**'
       - 'submodules/msquic-async-rs'
+      # **The composite action these steps call.** `submodules` decides what a
+      # job fetches, and it was not watched, so a change to it would have run
+      # no workflow that uses it. The same hole as `scripts/**` and for the
+      # same reason: a path filter has to cover the inputs, not just the file
+      # it is written in. (This workflow caches no cargo build at all, so
+      # `rust-cache` is not among its inputs.)
+      - '.github/actions/**'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 

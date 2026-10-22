@@ -58,6 +58,13 @@ on:
       # one by one already list both; this was the one that did not.
       - 'rust/Cargo.toml'
       - 'rust/Cargo.lock'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/migration-spike.yml'
   pull_request:
     paths:
@@ -96,6 +103,13 @@ on:
       # one by one already list both; this was the one that did not.
       - 'rust/Cargo.toml'
       - 'rust/Cargo.lock'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/migration-spike.yml'
   workflow_dispatch:
 
@@ -123,7 +137,7 @@ jobs:
         working-directory: submodules/msquic-async-rs/seera-msquic
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
 

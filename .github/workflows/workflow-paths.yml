@@ -42,7 +42,7 @@ jobs:
       # and reaching them is half of what this checks the filters do.
       - uses: ./.github/actions/submodules
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
       # Installed rather than assumed. The workflows are read as YAML and not

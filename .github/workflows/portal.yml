@@ -98,6 +98,13 @@ on:
       # script nor a unit file is a crate.
       - 'packaging/**'
       - 'scripts/**'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/portal.yml'
   pull_request:
     paths:
@@ -150,6 +157,13 @@ on:
       # script nor a unit file is a crate.
       - 'packaging/**'
       - 'scripts/**'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/portal.yml'
   workflow_dispatch:
 
@@ -175,7 +189,7 @@ jobs:
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
       # The integration tests stand up a real QUIC connection between the two
@@ -247,7 +261,7 @@ jobs:
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
         if: env.HAVE_KEYS == 'true'
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         if: env.HAVE_KEYS == 'true'
         with:
           workspaces: rust
@@ -417,7 +431,7 @@ jobs:
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
       # `--all-targets` so the test binaries compile too: a `cfg` that only
@@ -462,7 +476,7 @@ jobs:
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
 

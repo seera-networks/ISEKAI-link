@@ -37,6 +37,13 @@ on:
       # watched `scripts/`, so editing the bundler ran no bundle at all and the
       # first exercise of it was a release.
       - 'scripts/**'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/camera-apps.yml'
   pull_request:
     paths:
@@ -49,6 +56,13 @@ on:
       # watched `scripts/`, so editing the bundler ran no bundle at all and the
       # first exercise of it was a release.
       - 'scripts/**'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/camera-apps.yml'
   workflow_dispatch:
 
@@ -304,7 +318,7 @@ jobs:
       # ---- Build ----
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
 
