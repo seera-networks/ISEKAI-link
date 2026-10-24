@@ -239,6 +239,32 @@ none can be, everything above still works — over the relay.
 
 ---
 
+## Leaving a camera running, under systemd
+
+`camera-server --accept-privacy-policy` answers the consent screen in advance
+and records the agreement exactly as **Agree** does. Because it was answered
+before the window existed, the window then presses **Open** and **Start** by
+itself. Sign-in and pairing are still done in the window, once. If it is not
+signed in, it opens nothing and says so in its log.
+
+The Linux archive ships
+[`packaging/systemd/camera-server.service`](../packaging/systemd/camera-server.service),
+which runs that window on a virtual display (`xvfb-run`). Its header has the
+install steps:
+- unpack to `/usr/local/camera-apps`;
+- create a `camera` user in `video` and `render`;
+- sign in and pair in the window once, as that user;
+- enable the service.
+
+Two settings in it are measured rather than guessed:
+- **`render` group.** The window draws through the GPU, and without the render
+  nodes it exits with `WGPU error: Parent device is lost`.
+- **`CAMERA_PREVIEW_FPS=2`.** The window repaints at the camera's 30 frames a
+  second by default, and nobody looks at this one. On a Jetson Orin that is 1.1
+  cores at 30 and 0.4 at 2. What viewers receive is the same either way.
+
+---
+
 ## Managing who may connect
 
 **`Allowed devices`** lists the grants this camera has issued. **`Remove`**
