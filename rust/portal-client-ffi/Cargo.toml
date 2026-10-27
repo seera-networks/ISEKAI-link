@@ -5,7 +5,7 @@ name = "portal-client-ffi"
 # `rust/Cargo.toml`'s "one version for the whole workspace" rule stops at its
 # members. It was shipping as 0.1.0 while everything around it was 0.6.x --
 # and it *is* shipped: the Android portal app links it as a cdylib.
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 
 # Standalone workspace root, same reasoning as portal-server/portal-client:
