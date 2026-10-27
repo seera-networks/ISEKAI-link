@@ -16,7 +16,7 @@ package.edition = "2021"
 # `cargo build --locked` in that directory fails on the tag. Both were missed
 # at 0.7.0 and caught in review; it is written down here so the next bump does
 # not rediscover it.
-package.version = "0.8.0"
+package.version = "0.8.1"
 
 [workspace.dependencies]
 anyhow = "1"
