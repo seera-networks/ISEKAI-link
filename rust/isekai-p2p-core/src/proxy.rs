@@ -1241,6 +1241,62 @@ pub struct RelayRttSample {
     pub rtt_ms: Option<u32>,
 }
 
+/// Which address families this Endpoint reached one relay in, over the socket
+/// mode a relay leg uses (the relay address-family plan §4-4).
+///
+/// **Only what was measured and worked.** An absent family means "nothing to
+/// say", never "that family is broken" — the initiator cannot produce negative
+/// evidence at all, because a sample that only resolves at `per_relay` is
+/// dropped by a collection deadline of half the budget, and a dropped sample is
+/// an omission. Building on positive evidence is what makes both ends' reports
+/// mean the same thing (plan Q3).
+///
+/// The control plane intersects the two ends' sets. An empty intersection means
+/// no family is named in the answer, which is today's behaviour (Q5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayReach {
+    pub dp_id: String,
+    /// `"v4"` / `"v6"`, in the wire spelling the control plane reads — the
+    /// same one `RelayInfo.family` comes back in.
+    ///
+    /// Strings rather than an enum because this module builds without the
+    /// `msquic` feature, while the `AddressFamily` the measurement produces
+    /// lives behind it. [`transport::family_name`](crate::transport::family_name)
+    /// is the one place that spelling is decided.
+    ///
+    /// Never empty on the wire. An entry with no families says nothing that
+    /// leaving the entry out does not, and invites a reader to take it as
+    /// "this relay works in neither family" — which a probe that timed out
+    /// does not establish. [`reach_field`] drops such entries, so the
+    /// invariant holds for every caller rather than only the careful ones.
+    pub families: Vec<String>,
+}
+
+/// The `relay_reach` field for a request body, or `None` to leave it out.
+///
+/// **Absent means "nothing to report this round", not "the set is empty".**
+/// Every route that carries this replaces the stored set, so a round that
+/// measured no families must not be able to erase a set measured earlier. That
+/// split is easy to reach: the round-trip probe runs on a connected socket and
+/// survives the QMUX/TCP fallback, while a family landing counts only on an
+/// unconnected binding — so a host that moves onto a network blocking UDP/443,
+/// or behind a CLAT translator, reports good round trips and no families at
+/// all. Sending `[]` there would cost the control plane a good set for the
+/// next half hour.
+///
+/// Entries with no families are dropped for the same reason one of them is not
+/// worth sending alone.
+fn reach_field(reach: &[RelayReach]) -> Option<serde_json::Value> {
+    let worth_sending: Vec<&RelayReach> = reach
+        .iter()
+        .filter(|entry| !entry.families.is_empty())
+        .collect();
+    if worth_sending.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!(worth_sending))
+}
+
 /// A listener this Endpoint can reach or enrol on (spec §8.10).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReachableListener {
@@ -1587,7 +1643,7 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
     ) -> Result<PeerConnection, ProxyError> {
-        self.peer_connect_measured(capability, listener_id, protocol, candidates, &[])
+        self.peer_connect_measured(capability, listener_id, protocol, candidates, &[], &[])
             .await
     }
 
@@ -1605,14 +1661,18 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
         relay_rtt: &[RelayRttSample],
+        relay_reach: &[RelayReach],
     ) -> Result<PeerConnection, ProxyError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "capability": capability,
             "listener_id": listener_id,
             "protocol": protocol,
             "candidates": candidates,
             "relay_rtt": relay_rtt,
         });
+        if let Some(reach) = reach_field(relay_reach) {
+            body["relay_reach"] = reach;
+        }
         self.request_json("POST", "/v1/peer/connect", to_vec(&body))
             .await
     }
@@ -2171,17 +2231,28 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// **The report replaces the set.** Anything this Endpoint reported before
     /// and leaves out now is forgotten, so a relay that dropped out of the pool
     /// cannot keep winning on a stale number.
+    /// **`reach` replaces the stored set when it is sent, and is left out
+    /// when there is nothing to report** — see [`reach_field`], which is what
+    /// keeps a round that measured no families from erasing one measured
+    /// earlier. The plan's §4-4 names only the initiator's two connect bodies,
+    /// but the control plane intersects *both* ends' family sets (§7.2-2) and
+    /// this PUT is the listener's only way to report, so it carries the field
+    /// too.
     pub async fn report_relay_rtt(
         &self,
         listener_id: &str,
         samples: &[RelayRttSample],
+        reach: &[RelayReach],
     ) -> Result<usize, ProxyError> {
         #[derive(Deserialize)]
         struct Stored {
             #[serde(default)]
             stored: usize,
         }
-        let body = serde_json::json!({ "relay_rtt": samples });
+        let mut body = serde_json::json!({ "relay_rtt": samples });
+        if let Some(reach) = reach_field(reach) {
+            body["relay_reach"] = reach;
+        }
         let stored: Stored = self
             .request_json(
                 "PUT",
@@ -2200,7 +2271,7 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
     ) -> Result<PeerConnection, ProxyError> {
-        self.peer_connect_with_grant_measured(listener_id, protocol, candidates, &[])
+        self.peer_connect_with_grant_measured(listener_id, protocol, candidates, &[], &[])
             .await
     }
 
@@ -2212,13 +2283,17 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         protocol: &str,
         candidates: &[Candidate],
         relay_rtt: &[RelayRttSample],
+        relay_reach: &[RelayReach],
     ) -> Result<PeerConnection, ProxyError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "listener_id": listener_id,
             "protocol": protocol,
             "candidates": candidates,
             "relay_rtt": relay_rtt,
         });
+        if let Some(reach) = reach_field(relay_reach) {
+            body["relay_reach"] = reach;
+        }
         self.request_json("POST", "/v1/peer/connect", to_vec(&body))
             .await
     }
@@ -2737,6 +2812,123 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_slice(body).unwrap();
         assert_eq!(sent["capability"], "cap_x");
         assert_eq!(sent["candidates"][0]["type"], "srflx");
+    }
+
+    fn reach(dp_id: &str, families: &[&str]) -> RelayReach {
+        RelayReach {
+            dp_id: dp_id.to_owned(),
+            families: families.iter().map(|f| (*f).to_owned()).collect(),
+        }
+    }
+
+    /// All three report paths carry it, which the plan's §4-4 does not say:
+    /// it names the initiator's two connect bodies, but the control plane
+    /// intersects *both* ends' sets (§7.2-2) and the listener's only way to
+    /// report is the PUT. Miss one and the intersection is empty forever on
+    /// that side, which looks exactly like "no common family" and is not.
+    #[tokio::test]
+    async fn every_report_path_carries_the_family_sets() {
+        let connect = r#"{"connection_id":"pc_1","state":"relay","listener_id":"ln_1",
+            "protocol":"mjpeg","peer_endpoint":"ep:B","peer_candidates":[],
+            "created_at":"t","expires_at":"t"}"#;
+
+        let (by_capability, _key) = client(MockTransport::with_response(201, connect));
+        by_capability
+            .peer_connect_measured(
+                "cap",
+                "ln_1",
+                "mjpeg",
+                &[],
+                &[],
+                &[reach("dp_1", &["v6", "v4"])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            last_body(&by_capability)["relay_reach"],
+            serde_json::json!([{ "dp_id": "dp_1", "families": ["v6", "v4"] }]),
+            "the capability connect body"
+        );
+
+        let (by_grant, _key) = client(MockTransport::with_response(201, connect));
+        by_grant
+            .peer_connect_with_grant_measured("ln_1", "mjpeg", &[], &[], &[reach("dp_2", &["v4"])])
+            .await
+            .unwrap();
+        assert_eq!(
+            last_body(&by_grant)["relay_reach"],
+            serde_json::json!([{ "dp_id": "dp_2", "families": ["v4"] }]),
+            "the grant connect body"
+        );
+
+        let (listener, _key) = client(MockTransport::with_response(200, r#"{"stored":1}"#));
+        listener
+            .report_relay_rtt("ln_1", &[], &[reach("dp_3", &["v6"])])
+            .await
+            .unwrap();
+        assert_eq!(
+            last_body(&listener)["relay_reach"],
+            serde_json::json!([{ "dp_id": "dp_3", "families": ["v6"] }]),
+            "the listener's PUT"
+        );
+    }
+
+    /// Nothing measured leaves the field **out**, because every route that
+    /// carries it replaces the stored set: `[]` would erase a set measured on
+    /// an earlier round. The split is routine rather than exotic — the
+    /// round-trip probe runs on a connected socket and survives the QMUX/TCP
+    /// fallback, while a family landing counts only on an unconnected binding,
+    /// so a host behind a CLAT translator reports good round trips and no
+    /// families at all.
+    #[tokio::test]
+    async fn nothing_measured_leaves_the_field_out() {
+        let (listener, _key) = client(MockTransport::with_response(200, r#"{"stored":0}"#));
+        listener.report_relay_rtt("ln_1", &[], &[]).await.unwrap();
+        let sent = last_body(&listener);
+        assert!(
+            sent.get("relay_reach").is_none(),
+            "absent is 'nothing to report'; [] would be 'the set is empty'"
+        );
+        assert!(
+            sent.get("relay_rtt").is_some(),
+            "the round trips still go, and still mean what they did"
+        );
+    }
+
+    /// And an entry naming no families is dropped rather than sent, for every
+    /// caller — the invariant is documented on `RelayReach::families`, so it
+    /// is enforced here rather than only in the one caller that remembers.
+    #[tokio::test]
+    async fn an_entry_with_no_families_is_dropped_at_the_boundary() {
+        let (listener, _key) = client(MockTransport::with_response(200, r#"{"stored":1}"#));
+        listener
+            .report_relay_rtt(
+                "ln_1",
+                &[],
+                &[reach("dp_dark", &[]), reach("dp_fine", &["v4"])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            last_body(&listener)["relay_reach"],
+            serde_json::json!([{ "dp_id": "dp_fine", "families": ["v4"] }])
+        );
+
+        let (only_dark, _key) = client(MockTransport::with_response(200, r#"{"stored":0}"#));
+        only_dark
+            .report_relay_rtt("ln_1", &[], &[reach("dp_dark", &[])])
+            .await
+            .unwrap();
+        assert!(
+            last_body(&only_dark).get("relay_reach").is_none(),
+            "nothing left worth sending is the same as nothing measured"
+        );
+    }
+
+    fn last_body(client: &ProxyClient<MockTransport>) -> serde_json::Value {
+        let calls = client.transport.calls.lock().unwrap();
+        let (_, _, _, body) = calls.last().unwrap();
+        serde_json::from_slice(body).unwrap()
     }
 
     /// The shape of what goes out matters more than the plumbing: the server
