@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use isekai_p2p::agent::ObservedAddress;
+use isekai_p2p::agent::{ObservedAddress, SocketBinding};
 use msquic_async::{msquic, Connection, Listener, Registration, StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -119,6 +119,9 @@ fn observed_for(leg: SocketAddr) -> anyhow::Result<ObservedAddress> {
     Ok(ObservedAddress {
         local: leg,
         observed,
+        // The spike binds its own unconnected socket; this stands for what the
+        // connector would report for it.
+        binding: SocketBinding::Unconnected,
     })
 }
 

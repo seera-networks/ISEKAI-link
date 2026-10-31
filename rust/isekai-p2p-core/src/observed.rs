@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 // Reached through `h3-util` rather than depended on directly, like the rest of
 // this crate's msquic usage (see `crate::transport`).
 use h3_util::msquic_async::h3_msquic_async::msquic_async::{Connection, ConnectionEvent};
+use h3_util::msquic_async::{Binding, Established};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +35,17 @@ pub struct ObservedAddress {
     /// The address the proxy observes that binding at: the NAT mapping to
     /// advertise to the peer.
     pub observed: SocketAddr,
+    /// The socket mode the leg actually ended up on.
+    ///
+    /// **Carried because asking for an unconnected binding is not getting
+    /// one.** `RelayOptions { unconnected: true }` is a request; the connector
+    /// answers it with an ordinary connected socket on a CLAT/464XLAT host,
+    /// when nothing resolved can be bound, or when the QMUX fallback takes
+    /// over. A report from such a leg is still a true NAT mapping and worth
+    /// showing — `camera-server` prints it — but there is no shared binding
+    /// behind it for a direct path to be opened from, which is the one thing a
+    /// consumer must not assume. See [`Binding`].
+    pub binding: Binding,
 }
 
 /// The receiving half of an observed-address watch. `None` until the first
@@ -51,8 +63,14 @@ pub type ObservedAddressWatch = watch::Receiver<Option<ObservedAddress>>;
 /// including any reconnect. Reports from whichever connection is current
 /// overwrite the previous value, which is the behaviour wanted — a stale NAT
 /// mapping is worse than none.
+///
+/// Each report carries the socket mode its connection ended up on, rather than
+/// being filtered on it here. The two consumers want different things: a
+/// direct path can only be opened from an unconnected binding and must check,
+/// while a display of "this is the mapping the proxy sees" is true and useful
+/// either way. Filtering here would answer one of them by lying to the other.
 pub fn spawn_observed_address_watch(
-    mut conn_rx: mpsc::Receiver<Connection>,
+    mut conn_rx: mpsc::Receiver<Established>,
     shutdown: CancellationToken,
 ) -> ObservedAddressWatch {
     let (tx, rx) = watch::channel(None);
@@ -62,10 +80,10 @@ pub fn spawn_observed_address_watch(
                 _ = shutdown.cancelled() => break,
                 _ = tx.closed() => break,
                 conn = conn_rx.recv() => match conn {
-                    Some(conn) => {
+                    Some(Established { conn, binding }) => {
                         // Poll this connection until it ends, then go back to
                         // waiting for the next one.
-                        watch_connection(conn, &tx, &shutdown).await;
+                        watch_connection(conn, binding, &tx, &shutdown).await;
                     }
                     None => break,
                 },
@@ -77,6 +95,7 @@ pub fn spawn_observed_address_watch(
 
 async fn watch_connection(
     conn: Connection,
+    binding: Binding,
     tx: &watch::Sender<Option<ObservedAddress>>,
     shutdown: &CancellationToken,
 ) {
@@ -113,6 +132,7 @@ async fn watch_connection(
                     if tx.send(Some(ObservedAddress {
                         local: local_address,
                         observed: observed_address,
+                        binding,
                     })).is_err() {
                         // Every receiver is gone; nothing left to tell.
                         break;

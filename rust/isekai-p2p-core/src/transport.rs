@@ -16,8 +16,12 @@ use channel_masque::H3Channel;
 /// Re-exported so a caller of [`MasqueH3Transport::connect_unconnected`] can
 /// name the family without taking a dependency on the QUIC client crate.
 pub use h3_util::client::AddressFamily;
+use h3_util::msquic_async::Established;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use h3_util::msquic_async::h3_msquic_async::{msquic, msquic_async};
+/// Re-exported so a caller can read [`Landing::binding`] without a dependency
+/// on the QUIC client crate.
+pub use h3_util::msquic_async::{Binding, Connected};
 use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full};
 use tower::{Service, ServiceExt};
@@ -32,7 +36,7 @@ pub struct MasqueH3Transport {
     /// Connections the connector hands back, for the measuring path. `None`
     /// for one from [`MasqueH3Transport::connect`], which does not watch —
     /// nothing there needs to know.
-    conns: Option<Arc<Mutex<tokio::sync::mpsc::Receiver<msquic_async::Connection>>>>,
+    conns: Option<Arc<Mutex<tokio::sync::mpsc::Receiver<Established>>>>,
 }
 
 /// Where a measuring connection actually ended up.
@@ -41,10 +45,9 @@ pub struct Landing {
     /// The peer. Its family is the one the relay answered in — which is not
     /// necessarily the one that was asked for.
     pub remote: SocketAddr,
-    /// This side. Needed because it, not the request's success, is what says
-    /// whether the socket really ended up unconnected: the connector falls
-    /// back to a connected socket when the local address is a CLAT stub.
-    pub local: SocketAddr,
+    /// The socket mode the connector settled on, which the request's success
+    /// does not reveal: asking for an unconnected socket is not getting one.
+    pub binding: Binding,
 }
 
 impl MasqueH3Transport {
@@ -121,22 +124,16 @@ impl MasqueH3Transport {
     ///   still reaches the others, which is right for a leg and not enough for
     ///   a measurement: a name with no `AAAA` probed with `AddressFamily::V6`
     ///   succeeds over v4. `landing().remote` is which family was really used.
-    /// - The socket mode is a preference too. When the local address the
-    ///   connector would use is a CLAT stub, it *skips* the shared-binding and
-    ///   unconnected calls and starts an ordinary connected socket — the one
-    ///   mode that does work through a translator — so the probe succeeds
-    ///   while measuring something a leg cannot reproduce.
-    ///   `landing().local` is what reveals it.
-    ///
-    /// **One connected fallback is not detectable from here**: when every
-    /// resolved address fails `bind`+`connect`, the connector's
-    /// `first_routable` returns `None` and it falls through to the same plain
-    /// start, with msquic resolving the host itself and the family preference
-    /// ignored. The local address is then an ordinary interface address, so
-    /// nothing read back distinguishes it. It needs every candidate address to
-    /// fail while a plain start still succeeds, which is narrow — and the real
-    /// fix is upstream telling a caller which mode the connection ended in,
-    /// which would retire the stub check too.
+    /// - The socket mode is a preference too. The connector answers a request
+    ///   for an unconnected binding with an ordinary connected socket in three
+    ///   cases, and the request still succeeds — while measuring something a
+    ///   leg cannot reproduce. Two of them can happen here: a CLAT translator
+    ///   stub for a local address, and no resolved address that could be bound
+    ///   and connected. The third, the QMUX/TCP fallback, is removed rather
+    ///   than detected: this path is built without a QMUX configuration at
+    ///   all, so a failed QUIC start returns the error (see `build`).
+    ///   `landing().binding` is the connector's own answer for which it was,
+    ///   so none of it has to be inferred from the addresses.
     ///
     /// Must be called from inside a tokio runtime.
     pub fn connect_unconnected(target: &str, family: AddressFamily) -> anyhow::Result<Self> {
@@ -170,10 +167,10 @@ impl MasqueH3Transport {
         while let Ok(conn) = conns.try_recv() {
             newest = Some(conn);
         }
-        let conn = newest?;
+        let established = newest?;
         Some(Landing {
-            remote: conn.get_remote_addr().ok()?,
-            local: conn.get_local_addr().ok()?,
+            remote: established.conn.get_remote_addr().ok()?,
+            binding: established.binding,
         })
     }
 

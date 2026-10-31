@@ -78,7 +78,60 @@ pub enum RelayLegs {
 /// it, because `add_candidate_addr` accepts an address that is not bound here
 /// yet — msquic opens the path from the relay leg's binding once the peer's
 /// ADD_ADDRESS arrives (`docs/p2p_mode_migration_plan.md` §2.2.3).
+/// A leg's report that really is on an unconnected binding, so a direct path
+/// can be built from it.
+///
+/// **A connected socket's mapping is a real mapping and still useless here.**
+/// `RelayOptions { unconnected: true }` is a request, and the connector
+/// answers it with an ordinary connected socket on a CLAT/464XLAT host, when
+/// nothing resolved could be bound, or when the QMUX fallback took over — see
+/// [`Binding`]. There is no shared binding behind such a report, so a
+/// candidate built from it cannot be validated however many packets the peer
+/// aims at it: msquic never raises `PathValidated`, `advertise` has already
+/// stopped watching, and the peer has spent its punch attempts. For
+/// `Connected::QmuxFallback` it is not even a UDP mapping.
+///
+/// Relay-only is the right answer, and it is what this would have fallen back
+/// to anyway — just without the wasted attempts, and with a line saying why.
+///
+/// **A type rather than an `if` at the top of each function.** The two places
+/// that act on a report take this instead of an [`ObservedAddress`], so the
+/// check cannot be forgotten or deleted: there is no other way to make one.
+/// A test that the predicate is right does not show that it is *called*, and
+/// neither of those functions can be unit-tested — they need a live msquic
+/// connection — so the compiler is the only thing that can hold this.
+struct UnconnectedLeg(ObservedAddress);
+
+impl UnconnectedLeg {
+    /// `None`, with a line saying why, when the leg is not on an unconnected
+    /// binding. `side` names what is being given up, for the log.
+    fn check(address: ObservedAddress, side: &str) -> Option<Self> {
+        if address.binding.is_unconnected() {
+            return Some(Self(address));
+        }
+        tracing::info!(
+            local = %address.local,
+            observed = %address.observed,
+            binding = ?address.binding,
+            "the relay leg is not on an unconnected binding, so there is no direct path to \
+             {side}; staying relay-only",
+        );
+        None
+    }
+}
+
 pub fn prepare(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
+    let Some(candidate) = UnconnectedLeg::check(candidate, "offer") else {
+        return Ok(());
+    };
+    offer(conn, candidate)
+}
+
+/// [`prepare`] once the leg is known to be able to carry a direct path.
+///
+/// Split out so the check is the only way in: taking [`UnconnectedLeg`] means
+/// deleting it from `prepare` does not compile.
+fn offer(conn: &Connection, UnconnectedLeg(candidate): UnconnectedLeg) -> anyhow::Result<()> {
     // All three are required for a direct path to be validated at all — without
     // them msquic never raises `PathValidated`, whatever candidate is offered.
     conn.set_share_binding(true)
@@ -160,7 +213,10 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
         // binding is not re-advertised; the peer keeps the path it validated.
         loop {
             if let Some(address) = *observed.borrow_and_update() {
-                apply(&conn, address);
+                let Some(leg) = UnconnectedLeg::check(address, "advertise") else {
+                    return;
+                };
+                apply(&conn, leg);
                 break;
             }
             tokio::select! {
@@ -231,7 +287,7 @@ async fn leg_of(
     }
 }
 
-fn apply(conn: &Connection, address: ObservedAddress) {
+fn apply(conn: &Connection, UnconnectedLeg(address): UnconnectedLeg) {
     if let Err(e) = conn.add_bound_addr(address.local) {
         tracing::warn!(
             local = %address.local,
@@ -471,6 +527,38 @@ pub fn prefer_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isekai_p2p_core::transport::{Binding, Connected};
+
+    fn leg(binding: Binding) -> ObservedAddress {
+        ObservedAddress {
+            local: SocketAddr::from(([192, 168, 1, 59], 51000)),
+            observed: SocketAddr::from(([203, 0, 113, 5], 51000)),
+            binding,
+        }
+    }
+
+    #[test]
+    fn an_unconnected_leg_can_carry_a_direct_path() {
+        assert!(UnconnectedLeg::check(leg(Binding::Unconnected), "advertise").is_some());
+    }
+
+    #[test]
+    fn a_connected_leg_cannot_whatever_the_reason() {
+        // Every reason the connector gives is the same answer here: there is
+        // no shared binding behind the report, so a candidate built from it
+        // can never be validated. `QmuxFallback` is not even a UDP mapping.
+        for why in [
+            Connected::AsAsked,
+            Connected::ClatStub,
+            Connected::NoRoutableAddress,
+            Connected::QmuxFallback,
+        ] {
+            assert!(
+                UnconnectedLeg::check(leg(Binding::Connected(why)), "advertise").is_none(),
+                "{why:?} has no binding a direct path could use"
+            );
+        }
+    }
 
     fn pair(port: u16) -> (SocketAddr, SocketAddr) {
         (

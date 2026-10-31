@@ -47,7 +47,6 @@
 //! which is exactly what the reporting party could already do by hand, and is
 //! bounded the same way.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -292,30 +291,6 @@ where
     }
 }
 
-/// Whether `addr` falls in `192.0.0.0/29`, the IANA "IPv4 Service Continuity
-/// Prefix" — a CLAT/464XLAT translator's local address, or a DS-Lite B4's.
-///
-/// **A copy of the connector's own private `is_clat_stub`**
-/// (`h3-util/src/msquic_async/client.rs`), and it has to be, because the
-/// connector's decision is not readable from here: when the local address it
-/// would use falls in this range it *skips* the shared-binding and unconnected
-/// calls and starts an ordinary connected socket instead, logging a `warn!`
-/// and nothing a caller can test. Worth asking upstream to make `pub`.
-///
-/// `to_ipv4_mapped` rather than `to_ipv4` on purpose: the latter also unwraps
-/// IPv4-*compatible* addresses, which would make `::192.0.0.4` match.
-fn is_clat_stub(addr: &SocketAddr) -> bool {
-    let ip = match addr.ip() {
-        std::net::IpAddr::V4(ip) => ip,
-        std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-            Some(ip) => ip,
-            None => return false,
-        },
-    };
-    let [a, b, c, d] = ip.octets();
-    a == 192 && b == 0 && c == 0 && (d & 0xF8) == 0
-}
-
 /// The families a relay actually answered on, over a socket that really was
 /// unconnected.
 ///
@@ -326,21 +301,26 @@ fn is_clat_stub(addr: &SocketAddr) -> bool {
 /// one that would matter, because the control plane would then pick v6 as the
 /// common family and the leg would have nowhere to go.
 ///
-/// **A CLAT fallback is not an answer either.** If the local address is a
-/// translator stub, the connector quietly started a *connected* socket, which
-/// is the one mode that works through a translator — so the probe succeeded
-/// while measuring something a leg's unconnected binding cannot reproduce.
-/// Claiming that family is precisely the mistake this measurement exists to
-/// prevent, so such a landing contributes nothing. Nothing is lost by
-/// dropping it: a host in that state has no unconnected binding to offer, so
-/// it has no direct path to line up in any family.
+/// **A connected socket is not an answer either.** The connector answers a
+/// request for an unconnected binding with an ordinary connected socket in
+/// three cases — a CLAT translator stub, nothing routable to bind, or the
+/// QMUX/TCP fallback — and in all three the probe succeeds while measuring
+/// something a leg's unconnected binding cannot reproduce. Claiming that
+/// family is precisely the mistake this measurement exists to prevent, so such
+/// a landing contributes nothing. Nothing is lost by dropping it: a host in
+/// that state has no unconnected binding to offer, so it has no direct path to
+/// line up in any family.
+///
+/// The connector reports which it was, so none of this is inferred from the
+/// addresses — which is what it took to cover the "nothing routable" case at
+/// all (tonic-h3#5).
 ///
 /// Deduplicated, because both probes landing on the same family is the
 /// ordinary answer for a single-stack name and says one thing, not two.
 fn families_answered(landings: impl IntoIterator<Item = Option<Landing>>) -> Vec<AddressFamily> {
     let mut out = Vec::new();
     for landing in landings.into_iter().flatten() {
-        if is_clat_stub(&landing.local) {
+        if !landing.binding.is_unconnected() {
             continue;
         }
         let family = if landing.remote.is_ipv6() {
@@ -355,7 +335,7 @@ fn families_answered(landings: impl IntoIterator<Item = Option<Landing>>) -> Vec
     out
 }
 
-/// One relay, one family: `GET /health` on an unconnected socket, and where
+/// One relay, one family: `GET /health` asked the way a leg asks, and where
 /// the connection ended up.
 ///
 /// `None` for anything that did not answer — a connection that could not be
@@ -410,9 +390,9 @@ where
     let v6 = v6.ok().flatten();
     let families = families_answered([v4, v6]);
     // **Both landings in the line, not just the verdict.** An empty set has
-    // three different causes -- nothing answered, a CLAT fallback, or
-    // addresses that could not be read -- and the local addresses are what
-    // tell them apart.
+    // several different causes -- nothing answered, a connected fallback of
+    // one kind or another, or an address that could not be read -- and the
+    // landings carry the connector's own word on which it was.
     tracing::info!(
         dp_id = candidate.dp_id,
         base_url = candidate.base_url,
@@ -694,6 +674,7 @@ pub async fn measure_for_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isekai_p2p_core::transport::{Binding, Connected};
 
     #[test]
     fn reporting_is_well_inside_the_window() {
@@ -975,20 +956,20 @@ mod tests {
         );
     }
 
-    /// A landing on a real interface -- the ordinary case.
+    /// A landing on a real unconnected binding -- the ordinary case.
     fn on(remote: &str) -> Option<Landing> {
         Some(Landing {
             remote: remote.parse().unwrap(),
-            local: "198.51.100.7:51000".parse().unwrap(),
+            binding: Binding::Unconnected,
         })
     }
 
-    /// A landing whose local address says the connector fell back to a
-    /// connected socket.
-    fn via_clat(remote: &str) -> Option<Landing> {
+    /// A landing the connector reports as a connected socket, for one of the
+    /// reasons it has.
+    fn connected(remote: &str, why: Connected) -> Option<Landing> {
         Some(Landing {
             remote: remote.parse().unwrap(),
-            local: "192.0.0.4:51000".parse().unwrap(),
+            binding: Binding::Connected(why),
         })
     }
 
@@ -1143,42 +1124,40 @@ mod tests {
     }
 
     #[test]
-    fn a_clat_fallback_claims_nothing() {
+    fn a_connected_fallback_claims_nothing_whatever_its_reason() {
         // The probe succeeded, over a *connected* socket the connector
-        // silently substituted. Reporting v4 here is exactly the over-claim
-        // the plan's Q2 exists to prevent: a leg's unconnected binding cannot
-        // reproduce it.
-        assert_eq!(families_answered([via_clat("192.0.2.1:443")]), Vec::new());
+        // substituted. Reporting the family here is exactly the over-claim the
+        // plan's Q2 exists to prevent: a leg's unconnected binding cannot
+        // reproduce it. All four reasons the connector gives are the same
+        // answer to this question -- which is why it is asked of the reported
+        // binding and not of the addresses, and why this iterates the variants
+        // rather than only those reachable here. `QmuxFallback` is not
+        // reachable: the measuring transport is built without a QMUX
+        // configuration at all. The property is "no connected binding is ever
+        // credited", which has to hold for a variant that becomes reachable
+        // later too.
+        for why in [
+            Connected::AsAsked,
+            Connected::ClatStub,
+            Connected::NoRoutableAddress,
+            Connected::QmuxFallback,
+        ] {
+            assert_eq!(
+                families_answered([connected("192.0.2.1:443", why)]),
+                Vec::new(),
+                "{why:?} is not an unconnected binding"
+            );
+        }
     }
 
     #[test]
-    fn a_clat_fallback_does_not_poison_the_other_family() {
+    fn a_connected_fallback_does_not_poison_the_other_family() {
         assert_eq!(
-            families_answered([via_clat("192.0.2.1:443"), on("[2001:db8::1]:443")]),
+            families_answered([
+                connected("192.0.2.1:443", Connected::ClatStub),
+                on("[2001:db8::1]:443"),
+            ]),
             vec![AddressFamily::V6]
         );
-    }
-
-    #[test]
-    fn the_whole_service_continuity_prefix_is_a_stub() {
-        // `192.0.0.0/29`: .0 through .7, and not .8.
-        for d in 0..=7 {
-            let addr: SocketAddr = format!("192.0.0.{d}:1").parse().unwrap();
-            assert!(is_clat_stub(&addr), "192.0.0.{d} is in the /29");
-        }
-        assert!(!is_clat_stub(&"192.0.0.8:1".parse().unwrap()));
-        assert!(!is_clat_stub(&"192.0.1.4:1".parse().unwrap()));
-        assert!(!is_clat_stub(&"198.51.100.7:1".parse().unwrap()));
-    }
-
-    #[test]
-    fn a_v4_mapped_stub_is_a_stub_and_a_v4_compatible_one_is_not() {
-        // A v6 socket reaching a v4 translator reports `::ffff:192.0.0.4`, and
-        // that is still the translator. `::192.0.0.4` is a different thing
-        // entirely, and `to_ipv4` rather than `to_ipv4_mapped` would conflate
-        // them.
-        assert!(is_clat_stub(&"[::ffff:192.0.0.4]:1".parse().unwrap()));
-        assert!(!is_clat_stub(&"[::192.0.0.4]:1".parse().unwrap()));
-        assert!(!is_clat_stub(&"[2001:db8::1]:1".parse().unwrap()));
     }
 }
