@@ -1034,12 +1034,21 @@ async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
 /// How long `--whoami` waits for Identity before answering without it.
 const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// One row of [`show_relays`], header included, so the two cannot drift apart.
+fn relay_row(rtt: &str, families: &str, dp_id: &str, base_url: &str) -> String {
+    format!("{rtt:<14} {families:<8} {dp_id:<28} {base_url}")
+}
+
 /// `--relays` — measure this Endpoint's relay candidates and print them.
 ///
-/// **The same probe a real session runs**, so what this prints is what the
-/// control plane would be given, not an approximation of it. It reports
-/// nothing: a diagnostic that quietly replaced the stored measurements would
-/// make looking at the system change it.
+/// **The same probe a real session runs**, so the round trips it prints are
+/// what the control plane would be given, not an approximation of them. The
+/// `families` column is a second, different probe — a relay leg's unconnected
+/// socket rather than the control plane's connected one — because that is the
+/// mode whose answer decides whether a direct path can form.
+///
+/// It reports nothing: a diagnostic that quietly replaced the stored
+/// measurements would make looking at the system change it.
 async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
     let proxy = isekai_p2p::proxy_client(cfg, &token)?;
@@ -1063,7 +1072,18 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         .iter()
         .map(|s| (s.dp_id.as_str(), s.rtt_ms))
         .collect();
+    // **Which families answer, alongside the round trips.** An operator
+    // explaining why a direct path never formed between a v6 listener and a v4
+    // initiator is asking this question, and it costs two more dials per relay
+    // in a command that was already dialling every one of them.
+    let families: std::collections::HashMap<_, _> =
+        isekai_p2p::relay_rtt::observe_families(&candidates, opts.per_relay)
+            .await
+            .into_iter()
+            .collect();
 
+    // Named, because `families` is not guessable from its values.
+    println!("{}", relay_row("rtt", "families", "dp_id", "base_url"));
     for candidate in &candidates {
         // Three states, kept apart because they mean different things to the
         // choice: a number ranks, `unreachable` is dropped from a session's
@@ -1071,12 +1091,41 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         let verdict = match measured.get(candidate.dp_id.as_str()) {
             Some(Some(ms)) => format!("{ms} ms"),
             Some(None) => "unreachable".to_owned(),
-            None => "not measured (the round ran out of time)".to_owned(),
+            // Short enough to stay inside its column. With a header above
+            // the rows, a value that overflows shifts `families`, `dp_id` and
+            // `base_url` right on that row alone -- and this is the ordinary
+            // outcome for a far relay that misses the budget, so an operator
+            // reading down the `families` column would land on `dp_id` text.
+            // The reason is spelled out once, below the rows.
+            None => "not measured".to_owned(),
+        };
+        // Four states, and the empty one is not "neither family works": a
+        // relay that did not answer, or that answered only through a CLAT
+        // translator's connected socket, reports nothing rather than ruling a
+        // family out — see `relay_rtt::families_answered`.
+        let answers = match families.get(&candidate.dp_id) {
+            Some(families) if families.is_empty() => "none".to_owned(),
+            Some(families) => families
+                .iter()
+                .map(|family| match family {
+                    isekai_p2p::relay_rtt::AddressFamily::V4 => "v4",
+                    isekai_p2p::relay_rtt::AddressFamily::V6 => "v6",
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            None => "?".to_owned(),
         };
         println!(
-            "{:<14} {:<28} {}",
-            verdict, candidate.dp_id, candidate.base_url
+            "{}",
+            relay_row(&verdict, &answers, &candidate.dp_id, &candidate.base_url)
         );
+    }
+
+    if candidates
+        .iter()
+        .any(|c| !measured.contains_key(c.dp_id.as_str()))
+    {
+        println!("\n`not measured` means the round ran out of time, not that the relay is down.");
     }
 
     let fastest = samples

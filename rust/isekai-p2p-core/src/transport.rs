@@ -6,12 +6,16 @@
 //! msquic-served proxy. Header injection (Endpoint Token + PoP) is done by the
 //! caller ([`crate::proxy::ProxyClient`]); this just performs the exchange.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use bytes::Bytes;
 use channel_masque::H3Channel;
+/// Re-exported so a caller of [`MasqueH3Transport::connect_unconnected`] can
+/// name the family without taking a dependency on the QUIC client crate.
+pub use h3_util::client::AddressFamily;
 use h3_util::msquic_async::H3MsQuicAsyncConnector;
 use h3_util::msquic_async::h3_msquic_async::{msquic, msquic_async};
 use http::{Method, Request, Uri};
@@ -25,6 +29,22 @@ use crate::proxy::{ControlPlaneTransport, HttpResponse};
 pub struct MasqueH3Transport {
     channel: H3Channel<H3MsQuicAsyncConnector, Full<Bytes>>,
     uri: Uri,
+    /// Connections the connector hands back, for the measuring path. `None`
+    /// for one from [`MasqueH3Transport::connect`], which does not watch —
+    /// nothing there needs to know.
+    conns: Option<Arc<Mutex<tokio::sync::mpsc::Receiver<msquic_async::Connection>>>>,
+}
+
+/// Where a measuring connection actually ended up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Landing {
+    /// The peer. Its family is the one the relay answered in — which is not
+    /// necessarily the one that was asked for.
+    pub remote: SocketAddr,
+    /// This side. Needed because it, not the request's success, is what says
+    /// whether the socket really ended up unconnected: the connector falls
+    /// back to a connected socket when the local address is a CLAT stub.
+    pub local: SocketAddr,
 }
 
 impl MasqueH3Transport {
@@ -78,31 +98,145 @@ impl MasqueH3Transport {
 
     /// Connect to the proxy at `target` (e.g. `https://link.isekai.tools:6443`).
     pub fn connect(target: &str) -> anyhow::Result<Self> {
+        Self::build(target, None)
+    }
+
+    /// Ask the relay at `target` the way a **relay leg** would: on an
+    /// unconnected, shared binding, preferring `family`, with no TCP fallback.
+    ///
+    /// **For measuring whether a relay answers in a family, and only that.**
+    /// A leg's socket is unconnected, and the two modes do not behave the same
+    /// on a 464XLAT host: a connected socket is associated with the CLAT
+    /// translator's path at `connect()` time and works through it, while an
+    /// unconnected one is only `bind()`-ed and does not (isekai-link#213).
+    /// So a measurement taken on `connect`'s connected socket answers a
+    /// different question from the one a leg will ask, and on a 464XLAT host
+    /// it answers it wrongly — "v4 works", for a family the leg cannot use.
+    ///
+    /// **Success here is not the answer — [`landing`](Self::landing) is.**
+    /// Two things make the request's success say less than it looks like it
+    /// says, and both are read off the landing rather than assumed:
+    ///
+    /// - The family is a *preference*. If nothing in it routes, the connector
+    ///   still reaches the others, which is right for a leg and not enough for
+    ///   a measurement: a name with no `AAAA` probed with `AddressFamily::V6`
+    ///   succeeds over v4. `landing().remote` is which family was really used.
+    /// - The socket mode is a preference too. When the local address the
+    ///   connector would use is a CLAT stub, it *skips* the shared-binding and
+    ///   unconnected calls and starts an ordinary connected socket — the one
+    ///   mode that does work through a translator — so the probe succeeds
+    ///   while measuring something a leg cannot reproduce.
+    ///   `landing().local` is what reveals it.
+    ///
+    /// **One connected fallback is not detectable from here**: when every
+    /// resolved address fails `bind`+`connect`, the connector's
+    /// `first_routable` returns `None` and it falls through to the same plain
+    /// start, with msquic resolving the host itself and the family preference
+    /// ignored. The local address is then an ordinary interface address, so
+    /// nothing read back distinguishes it. It needs every candidate address to
+    /// fail while a plain start still succeeds, which is narrow — and the real
+    /// fix is upstream telling a caller which mode the connection ended in,
+    /// which would retire the stub check too.
+    ///
+    /// Must be called from inside a tokio runtime.
+    pub fn connect_unconnected(target: &str, family: AddressFamily) -> anyhow::Result<Self> {
+        Self::build(target, Some(family))
+    }
+
+    /// Where the connection this transport last used ended up.
+    ///
+    /// **Call it after an exchange has succeeded, and it does not race.** The
+    /// connector hands the connection over once the handshake is done and
+    /// before it builds the HTTP/3 connection the request goes out on, so a
+    /// completed request means the connection is already queued here.
+    ///
+    /// **Does not wait, on purpose.** The sender lives in the connector this
+    /// transport owns, so it is never dropped while `self` is alive and an
+    /// awaiting `recv()` would pend forever rather than report "nothing was
+    /// connected". Taking whatever is queued cannot hang, and an empty queue
+    /// is the honest `None`.
+    ///
+    /// **Newest wins.** The queue is in order of dial, and the channel
+    /// reconnects when a driver dies: a connection established and
+    /// immediately lost, with the request served by the next one, leaves two.
+    /// The last is the one that answered.
+    ///
+    /// `None` means nothing was connected, or a transport from
+    /// [`connect`](Self::connect), which does not watch.
+    pub fn landing(&self) -> Option<Landing> {
+        let conns = self.conns.as_ref()?;
+        let mut conns = conns.lock().ok()?;
+        let mut newest = None;
+        while let Ok(conn) = conns.try_recv() {
+            newest = Some(conn);
+        }
+        let conn = newest?;
+        Some(Landing {
+            remote: conn.get_remote_addr().ok()?,
+            local: conn.get_local_addr().ok()?,
+        })
+    }
+
+    /// Everything both constructors share, so they cannot drift on the parts
+    /// that are not the point: the certificate check and the QMUX fallback.
+    fn build(target: &str, measuring: Option<AddressFamily>) -> anyhow::Result<Self> {
         let uri: Uri = target.parse().context("invalid proxy target URI")?;
         let (registration, config) = make_client_config(None, false, Liveness::ControlPlane)?;
-        // **The TCP fallback, and why it is not optional.** See
-        // `bind::relay_connector` for the mechanism; here it is what lets a
-        // host whose egress drops UDP reach the control plane at all -- a
+        // **The TCP fallback, and why the measuring path must not have it.**
+        // See `bind::relay_connector` for the mechanism; for the control plane
+        // it is what lets a host whose egress drops UDP reach it at all -- a
         // control plane serving QMUX on its TCP port is dialled at the same
         // address, so there is nothing to choose and nothing to pass.
-        let (registration, config_qmux) =
-            make_client_config(Some(registration), true, Liveness::ControlPlane)?;
+        //
+        // A measurement is a different question. The fallback dials TCP and
+        // resolves the host itself, so the family preference does not reach
+        // it: a relay whose AAAA host has UDP/443 firewalled and TCP/443 open
+        // would answer `/health` over TCP and be recorded as a family that
+        // works -- for a leg that is UDP only and would have nowhere to go.
+        // Without a QMUX configuration the connector returns the QUIC error
+        // instead, which is the honest "this family did not answer".
+        let config_qmux = match measuring {
+            Some(_) => None,
+            None => {
+                // `make_client_config` hands back the registration it was
+                // given, so the one dropped here is the one still held.
+                let (_, config_qmux) =
+                    make_client_config(Some(registration.clone()), true, Liveness::ControlPlane)?;
+                Some(config_qmux)
+            }
+        };
         // The certificate has to name the host we dialled, and that is checked
         // here rather than assumed of the layer below (#134).
         let host = uri
             .host()
             .context("proxy target URI has no host")?
             .to_owned();
-        let connector = H3MsQuicAsyncConnector::new(
+        let mut connector = H3MsQuicAsyncConnector::new(
             uri.clone(),
             config,
-            Some(config_qmux),
-            false,
+            config_qmux,
+            measuring.is_some(),
             registration,
         )
         .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
+        // Watched only where it is asked for, and read by the caller rather
+        // than by a task of our own -- see [`landing`](Self::landing) for why
+        // that is what makes it race-free.
+        let conns = match measuring {
+            Some(family) => {
+                connector = connector.with_preferred_address_family(family);
+                let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(4);
+                connector = connector.with_channel(conn_tx);
+                Some(Arc::new(Mutex::new(conn_rx)))
+            }
+            None => None,
+        };
         let channel = H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
-        Ok(Self { channel, uri })
+        Ok(Self {
+            channel,
+            uri,
+            conns,
+        })
     }
 }
 
