@@ -91,7 +91,7 @@ on:
 jobs:
   apple-native:
     name: Build FFI + Swift bindings (macOS native)
-    runs-on: macos-14
+    runs-on: macos-15
     defaults:
       run:
         working-directory: rust
@@ -119,7 +119,7 @@ jobs:
 
   ios-app:
     name: Build iOS app + relay integration test
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       # An Auth0 access token for the live Identity/Proxy. Absent (forks, or
       # before anyone sets it) the integration test is skipped and the job stays
@@ -252,7 +252,7 @@ jobs:
   ios-ipa:
     name: Package an unsigned device .ipa
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/submodules

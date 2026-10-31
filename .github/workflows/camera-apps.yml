@@ -94,7 +94,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        os: [ubuntu-latest, windows-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/submodules
@@ -409,7 +409,12 @@ jobs:
       - name: Check the archives are runnable
         run: |
           set -euo pipefail
-          for zip in release/camera-apps-ubuntu-latest.zip release/camera-apps-macos-14.zip; do
+          # **Globbed, not listed.** These names carry the runner label, so
+          # `macos-14` becoming `macos-15` renamed one of them -- and a list
+          # would have gone on checking a file that no longer exists, or
+          # stopped checking one that does.
+          for zip in release/camera-apps-*.zip; do
+            case "$zip" in *windows*) continue;; esac  # see above
             bad=$(unzip -ZT "$zip" \
               | awk '$NF ~ /\/(bin\/)?camera-(server|client)$/ && $1 !~ /^-rwx/ {print $NF}')
             if [ -n "$bad" ]; then
