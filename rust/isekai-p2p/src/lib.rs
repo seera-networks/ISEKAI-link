@@ -105,5 +105,10 @@ pub mod agent {
     pub use isekai_p2p_core::proxy::{
         PublicAddress, PublicListener, PublicTarget, RelayInfo, RelayRole, RelayTicket,
     };
-    pub use isekai_p2p_core::transport::{drain_msquic, shutdown_msquic, MasqueH3Transport};
+    // `Binding` is renamed on the way out: `proxy::Binding`, re-exported above,
+    // is an entirely different thing — an Endpoint's control-plane binding, not
+    // a socket mode.
+    pub use isekai_p2p_core::transport::{
+        drain_msquic, shutdown_msquic, Binding as SocketBinding, MasqueH3Transport,
+    };
 }

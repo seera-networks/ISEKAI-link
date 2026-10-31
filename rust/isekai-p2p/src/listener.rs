@@ -1403,6 +1403,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isekai_p2p_core::transport::Binding;
 
     /// Built from the JSON the proxy actually sends, not from the struct.
     ///
@@ -1490,6 +1491,7 @@ mod tests {
         ObservedAddress {
             local: addr(port),
             observed: addr(port + 1),
+            binding: Binding::Unconnected,
         }
     }
 

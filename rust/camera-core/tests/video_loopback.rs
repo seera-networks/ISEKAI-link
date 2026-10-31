@@ -21,7 +21,7 @@ use bytes::Bytes;
 use camera_core::video::{
     bind_video_listener, receive_frames, serve_frames, serve_frames_with, RelayLegs, ServeOptions,
 };
-use isekai_p2p::agent::ObservedAddress;
+use isekai_p2p::agent::{ObservedAddress, SocketBinding};
 use msquic_async::{msquic, Registration};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -113,6 +113,7 @@ async fn frames_keep_flowing_when_the_direct_path_cannot_be_advertised() {
     let (observed_tx, observed_rx) = watch::channel(Some(ObservedAddress {
         local: "192.0.2.1:40000".parse().unwrap(),
         observed: "203.0.113.5:40000".parse().unwrap(),
+        binding: SocketBinding::Unconnected,
     }));
 
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
