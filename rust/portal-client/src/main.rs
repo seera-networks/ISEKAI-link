@@ -1036,7 +1036,7 @@ const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One row of [`show_relays`], header included, so the two cannot drift apart.
 fn relay_row(rtt: &str, families: &str, probe: &str, dp_id: &str, base_url: &str) -> String {
-    format!("{rtt:<14} {families:<8} {probe:<10} {dp_id:<28} {base_url}")
+    format!("{rtt:<14} {families:<8} {probe:<18} {dp_id:<28} {base_url}")
 }
 
 /// `--relays` — measure this Endpoint's relay candidates and print them.
@@ -1046,7 +1046,7 @@ fn relay_row(rtt: &str, families: &str, probe: &str, dp_id: &str, base_url: &str
 /// `families` column is a second, different probe — a relay leg's unconnected
 /// socket rather than the control plane's connected one — because that is the
 /// mode whose answer decides whether a direct path can form. The `probe`
-/// column is what that cost in milliseconds, `v4/v6` — the number
+/// column is what that cost, per family, in milliseconds — the number
 /// `docs/relay_address_family_plan.md` §8-6 defers the initiator's budget
 /// decision to, and the reason this command is the fastest way to collect it:
 /// it runs the same observation a listener runs, on demand, instead of once a
@@ -1082,7 +1082,7 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
     // initiator is asking this question, and it costs two more dials per relay
     // in a command that was already dialling every one of them.
     let families: std::collections::HashMap<_, _> =
-        isekai_p2p::relay_rtt::observe_families(&candidates, opts.per_relay)
+        isekai_p2p::relay_rtt::observe_families(&candidates, opts.per_relay, opts.budget)
             .await
             .into_iter()
             .map(|one| (one.dp_id.clone(), one))
@@ -1130,13 +1130,23 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         // is a question about these milliseconds. Both are shown because the
         // *dead* family is the expensive one, and it is the one that would eat
         // the budget.
+        // **Labelled, because the set is not fixed.** Only the families worth
+        // asking about are probed, so a single-stack relay has one value --
+        // an unlabelled number there reads as v4 even for a v6-only relay.
         let probe = match observed {
+            Some(one) if one.probes.is_empty() => "none".to_owned(),
             Some(one) => one
                 .probes
                 .iter()
-                .map(|p| p.took.as_millis().to_string())
+                .map(|p| {
+                    let family = match p.family {
+                        isekai_p2p::relay_rtt::AddressFamily::V4 => "v4",
+                        isekai_p2p::relay_rtt::AddressFamily::V6 => "v6",
+                    };
+                    format!("{family}={}", p.took.as_millis())
+                })
                 .collect::<Vec<_>>()
-                .join("/"),
+                .join(" "),
             None => "-".to_owned(),
         };
         println!(

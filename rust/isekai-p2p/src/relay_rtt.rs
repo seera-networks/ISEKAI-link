@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use isekai_p2p_core::proxy::{ProxyClient, RelayCandidate, RelayReach, RelayRttSample};
 pub use isekai_p2p_core::transport::AddressFamily;
-use isekai_p2p_core::transport::{Landing, MasqueH3Transport, family_name};
+use isekai_p2p_core::transport::{Landing, MasqueH3Transport, families_resolved, family_name};
 use tokio::task::JoinSet;
 
 /// How long a relay's measurements stay usable at the control plane.
@@ -112,12 +112,13 @@ pub struct ProbeOptions {
     /// between those two is the difference between "do not route me through it"
     /// and "I have nothing to say about it" (§5).
     ///
-    /// **It does not cover the family observation `round` runs after it.**
-    /// That pass is bounded on its own, by one [`per_relay`](Self::per_relay)
-    /// per relay with the relays concurrent — so a round can take this plus
-    /// roughly one `per_relay`. Said rather than quietly folded in, because
-    /// folding it in would mean a measurement and an observation competing for
-    /// the same deadline, and the measurement is the one that gets reported.
+    /// **It bounds the family observation too, separately.** `round` gives
+    /// that pass this same budget, and `measure_for_connect` gives it whatever
+    /// is left after the round trips — so a round can take this twice over at
+    /// worst, and a connect stays inside it. Earlier the observation was
+    /// bounded only per relay, which let a dual-stack relay take the whole
+    /// `per_relay` inside a smaller budget and overrun what the connect
+    /// advertises.
     pub budget: Duration,
 }
 
@@ -396,6 +397,24 @@ async fn family_landing(base_url: &str, family: AddressFamily) -> Option<Landing
     transport.landing()
 }
 
+/// [`timed_probe`], or nothing when `asked` does not name this family.
+async fn maybe_probe<F, Fut>(
+    asked: &[AddressFamily],
+    family: AddressFamily,
+    base_url: &str,
+    per_relay: Duration,
+    probe: &F,
+) -> Option<FamilyProbe>
+where
+    F: Fn(String, AddressFamily) -> Fut,
+    Fut: std::future::Future<Output = Option<Landing>>,
+{
+    if !asked.contains(&family) {
+        return None;
+    }
+    Some(timed_probe(base_url, family, per_relay, probe).await)
+}
+
 /// [`family_landing`] under `per_relay`, timed either way.
 ///
 /// The duration is measured around the timeout rather than inside it, so a
@@ -443,6 +462,7 @@ where
 /// Concurrent, so one `per_relay` each still bounds the relay as a whole.
 async fn relay_families<F, Fut>(
     candidate: &RelayCandidate,
+    asked: &[AddressFamily],
     per_relay: Duration,
     probe: F,
 ) -> FamilyObservation
@@ -450,13 +470,27 @@ where
     F: Fn(String, AddressFamily) -> Fut,
     Fut: std::future::Future<Output = Option<Landing>>,
 {
+    // At most two, so `join!` of two optionals rather than a `JoinSet`: the
+    // probes still overlap, and a family that was not asked for costs no task.
     let (v4, v6) = tokio::join!(
-        timed_probe(&candidate.base_url, AddressFamily::V4, per_relay, &probe),
-        timed_probe(&candidate.base_url, AddressFamily::V6, per_relay, &probe),
+        maybe_probe(
+            asked,
+            AddressFamily::V4,
+            &candidate.base_url,
+            per_relay,
+            &probe
+        ),
+        maybe_probe(
+            asked,
+            AddressFamily::V6,
+            &candidate.base_url,
+            per_relay,
+            &probe
+        ),
     );
     let observed = FamilyObservation {
         dp_id: candidate.dp_id.clone(),
-        probes: vec![v4, v6],
+        probes: [v4, v6].into_iter().flatten().collect(),
     };
     // **Both landings and both durations, not just the verdict.** An empty set
     // has several different causes -- nothing answered, a connected fallback
@@ -464,14 +498,27 @@ where
     // landings carry the connector's own word on which it was. The durations
     // are what §8-6 of the plan is waiting on: whether the initiator's connect
     // budget can afford to ask this at all.
+    if asked.is_empty() {
+        // **Nothing was asked, so there is nothing to claim.** Saying "which
+        // families this relay answers on" here would assert something no
+        // probe tested -- and on the initiator's path, where single-stack
+        // relays are deliberately not dialled, it would be one such line per
+        // relay per outgoing connection.
+        tracing::debug!(
+            dp_id = candidate.dp_id,
+            "no family to choose between for this relay; not dialling it"
+        );
+        return observed;
+    }
     tracing::info!(
         dp_id = candidate.dp_id,
         base_url = candidate.base_url,
         families = ?observed.families(),
-        asked_v4_landed = ?v4.landed,
-        asked_v4_ms = v4.took.as_millis(),
-        asked_v6_landed = ?v6.landed,
-        asked_v6_ms = v6.took.as_millis(),
+        // The families actually dialled. Not "what the name resolves to": the
+        // initiator passes only those worth asking about, so a single-stack
+        // name reaches here as an empty list and is handled above.
+        asked = ?asked,
+        probes = ?observed.probes,
         "which families this relay answers on, over an unconnected socket",
     );
     observed
@@ -515,10 +562,18 @@ where
 pub async fn observe_families(
     candidates: &[RelayCandidate],
     per_relay: Duration,
+    budget: Duration,
 ) -> Vec<FamilyObservation> {
-    observe_families_with(candidates, per_relay, |base_url, family| async move {
-        family_landing(&base_url, family).await
-    })
+    // A slice of the budget for resolution, the rest for probing: a resolver
+    // that has gone quiet must not spend the whole pass before a single dial.
+    let asked = resolve_all(candidates, budget / 4).await;
+    observe_families_with(
+        candidates,
+        &asked,
+        per_relay,
+        budget,
+        |base_url, family| async move { family_landing(&base_url, family).await },
+    )
     .await
 }
 
@@ -526,7 +581,9 @@ pub async fn observe_families(
 /// without a relay — the same seam [`measure_with`] exists for.
 async fn observe_families_with<F, Fut>(
     candidates: &[RelayCandidate],
+    asked: &[Vec<AddressFamily>],
     per_relay: Duration,
+    budget: Duration,
     probe: F,
 ) -> Vec<FamilyObservation>
 where
@@ -534,13 +591,21 @@ where
     Fut: std::future::Future<Output = Option<Landing>> + Send + 'static,
 {
     let mut set = JoinSet::new();
-    for candidate in candidates {
+    for (candidate, asked) in candidates.iter().zip(asked) {
         let candidate = candidate.clone();
+        let asked = asked.clone();
         let probe = probe.clone();
-        set.spawn(async move { relay_families(&candidate, per_relay, probe).await });
+        set.spawn(async move { relay_families(&candidate, &asked, per_relay, probe).await });
     }
+    // **Bounded as a whole, the way [`measure_with`] is.** Without this the
+    // pass is bounded only per relay, so on the initiator's path a dual-stack
+    // relay could take the full `per_relay` inside a budget half that size --
+    // the connect would overrun what it advertises. What is done by the
+    // deadline is kept; the rest is an omission, which positive-only reporting
+    // already treats as "nothing measured".
+    let deadline = Instant::now() + budget;
     let mut out = Vec::new();
-    while let Some(joined) = set.join_next().await {
+    while let Ok(Some(joined)) = tokio::time::timeout_at(deadline.into(), set.join_next()).await {
         // A panicking probe costs its own line, never the pass.
         match joined {
             Ok(observed) => out.push(observed),
@@ -648,6 +713,14 @@ impl Drop for RelayRttReporter {
 /// which the empty entry means more. Sending it would invite the control plane
 /// to read it as "this relay works in neither family", which is the one thing
 /// a probe that timed out does not establish.
+///
+/// **Which makes the list partial, and is why the control plane merges by
+/// `dp_id` rather than replacing the set** (plan §7.2-1). A relay left out
+/// because its probe did not land this round must keep whatever it reported
+/// before: this side cannot tell "not measured" from "nothing works", so it
+/// has no basis for erasing anything. The difference from `relay_rtt`, which
+/// *does* replace, is that `relay_rtt` can say "measured and unreachable"
+/// with a null and this cannot say its equivalent at all.
 fn reach_to_report(observed: &[FamilyObservation]) -> Vec<RelayReach> {
     observed
         .iter()
@@ -719,7 +792,7 @@ async fn round(
     // [`RETRY_IN`], whose whole cost model is that each attempt is one QUIC
     // connection whose failure the transport logs at `ERROR`. Past them, at
     // least one relay answered, so there is something to measure.
-    let observed = observe_families(&candidates, opts.per_relay).await;
+    let observed = observe_families(&candidates, opts.per_relay, opts.budget).await;
     let reach = reach_to_report(&observed);
     let stored = proxy
         .report_relay_rtt(listener_id, &samples, &reach)
@@ -736,15 +809,88 @@ async fn round(
     Ok(())
 }
 
+/// Resolve every candidate at once, under one deadline.
+///
+/// **`getaddrinfo` has no deadline of its own.** `dns_resolve` ends in
+/// `tokio::net::lookup_host`, which is blocking `getaddrinfo` on the blocking
+/// pool: a host whose first nameserver black-holes takes `resolv.conf`'s
+/// default 5 s × 2 attempts *per name*, and nothing cancels it. Sequentially
+/// and unbounded in front of a connect with a 1500 ms budget, three relays
+/// could add tens of seconds to something a person is waiting on.
+///
+/// So: all at once, and `None` for anything not resolved by the deadline.
+/// `None` is "nothing to ask about", which positive-only reporting already
+/// treats as nothing measured. Nor is resolution cached in general — glibc
+/// does not, whatever `nscd` or `systemd-resolved` may be doing — so this
+/// cannot be assumed cheap.
+async fn resolve_all(candidates: &[RelayCandidate], budget: Duration) -> Vec<Vec<AddressFamily>> {
+    resolve_all_with(candidates, budget, |base_url| async move {
+        families_resolved(&base_url).await
+    })
+    .await
+}
+
+/// [`resolve_all`] with the resolver injected, so the deadline is testable
+/// without DNS — the same seam [`measure_with`] and [`observe_families_with`]
+/// exist for.
+async fn resolve_all_with<F, Fut>(
+    candidates: &[RelayCandidate],
+    budget: Duration,
+    resolve: F,
+) -> Vec<Vec<AddressFamily>>
+where
+    F: Fn(String) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Vec<AddressFamily>> + Send + 'static,
+{
+    let mut set = JoinSet::new();
+    for (i, candidate) in candidates.iter().enumerate() {
+        let base_url = candidate.base_url.clone();
+        let resolve = resolve.clone();
+        set.spawn(async move { (i, resolve(base_url).await) });
+    }
+    let deadline = Instant::now() + budget;
+    let mut out = vec![Vec::new(); candidates.len()];
+    while let Ok(Some(Ok((i, resolved)))) =
+        tokio::time::timeout_at(deadline.into(), set.join_next()).await
+    {
+        out[i] = resolved;
+    }
+    out
+}
+
+/// Which of a relay's resolved families the **initiator** should spend a dial
+/// on: none, unless there is a choice to report.
+///
+/// **A relay whose name resolves to one family offers no choice.** Both ends
+/// must use that family or not reach it at all, so reporting it tells the
+/// control plane nothing it cannot see in its own pool, and the dial is pure
+/// cost on a path somebody is waiting on. Every relay in the deployment
+/// measured on 2026-11-01 is A-only, so this is the ordinary case (plan §8.1).
+///
+/// The listener does not use this: it has half an hour and the answer is worth
+/// logging either way.
+fn worth_asking(resolved: Vec<AddressFamily>) -> Vec<AddressFamily> {
+    if resolved.len() > 1 {
+        resolved
+    } else {
+        Vec::new()
+    }
+}
+
 /// Measure for a one-shot initiator, swallowing every failure.
 ///
 /// An initiator that cannot measure still connects. Its measurements are an
 /// optimization on which relay gets chosen, so failing to produce them falls
 /// back to the target's alone — never to no connection.
+///
+/// **Returns the family sets too**, which is what lets the control plane
+/// intersect the two ends (plan §4-4, §7.2-2): until this side reported, the
+/// intersection was empty whatever the listener said, and no family could be
+/// chosen.
 pub async fn measure_for_connect(
     proxy: &ProxyClient<MasqueH3Transport>,
     opts: &ProbeOptions,
-) -> Vec<RelayRttSample> {
+) -> (Vec<RelayRttSample>, Vec<RelayReach>) {
     // **Inside the budget, because the budget is a promise to the person
     // waiting on `connect`.** The control-plane transport has no request
     // timeout of its own, so an unanswered read here is bounded only by QUIC's
@@ -755,24 +901,58 @@ pub async fn measure_for_connect(
         Ok(Ok(Some(candidates))) if !candidates.is_empty() => candidates,
         Ok(Ok(_)) => {
             tracing::debug!("no relays to measure; connecting unmeasured");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         Ok(Err(err)) => {
             tracing::debug!(%err, "could not read the relay candidates; connecting unmeasured");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         Err(_) => {
             tracing::debug!(
                 "reading the relay candidates outran the budget; connecting unmeasured"
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
     let opts = ProbeOptions {
         budget: opts.budget / 2,
         ..opts.clone()
     };
-    measure(&candidates, &opts).await
+    // **Which relays have a family to choose between, decided before any
+    // packet goes out.** A relay whose name resolves to one family offers no
+    // choice, so probing it buys nothing — and every relay in the deployment
+    // measured on 2026-11-01 is A-only, which makes this the ordinary case
+    // rather than an optimization for a corner (plan §8.1). Resolution is a
+    // cached lookup, so the common path adds no dial at all.
+    let started = Instant::now();
+    let samples = measure(&candidates, &opts).await;
+    // **After the round trips, not beside them.** Overlapping would cost no
+    // wall clock, but `time_exchanges` keeps the *minimum* exchange, so two
+    // extra dials per relay competing for the same budget inflate the very
+    // numbers that decide which relay gets chosen -- a worse trade than a
+    // slower family answer. Running after also means the leftover budget is
+    // known rather than shared.
+    //
+    // **Only where there is a choice**, so the common path pays nothing: with
+    // every relay single-stack -- the deployment measured on 2026-11-01 --
+    // `asked` is empty throughout, `resolve_all` is the only cost, and no dial
+    // is made.
+    let left = opts.budget.saturating_sub(started.elapsed());
+    let asked: Vec<Vec<AddressFamily>> = resolve_all(&candidates, left / 4)
+        .await
+        .into_iter()
+        .map(worth_asking)
+        .collect();
+    let left = opts.budget.saturating_sub(started.elapsed());
+    let observed = observe_families_with(
+        &candidates,
+        &asked,
+        opts.per_relay.min(left),
+        left,
+        |base_url, family| async move { family_landing(&base_url, family).await },
+    )
+    .await;
+    (samples, reach_to_report(&observed))
 }
 
 #[cfg(test)]
@@ -1060,6 +1240,13 @@ mod tests {
         );
     }
 
+    /// Both families asked for, per candidate — what a dual-stack name
+    /// resolves to. Passed in rather than resolved, so these tests never touch
+    /// DNS.
+    fn both(n: usize) -> Vec<Vec<AddressFamily>> {
+        vec![vec![AddressFamily::V4, AddressFamily::V6]; n]
+    }
+
     /// An observation standing for "these families landed on an unconnected
     /// binding", with the durations left out — `reach_to_report` does not read
     /// them.
@@ -1169,7 +1356,9 @@ mod tests {
                 candidate("dp1_also_stuck"),
                 candidate("dp1_fine"),
             ],
+            &both(3),
             Duration::from_secs(3),
+            Duration::from_secs(30),
             |base_url, family| async move {
                 if base_url.contains("stuck") {
                     // Outlives its own per-relay limit, let alone a shared one.
@@ -1203,7 +1392,9 @@ mod tests {
         // answers on v4.
         let observed = observe_families_with(
             &[candidate("dp1_dark_v6")],
+            &both(1),
             Duration::from_secs(3),
+            Duration::from_secs(30),
             |_, family| async move {
                 if family == AddressFamily::V6 {
                     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1225,7 +1416,9 @@ mod tests {
         // dialled at all and a v6-only relay reports `none`.
         let observed = observe_families_with(
             &[candidate("dp1_dark_v4")],
+            &both(1),
             Duration::from_secs(3),
+            Duration::from_secs(30),
             |_, family| async move {
                 if family == AddressFamily::V4 {
                     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1241,6 +1434,187 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_single_stack_relay_is_asked_once() {
+        // The field answer to the plan's §8-6: do not ask a family the name
+        // does not have. Every relay in the deployment measured is A-only, so
+        // this is the ordinary case, not the corner one -- and a family with
+        // one entry has no choice to report anyway.
+        let observed = observe_families_with(
+            &[candidate("dp1_v4_only")],
+            &[vec![AddressFamily::V4]],
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+            |_, family| async move {
+                assert_eq!(family, AddressFamily::V4, "v6 must not be dialled");
+                on("192.0.2.9:443")
+            },
+        )
+        .await;
+        assert_eq!(observed[0].probes.len(), 1, "one probe, not two");
+        assert_eq!(observed[0].families(), vec![AddressFamily::V4]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resolver_that_hangs_does_not_hold_up_the_connect() {
+        // The highest-cost thing in this change: `families_resolved` ends in
+        // blocking `getaddrinfo`, which has no deadline of its own -- a host
+        // whose first nameserver black-holes spends `resolv.conf`'s 5 s x 2
+        // attempts *per name*. Unbounded and sequential in front of a connect
+        // with a 1500 ms budget, three relays could add tens of seconds to
+        // something a person is waiting on. Bounded and concurrent: the names
+        // that answered are used, the rest are "nothing to ask about".
+        let started = tokio::time::Instant::now();
+        // **The slow name goes first on purpose.** Resolved one after the
+        // other it would consume the whole deadline and the second name would
+        // never be looked up at all -- the order the candidate list happens to
+        // arrive in would decide which relays can be asked about.
+        let resolved = resolve_all_with(
+            &[candidate("dp1_slow_dns"), candidate("dp1_fine")],
+            Duration::from_millis(300),
+            |base_url| async move {
+                if base_url.contains("slow_dns") {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+                // Not instant: a real lookup is never ready on its first
+                // poll, and a fake one that is would complete even under an
+                // already-elapsed deadline — which made a sequential version
+                // of this pass.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                vec![AddressFamily::V4, AddressFamily::V6]
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "the deadline cut it off -- took {elapsed:?}"
+        );
+        assert_eq!(
+            resolved,
+            vec![Vec::new(), vec![AddressFamily::V4, AddressFamily::V6]],
+            "the name that answered is kept, in its own slot; the other asks nothing"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_observation_as_a_whole_stops_at_its_budget() {
+        // Bounded like `measure_with`, not only per relay. Without this the
+        // pass runs to the slowest relay's `per_relay`, which on the
+        // initiator's path is longer than the budget it was given -- the
+        // connect would overrun what it advertises.
+        let started = tokio::time::Instant::now();
+        let observed = observe_families_with(
+            &[candidate("dp1_fine"), candidate("dp1_stuck")],
+            &both(2),
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+            |base_url, _| async move {
+                if base_url.contains("stuck") {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                on("192.0.2.9:443")
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the budget cut it off rather than the per-relay limit -- took {elapsed:?}"
+        );
+        assert_eq!(
+            verdicts(observed),
+            vec![("dp1_fine".to_owned(), vec![AddressFamily::V4])],
+            "what landed by the deadline is kept; the rest is an omission"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_with_no_choice_is_not_dialled_at_all() {
+        // What makes this affordable on the initiator's path: an empty `asked`
+        // means no probe runs, so the common case (every relay single-stack,
+        // as measured on 2026-11-01) adds no dial to a connect somebody is
+        // waiting on. `measure_for_connect` passes an empty list for exactly
+        // those relays.
+        let dialled = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = dialled.clone();
+        let observed = observe_families_with(
+            &[candidate("dp1_no_choice")],
+            &[Vec::new()],
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+            move |_, _| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    on("192.0.2.9:443")
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            dialled.load(Ordering::Relaxed),
+            0,
+            "a relay with one family offers no choice, so nothing is dialled"
+        );
+        assert!(observed[0].probes.is_empty());
+        assert!(
+            observed[0].families().is_empty(),
+            "and it claims nothing, which is the positive-only answer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dual_stack_relay_is_asked_twice_and_at_once() {
+        // **Wall clock, not `took()`.** `took()` is the max of the probes' own
+        // durations, which is 200 ms whether they ran together or one after
+        // the other -- an earlier version of this test asserted on it and
+        // passed with the families made sequential, which is the opposite of
+        // what it claims to check.
+        let started = tokio::time::Instant::now();
+        let observed = observe_families_with(
+            &[candidate("dp1_both")],
+            &both(1),
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+            |_, family| async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                match family {
+                    AddressFamily::V4 => on("192.0.2.9:443"),
+                    AddressFamily::V6 => on("[2001:db8::9]:443"),
+                }
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(observed[0].probes.len(), 2);
+        assert_eq!(
+            observed[0].families(),
+            vec![AddressFamily::V4, AddressFamily::V6]
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "the two families overlap, so a relay costs one probe's worth and \
+             not two -- took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn the_initiator_spends_a_dial_only_where_there_is_a_choice() {
+        // What makes this affordable inside a connect: with every relay
+        // single-stack -- the deployment measured on 2026-11-01 -- the
+        // initiator adds no dial at all.
+        assert!(worth_asking(vec![AddressFamily::V4]).is_empty());
+        assert!(worth_asking(vec![AddressFamily::V6]).is_empty());
+        assert!(worth_asking(Vec::new()).is_empty());
+        assert_eq!(
+            worth_asking(vec![AddressFamily::V4, AddressFamily::V6]),
+            vec![AddressFamily::V4, AddressFamily::V6],
+            "a dual-stack relay is the only one with something to report"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_probe_that_ran_out_reports_the_budget_it_spent() {
         // The duration is taken around the timeout, not inside it. Inside, a
         // probe that never resolves contributes nothing -- and a dead family
@@ -1248,7 +1622,9 @@ mod tests {
         // the initiator's budget decision depends on (plan §8-6).
         let observed = observe_families_with(
             &[candidate("dp1_half_dark")],
+            &both(1),
             Duration::from_secs(3),
+            Duration::from_secs(30),
             |_, family| async move {
                 if family == AddressFamily::V6 {
                     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1284,7 +1660,9 @@ mod tests {
         // broken".
         let observed = observe_families_with(
             &[candidate("dp1_dark")],
+            &both(1),
             Duration::from_secs(3),
+            Duration::from_secs(30),
             |_, _| async move {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 on("192.0.2.9:443")
