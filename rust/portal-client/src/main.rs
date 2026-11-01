@@ -1035,8 +1035,8 @@ async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
 const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One row of [`show_relays`], header included, so the two cannot drift apart.
-fn relay_row(rtt: &str, families: &str, dp_id: &str, base_url: &str) -> String {
-    format!("{rtt:<14} {families:<8} {dp_id:<28} {base_url}")
+fn relay_row(rtt: &str, families: &str, probe: &str, dp_id: &str, base_url: &str) -> String {
+    format!("{rtt:<14} {families:<8} {probe:<10} {dp_id:<28} {base_url}")
 }
 
 /// `--relays` — measure this Endpoint's relay candidates and print them.
@@ -1045,7 +1045,12 @@ fn relay_row(rtt: &str, families: &str, dp_id: &str, base_url: &str) -> String {
 /// what the control plane would be given, not an approximation of them. The
 /// `families` column is a second, different probe — a relay leg's unconnected
 /// socket rather than the control plane's connected one — because that is the
-/// mode whose answer decides whether a direct path can form.
+/// mode whose answer decides whether a direct path can form. The `probe`
+/// column is what that cost in milliseconds, `v4/v6` — the number
+/// `docs/relay_address_family_plan.md` §8-6 defers the initiator's budget
+/// decision to, and the reason this command is the fastest way to collect it:
+/// it runs the same observation a listener runs, on demand, instead of once a
+/// half hour into a journal.
 ///
 /// It reports nothing: a diagnostic that quietly replaced the stored
 /// measurements would make looking at the system change it.
@@ -1080,10 +1085,14 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         isekai_p2p::relay_rtt::observe_families(&candidates, opts.per_relay)
             .await
             .into_iter()
+            .map(|one| (one.dp_id.clone(), one))
             .collect();
 
     // Named, because `families` is not guessable from its values.
-    println!("{}", relay_row("rtt", "families", "dp_id", "base_url"));
+    println!(
+        "{}",
+        relay_row("rtt", "families", "probe", "dp_id", "base_url")
+    );
     for candidate in &candidates {
         // Three states, kept apart because they mean different things to the
         // choice: a number ranks, `unreachable` is dropped from a session's
@@ -1103,7 +1112,8 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         // relay that did not answer, or that answered only through a CLAT
         // translator's connected socket, reports nothing rather than ruling a
         // family out — see `relay_rtt::families_answered`.
-        let answers = match families.get(&candidate.dp_id) {
+        let observed = families.get(&candidate.dp_id);
+        let answers = match observed.map(|one| one.families()) {
             Some(families) if families.is_empty() => "none".to_owned(),
             Some(families) => families
                 .iter()
@@ -1115,9 +1125,29 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
                 .join(","),
             None => "?".to_owned(),
         };
+        // **What asking cost, per family.** The initiator has roughly 750 ms
+        // for a whole measurement round, so whether it can afford to ask this
+        // is a question about these milliseconds. Both are shown because the
+        // *dead* family is the expensive one, and it is the one that would eat
+        // the budget.
+        let probe = match observed {
+            Some(one) => one
+                .probes
+                .iter()
+                .map(|p| p.took.as_millis().to_string())
+                .collect::<Vec<_>>()
+                .join("/"),
+            None => "-".to_owned(),
+        };
         println!(
             "{}",
-            relay_row(&verdict, &answers, &candidate.dp_id, &candidate.base_url)
+            relay_row(
+                &verdict,
+                &answers,
+                &probe,
+                &candidate.dp_id,
+                &candidate.base_url
+            )
         );
     }
 
