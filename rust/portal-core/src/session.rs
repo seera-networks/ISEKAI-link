@@ -780,6 +780,7 @@ async fn open_the_peer_connection(
             None
         }
     };
+    isekai_p2p::peer::require_something_to_check(verify, pin.is_some())?;
 
     // Resolved before the dial: a candidate has to be offered before `start`,
     // and the handshake can take a long time by design, so there is no useful

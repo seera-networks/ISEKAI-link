@@ -402,6 +402,15 @@ impl MyApp {
                     None
                 }
             };
+            if let Err(e) = camera_core::require_something_to_check(verify, pin.is_some()) {
+                shared.lock().unwrap().status = format!("refused: {e}");
+                tracing::error!("{e}");
+                // Closed for the same reason as a wrong peer above: otherwise
+                // the camera goes on holding a relay leg for a viewer that
+                // has refused it.
+                session.close().await;
+                return;
+            }
             {
                 let mut s = shared.lock().unwrap();
                 s.connection_id = Some(session.connection_id().to_string());

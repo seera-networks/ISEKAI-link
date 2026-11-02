@@ -25,7 +25,7 @@ use isekai_p2p::agent::{ObservedAddress, ObservedAddressWatch};
 use isekai_p2p::direct_path::{prefer_path, RelayPath};
 use isekai_p2p::peer::log_connection_stats;
 // Re-exported under the names the viewers and the FFI already import.
-pub use isekai_p2p::peer::{AttestedPeer, Unpinnable};
+pub use isekai_p2p::peer::{require_something_to_check, AttestedPeer, Unpinnable};
 
 use crate::tls::{dev_cert, VideoCert};
 
