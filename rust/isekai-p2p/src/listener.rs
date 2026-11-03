@@ -509,10 +509,20 @@ impl ListenerSession {
     /// `relay_base_url` is where this connection's relay answers, from the
     /// connection view. `None` — no registered relay — keeps the old
     /// behaviour of binding against the control plane's own data path.
+    ///
+    /// `relay_family` and `info_family` are the two places the chosen family
+    /// lives — `PeerConnection::relay_family` and `RelayInfo::family`. **Both,
+    /// not just the one a listener normally reads**, so that a control plane
+    /// populating one and not the other cannot constrain one end and leave the
+    /// other free: see [`relay_family::chosen`](crate::relay_family::chosen).
+    /// `None` for both — no common family, or a control plane that does not
+    /// choose — leaves the leg picking for itself, exactly as before.
     pub async fn bind(
         &mut self,
         connection_id: &str,
         relay_base_url: Option<&str>,
+        relay_family: Option<&str>,
+        info_family: Option<&str>,
     ) -> anyhow::Result<()> {
         if self.binds.contains_key(connection_id) {
             return Ok(());
@@ -568,6 +578,7 @@ impl ListenerSession {
         // relay, and the data path refuses it — correctly, and confusingly,
         // because the refusal names a ticket problem when the mistake was the
         // host we dialled.
+        let family = crate::relay_family::chosen(info_family, relay_family, connection_id);
         let session = open_bind_session(
             relay_base_url.unwrap_or(&self.proxy_url),
             // The current one, not the one the session started with: a leg
@@ -578,6 +589,7 @@ impl ListenerSession {
             self.forward_to,
             ticket.as_ref().map(|t| t.ticket.as_str()),
             self.opts.clone(),
+            family,
         )
         .await?;
         let inbound = session.inbound_activity();
@@ -769,6 +781,8 @@ impl ListenerSession {
                 .bind(
                     &connection.connection_id,
                     connection.relay_base_url.as_deref(),
+                    connection.relay_family.as_deref(),
+                    connection.relay.as_ref().and_then(|r| r.family.as_deref()),
                 )
                 .await
             {
@@ -1376,7 +1390,12 @@ pub async fn run(
                     let result = match session.proxy.get_connection(&connection_id).await {
                         Ok(c) => {
                             session
-                                .bind(&connection_id, c.relay_base_url.as_deref())
+                                .bind(
+                                    &connection_id,
+                                    c.relay_base_url.as_deref(),
+                                    c.relay_family.as_deref(),
+                                    c.relay.as_ref().and_then(|r| r.family.as_deref()),
+                                )
                                 .await
                         }
                         Err(e) => Err(anyhow::anyhow!(

@@ -284,6 +284,21 @@ pub struct RelayInfo {
     /// during a certificate rotation; empty when nothing is pinned.
     #[serde(default)]
     pub spki_sha256: Vec<String>,
+    /// The address family **both ends** should dial this relay in, `"v4"` or
+    /// `"v6"` — the intersection of the two parties' [`RelayReach`] sets.
+    ///
+    /// **Absent is the answer whenever there is no common family**, and that
+    /// absence is not a degraded case: with nothing in common the two ends
+    /// cannot reach each other directly whatever they dial, so relaying on is
+    /// correct and each end picks for itself exactly as it does today (plan
+    /// Q5). It is equally absent against a control plane that does not know
+    /// about this at all.
+    ///
+    /// **The initiator reads it here; the listener cannot.** A listener never
+    /// looks at `relay`, so the same value is repeated as
+    /// [`PeerConnection::relay_family`] — see that field (plan Q4).
+    #[serde(default)]
+    pub family: Option<String>,
 }
 
 /// Which leg of a relay a ticket is for (spec §8.14.1).
@@ -1399,6 +1414,18 @@ pub struct PeerConnection {
     /// its ticket may be redeemed.
     #[serde(default)]
     pub relay_base_url: Option<String>,
+    /// The address family to dial `relay_base_url` in — the **listener's** copy
+    /// of [`RelayInfo::family`].
+    ///
+    /// **Repeated rather than shared because a listener does not read
+    /// `relay`.** It takes `relay_base_url` from here (see that field), so a
+    /// family carried only inside `relay` would reach the initiator and leave
+    /// the listener dialling whatever it would have dialled anyway — and one
+    /// end choosing is worse than neither, since it is the *pair* that has to
+    /// match. The two are expected to agree; this one is what a listener acts
+    /// on (plan Q4).
+    #[serde(default)]
+    pub relay_family: Option<String>,
     /// The loopback FQDN the initiator should dial for the video QUIC over the
     /// relay, so it can validate the per-endpoint certificate the listener
     /// downloaded. `None` when the proxy has relay certificates disabled — in
@@ -2929,6 +2956,55 @@ mod tests {
         let calls = client.transport.calls.lock().unwrap();
         let (_, _, _, body) = calls.last().unwrap();
         serde_json::from_slice(body).unwrap()
+    }
+
+    /// Both halves of the answer are read, from the two places they live.
+    ///
+    /// A listener never looks at `relay`, so a family carried only there would
+    /// reach the initiator and leave the listener dialling whatever it would
+    /// have anyway — and one end choosing is worse than neither, because it is
+    /// the pair that has to match (plan Q4).
+    #[tokio::test]
+    async fn the_chosen_family_is_read_from_both_fields() {
+        let resp = r#"{"connection_id":"pc_1","state":"relay","listener_id":"ln_1",
+            "protocol":"mjpeg","peer_endpoint":"ep:B","peer_candidates":[],
+            "created_at":"t","expires_at":"t",
+            "relay":{"masque_uri":"https://p/","session_id":"s1","family":"v6"},
+            "relay_base_url":"https://dp1.example:8443","relay_family":"v6"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        let connection = client
+            .peer_connect_measured("cap", "ln_1", "mjpeg", &[], &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            connection.relay.as_ref().unwrap().family.as_deref(),
+            Some("v6"),
+            "the initiator's copy"
+        );
+        assert_eq!(
+            connection.relay_family.as_deref(),
+            Some("v6"),
+            "the listener's copy, which is the one it can reach"
+        );
+    }
+
+    /// And absent is the ordinary case: no common family, or a control plane
+    /// that does not choose at all. Both must parse, because a response this
+    /// cannot read costs the connection rather than the direct path.
+    #[tokio::test]
+    async fn a_response_that_names_no_family_still_parses() {
+        let resp = r#"{"connection_id":"pc_1","state":"relay","listener_id":"ln_1",
+            "protocol":"mjpeg","peer_endpoint":"ep:B","peer_candidates":[],
+            "created_at":"t","expires_at":"t",
+            "relay":{"masque_uri":"https://p/","session_id":"s1"},
+            "relay_base_url":"https://dp1.example:8443"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, resp));
+        let connection = client
+            .peer_connect_measured("cap", "ln_1", "mjpeg", &[], &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(connection.relay.as_ref().unwrap().family, None);
+        assert_eq!(connection.relay_family, None);
     }
 
     /// The shape of what goes out matters more than the plumbing: the server

@@ -296,6 +296,10 @@ pub async fn open<T: ControlPlaneTransport>(
         forward_to,
         ticket.as_deref(),
         RelayOptions::default(),
+        // **A public address has nobody to agree with.** It is one socket for
+        // traffic from anyone (`RelayRole::PublicAddress`), so there is no far
+        // end whose family has to match and nothing to constrain this to.
+        None,
     )
     .await
     .with_context(|| format!("bind the public address for {listener_id}"))?;
@@ -470,6 +474,7 @@ mod tests {
             masque_uri: "https://dp1.example:8443/.well-known/masque/udp/%2A/%2A/".to_owned(),
             session_id: None,
             dp_id: dp_id.map(str::to_owned),
+            family: None,
             spki_sha256: Vec::new(),
         }
     }

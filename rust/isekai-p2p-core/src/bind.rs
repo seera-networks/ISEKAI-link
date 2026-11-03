@@ -53,7 +53,7 @@ use tower_http::auth::AddAuthorizationLayer;
 use crate::endpoint::EndpointKey;
 use crate::observed::{ObservedAddressWatch, spawn_observed_address_watch};
 use crate::pop;
-use crate::transport::{Liveness, make_client_config};
+use crate::transport::{AddressFamily, Liveness, make_client_config};
 
 /// How a relay leg's underlying QUIC connection is set up.
 ///
@@ -160,6 +160,7 @@ fn check_relay_uri(uri: &Uri) -> anyhow::Result<()> {
 fn relay_connector(
     uri: Uri,
     opts: &RelayOptions,
+    family: Option<AddressFamily>,
     shutdown: CancellationToken,
     liveness: Liveness,
 ) -> anyhow::Result<(H3MsQuicAsyncConnector, ObservedAddressWatch)> {
@@ -189,6 +190,40 @@ fn relay_connector(
     .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
     let (conn_tx, conn_rx) = mpsc::channel(4);
     let observed = spawn_observed_address_watch(conn_rx, shutdown);
+    // **The family the control plane chose for *both* ends** (plan Q6). It is
+    // applied here because this is where the connector is built, and inside
+    // `connect` is where an address is actually picked -- `bind.rs` never
+    // resolves anything itself.
+    //
+    // A preference, not a requirement: with nothing routable in the named
+    // family the connector still reaches the others. Right, and deliberately
+    // so -- the family was reported as usable at measurement time, so arriving
+    // here with it unusable means the route changed since, and reaching the
+    // relay matters more than reaching it in the agreed family. The cost is
+    // the direct path, which would not have formed either way.
+    //
+    // **And it is honoured only on an unconnected leg.** The connector picks
+    // the address only inside `if self.is_unconnected`; with a connected
+    // socket msquic resolves the host in `start` and the preference is never
+    // consulted. So a leg built with `RelayOptions { unconnected: false }` --
+    // `isekai-client-ffi` with migration off -- drops the agreed family while
+    // its peer honours it. Harmless, because such a leg has no direct path to
+    // line up anyway, but worth saying out loud rather than leaving a reader
+    // to find it upstream, and worth a line rather than nothing: "the family
+    // was agreed" and "the family was applied" are different facts and only
+    // one of them is visible from the response.
+    let connector = match family {
+        Some(family) if opts.unconnected => connector.with_preferred_address_family(family),
+        Some(family) => {
+            tracing::debug!(
+                ?family,
+                "the control plane chose an address family, but this leg is on a connected \
+                 socket, which cannot honour it; it has no direct path either way"
+            );
+            connector
+        }
+        None => connector,
+    };
     Ok((connector.with_channel(conn_tx), observed))
 }
 
@@ -417,6 +452,12 @@ pub async fn open_bind_session(
     forward_to: SocketAddr,
     ticket: Option<&str>,
     opts: RelayOptions,
+    // The family the control plane chose for both ends, from
+    // `PeerConnection::relay_family` (a listener) or `RelayInfo::family` (an
+    // initiator). An **argument rather than a `RelayOptions` field** because
+    // it arrives in the connect *response*, while the options are built by the
+    // application before that (plan Q7). `None` is today's behaviour.
+    family: Option<AddressFamily>,
 ) -> anyhow::Result<BindSession> {
     open_bound_udp(
         target,
@@ -426,6 +467,7 @@ pub async fn open_bind_session(
         forward_to,
         ticket,
         opts,
+        family,
     )
     .await
 }
@@ -481,6 +523,12 @@ pub async fn open_public_bind_session(
     forward_to: SocketAddr,
     ticket: Option<&str>,
     opts: RelayOptions,
+    // The family the control plane chose for both ends, from
+    // `PeerConnection::relay_family` (a listener) or `RelayInfo::family` (an
+    // initiator). An **argument rather than a `RelayOptions` field** because
+    // it arrives in the connect *response*, while the options are built by the
+    // application before that (plan Q7). `None` is today's behaviour.
+    family: Option<AddressFamily>,
 ) -> anyhow::Result<BindSession> {
     open_bound_udp(
         target,
@@ -490,6 +538,7 @@ pub async fn open_public_bind_session(
         forward_to,
         ticket,
         opts,
+        family,
     )
     .await
 }
@@ -542,6 +591,12 @@ async fn open_bound_udp(
     forward_to: SocketAddr,
     ticket: Option<&str>,
     opts: RelayOptions,
+    // The family the control plane chose for both ends, from
+    // `PeerConnection::relay_family` (a listener) or `RelayInfo::family` (an
+    // initiator). An **argument rather than a `RelayOptions` field** because
+    // it arrives in the connect *response*, while the options are built by the
+    // application before that (plan Q7). `None` is today's behaviour.
+    family: Option<AddressFamily>,
 ) -> anyhow::Result<BindSession> {
     let uri: Uri = target.parse().context("invalid proxy target URI")?;
     // **Checked on this path too.** The connect leg validates inside
@@ -565,7 +620,8 @@ async fn open_bound_udp(
         BoundUdp::PublicAddress => Liveness::PublicAddress,
         BoundUdp::BindLeg { .. } | BoundUdp::ConnectLeg { .. } => Liveness::RelayLeg,
     };
-    let (connector, observed) = relay_connector(uri.clone(), &opts, shutdown.clone(), liveness)?;
+    let (connector, observed) =
+        relay_connector(uri.clone(), &opts, family, shutdown.clone(), liveness)?;
     // **Armed against this function being dropped before it returns.**
     // Everything below runs on a task of its own holding a clone of
     // `shutdown`, and a `CancellationToken` does not cancel when a clone is
@@ -785,6 +841,12 @@ pub async fn open_connect_relay(
     // registered relay — dials `proxy_url`.
     dp_id: Option<&str>,
     opts: RelayOptions,
+    // The family the control plane chose for both ends, from
+    // `PeerConnection::relay_family` (a listener) or `RelayInfo::family` (an
+    // initiator). An **argument rather than a `RelayOptions` field** because
+    // it arrives in the connect *response*, while the options are built by the
+    // application before that (plan Q7). `None` is today's behaviour.
+    family: Option<AddressFamily>,
 ) -> anyhow::Result<ConnectRelay> {
     let masque: Uri = masque_uri.parse().context("invalid masque_uri")?;
     let target_path = masque
@@ -812,8 +874,13 @@ pub async fn open_connect_relay(
     let shutdown = CancellationToken::new();
     // The initiator's connect leg — the one thing here that replaces itself,
     // and the reason these timings exist (`transport::RELAY_LEG_KEEPALIVE`).
-    let (connector, observed) =
-        relay_connector(uri.clone(), &opts, shutdown.clone(), Liveness::RelayLeg)?;
+    let (connector, observed) = relay_connector(
+        uri.clone(),
+        &opts,
+        family,
+        shutdown.clone(),
+        Liveness::RelayLeg,
+    )?;
     // **Armed against this function being dropped before it returns.**
     // Everything below runs on a task of its own holding a clone of
     // `shutdown`, and a `CancellationToken` does not cancel when a clone is

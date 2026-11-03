@@ -211,7 +211,7 @@ connector を**構築する**だけである。したがって connector にフ�
 | 4 | `RelayReach { dp_id, families }` と送信。**報告経路は 3 つあるので全部** — initiator の connect 本体 2 つ（`peer_connect_measured` と `peer_connect_with_grant_measured`）と、**listener の PUT（`report_relay_rtt`）**。§7.2-2 が両端の積を取るので、listener の口を落とすとその側は永久に空になり、「共通ファミリーが無い」と区別が付かない | `isekai-p2p-core/src/proxy.rs` |
 | 5 | `RelayInfo.family` と `PeerConnection.relay_family` を読む（`serde(default)`、Q4）| `isekai-p2p-core/src/proxy.rs` |
 | 6 | 指定を connector に渡す。`open_connect_relay` / `bind` の引数として運ぶ（Q7）| `isekai-p2p-core/src/bind.rs`, `isekai-p2p/src/{initiator,listener}.rs` |
-| 6b | 署名変更の呼び出し側 | `portal-core/src/session.rs`, `camera-core/src/server.rs`, `camera-client`, `isekai-client-ffi` |
+| ~~6b~~ | ~~署名変更の呼び出し側~~ — **不要だった。** ファミリーは `open_connect_relay` / `open_bind_session` の引数として運ぶが、アプリはそれらを直接呼ばず `InitiatorSession` / `ListenerSession` を使い、接続応答はそれらが既に持っている。`rust/` 以下で `open_*` を呼ぶのは `isekai-p2p` 内部と `isekai-agent` だけ（後者はファミリーを持たないので `None`）| — |
 | 7 | 文書 | `docs/relay_proximity_client.md`、本書（仕様 `p2p_connect_spec.md` は ISEKAI-link-server 側）|
 
 ---
@@ -235,7 +235,10 @@ connector を**構築する**だけである。したがって connector にフ�
    > 設計なので、initiator が空を送るのは「未測定」であって害は無い（積が空 =
    > 省略 = 今日の挙動、Q5）。**ただし片側だけでは機能は効かない** — initiator の
    > 測定が入るまで、共通ファミリーは選ばれない
-4. **応答の読み取りと適用（5・6・6b）。** サーバがまだ返さないなら省略 = 今日の挙動
+4. **応答の読み取りと適用（5・6）。** サーバがまだ返さないなら省略 = 今日の挙動
+
+   > **6b は不要だった**（上の表）。Q7 の「引数として運ぶ」判断の帰結で、
+   > アプリの署名は変わらない
 5. **制御プレーン側**（§7.2）。ここで要求が満たされる
 6. **文書（7）**
 
