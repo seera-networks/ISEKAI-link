@@ -28,6 +28,47 @@ use tower::{Service, ServiceExt};
 
 use crate::proxy::{ControlPlaneTransport, HttpResponse};
 
+/// Which families a relay's name actually resolves to.
+///
+/// **The answer to "how should the probe budget be split between the
+/// families?" turned out to be "do not ask a family that has no address"**
+/// (plan §8.1). Measured in the field: asking for a family the name does not
+/// have costs nothing — `first_routable` has nothing to reorder and rejects at
+/// the route test rather than at a handshake — so the only expensive case left
+/// is a family that *does* resolve and black-holes UDP, which spends the whole
+/// `per_relay`. That one is visible here, before any packet is sent.
+///
+/// So a single-stack relay costs one probe instead of two, and a relay with
+/// one family has no choice to report anyway.
+///
+/// **A resolver failure probes everything rather than nothing.** A hiccup in
+/// DNS should not quietly turn the observation off; the probe resolves again
+/// for itself and will fail there if the name really is gone.
+pub async fn families_resolved(base_url: &str) -> Vec<AddressFamily> {
+    let both = vec![AddressFamily::V4, AddressFamily::V6];
+    let Ok(uri) = base_url.parse::<Uri>() else {
+        return both;
+    };
+    let addrs = match h3_util::client::dns_resolve(&uri).await {
+        Ok(addrs) => addrs,
+        Err(err) => {
+            tracing::debug!(%err, base_url, "could not resolve a relay; probing both families");
+            return both;
+        }
+    };
+    let resolved: Vec<AddressFamily> = both
+        .iter()
+        .copied()
+        .filter(|family| addrs.iter().any(|addr| family.holds(addr)))
+        .collect();
+    if resolved.is_empty() {
+        // Resolved to nothing at all. Probing says so with a real error
+        // rather than an empty set that looks like a decision.
+        return both;
+    }
+    resolved
+}
+
 /// The wire spelling of an address family: `"v4"` / `"v6"`.
 ///
 /// **One place, because two sides have to agree.** It is what
