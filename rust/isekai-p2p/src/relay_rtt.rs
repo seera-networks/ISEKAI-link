@@ -335,6 +335,49 @@ fn families_answered(landings: impl IntoIterator<Item = Option<Landing>>) -> Vec
     out
 }
 
+/// One family's probe of one relay: how long it took, and where it landed.
+///
+/// **The duration is the point, not a nicety.** The plan defers how to divide
+/// the initiator's connect budget between the families until "段 2 の実測を
+/// 見てから決める" (§8-6) — and until this was recorded, the observation
+/// answered *which* families work without answering what asking costs, which
+/// is the number that decision needs. A probe that did not land still has a
+/// duration, and that one matters most: it is what a dead family charges the
+/// budget.
+#[derive(Debug, Clone, Copy)]
+pub struct FamilyProbe {
+    pub family: AddressFamily,
+    pub took: Duration,
+    /// `None` when nothing answered, or when it answered on a socket mode a
+    /// leg cannot reproduce — see [`families_answered`].
+    pub landed: Option<Landing>,
+}
+
+/// What one relay answered, and what asking cost.
+#[derive(Debug, Clone)]
+pub struct FamilyObservation {
+    pub dp_id: String,
+    pub probes: Vec<FamilyProbe>,
+}
+
+impl FamilyObservation {
+    /// The families worth reporting — positive-only, see
+    /// [`families_answered`].
+    pub fn families(&self) -> Vec<AddressFamily> {
+        families_answered(self.probes.iter().map(|probe| probe.landed))
+    }
+
+    /// What this relay's probes cost in total. Concurrent, so it is the
+    /// slowest rather than the sum.
+    pub fn took(&self) -> Duration {
+        self.probes
+            .iter()
+            .map(|probe| probe.took)
+            .max()
+            .unwrap_or_default()
+    }
+}
+
 /// One relay, one family: `GET /health` asked the way a leg asks, and where
 /// the connection ended up.
 ///
@@ -351,6 +394,37 @@ async fn family_landing(base_url: &str, family: AddressFamily) -> Option<Landing
     };
     health(&transport).await?;
     transport.landing()
+}
+
+/// [`family_landing`] under `per_relay`, timed either way.
+///
+/// The duration is measured around the timeout rather than inside it, so a
+/// probe that ran out reports the budget it spent rather than nothing.
+async fn timed_probe<F, Fut>(
+    base_url: &str,
+    family: AddressFamily,
+    per_relay: Duration,
+    probe: &F,
+) -> FamilyProbe
+where
+    F: Fn(String, AddressFamily) -> Fut,
+    Fut: std::future::Future<Output = Option<Landing>>,
+{
+    // **`tokio`'s clock, not `std`'s.** The same instant in production — it
+    // reads the real clock unless a test pauses it — and under a paused clock
+    // it advances with the timeout, which is what makes "a probe that ran out
+    // reports the budget it spent" a thing a test can assert rather than a
+    // claim in a comment.
+    let started = tokio::time::Instant::now();
+    let landed = tokio::time::timeout(per_relay, probe(base_url.to_owned(), family))
+        .await
+        .ok()
+        .flatten();
+    FamilyProbe {
+        family,
+        took: started.elapsed(),
+        landed,
+    }
 }
 
 /// Which families one relay answers on.
@@ -371,37 +445,36 @@ async fn relay_families<F, Fut>(
     candidate: &RelayCandidate,
     per_relay: Duration,
     probe: F,
-) -> Vec<AddressFamily>
+) -> FamilyObservation
 where
     F: Fn(String, AddressFamily) -> Fut,
     Fut: std::future::Future<Output = Option<Landing>>,
 {
     let (v4, v6) = tokio::join!(
-        tokio::time::timeout(
-            per_relay,
-            probe(candidate.base_url.clone(), AddressFamily::V4)
-        ),
-        tokio::time::timeout(
-            per_relay,
-            probe(candidate.base_url.clone(), AddressFamily::V6)
-        ),
+        timed_probe(&candidate.base_url, AddressFamily::V4, per_relay, &probe),
+        timed_probe(&candidate.base_url, AddressFamily::V6, per_relay, &probe),
     );
-    let v4 = v4.ok().flatten();
-    let v6 = v6.ok().flatten();
-    let families = families_answered([v4, v6]);
-    // **Both landings in the line, not just the verdict.** An empty set has
-    // several different causes -- nothing answered, a connected fallback of
-    // one kind or another, or an address that could not be read -- and the
-    // landings carry the connector's own word on which it was.
+    let observed = FamilyObservation {
+        dp_id: candidate.dp_id.clone(),
+        probes: vec![v4, v6],
+    };
+    // **Both landings and both durations, not just the verdict.** An empty set
+    // has several different causes -- nothing answered, a connected fallback
+    // of one kind or another, or an address that could not be read -- and the
+    // landings carry the connector's own word on which it was. The durations
+    // are what §8-6 of the plan is waiting on: whether the initiator's connect
+    // budget can afford to ask this at all.
     tracing::info!(
         dp_id = candidate.dp_id,
         base_url = candidate.base_url,
-        ?families,
-        asked_v4_landed = ?v4,
-        asked_v6_landed = ?v6,
+        families = ?observed.families(),
+        asked_v4_landed = ?v4.landed,
+        asked_v4_ms = v4.took.as_millis(),
+        asked_v6_landed = ?v6.landed,
+        asked_v6_ms = v6.took.as_millis(),
         "which families this relay answers on, over an unconnected socket",
     );
-    families
+    observed
 }
 
 /// Which families each relay answers on, logged **and now reported**.
@@ -442,7 +515,7 @@ where
 pub async fn observe_families(
     candidates: &[RelayCandidate],
     per_relay: Duration,
-) -> Vec<(String, Vec<AddressFamily>)> {
+) -> Vec<FamilyObservation> {
     observe_families_with(candidates, per_relay, |base_url, family| async move {
         family_landing(&base_url, family).await
     })
@@ -455,7 +528,7 @@ async fn observe_families_with<F, Fut>(
     candidates: &[RelayCandidate],
     per_relay: Duration,
     probe: F,
-) -> Vec<(String, Vec<AddressFamily>)>
+) -> Vec<FamilyObservation>
 where
     F: Fn(String, AddressFamily) -> Fut + Send + Sync + Clone + 'static,
     Fut: std::future::Future<Output = Option<Landing>> + Send + 'static,
@@ -464,10 +537,7 @@ where
     for candidate in candidates {
         let candidate = candidate.clone();
         let probe = probe.clone();
-        set.spawn(async move {
-            let families = relay_families(&candidate, per_relay, probe).await;
-            (candidate.dp_id, families)
-        });
+        set.spawn(async move { relay_families(&candidate, per_relay, probe).await });
     }
     let mut out = Vec::new();
     while let Some(joined) = set.join_next().await {
@@ -578,9 +648,10 @@ impl Drop for RelayRttReporter {
 /// which the empty entry means more. Sending it would invite the control plane
 /// to read it as "this relay works in neither family", which is the one thing
 /// a probe that timed out does not establish.
-fn reach_to_report(observed: Vec<(String, Vec<AddressFamily>)>) -> Vec<RelayReach> {
+fn reach_to_report(observed: &[FamilyObservation]) -> Vec<RelayReach> {
     observed
-        .into_iter()
+        .iter()
+        .map(|one| (one.dp_id.clone(), one.families()))
         .filter(|(_, families)| !families.is_empty())
         .map(|(dp_id, families)| RelayReach {
             dp_id,
@@ -649,7 +720,7 @@ async fn round(
     // connection whose failure the transport logs at `ERROR`. Past them, at
     // least one relay answered, so there is something to measure.
     let observed = observe_families(&candidates, opts.per_relay).await;
-    let reach = reach_to_report(observed);
+    let reach = reach_to_report(&observed);
     let stored = proxy
         .report_relay_rtt(listener_id, &samples, &reach)
         .await?;
@@ -989,6 +1060,38 @@ mod tests {
         );
     }
 
+    /// An observation standing for "these families landed on an unconnected
+    /// binding", with the durations left out — `reach_to_report` does not read
+    /// them.
+    fn answered(dp_id: &str, families: &[AddressFamily]) -> FamilyObservation {
+        FamilyObservation {
+            dp_id: dp_id.to_owned(),
+            probes: families
+                .iter()
+                .map(|family| FamilyProbe {
+                    family: *family,
+                    took: Duration::from_millis(1),
+                    landed: match family {
+                        AddressFamily::V4 => on("192.0.2.1:443"),
+                        AddressFamily::V6 => on("[2001:db8::1]:443"),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// `(dp_id, families)` per relay, sorted — a `JoinSet` finishes in
+    /// whatever order it finishes, and the durations are not what these tests
+    /// are about.
+    fn verdicts(observed: Vec<FamilyObservation>) -> Vec<(String, Vec<AddressFamily>)> {
+        let mut out: Vec<_> = observed
+            .into_iter()
+            .map(|one| (one.dp_id.clone(), one.families()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// A landing on a real unconnected binding -- the ordinary case.
     fn on(remote: &str) -> Option<Landing> {
         Some(Landing {
@@ -1079,11 +1182,8 @@ mod tests {
             },
         )
         .await;
-        // By `dp_id`: a `JoinSet` finishes in whatever order it finishes.
-        let mut observed = observed;
-        observed.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
-            observed,
+            verdicts(observed),
             vec![
                 ("dp1_also_stuck".to_owned(), vec![]),
                 ("dp1_fine".to_owned(), vec![AddressFamily::V4]),
@@ -1113,7 +1213,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            observed,
+            verdicts(observed),
             vec![("dp1_dark_v6".to_owned(), vec![AddressFamily::V4])]
         );
     }
@@ -1135,8 +1235,46 @@ mod tests {
         )
         .await;
         assert_eq!(
-            observed,
+            verdicts(observed),
             vec![("dp1_dark_v4".to_owned(), vec![AddressFamily::V6])]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_that_ran_out_reports_the_budget_it_spent() {
+        // The duration is taken around the timeout, not inside it. Inside, a
+        // probe that never resolves contributes nothing -- and a dead family
+        // costing "0 ms" is the opposite of the truth, in the one measurement
+        // the initiator's budget decision depends on (plan §8-6).
+        let observed = observe_families_with(
+            &[candidate("dp1_half_dark")],
+            Duration::from_secs(3),
+            |_, family| async move {
+                if family == AddressFamily::V6 {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                on("192.0.2.9:443")
+            },
+        )
+        .await;
+        let one = &observed[0];
+        let v4 = one.probes.iter().find(|p| p.family == AddressFamily::V4);
+        let v6 = one.probes.iter().find(|p| p.family == AddressFamily::V6);
+        assert_eq!(
+            v4.unwrap().took,
+            Duration::from_millis(150),
+            "the family that answered reports what it took"
+        );
+        assert_eq!(
+            v6.unwrap().took,
+            Duration::from_secs(3),
+            "the family that hung reports the whole budget, not zero"
+        );
+        assert_eq!(
+            one.took(),
+            Duration::from_secs(3),
+            "the relay's cost is the slowest probe, because they run at once"
         );
     }
 
@@ -1153,7 +1291,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(observed, vec![("dp1_dark".to_owned(), vec![])]);
+        assert_eq!(verdicts(observed), vec![("dp1_dark".to_owned(), vec![])]);
     }
 
     #[test]
@@ -1161,10 +1299,7 @@ mod tests {
         // `["v6", "v4"]` in the plan's §4-4 example, and the same spelling
         // `RelayInfo.family` comes back in. A rename on either side silently
         // stops the two ends' sets from intersecting.
-        let reach = reach_to_report(vec![(
-            "dp_1".to_owned(),
-            vec![AddressFamily::V6, AddressFamily::V4],
-        )]);
+        let reach = reach_to_report(&[answered("dp_1", &[AddressFamily::V6, AddressFamily::V4])]);
         assert_eq!(
             serde_json::to_value(&reach).unwrap(),
             serde_json::json!([{ "dp_id": "dp_1", "families": ["v6", "v4"] }])
@@ -1176,9 +1311,9 @@ mod tests {
         // An empty entry says what omitting it says, and inviting the control
         // plane to read it as "neither family works" is the one thing a probe
         // that timed out does not establish.
-        let reach = reach_to_report(vec![
-            ("dp_dark".to_owned(), vec![]),
-            ("dp_fine".to_owned(), vec![AddressFamily::V4]),
+        let reach = reach_to_report(&[
+            answered("dp_dark", &[]),
+            answered("dp_fine", &[AddressFamily::V4]),
         ]);
         assert_eq!(
             serde_json::to_value(&reach).unwrap(),
@@ -1188,8 +1323,8 @@ mod tests {
 
     #[test]
     fn an_observation_round_that_measured_nothing_sends_nothing() {
-        assert!(reach_to_report(vec![("dp_a".to_owned(), vec![])]).is_empty());
-        assert!(reach_to_report(Vec::new()).is_empty());
+        assert!(reach_to_report(&[answered("dp_a", &[])]).is_empty());
+        assert!(reach_to_report(&[]).is_empty());
     }
 
     #[test]
