@@ -1051,6 +1051,20 @@ async fn attach(
         &crate::relay_rtt::ProbeOptions::initiator_defaults(),
     )
     .await;
+    // **Empty, and that is a measurement decision rather than an oversight.**
+    // The field is here so the control plane sees the initiator's half the
+    // moment there is one to send, and empty is the honest value until then:
+    // a family set is positive-only, so sending nothing is "nothing measured"
+    // and costs only the chance of a direct path, never the connection.
+    //
+    // Measuring it needs two more QUIC connections per relay inside a connect
+    // somebody is waiting on -- `initiator_defaults` gives the whole round
+    // 1500ms and the collection deadline half of that -- and the plan defers
+    // how to divide that between the families until the listener's own
+    // observation has shown what a probe actually costs in the field
+    // (`docs/relay_address_family_plan.md` §8-6). The listener reports on a
+    // thirty-minute cadence and has the room; this path does not, yet.
+    let relay_reach: &[isekai_p2p_core::proxy::RelayReach] = &[];
     let connection = match auth {
         Authorization::Capability(capability) => {
             proxy
@@ -1060,6 +1074,7 @@ async fn attach(
                     &cfg.protocol,
                     candidates,
                     &relay_rtt,
+                    relay_reach,
                 )
                 .await?
         }
@@ -1070,6 +1085,7 @@ async fn attach(
                     &cfg.protocol,
                     candidates,
                     &relay_rtt,
+                    relay_reach,
                 )
                 .await?
         }

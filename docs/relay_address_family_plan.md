@@ -35,7 +35,7 @@ related: relay_proximity_client.md, p2p_mode_migration_plan.md §2.2.3, p2p_conn
 | ファミリーを決めている場所 | **`H3MsQuicAsyncConnector::connect` の中**（`h3-util/src/msquic_async/client.rs`、`first_routable(dns_resolve(…))`）。`bind::relay_connector` は connector を**構築するだけ**で、`first_routable` を呼ぶ箇所は `rust/` 以下に無い |
 | その選択が走る条件 | **`if self.is_unconnected`（client.rs:125）の中だけ。** 未接続モードでなければ msquic が `start` で自分で解決する |
 | 測定の実体 | `relay_rtt::probe` が `MasqueH3Transport::connect` 経由で H3 `GET /health`。**その transport は `is_unconnected = false`**（`transport.rs`）なので、上の選択ブロックを通らない |
-| リスナーの報告経路 | `PUT /v1/peer-listeners/{listener_id}/relay-rtt`、本体 `{"relay_rtt": [RelayRttSample]}`（`proxy.rs::report_relay_rtt`）|
+| リスナーの報告経路 | `PUT /v1/peer-listeners/{listener_id}/relay-rtt`、本体 `{"relay_rtt": [RelayRttSample]}` に段 3 で `relay_reach` が加わる（`proxy.rs::report_relay_rtt`）。**両端の積を取るので、これが listener 側の唯一の口である**（§4-4）|
 | initiator の報告経路 | connect の本体。**2 つある** — `peer_connect_measured`（capability 認可）と `peer_connect_with_grant_measured`（grant 認可）。`initiator.rs` が `Authorization` で振り分ける |
 | 測定の入口 | `relay_rtt::measure_for_connect`（`initiator.rs` から呼ばれる）|
 | 制御プレーンの応答 | `RelayInfo { masque_uri, … }` が `PeerConnection.relay: Option<RelayInfo>` に入る。**`relay_base_url` はそれとは別の、`PeerConnection` 直下のフィールド**で、listener は `relay_base_url` しか読まない（`listener.rs:771`）|
@@ -208,7 +208,7 @@ connector を**構築する**だけである。したがって connector にフ�
 | 1 | **connector がファミリーの指定を受ける**（builder）。指定があれば `first_routable` に渡す前に解決結果を絞る | **tonic-h3**: `h3-util/src/msquic_async/client.rs`（§7.1）|
 | 2 | **未接続ソケットでの測定経路**。`MasqueH3Transport` は `is_unconnected = false` なので、測定用に未接続の口が要る（Q2）| `isekai-p2p-core/src/transport.rs`, `isekai-p2p/src/relay_rtt.rs` |
 | 3 | ファミリーごとの測定と `families` の算出（肯定のみ、Q3）| `isekai-p2p/src/relay_rtt.rs` |
-| 4 | `RelayReach { dp_id, families }` と送信。**connect 本体は 2 つあるので両方**（`peer_connect_measured` と `peer_connect_with_grant_measured`）| `isekai-p2p-core/src/proxy.rs` |
+| 4 | `RelayReach { dp_id, families }` と送信。**報告経路は 3 つあるので全部** — initiator の connect 本体 2 つ（`peer_connect_measured` と `peer_connect_with_grant_measured`）と、**listener の PUT（`report_relay_rtt`）**。§7.2-2 が両端の積を取るので、listener の口を落とすとその側は永久に空になり、「共通ファミリーが無い」と区別が付かない | `isekai-p2p-core/src/proxy.rs` |
 | 5 | `RelayInfo.family` と `PeerConnection.relay_family` を読む（`serde(default)`、Q4）| `isekai-p2p-core/src/proxy.rs` |
 | 6 | 指定を connector に渡す。`open_connect_relay` / `bind` の引数として運ぶ（Q7）| `isekai-p2p-core/src/bind.rs`, `isekai-p2p/src/{initiator,listener}.rs` |
 | 6b | 署名変更の呼び出し側 | `portal-core/src/session.rs`, `camera-core/src/server.rs`, `camera-client`, `isekai-client-ffi` |
@@ -228,6 +228,13 @@ connector を**構築する**だけである。したがって connector にフ�
    応答するのかが分かる** — この計画全体が立つかどうかの前提
 3. **`relay_reach` の送信（4）。** 旧い制御プレーンは無視するので安全。この時点で
    制御プレーン側が判断材料を得る
+
+   > **送るのは listener の半分だけになる。** 測定は 2 段目で listener の経路にしか
+   > 載せていない。initiator は 1 回の connect に 1500ms しか無く、ファミリー間の
+   > 予算の分け方は §8-6 が「段 2 の実測を見てから決める」としている。肯定のみの
+   > 設計なので、initiator が空を送るのは「未測定」であって害は無い（積が空 =
+   > 省略 = 今日の挙動、Q5）。**ただし片側だけでは機能は効かない** — initiator の
+   > 測定が入るまで、共通ファミリーは選ばれない
 4. **応答の読み取りと適用（5・6・6b）。** サーバがまだ返さないなら省略 = 今日の挙動
 5. **制御プレーン側**（§7.2）。ここで要求が満たされる
 6. **文書（7）**
@@ -252,6 +259,16 @@ connector を**構築する**だけである。したがって connector にフ�
 - `relay_reach` が無い要求（旧クライアント相当）を制御プレーンが今日どおり扱えること
 - `relay_rtt` の内容と意味が**変わっていない**こと
 - **grant 認可の connect でも送られる**こと（`peer_connect_with_grant_measured`）
+- **listener の PUT でも送られる**こと（`report_relay_rtt`）。両端の積を取る設計
+  （§7.2-2）なので、ここが落ちると listener 側が永久に空になり、「共通ファミリーが
+  無い」と区別が付かない
+- ファミリーが 1 つも測れなかったラウンドで、**`relay_reach` を省略する**こと
+  （空配列を送らない）。どの口も送れば保存集合を置き換えるので、空を送ると以前に
+  測れていた集合を消してしまう。RTT は接続済みソケットで QMUX フォールバックも
+  通るが、ファミリーは未接続バインドでしか数えないので、**RTT は良好でファミリーが
+  空というラウンドは普通に起こる**
+- families が空のエントリを**送らない**こと（`dp_id` だけのエントリに意味は無く、
+  「どちらのファミリーも駄目」と読まれる余地だけが残る）
 
 ### 適用（段 4）
 - `family: "v6"` を受けたとき、解決結果の IPv4 を**使わない**こと
@@ -287,6 +304,13 @@ connector を**構築する**だけである。したがって connector にフ�
 ### 7.2 ISEKAI-link-server
 
 1. **`relay_reach` を読む**（Q3 の形）。無ければ今日どおり `relay_rtt` だけで選ぶ
+
+   > **省略と空配列を区別すること。** フィールドが**無い**のは「今回は報告が無い」で
+   > あり、保存済みの集合は**そのまま残す**。クライアントは、ファミリーを 1 つも
+   > 測れなかったラウンドでは送らない（段 3 で実装済み）。RTT は接続済みソケットで
+   > 測り QMUX フォールバックも通るのに、ファミリーは未接続バインドでしか数えないので、
+   > 「RTT は良好・ファミリーは空」は普通に起こる状態である。ここを「空で置き換え」と
+   > 実装すると、UDP を塞ぐ網に移動したホストが**以前測れていた集合を消す**
 2. **両端の `families` の積を取り**、接続応答に `RelayInfo.family` と
    `PeerConnection.relay_family` の**両方**を載せる（Q4）。積が空なら**省略する**（Q5）
 3. リレー選択が `(relay)` から `(relay, family)` になる

@@ -28,6 +28,20 @@ use tower::{Service, ServiceExt};
 
 use crate::proxy::{ControlPlaneTransport, HttpResponse};
 
+/// The wire spelling of an address family: `"v4"` / `"v6"`.
+///
+/// **One place, because two sides have to agree.** It is what
+/// [`RelayReach::families`](crate::proxy::RelayReach::families) is sent as and
+/// what `RelayInfo.family` comes back as, and `proxy` cannot name
+/// `AddressFamily` at all — that type arrives with the `msquic` feature, and
+/// the module holding the wire types builds without it.
+pub fn family_name(family: AddressFamily) -> &'static str {
+    match family {
+        AddressFamily::V4 => "v4",
+        AddressFamily::V6 => "v6",
+    }
+}
+
 /// An HTTP/3 control-plane transport to the MASQUE proxy.
 #[derive(Clone)]
 pub struct MasqueH3Transport {

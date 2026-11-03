@@ -51,9 +51,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use isekai_p2p_core::proxy::{ProxyClient, RelayCandidate, RelayRttSample};
+use isekai_p2p_core::proxy::{ProxyClient, RelayCandidate, RelayReach, RelayRttSample};
 pub use isekai_p2p_core::transport::AddressFamily;
-use isekai_p2p_core::transport::{Landing, MasqueH3Transport};
+use isekai_p2p_core::transport::{Landing, MasqueH3Transport, family_name};
 use tokio::task::JoinSet;
 
 /// How long a relay's measurements stay usable at the control plane.
@@ -404,13 +404,21 @@ where
     families
 }
 
-/// Which families each relay answers on, **logged and not reported**.
+/// Which families each relay answers on, logged **and now reported**.
 ///
-/// This is the observation step of `docs/relay_address_family_plan.md`: before
-/// anything is sent to the control plane or acted on, the question is whether a
-/// relay on a dual-stack host answers on *both* families over the socket mode a
-/// leg uses. The plan rests on it, and nothing here knows the answer yet for a
-/// real deployment.
+/// The question is whether a relay on a dual-stack host answers on *both*
+/// families over the socket mode a leg uses — the premise
+/// `docs/relay_address_family_plan.md` rests on, and one nothing here knows
+/// the answer to yet for a real deployment, which is why every round still
+/// says what it found at `INFO`.
+///
+/// **What this returns goes on the wire.** `round` sends it as `relay_reach`
+/// (plan §4-4), and the control plane intersects it with the far end's set, so
+/// an entry means "measured, and it worked" and nothing else. In particular an
+/// entry with an empty family list must never be taken as "neither family
+/// works": a probe that timed out looks identical. `reach_to_report` drops
+/// those, and [`reach_field`](isekai_p2p_core::proxy) drops them again at the
+/// request boundary for callers that do not.
 ///
 /// **Concurrent, one `per_relay` budget each.** Sequentially under a single
 /// cap, a slow or dark relay early in the list eats the budget and the tail is
@@ -427,10 +435,10 @@ where
 /// when migration is on (`bind::relay_connector` takes it from the caller's
 /// options); with migration off there is no direct path to line a family up
 /// for, so there is nothing for this to be wrong about.
-/// Returns what it logged, keyed by `dp_id`, so the operator-facing
-/// diagnostic can print it — `portal-client show-relays` is where this answer
-/// is most likely to be read, and a log line in a listener's journal is not
-/// where an operator goes looking for it.
+/// Returns what it logged, keyed by `dp_id`, for the two callers that need it:
+/// `round` sends it, and `portal-client show-relays` prints it — an operator
+/// explaining a missing direct path does not go looking in a listener's
+/// journal.
 pub async fn observe_families(
     candidates: &[RelayCandidate],
     per_relay: Duration,
@@ -562,6 +570,28 @@ impl Drop for RelayRttReporter {
     }
 }
 
+/// What an observation round is worth sending.
+///
+/// **Relays that answered in nothing are left out, not sent empty.** An entry
+/// with no families says exactly what omitting it says — "nothing measured" —
+/// and the reports are positive-only (plan Q3), so there is no reading under
+/// which the empty entry means more. Sending it would invite the control plane
+/// to read it as "this relay works in neither family", which is the one thing
+/// a probe that timed out does not establish.
+fn reach_to_report(observed: Vec<(String, Vec<AddressFamily>)>) -> Vec<RelayReach> {
+    observed
+        .into_iter()
+        .filter(|(_, families)| !families.is_empty())
+        .map(|(dp_id, families)| RelayReach {
+            dp_id,
+            families: families
+                .into_iter()
+                .map(|family| family_name(family).to_owned())
+                .collect(),
+        })
+        .collect()
+}
+
 /// Read the candidates, measure them, report what was measured.
 async fn round(
     proxy: &ProxyClient<MasqueH3Transport>,
@@ -612,20 +642,23 @@ async fn round(
         // gone, the stored rows lapse on their own window anyway.
         anyhow::bail!("every relay was unreachable, which is more likely to be this end");
     }
-    // **Observation only, and after the bails on purpose.** See
-    // `observe_families`: nothing is sent and nothing is decided. It is below
-    // the two bails because on a host with no route to the deployment they are
-    // where the round ends, and probing anyway would triple the failing dials
-    // each retry makes -- see [`RETRY_IN`], whose whole cost model is that each
-    // attempt is one QUIC connection whose failure the transport logs at
-    // `ERROR`. Past them, at least one relay answered, so there is something
-    // for this to be measuring.
-    let _ = observe_families(&candidates, opts.per_relay).await;
-    let stored = proxy.report_relay_rtt(listener_id, &samples).await?;
+    // **After the bails on purpose.** It is below them because on a host with
+    // no route to the deployment they are where the round ends, and probing
+    // anyway would triple the failing dials each retry makes -- see
+    // [`RETRY_IN`], whose whole cost model is that each attempt is one QUIC
+    // connection whose failure the transport logs at `ERROR`. Past them, at
+    // least one relay answered, so there is something to measure.
+    let observed = observe_families(&candidates, opts.per_relay).await;
+    let reach = reach_to_report(observed);
+    let stored = proxy
+        .report_relay_rtt(listener_id, &samples, &reach)
+        .await?;
     tracing::debug!(
         listener_id,
         measured = samples.len(),
         unreachable = samples.iter().filter(|s| s.rtt_ms.is_none()).count(),
+        // Relays, not families: one entry can name both.
+        relays_with_families = reach.len(),
         stored,
         "reported relay round trips"
     );
@@ -1121,6 +1154,42 @@ mod tests {
         )
         .await;
         assert_eq!(observed, vec![("dp1_dark".to_owned(), vec![])]);
+    }
+
+    #[test]
+    fn what_is_sent_is_the_wire_spelling_the_plan_names() {
+        // `["v6", "v4"]` in the plan's §4-4 example, and the same spelling
+        // `RelayInfo.family` comes back in. A rename on either side silently
+        // stops the two ends' sets from intersecting.
+        let reach = reach_to_report(vec![(
+            "dp_1".to_owned(),
+            vec![AddressFamily::V6, AddressFamily::V4],
+        )]);
+        assert_eq!(
+            serde_json::to_value(&reach).unwrap(),
+            serde_json::json!([{ "dp_id": "dp_1", "families": ["v6", "v4"] }])
+        );
+    }
+
+    #[test]
+    fn a_relay_that_answered_in_nothing_is_left_out_rather_than_sent_empty() {
+        // An empty entry says what omitting it says, and inviting the control
+        // plane to read it as "neither family works" is the one thing a probe
+        // that timed out does not establish.
+        let reach = reach_to_report(vec![
+            ("dp_dark".to_owned(), vec![]),
+            ("dp_fine".to_owned(), vec![AddressFamily::V4]),
+        ]);
+        assert_eq!(
+            serde_json::to_value(&reach).unwrap(),
+            serde_json::json!([{ "dp_id": "dp_fine", "families": ["v4"] }])
+        );
+    }
+
+    #[test]
+    fn an_observation_round_that_measured_nothing_sends_nothing() {
+        assert!(reach_to_report(vec![("dp_a".to_owned(), vec![])]).is_empty());
+        assert!(reach_to_report(Vec::new()).is_empty());
     }
 
     #[test]
