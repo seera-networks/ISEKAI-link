@@ -451,14 +451,33 @@ mod tests {
             .expect("the hop stopped when its handle went");
 
         // And its port carries nothing, which is the observable half.
-        let after = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        //
+        // **The hop's port is free the moment it stops, and the OS may hand it
+        // straight back.** A socket that got it would be sending to itself
+        // below and would receive its own `ping`, which says nothing about the
+        // hop. Keep binding until it is a different port.
+        let after = loop {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            if sock.local_addr().expect("addr") != addr {
+                break sock;
+            }
+        };
         after.send_to(b"ping", addr).await.expect("send");
         let mut got = [0_u8; 64];
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), after.recv_from(&mut got))
-                .await
-                .is_err(),
-        );
+        // **"Nothing came back" has two shapes, and only one of them is a
+        // timeout.** Sending to a closed local port raises ICMP
+        // port-unreachable, and Windows delivers that to the sending socket as
+        // `WSAECONNRESET` on the next receive, where Linux drops it. So the
+        // receive *resolving* is not a failure -- resolving with a datagram is.
+        // Asserting on the timeout alone is what made this pass on Linux and
+        // fail on Windows the first time CI ran this crate's tests there.
+        match tokio::time::timeout(Duration::from_millis(300), after.recv_from(&mut got)).await {
+            Err(_) => {}
+            Ok(Err(_)) => {}
+            Ok(Ok((n, from))) => {
+                panic!("the stopped hop's port answered with {n} bytes from {from}")
+            }
+        }
     }
 
     /// Nothing can go back before something has come out — stated in `Hop`'s

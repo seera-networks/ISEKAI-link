@@ -1088,6 +1088,11 @@ async fn attach(
     // right in both cases: the first accepts it, and the second answers
     // `relay-ticket-required`, which names the real problem.
     let ticket = connection.ticket.clone();
+    let family = crate::relay_family::chosen(
+        relay.family.as_deref(),
+        connection.relay_family.as_deref(),
+        &connection.connection_id,
+    );
     let handle = open_connect_relay(
         &cfg.proxy_url,
         &proxy.endpoint_token(),
@@ -1098,6 +1103,11 @@ async fn attach(
         ticket.as_ref().map(|t| t.ticket.as_str()),
         relay.dp_id.as_deref(),
         opts,
+        // **The family the control plane chose, from the connect response.**
+        // `None` means no common family, or a control plane that does not
+        // choose -- each end picks for itself, which is today's behaviour and
+        // the right answer when the two have nothing in common (plan Q5).
+        family,
     )
     .await?;
     let lease = ConnectionLease::spawn(

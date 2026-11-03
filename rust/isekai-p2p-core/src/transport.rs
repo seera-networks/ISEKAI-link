@@ -69,6 +69,23 @@ pub async fn families_resolved(base_url: &str) -> Vec<AddressFamily> {
     resolved
 }
 
+/// The family a wire spelling names, or `None` for anything else.
+///
+/// **Unknown is not an error.** A control plane that grows a third spelling,
+/// or a typo in a deployment's own config, must not cost the connection: the
+/// family is a preference and dropping it falls back to "no constraint",
+/// which is what absent already means (plan Q5, Q6). The caller logs it.
+///
+/// The inverse of [`family_name`], and the pair is what keeps a report and
+/// the answer to it talking about the same thing.
+pub fn family_from_name(name: &str) -> Option<AddressFamily> {
+    match name {
+        "v4" => Some(AddressFamily::V4),
+        "v6" => Some(AddressFamily::V6),
+        _ => None,
+    }
+}
+
 /// The wire spelling of an address family: `"v4"` / `"v6"`.
 ///
 /// **One place, because two sides have to agree.** It is what
@@ -750,4 +767,31 @@ pub(crate) fn make_client_config(
     }
     configuration.load_credential(&credential)?;
     Ok((registration, Arc::new(configuration)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pair has to agree, or a report and the answer to it are about
+    /// different things: this side sends `family_name` and reads back
+    /// `family_from_name`, and the control plane sits between them.
+    #[test]
+    fn the_spelling_survives_a_round_trip() {
+        for family in [AddressFamily::V4, AddressFamily::V6] {
+            assert_eq!(family_from_name(family_name(family)), Some(family));
+        }
+        assert_eq!(family_name(AddressFamily::V4), "v4");
+        assert_eq!(family_name(AddressFamily::V6), "v6");
+    }
+
+    /// Anything else drops the constraint rather than failing. A spelling this
+    /// does not know is a control plane newer than this binary, or a typo —
+    /// neither is a reason to lose the connection.
+    #[test]
+    fn an_unknown_spelling_is_no_constraint() {
+        for name in ["", "V4", "ipv4", "inet6", "4", "v7"] {
+            assert_eq!(family_from_name(name), None, "{name:?}");
+        }
+    }
 }

@@ -57,6 +57,7 @@ pub use listener::{
 pub mod direct_path;
 pub mod endpoint_cert;
 pub mod peer;
+pub mod relay_family;
 /// Measuring the relays so a near one is chosen (`relay_proximity_plan.md`).
 pub mod relay_rtt;
 
