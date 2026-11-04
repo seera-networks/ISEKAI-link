@@ -501,9 +501,15 @@ where
     if asked.is_empty() {
         // **Nothing was asked, so there is nothing to claim.** Saying "which
         // families this relay answers on" here would assert something no
-        // probe tested -- and on the initiator's path, where single-stack
-        // relays are deliberately not dialled, it would be one such line per
-        // relay per outgoing connection.
+        // probe tested.
+        //
+        // **Unreachable by construction, and kept as a guard.** Every road to
+        // an empty `asked` was closed: `worth_asking` is the identity, and
+        // `families_resolved` answers a parse failure, a resolver error *and*
+        // a name that resolved to nothing with both families -- as does
+        // `resolve_all`'s deadline. Naming a live cause here would be wrong,
+        // and removing the branch would make a future empty list silently
+        // claim a family nothing measured.
         tracing::debug!(
             dp_id = candidate.dp_id,
             "no family to choose between for this relay; not dialling it"
@@ -514,9 +520,9 @@ where
         dp_id = candidate.dp_id,
         base_url = candidate.base_url,
         families = ?observed.families(),
-        // The families actually dialled. Not "what the name resolves to": the
-        // initiator passes only those worth asking about, so a single-stack
-        // name reaches here as an empty list and is handled above.
+        // The families actually dialled, which is every one the name
+        // resolves to -- a single-stack name arrives as a one-element list and
+        // is probed, because its one family is what the far end has to match.
         asked = ?asked,
         probes = ?observed.probes,
         "which families this relay answers on, over an unconnected socket",
@@ -801,10 +807,20 @@ async fn round(
         listener_id,
         measured = samples.len(),
         unreachable = samples.iter().filter(|s| s.rtt_ms.is_none()).count(),
-        // Relays, not families: one entry can name both.
-        relays_with_families = reach.len(),
         stored,
         "reported relay round trips"
+    );
+    // **The same line the initiator logs, for the same reason** — the control
+    // plane intersects the two ends, so each half has to be readable on its
+    // own side. This one was a count inside a `debug!` and that was not
+    // enough: the question is *which* families, and an operator comparing the
+    // two ends should not have to raise the level on one of them.
+    tracing::info!(
+        listener_id,
+        // Relays, not families: one entry can name both.
+        relays = reach.len(),
+        reach = ?reach,
+        "reporting which families this end reached each relay in",
     );
     Ok(())
 }
@@ -848,33 +864,69 @@ where
         let resolve = resolve.clone();
         set.spawn(async move { (i, resolve(base_url).await) });
     }
+    // **A name that misses the deadline falls back to both families, not to
+    // none.** `families_resolved` already answers a resolver *failure* that
+    // way -- "a hiccup in DNS should not quietly turn the observation off" --
+    // and its own deadline firing first must not route around that. Seeding
+    // with an empty list did: no family asked about, no entry reported, and an
+    // empty report from one end makes the control plane's intersection empty
+    // however much the far end measured. That is the 2026-11-04 failure, and
+    // the resolve step's slice of the budget is small enough (a quarter of
+    // what is left, against a blocking `getaddrinfo` glibc does not cache)
+    // that it is reachable.
+    let both = || vec![AddressFamily::V4, AddressFamily::V6];
     let deadline = Instant::now() + budget;
-    let mut out = vec![Vec::new(); candidates.len()];
+    let mut out: Vec<Option<Vec<AddressFamily>>> = vec![None; candidates.len()];
     while let Ok(Some(Ok((i, resolved)))) =
         tokio::time::timeout_at(deadline.into(), set.join_next()).await
     {
-        out[i] = resolved;
+        out[i] = Some(resolved);
     }
-    out
+    out.into_iter()
+        .zip(candidates)
+        .map(|(resolved, candidate)| match resolved {
+            Some(resolved) => resolved,
+            None => {
+                tracing::debug!(
+                    dp_id = candidate.dp_id,
+                    "resolving this relay outran its share of the budget; asking about \
+                     both families rather than neither"
+                );
+                both()
+            }
+        })
+        .collect()
 }
 
 /// Which of a relay's resolved families the **initiator** should spend a dial
-/// on: none, unless there is a choice to report.
+/// on: all of them.
 ///
-/// **A relay whose name resolves to one family offers no choice.** Both ends
-/// must use that family or not reach it at all, so reporting it tells the
-/// control plane nothing it cannot see in its own pool, and the dial is pure
-/// cost on a path somebody is waiting on. Every relay in the deployment
-/// measured on 2026-11-01 is A-only, so this is the ordinary case (plan §8.1).
+/// **This used to drop a relay that resolved to one family, and that was
+/// wrong** — it is what stopped a direct path forming between a dual-stack
+/// `portal-server` and an IPv4-only `portal-client` on 2026-11-04.
 ///
-/// The listener does not use this: it has half an hour and the answer is worth
-/// logging either way.
+/// The reasoning was: "a relay whose name resolves to one family offers no
+/// choice, so reporting it tells the control plane nothing." **"Offers no
+/// choice" was true of this host, not of the pair.** The relay in that case has
+/// both `A` and `AAAA`; the v4-only client resolves only `A` because
+/// `getaddrinfo` filters `AAAA` with no local IPv6. So the server had a choice
+/// and the client had none — and the client's single family is **the half that
+/// decides**. Suppressing it left the control plane intersecting the server's
+/// `[v4, v6]` with nothing, which is empty, so it named no family, so the
+/// server's unconstrained leg took the `AAAA` the resolver puts first and the
+/// two ends never lined up.
+///
+/// **The §8.1 measurement is what made it look free.** Every relay was A-only
+/// for *both* ends then, so "one family" and "no choice for the pair"
+/// coincided. They stopped coinciding the moment a relay gained an `AAAA` —
+/// the very condition this whole plan exists for.
+///
+/// Kept as a function because the cost it was weighing is real: this is one
+/// probe per single-family relay inside a connect somebody is waiting on.
+/// Bounded by the leftover budget like the rest of the pass, and the same one
+/// probe the listener already makes.
 fn worth_asking(resolved: Vec<AddressFamily>) -> Vec<AddressFamily> {
-    if resolved.len() > 1 {
-        resolved
-    } else {
-        Vec::new()
-    }
+    resolved
 }
 
 /// Measure for a one-shot initiator, swallowing every failure.
@@ -890,6 +942,9 @@ fn worth_asking(resolved: Vec<AddressFamily>) -> Vec<AddressFamily> {
 pub async fn measure_for_connect(
     proxy: &ProxyClient<MasqueH3Transport>,
     opts: &ProbeOptions,
+    // Only so the line below can be matched against the far end's, which
+    // carries the same field. A process can have several connects in flight.
+    listener_id: &str,
 ) -> (Vec<RelayRttSample>, Vec<RelayReach>) {
     // **Inside the budget, because the budget is a promise to the person
     // waiting on `connect`.** The control-plane transport has no request
@@ -918,41 +973,79 @@ pub async fn measure_for_connect(
         budget: opts.budget / 2,
         ..opts.clone()
     };
-    // **Which relays have a family to choose between, decided before any
-    // packet goes out.** A relay whose name resolves to one family offers no
-    // choice, so probing it buys nothing — and every relay in the deployment
-    // measured on 2026-11-01 is A-only, which makes this the ordinary case
-    // rather than an optimization for a corner (plan §8.1). Resolution is a
-    // cached lookup, so the common path adds no dial at all.
-    let started = Instant::now();
-    let samples = measure(&candidates, &opts).await;
-    // **After the round trips, not beside them.** Overlapping would cost no
-    // wall clock, but `time_exchanges` keeps the *minimum* exchange, so two
-    // extra dials per relay competing for the same budget inflate the very
-    // numbers that decide which relay gets chosen -- a worse trade than a
-    // slower family answer. Running after also means the leftover budget is
-    // known rather than shared.
+    // **Both under the one deadline, running together.** `measure` is built
+    // to spend its whole budget -- it collects under `timeout_at`, so it waits
+    // for an outstanding probe until the deadline -- which means anything
+    // sequenced after it gets whatever is left, and that is usually nothing.
+    // Measured in the field on 2026-11-04: `left` came out at 83 ms against a
+    // probe that needs 70-85 ms for a near relay and 365-440 ms for a far one,
+    // so both probes were cut at 83 ms with nothing landed, the report went
+    // out empty, and no family could be named. It worked only on the rounds
+    // where `measure` happened to finish early, which is what "sometimes"
+    // meant.
     //
-    // **Only where there is a choice**, so the common path pays nothing: with
-    // every relay single-stack -- the deployment measured on 2026-11-01 --
-    // `asked` is empty throughout, `resolve_all` is the only cost, and no dial
-    // is made.
-    let left = opts.budget.saturating_sub(started.elapsed());
-    let asked: Vec<Vec<AddressFamily>> = resolve_all(&candidates, left / 4)
+    // **This reverses the preference stated when it was sequenced** (#327
+    // review): overlapping them does cost round-trip accuracy, because extra
+    // dials compete for the same window. That concern was right and the
+    // balance was wrong. `time_exchanges` keeps the *minimum* of several
+    // exchanges on an already-open connection, which is the standard defence
+    // against transient load, while a family measurement that almost never
+    // completes is not a measurement. A slightly noisier relay ranking is the
+    // cheaper mistake.
+    //
+    // Resolution stays ahead of the probes -- they need its answer -- and
+    // takes a quarter of the window, falling back to both families rather
+    // than none when it runs out (see `resolve_all`).
+    // **One window for everything after the listing, measured from here.**
+    // Resolution runs ahead of the probes because they need its answer, so it
+    // has to come *out of* the window rather than on top of it: giving the
+    // join the full budget after the resolve had already spent a quarter of it
+    // put the connect at 9/8 of what `initiator_defaults` advertises -- 1687ms
+    // against 1500 -- and `budget`'s own doc promises the opposite. Reachable
+    // exactly in the case the fallback above was written for: a slow resolver
+    // spends its whole slice and the probe pass then runs its own full window.
+    let started = Instant::now();
+    let asked: Vec<Vec<AddressFamily>> = resolve_all(&candidates, opts.budget / 4)
         .await
         .into_iter()
         .map(worth_asking)
         .collect();
+    // What is left pays for both arms. A slow resolver therefore shortens the
+    // round trips as well, which is the honest cost of keeping the promise:
+    // the alternative is overrunning it.
     let left = opts.budget.saturating_sub(started.elapsed());
-    let observed = observe_families_with(
-        &candidates,
-        &asked,
-        opts.per_relay.min(left),
-        left,
-        |base_url, family| async move { family_landing(&base_url, family).await },
-    )
-    .await;
-    (samples, reach_to_report(&observed))
+    let opts = ProbeOptions {
+        budget: left,
+        ..opts.clone()
+    };
+    let (samples, observed) = tokio::join!(
+        measure(&candidates, &opts),
+        observe_families_with(
+            &candidates,
+            &asked,
+            opts.per_relay.min(left),
+            left,
+            |base_url, family| async move { family_landing(&base_url, family).await },
+        ),
+    );
+    let reach = reach_to_report(&observed);
+    // **What this end is about to claim, including when it claims nothing.**
+    // The control plane intersects the two ends, so an empty report from here
+    // makes the intersection empty however much the far end measured -- and
+    // the only visible consequence is a direct path that does not form, which
+    // says nothing about whose half was missing.
+    //
+    // That cost a day: a v4-only initiator sent nothing (`worth_asking` used
+    // to drop a relay offering it one family), the control plane correctly
+    // named no family, and with no line here the empty half looked like the
+    // far side's problem.
+    tracing::info!(
+        listener_id,
+        relays = reach.len(),
+        reach = ?reach,
+        "reporting which families this end reached each relay in",
+    );
+    (samples, reach)
 }
 
 #[cfg(test)]
@@ -1435,10 +1528,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_single_stack_relay_is_asked_once() {
-        // The field answer to the plan's §8-6: do not ask a family the name
-        // does not have. Every relay in the deployment measured is A-only, so
-        // this is the ordinary case, not the corner one -- and a family with
-        // one entry has no choice to report anyway.
+        // One probe, not two: the name has one family, so there is no second
+        // one to ask about. It *is* asked about -- that one family is what the
+        // far end has to match, which is what #335 corrected.
         let observed = observe_families_with(
             &[candidate("dp1_v4_only")],
             &[vec![AddressFamily::V4]],
@@ -1491,8 +1583,22 @@ mod tests {
         );
         assert_eq!(
             resolved,
-            vec![Vec::new(), vec![AddressFamily::V4, AddressFamily::V6]],
-            "the name that answered is kept, in its own slot; the other asks nothing"
+            vec![
+                vec![AddressFamily::V4, AddressFamily::V6],
+                vec![AddressFamily::V4, AddressFamily::V6]
+            ],
+            "the name that answered is kept in its own slot, and the one that did not \
+             asks about both rather than neither"
+        );
+        // **Why both and not none.** This used to seed the missed slot with an
+        // empty list, which meant no probe, no entry in the report, and an
+        // empty intersection at the control plane -- the same failure as the
+        // `worth_asking` bug, reached by a different road. `families_resolved`
+        // answers a resolver *failure* with both families for exactly this
+        // reason; its own deadline must not route around that.
+        assert!(
+            resolved.iter().all(|f| !f.is_empty()),
+            "a slow resolver must not silently turn the observation off"
         );
     }
 
@@ -1530,12 +1636,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_relay_with_no_choice_is_not_dialled_at_all() {
-        // What makes this affordable on the initiator's path: an empty `asked`
-        // means no probe runs, so the common case (every relay single-stack,
-        // as measured on 2026-11-01) adds no dial to a connect somebody is
-        // waiting on. `measure_for_connect` passes an empty list for exactly
-        // those relays.
+    async fn an_empty_ask_dials_nothing() {
+        // An empty `asked` means no probe runs. **No production path produces
+        // one any more** -- `worth_asking` is the identity, `families_resolved`
+        // answers a parse failure, a resolver error and a name that resolved to
+        // nothing with *both* families, and `resolve_all`'s deadline does the
+        // same. Kept as a guard over the one thing that must stay true if a
+        // caller ever passes one: nothing is dialled and nothing is claimed.
         let dialled = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let counter = dialled.clone();
         let observed = observe_families_with(
@@ -1555,7 +1662,7 @@ mod tests {
         assert_eq!(
             dialled.load(Ordering::Relaxed),
             0,
-            "a relay with one family offers no choice, so nothing is dialled"
+            "a name that resolved to nothing has nothing to dial"
         );
         assert!(observed[0].probes.is_empty());
         assert!(
@@ -1600,18 +1707,31 @@ mod tests {
     }
 
     #[test]
-    fn the_initiator_spends_a_dial_only_where_there_is_a_choice() {
-        // What makes this affordable inside a connect: with every relay
-        // single-stack -- the deployment measured on 2026-11-01 -- the
-        // initiator adds no dial at all.
-        assert!(worth_asking(vec![AddressFamily::V4]).is_empty());
-        assert!(worth_asking(vec![AddressFamily::V6]).is_empty());
-        assert!(worth_asking(Vec::new()).is_empty());
+    fn the_initiator_reports_a_single_family_too() {
+        // **The regression this replaces.** The old version asserted the
+        // opposite -- that a single-family relay is not worth a dial -- and
+        // that is exactly what stopped a direct path forming between a
+        // dual-stack server and an IPv4-only client: the client resolves only
+        // `A` for a relay that has both, so its one family is the half that
+        // decides, and dropping it left the intersection empty.
+        assert_eq!(
+            worth_asking(vec![AddressFamily::V4]),
+            vec![AddressFamily::V4],
+            "an IPv4-only host's one family is what the far end has to match"
+        );
+        assert_eq!(
+            worth_asking(vec![AddressFamily::V6]),
+            vec![AddressFamily::V6]
+        );
         assert_eq!(
             worth_asking(vec![AddressFamily::V4, AddressFamily::V6]),
-            vec![AddressFamily::V4, AddressFamily::V6],
-            "a dual-stack relay is the only one with something to report"
+            vec![AddressFamily::V4, AddressFamily::V6]
         );
+        // An empty input stays empty, which is the identity holding rather
+        // than a live case: `families_resolved` never returns an empty list
+        // (both families for a parse failure, a resolver error, or a name that
+        // resolved to nothing), so nothing in production reaches this.
+        assert!(worth_asking(Vec::new()).is_empty());
     }
 
     #[tokio::test(start_paused = true)]

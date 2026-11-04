@@ -38,8 +38,10 @@ use crate::proxy::{ControlPlaneTransport, HttpResponse};
 /// is a family that *does* resolve and black-holes UDP, which spends the whole
 /// `per_relay`. That one is visible here, before any packet is sent.
 ///
-/// So a single-stack relay costs one probe instead of two, and a relay with
-/// one family has no choice to report anyway.
+/// So a single-stack relay costs one probe instead of two. **It still costs
+/// one** — its single family is reported, because when the far end is
+/// dual-stack that one family is the half that decides. Dropping it is what
+/// stopped a direct path forming on 2026-11-04 (plan §8.1 追記 2).
 ///
 /// **A resolver failure probes everything rather than nothing.** A hiccup in
 /// DNS should not quietly turn the observation off; the probe resolves again
