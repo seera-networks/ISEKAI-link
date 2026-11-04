@@ -1049,6 +1049,7 @@ async fn attach(
     let (relay_rtt, relay_reach) = crate::relay_rtt::measure_for_connect(
         proxy,
         &crate::relay_rtt::ProbeOptions::initiator_defaults(),
+        listener_id,
     )
     .await;
     let connection = match auth {
