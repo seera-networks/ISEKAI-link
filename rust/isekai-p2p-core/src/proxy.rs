@@ -3007,6 +3007,29 @@ mod tests {
         assert_eq!(connection.relay_family, None);
     }
 
+    /// A dated grant sends the seconds asked for, and the caller reads the
+    /// expiry back from the response rather than assuming its own number —
+    /// the proxy clamps, so the two need not agree.
+    #[tokio::test]
+    async fn a_dated_grant_sends_its_ttl_and_reads_back_the_expiry() {
+        let body = r#"{"grant_id":"gr_2","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
+            "created_at":"2026-11-05T09:00:00Z","expires_at":"2026-11-05T10:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let grant = client
+            .create_grant("ep:A", "mjpeg", Some(7200), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            grant.expires_at.as_deref(),
+            Some("2026-11-05T10:00:00Z"),
+            "the server's expiry, which is an hour where two were asked for"
+        );
+        let sent = last_body(&client);
+        assert_eq!(sent["ttl"], 7200, "the seconds asked for go on the wire");
+        assert!(sent["label"].is_null(), "no label means none is sent");
+    }
+
     /// The shape of what goes out matters more than the plumbing: the server
     /// decides what a request means from these fields, and a rename on either
     /// side is otherwise only found on a device.
@@ -3231,6 +3254,15 @@ mod tests {
         assert_eq!(sent["allowed_endpoint"], "ep:A");
         assert_eq!(sent["protocol"], "mjpeg");
         assert!(sent["ttl"].is_null(), "no ttl means until revoked");
+        // **The label was passed and never checked.** A grant is the pair and
+        // the protocol; the label is the only part that is purely for whoever
+        // reads `--grants` later, which is exactly the part a silent drop
+        // would never be noticed in.
+        assert_eq!(sent["label"], "phone");
+        assert!(
+            sent.get("listener_id").is_none(),
+            "a grant authorizes reaching this Endpoint, not one of its listeners"
+        );
     }
 
     /// A line is not a chunk. The network splits the body wherever it likes, so

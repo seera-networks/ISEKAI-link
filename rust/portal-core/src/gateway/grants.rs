@@ -45,6 +45,23 @@ impl ExistedBefore {
     const WINDOW: time::Duration = time::Duration::seconds(30);
 }
 
+/// Whether a create answered with a grant that was **already there**.
+///
+/// **Creating a grant for a pair that has one is an update, not a refusal**
+/// (see [`Ledger::note_existing`]). The proxy answers `200` with the existing
+/// id and leaves `created_at` untouched, so the age of what came back is the
+/// only thing separating "I made this" from "I edited somebody else's".
+///
+/// Public because `portal-server`'s `--grant` needs the same answer for a
+/// different purpose — telling the operator which of the two happened — and a
+/// second copy of the window would be a constant free to drift from the one
+/// the ledger decides by.
+pub fn already_existed(created_at: Option<&str>) -> bool {
+    created_at
+        .and_then(|text| OffsetDateTime::parse(text, &Rfc3339).ok())
+        .is_some_and(|at| OffsetDateTime::now_utc() - at > ExistedBefore::WINDOW)
+}
+
 /// A grant's identity at the proxy.
 pub type GrantKey = (String, String);
 
@@ -220,10 +237,7 @@ impl Ledger {
             ours.insert(grant_id);
             return true;
         }
-        let existed_before = created_at
-            .and_then(|text| OffsetDateTime::parse(text, &Rfc3339).ok())
-            .is_some_and(|at| OffsetDateTime::now_utc() - at > ExistedBefore::WINDOW);
-        if existed_before {
+        if already_existed(created_at) {
             self.theirs.insert(key);
             return false;
         }

@@ -54,6 +54,8 @@ portal-server --key ./portal-server.pem --register --pair
 
 portal-server --key ./portal-server.pem --config ./portal-server.toml
 
+portal-server --grant ep:1a2b... --grants
+
 portal-server --grants",
     note = "\
 Sign in once with --login. It runs the Auth0 device flow -- a code and a URL to
@@ -92,9 +94,15 @@ expiry unless one is set, and -- because a Grant's key does not name a listener
 That is what an installation should run on. Use --grants to see who is in and
 --revoke to take it away.
 
+--grant is the same standing access when you already know the peer's Endpoint ID
+-- nothing to hand over and nothing to redeem. It stands until revoked, and a
+--gateway-config run leaves it alone: that loop only takes away grants it made
+itself.
+
 Everything to do with authorising somebody answers and exits without serving:
---pair, --ticket, --tickets, --revoke-ticket, --grants and --revoke all act on
-the Endpoint rather than on a listener, so a code can be issued while a server
+--pair, --ticket, --tickets, --revoke-ticket, --grant, --grants and --revoke
+all act on the Endpoint rather than on a listener, so a code can be issued
+while a server
 is already running rather than only by starting one. --allow is the exception;
 a capability is issued against the listener it is for.
 
@@ -245,6 +253,25 @@ struct Args {
     /// how long the pairing code lasts, in seconds. Clamped to 60..=300
     #[argh(option)]
     pairing_ttl: Option<u64>,
+    /// an Endpoint ID to let in, as a GRANT, and exit. Standing access that
+    /// survives this server restarting -- `--pair` and `--ticket` are the same
+    /// thing arranged by handing something over, and this is for when you
+    /// already know the ID. IT IS GRANTED OVER --protocol, because a grant is
+    /// the pair AND the protocol -- one for a protocol this server does not
+    /// serve reaches nothing. Take it away with --revoke
+    #[argh(option)]
+    grant: Option<String>,
+    /// what a --grant is for. Shown in --grants. The proxy's own length limit
+    /// applies
+    #[argh(option)]
+    grant_label: Option<String>,
+    /// how long a --grant lasts, in seconds. Omitted means until revoked,
+    /// which is what standing access usually wants. NOT --grant-ttl, which is
+    /// the life of the grant a redeemed --ticket or --provisioning-key makes.
+    /// The proxy clamps this and the line printed shows what it decided, not
+    /// what was asked for
+    #[argh(option)]
+    grant_expires_in: Option<u64>,
     /// print who may reach this Endpoint, and exit
     #[argh(switch)]
     grants: bool,
@@ -354,6 +381,124 @@ struct Args {
     oidc_token_file: Vec<String>,
 }
 
+/// The lines a `--grant` prints after the first: when it ends, how to end it
+/// early, and whether it was this run that made it.
+///
+/// **A function so the decisions can be tested.** Two of them are the kind a
+/// `println!` in `main` hides. The first is which of two things to believe —
+/// `expires_at`, which the proxy decided, or `--grant-expires-in`, which is
+/// only what was asked for; the proxy clamps, so echoing the request can print
+/// a time that is not when this grant ends. The second is
+/// [`portal_core::gateway::grants::already_existed`]:
+/// claiming a grant "stands until revoked" when the create merely updated the
+/// Gateway's would promise access that `settle_grants` takes away when the
+/// lease ends — and the create will have overwritten its label and expiry on
+/// the way past.
+///
+/// `asked` is carried only to notice the proxy ignoring it: a `ttl` that
+/// produced no `expires_at` would otherwise look honoured, and the operator
+/// learns of it when the access does not lapse.
+fn grant_lifetime_lines(grant: &isekai_p2p::agent::Grant, asked: Option<u64>) -> Vec<String> {
+    let mut lines = vec![match &grant.expires_at {
+        Some(at) => format!("              until {at}  (--revoke {})", grant.grant_id),
+        None => format!(
+            "              stands until revoked (--revoke {})",
+            grant.grant_id
+        ),
+    }];
+    if asked.is_some() && grant.expires_at.is_none() {
+        lines.push("              NOTE: asked for an expiry and the proxy named none".to_owned());
+    }
+    if portal_core::gateway::grants::already_existed(grant.created_at.as_deref()) {
+        lines.push(
+            "              NOTE: this pair already had a grant -- the create UPDATED it, \
+             label and expiry included. If something else made it (a --gateway-config run, \
+             a redeemed ticket) that owner may still revoke it"
+                .to_owned(),
+        );
+    }
+    lines
+}
+
+/// Refuse `--grant-expires-in` and `--grant-label` where there is no `--grant`.
+///
+/// **A run that dropped them quietly would leave the operator believing they
+/// had dated an access that in fact stands until revoked** — the direction that
+/// matters, because that mistake is discovered by nothing happening. Same
+/// reason the binding flags are refused without `--provisioning-key`.
+///
+/// Its own function so it can be tested: the sibling guard for the binding
+/// flags is inline in `main`, which is why nothing pins it.
+fn check_grant_options(args: &Args) -> anyhow::Result<()> {
+    if args.grant.is_none() && (args.grant_expires_in.is_some() || args.grant_label.is_some()) {
+        anyhow::bail!(
+            "--grant-expires-in and --grant-label describe a --grant, and this run is not \
+             making one"
+        );
+    }
+    // **The mirror, and the help predicts the mistake it catches.** `--grant`'s
+    // own text says "NOT --grant-ttl", which is where an operator learns the
+    // two exist -- and `--grant-ttl` is read only on the `--ticket` and
+    // `--provisioning-key` paths, so passing it with `--grant` made an undated
+    // grant and said nothing. Use `--grant-expires-in` there.
+    if args.grant.is_some() && args.grant_ttl.is_some() && !args.ticket && !args.provisioning_key {
+        anyhow::bail!(
+            "--grant-ttl is the life of the grant a redeemed --ticket or --provisioning-key \
+             makes, and this run is making neither. --grant-expires-in is what dates a --grant"
+        );
+    }
+    Ok(())
+}
+
+/// The Endpoint a `--grant` names, refused here if it cannot be one.
+///
+/// **Checked on the arguments, before anything authenticates** — the same
+/// reason `provisioning_binding` is: a mistyped ID is a typo, and finding out
+/// after a sign-in and an Identity round trip tells the operator nothing the
+/// shape of the string did not already say.
+///
+/// Only the shape. Whether that Endpoint exists, is revoked, or is one this
+/// deployment knows is the control plane's answer to give, and it gives the
+/// same one for all three (§8.13.6) — so guessing here would be inventing a
+/// distinction the server refuses to make.
+fn grant_target(args: &Args) -> anyhow::Result<Option<&str>> {
+    let Some(id) = args.grant.as_deref() else {
+        return Ok(None);
+    };
+    let rest = id
+        .strip_prefix(isekai_p2p::agent::ENDPOINT_ID_PREFIX)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--grant takes an Endpoint ID, which begins `{}` -- got {id:?}. \
+                 `--grants` prints the ones already let in, and a peer's own \
+                 `--whoami` prints theirs",
+                isekai_p2p::agent::ENDPOINT_ID_PREFIX,
+            )
+        })?;
+    // **Exactly 64 lowercase hex.** An Endpoint ID is `"ep:" + hex(SHA-256(…))`
+    // (spec §4.2, pinned by `endpoint_id_is_prefixed_hex_and_stable`), so a
+    // half-copied id -- the likeliest paste error there is -- has to be caught
+    // here. Accepting any length let `ep:63e2433a` through to the control
+    // plane, whose answer is the deliberately uniform refusal (§8.13.6) that
+    // says nothing about what went wrong.
+    const HEX: usize = 64;
+    if rest.len() != HEX || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "--grant takes an Endpoint ID: `{}` followed by {HEX} hex digits (spec §4.2) \
+             -- got {id:?}, which has {}",
+            isekai_p2p::agent::ENDPOINT_ID_PREFIX,
+            rest.len(),
+        );
+    }
+    if rest.bytes().any(|b| b.is_ascii_uppercase()) {
+        anyhow::bail!(
+            "--grant takes an Endpoint ID in lowercase hex -- got {id:?}. The ID is \
+             compared as text, so an uppercase copy names nothing"
+        );
+    }
+    Ok(Some(id))
+}
+
 /// Answer `--grants` and `--revoke`, which need no listener.
 ///
 /// **Its own path, and it exits.** These are questions about who may reach this
@@ -366,6 +511,9 @@ async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Res
     // round trip tells the operator nothing extra. `portal-client` checks a
     // ticket's authority the same way and for the same reason.
     let binding = provisioning_binding(args)?;
+    // Same pass, same reason: a `--grant` that cannot name an Endpoint is
+    // refused before the sign-in rather than after it.
+    grant_target(args)?;
     let cfg = config(args, tokens).await?;
     // **These enrol, and still must not give the slot back.** `grant_admin`
     // issues an Endpoint Token, which on the unattended path is what registers,
@@ -1170,6 +1318,51 @@ async fn grant_admin(
             .with_context(|| format!("revoke {grant_id}"))?;
         println!("revoked     : {grant_id}");
     }
+    if let Some(allowed) = grant_target(args)? {
+        // **Omitted means until revoked**, which `create_grant`'s own doc calls
+        // the usual case for standing access. `--grant-expires-in` is the way
+        // to date one; the `--grant-ttl` flag next to it is *not* it -- that is
+        // the life of the grant a redeemed `--ticket` or `--provisioning-key`
+        // makes, which clamps differently and is set in a different flow.
+        let grant = proxy
+            .create_grant(
+                allowed,
+                &args.protocol,
+                args.grant_expires_in,
+                args.grant_label.as_deref(),
+            )
+            .await
+            .with_context(|| format!("grant {allowed} access over {}", args.protocol))?;
+        // **The protocol and the label are both in the line**, because a grant
+        // is the pair *and* the protocol: a run that printed only the id and
+        // the Endpoint would leave the half an operator is most likely to have
+        // got wrong -- the protocol comes from `--protocol`, whose default is
+        // easy not to notice -- needing a second call to see.
+        println!(
+            "granted     : {}  {}  ({}{})",
+            grant.grant_id,
+            allowed,
+            args.protocol,
+            args.grant_label
+                .as_deref()
+                .map(|l| format!(", {l}"))
+                .unwrap_or_default(),
+        );
+        // **The server's answer, not the request.** The proxy clamps a grant's
+        // lifetime, so echoing `--grant-expires-in` could print a number that
+        // is not when this grant ends. `expires_at` is what it decided; absent
+        // means nothing dates it.
+        //
+        // And either way the second half is worth saying, because the policy
+        // loop revokes grants: a Gateway run settles the proxy's grants against
+        // its table and takes away what is not in it -- but only what *it*
+        // made. `note_existing` marks anything it finds as "served but never
+        // removed", so this survives a `--gateway-config` run and `--revoke` is
+        // how it goes.
+        for line in grant_lifetime_lines(&grant, args.grant_expires_in) {
+            println!("{line}");
+        }
+    }
     if args.grants {
         let grants = proxy.list_grants().await.context("list grants")?;
         if grants.is_empty() {
@@ -1177,7 +1370,7 @@ async fn grant_admin(
         }
         for grant in &grants {
             println!(
-                "grant       : {}  {}  ({}{})",
+                "grant       : {}  {}  ({}{}{})",
                 grant.grant_id,
                 grant.allowed_endpoint.as_deref().unwrap_or("?"),
                 grant.origin.as_deref().unwrap_or("origin unknown"),
@@ -1185,6 +1378,17 @@ async fn grant_admin(
                     .label
                     .as_deref()
                     .map(|l| format!(", {l}"))
+                    .unwrap_or_default(),
+                // **The expiry belongs here, now that one can be set.** This is
+                // the only command for reading back who is in, and without it a
+                // grant dated by `--grant-expires-in` is indistinguishable from
+                // standing access -- the same "the operator believes access is
+                // standing when it is not" failure the new guard and the
+                // lifetime line were added to prevent.
+                grant
+                    .expires_at
+                    .as_deref()
+                    .map(|at| format!(", until {at}"))
                     .unwrap_or_default(),
             );
         }
@@ -1621,6 +1825,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // Everything here is an Endpoint-token call that names no listener
     // (§8.8, §8.12), so none of it needs a server standing up first.
     let administering = args.grants
+        || args.grant.is_some()
         || args.revoke.is_some()
         || args.pair
         || args.ticket
@@ -1641,6 +1846,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
              is not issuing one"
         );
     }
+    check_grant_options(&args)?;
     // **`--allow` is the one that does need a listener**, and these paths exit
     // before there is one. Dropping it quietly is the worst of the three
     // options: the code or the listing would print, the run would look like it
@@ -2006,5 +2212,168 @@ mod tests {
                 subject: "repo:o/r".to_owned(),
             },
         );
+    }
+
+    /// `--grant` is settled on the argument, before any sign-in: a mistyped ID
+    /// is a typo, and an Identity round trip adds nothing to what the string
+    /// already says.
+    #[test]
+    fn a_grant_target_must_look_like_an_endpoint_id() {
+        let args = |grant: Option<&str>| Args {
+            grant: grant.map(str::to_owned),
+            ..Args::from_args(&["portal-server"], &[]).expect("defaults")
+        };
+        assert_eq!(grant_target(&args(None)).expect("no --grant"), None);
+        let ok = "ep:63e2433ae3cd01ea4bdf8a6dab51d6f2caf3f03f7e74ad8c834eb6b6b10318ef";
+        assert_eq!(grant_target(&args(Some(ok))).expect("an id"), Some(ok));
+
+        let upper = format!("ep:{}", &ok[3..].to_ascii_uppercase());
+        let short = &ok[..20]; // a paste that stopped early
+        let long = format!("{ok}ff");
+        for bad in [
+            "63e2433a",     // no prefix
+            "ep:",          // prefix and nothing else
+            "ep:not-hex",   // not hex
+            "ep:63e2433a!", // trailing junk
+            "EP:63e2433a",  // the prefix is lowercase
+            "ep:63e2433a ", // a shell leaving a space in
+            // **The likeliest paste error, and it used to pass.** Valid hex,
+            // lowercase, just not all of it -- so the pre-flight let it reach
+            // the control plane, whose refusal is uniform and says nothing.
+            short,
+            &upper, // hex is compared as text; an uppercase copy names nothing
+            &long,  // one digit too many
+        ] {
+            let err = grant_target(&args(Some(bad)))
+                .expect_err(&format!("{bad:?} cannot name an Endpoint"));
+            // The message has to carry the offending string: an operator who
+            // pasted the wrong field needs to see what arrived.
+            assert!(
+                format!("{err}").contains(bad),
+                "the error should quote {bad:?}, got {err}"
+            );
+        }
+    }
+
+    /// The two options that only describe a `--grant` are refused without one,
+    /// rather than dropped — a dated access that silently stands until revoked
+    /// is discovered by nothing happening.
+    #[test]
+    fn grant_options_need_a_grant() {
+        let args = |grant: Option<&str>, secs: Option<u64>, label: Option<&str>| Args {
+            grant: grant.map(str::to_owned),
+            grant_expires_in: secs,
+            grant_label: label.map(str::to_owned),
+            ..Args::from_args(&["portal-server"], &[]).expect("defaults")
+        };
+        let with_grant_ttl = |grant: Option<&str>, ticket: bool, key: bool| Args {
+            grant: grant.map(str::to_owned),
+            grant_ttl: Some(3600),
+            ticket,
+            provisioning_key: key,
+            ..Args::from_args(&["portal-server"], &[]).expect("defaults")
+        };
+        let ep = "ep:63e2433a";
+        check_grant_options(&args(None, None, None)).expect("neither option, no grant");
+        check_grant_options(&args(Some(ep), Some(60), Some("phone"))).expect("both, with a grant");
+        check_grant_options(&args(Some(ep), None, None)).expect("a grant on its own");
+
+        check_grant_options(&args(None, Some(60), None))
+            .expect_err("an expiry with nothing to date");
+        check_grant_options(&args(None, None, Some("phone")))
+            .expect_err("a label with nothing to label");
+        check_grant_options(&args(None, Some(60), Some("phone")))
+            .expect_err("both, with nothing to describe");
+
+        // **`--grant-ttl` is the trap `--grant`'s own help names.** It is read
+        // only on the `--ticket` and `--provisioning-key` paths, so with
+        // `--grant` it made an undated grant and said nothing -- the same
+        // class as the two above, and the one an operator reaches for first
+        // because the names are a letter apart in meaning.
+        check_grant_options(&with_grant_ttl(Some(ep), false, false))
+            .expect_err("--grant-ttl with --grant and neither path that reads it");
+        check_grant_options(&with_grant_ttl(Some(ep), true, false)).expect("--ticket does read it");
+        check_grant_options(&with_grant_ttl(Some(ep), false, true))
+            .expect("--provisioning-key does read it");
+        check_grant_options(&with_grant_ttl(None, true, false))
+            .expect("no --grant at all is the ticket flow, untouched");
+    }
+
+    /// The lifetime line believes the proxy, not the request — it clamps, so
+    /// the two need not agree, and printing the request would name a time that
+    /// is not when the grant ends.
+    #[test]
+    fn the_lifetime_line_reports_what_the_proxy_decided() {
+        let grant = |expires: Option<&str>| isekai_p2p::agent::Grant {
+            grant_id: "gr_1".to_owned(),
+            owner_endpoint: "ep:B".to_owned(),
+            allowed_endpoint: Some("ep:A".to_owned()),
+            protocol: Some("isekai-portal-v1".to_owned()),
+            origin: Some("manual".to_owned()),
+            provisioning_key_id: None,
+            label: None,
+            created_at: None,
+            expires_at: expires.map(str::to_owned),
+        };
+
+        // Asked two hours, clamped to one: the line says the hour.
+        let lines = grant_lifetime_lines(&grant(Some("2026-11-05T10:00:00Z")), Some(7200));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("2026-11-05T10:00:00Z") && !lines[0].contains("7200"),
+            "the proxy's expiry, not the request: {}",
+            lines[0]
+        );
+
+        // No request and no expiry: standing access.
+        let lines = grant_lifetime_lines(&grant(None), None);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("stands until revoked"), "{}", lines[0]);
+
+        // Asked and ignored: said out loud, because nothing else would show it.
+        let lines = grant_lifetime_lines(&grant(None), Some(60));
+        assert_eq!(lines.len(), 2, "the note is the second line");
+        assert!(lines[1].contains("asked for an expiry"), "{}", lines[1]);
+    }
+
+    /// Creating over an existing grant is an **update**, and the line must not
+    /// promise standing access over something another owner may revoke.
+    #[test]
+    fn a_create_that_only_updated_says_so() {
+        let dated = |created: Option<&str>| isekai_p2p::agent::Grant {
+            grant_id: "gr_1".to_owned(),
+            owner_endpoint: "ep:B".to_owned(),
+            allowed_endpoint: Some("ep:A".to_owned()),
+            protocol: Some("isekai-portal-v1".to_owned()),
+            origin: Some("manual".to_owned()),
+            provisioning_key_id: None,
+            label: None,
+            created_at: created.map(str::to_owned),
+            expires_at: None,
+        };
+
+        // Made just now: no note. The proxy returns `created_at` on a fresh
+        // create too, so "has one" is not the test -- its age is.
+        let fresh = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format");
+        let lines = grant_lifetime_lines(&dated(Some(&fresh)), None);
+        assert_eq!(
+            lines.len(),
+            1,
+            "a fresh create says nothing extra: {lines:?}"
+        );
+
+        // Older than the window: this run updated what was already there.
+        let lines = grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), None);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].contains("UPDATED it") && lines[1].contains("revoke it"),
+            "it has to say both what happened and who else may undo it: {}",
+            lines[1]
+        );
+
+        // No `created_at` at all: nothing to judge by, so no claim either way.
+        assert_eq!(grant_lifetime_lines(&dated(None), None).len(), 1);
     }
 }
