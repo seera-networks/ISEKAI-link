@@ -1254,6 +1254,48 @@ It is refused when the membership is created, but administration can be granted
 afterwards, and the moment it is granted is not something Identity is told
 about.
 
+## Letting somebody in by Endpoint ID
+
+`--pair` and `--ticket` both arrange standing access by handing something over
+and having it redeemed. When you already know the peer's Endpoint ID, there is
+nothing to hand over:
+
+```sh
+portal-server --grant ep:4d5e6f… --grant-label "masa's laptop"
+```
+
+```
+granted     : gr_5f6a7b…  ep:4d5e6f…  (isekai-portal-v1, masa's laptop)
+              stands until revoked (--revoke gr_5f6a7b…)
+```
+
+**A grant is the pair *and* the protocol**, and the protocol comes from
+`--protocol` — whose default is `isekai-portal-v1`. One for a protocol this
+server does not serve reaches nothing, which is why the line prints it.
+
+Dated access instead of standing:
+
+```sh
+portal-server --grant ep:4d5e6f… --grant-expires-in 3600
+```
+
+The line then names the expiry **the proxy decided**, not the seconds asked
+for: it clamps, so the two need not agree. Do not reach for `--grant-ttl` here
+— that one is the life of the grant a redeemed `--ticket` or
+`--provisioning-key` makes, and passing it with `--grant` is refused rather
+than ignored.
+
+> **Creating over a pair that already has a grant updates it**, label and
+> expiry included, and the proxy answers with the existing id. The line says so
+> when that happens, because if something else made that grant — a
+> `--gateway-config` run, a redeemed ticket — that owner may still revoke it,
+> and the access you believe you just arranged would go with it.
+
+The Endpoint ID is checked before anything signs in: `ep:` followed by 64
+lowercase hex digits. A half-copied id is the likeliest mistake here, and the
+control plane answers the same way for an unknown Endpoint as for a revoked
+one, so it cannot tell you which.
+
 ## Taking access away
 
 ```sh
@@ -1262,6 +1304,7 @@ portal-server --grants
 
 ```
 grant       : gr_5f6a7b…  ep:4d5e6f…  (pairing, masa's laptop)
+grant       : gr_8c9d0e…  ep:1a2b3c…  (manual, until 2026-11-05T10:00:00Z)
 ```
 
 ```sh
@@ -1272,9 +1315,11 @@ Both answer and exit without serving anything. That is not just tidiness: a
 second Peer Listener under this Endpoint is one more row for every client that
 looks one up, so asking "who is in?" must not put one there.
 
-A grant stands until revoked, so this is the counterpart of pairing and not an
-afterthought. Grants belong to the Endpoint rather than to a listener, so they
-survive restarts — which means nothing expires them by accident either.
+A grant stands until revoked unless one was dated with `--grant-expires-in`,
+in which case `--grants` names the expiry. Either way this is the counterpart
+of pairing and not an afterthought. Grants belong to the Endpoint rather than
+to a listener, so they survive restarts — which means nothing expires an
+undated one by accident either.
 
 ### Taking a device away
 
