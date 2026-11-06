@@ -73,6 +73,26 @@ extension ViewerSettings {
         logFilter = try c.decodeIfPresent(String.self, forKey: .logFilter) ?? d.logFilter
     }
 
+    /// The server fields are left out while they still equal the default.
+    /// Stored, a default outlives the build it came from: `init(from:)` keeps a
+    /// stored value, so an install that once connected would keep dialing the
+    /// old address after the default moves (#325). Left out, decoding falls
+    /// back to whatever the default is then. One typed by hand is kept.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        let d = ViewerSettings()
+        if identityURL != d.identityURL { try c.encode(identityURL, forKey: .identityURL) }
+        if proxyURL != d.proxyURL { try c.encode(proxyURL, forKey: .proxyURL) }
+        if protocolName != d.protocolName { try c.encode(protocolName, forKey: .protocolName) }
+        try c.encode(capability, forKey: .capability)
+        try c.encode(listenerID, forKey: .listenerID)
+        try c.encode(expectedEndpoint, forKey: .expectedEndpoint)
+        try c.encode(register, forKey: .register)
+        try c.encode(insecureSkipVerify, forKey: .insecureSkipVerify)
+        try c.encode(enableMigration, forKey: .enableMigration)
+        try c.encode(logFilter, forKey: .logFilter)
+    }
+
     private static let defaultsKey = "viewer.settings"
 
     /// The saved settings, or fresh defaults.
