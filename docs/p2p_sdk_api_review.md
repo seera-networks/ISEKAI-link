@@ -42,9 +42,13 @@ ISEKAI link p2p を**外部に提供する SDK として使えるようにする
 内訳の大きいものは `proxy.rs` 108、`identity.rs` 60、`auth0.rs` 31、`initiator.rs` 28、
 `listener.rs` 26。
 
-CLI も同じ層に乗っている: `isekai-p2p` 自身が `[[bin]] isekai-agent` を持ち、
-`portal-client` / `portal-server` / `camera-server` / `camera-client` が
-`isekai-p2p` を直接使う。
+CLI も同じ層に乗っている: `isekai-p2p` 自身が `[[bin]] isekai-agent` を持つ。
+`isekai-p2p` に直接依存するのは `camera-core`, `portal-core`,
+`isekai-client-ffi`, `portal-client-ffi`, `portal-client`, `portal-server`,
+`utils`。**`camera-server` と `camera-client` は含まれない** — この 2 つは
+`camera-core` の再輸出を通し、`isekai_p2p` を一度も名指ししない。
+つまり camera 側は上図のとおりアプリ core の上に乗り、portal 側は CLI が
+`isekai-p2p` を直接叩く、という非対称がある。
 
 ### 2.1 feature ゲート
 
@@ -147,11 +151,15 @@ p2p の部品のうち**利用側が手で駆動している**もの:
 
 | 部品 | 駆動している場所 |
 | --- | --- |
-| `direct_path::advertise` | `portal-core/src/session.rs`, `portal-core/src/path.rs`, `camera-core/src/video.rs` |
-| `legs()` / `relay_leg()` | 両 core と `portal-client`、camera の examples 多数 |
-| `observed_address()` | `portal-core/src/session.rs`, `camera-core/src/{video,server}.rs` |
+| `direct_path::advertise` | 2 箇所: `portal-core/src/session.rs:269`, `camera-core/src/video.rs:167` |
+| `direct_path::{prefer_path, RelayPath}` | `portal-core/src/path.rs:117`, `camera-core/src/video.rs:25` |
+| `legs()` / `relay_leg()` | 4 箇所: `camera-core/src/server.rs:158`, `portal-core/src/session.rs:251`, `portal-client/src/main.rs:888`, `portal-client-ffi/src/lib.rs:455` |
+| `observed_address()` | 5 箇所: `portal-core/src/session.rs:838`, `camera-core/src/server.rs:152`, `camera-client/src/main.rs:434`, `isekai-client-ffi/src/lib.rs:918`, `camera-core/examples/relay_migration_e2e.rs:195` |
 | `relay_rtt` | `portal-client/src/main.rs` **のみ** |
 | `DatapathHook` | テストと example のみ |
+
+FFI の 2 本が `relay_leg()` と `observed_address()` を直接使っている点に注意。
+§3.3 で「事実上の SDK」と呼んだ層自身が、低位の面を消費している。
 
 逆に、**公開されているが利用側に消費者がいない**面:
 `poll_signaling`、`RelayRttReporter`、`ListenerEvent`、`measure_for_connect`
@@ -173,11 +181,14 @@ p2p の部品のうち**利用側が手で駆動している**もの:
 （`:733`）→ `observed_address()` を watch → `local_addr()` に自前の転送を繋ぐ →
 `close()` → `drain_msquic` / `shutdown_msquic`。
 
-この 1 フローのために `isekai_p2p` から使われる入口は
-`issue_endpoint_token`, `proxy_client`, `ListenerSession`, `listener::{run, ListenerCommand}`,
-`AcceptPolicy`, `InitiatorSession`, `P2pConfig`, `RelayOptions`, `direct_path`,
-`endpoint_cert`, `peer::{AttestedPeer, PeerSession, drain_registration}`,
-`ReachableListener`, `agent::ObservedAddress` の **14 種**。
+この 1 フローのために `portal-core/src/session.rs` が `isekai_p2p` から
+入れている名前は、7 つの `use` 文で **17 個**:
+`ReachableListener`, `RelayOptions`, `direct_path`(self), `RelayLegs`,
+`endpoint_cert`, `run`, `ListenerCommand`, `AttestedPeer`, `PeerSession`,
+`issue_endpoint_token`, `proxy_client`, `AcceptPolicy`, `InitiatorSession`,
+`ListenerSession`, `P2pConfig`, `PeerDirectory`, `SignalingEvent`。
+さらに `peer::drain_registration`（`:154`）と `agent::ObservedAddress`（`:837`）を
+フルパスで呼ぶので、**合計 19 の入口**を 1 ファイルが掴んでいる。
 
 ## 5. API が暗黙に要求している約束事
 
@@ -197,10 +208,18 @@ p2p の部品のうち**利用側が手で駆動している**もの:
 
 利用側が正しい順序で呼ぶ責任を持つ。
 
-- `drain_msquic(timeout)`（`:460`）— 閉じずに排出。プロセスを去る直前用。
-  タイムアウト時は registration を**意図的にリーク**する。
-- `shutdown_msquic(timeout)`（`:480`）— 排出してから閉じる。
+- `drain_msquic(timeout)`（`:460`）— 閉じずに排出し、**成否にかかわらず
+  必ず** `std::mem::forget` で registration をリークする（`:476`、
+  `if !drained` の外）。デストラクタを走らせずにプロセスを去る経路のためのもので、
+  自身の doc が理由を書いている — 「終了経路で閉じて得るものはないので、ここは閉じない」。
+- `shutdown_msquic(timeout)`（`:480`）— 排出してから閉じる。排出できたときだけ
+  `drop`（＝`RegistrationClose` が走る）、**タイムアウトしたときに限って**
+  `forget` でリークする。
 - `peer::drain_registration(&reg, timeout)`（`peer.rs:110`）。
+
+**2 つの違いは「いつリークするか」**: `drain` は常に、`shutdown` は失敗時だけ。
+終了経路で `shutdown` を選ぶと、排出できた場合に `RegistrationClose` の
+同期待ちへ入る。
 
 守らなかった場合の症状は `portal-client-ffi` の `close_and_wait` に詳述されている:
 `Runtime::drop` は実行中のタスクを中断するため、`close()` 途中で落とすと
@@ -263,13 +282,15 @@ FFI は自前で `APP_PAIR_DEADLINE`（30 秒）と `APP_CONNECT_DEADLINE` を�
 
 5. **長い位置引数リスト**。`bind.rs` の入口は
    `open_bind_session` 8 引数、`open_public_bind_session` 7、
-   `open_connect_relay` 9（いずれも位置引数で、末尾 2 つは
+   `open_connect_relay` 10（いずれも位置引数で、末尾 2 つは
    `opts: RelayOptions, family: Option<AddressFamily>`）。
-   `RelayOptions`（3 フィールド）は `Default` を導出していて
-   「既存の呼び出し側が変わらず動く既定」と明記されているが、
-   **ワークスペース内 15 の構築箇所すべてが全フィールドを書き出し、
-   `..Default::default()` を使っているものは 0**。用意された既定が
-   事実上使われておらず、各所に `datapath_hook: None` が並ぶ。
+   `RelayOptions`（3 フィールド）は `Default` を導出しており、
+   オプションを取らない経路 4 箇所がそれを使っている
+   （`listener.rs:402`, `initiator.rs:708`, `public.rs:298`,
+   `bin/isekai-agent.rs:445`）。一方で**構造体リテラルで組む 7 箇所は
+   すべて全フィールドを書き出し、`..Default::default()` を使うものは 0** で、
+   各所に `datapath_hook: None` が並ぶ。既定は効いているが、
+   1 つでも指定したい呼び出し側は 3 つ全部書くことになる。
 
 6. **enum であるべきものが `Option<&str>`**。
    `ListenerSession::bind(connection_id, relay_base_url, relay_family, info_family)`
@@ -339,6 +360,13 @@ until every connection and stream derived from it has been closed"）。
 clippy も通るため検出されなかった。**終了順序（§5.2）を説明する 2 関数の片方が
 無記載**というのは、SDK 化の観点でそのまま放置できない。修正は doc ブロックを
 2 つに割って後半を `shutdown_msquic` に戻すだけ。
+
+**この文書自身が実害を受けた**: §5.2 の初稿は「`drain_msquic` はタイムアウト時に
+リークする」と書いていた。連結された doc を `drain_msquic` のものとして読んだ結果で、
+実際は `drain` が常にリークし、`shutdown` がタイムアウト時だけリークする
+（コードレビューで指摘され、`:476` と `:502` を読んで訂正）。
+終了順序を間違えると #176 の同期待ちに入るという、この節が警告している
+まさにその取り違えを、この節自身が一度やった。
 
 ## 9. SDK 設計時に決めるべき問い
 
