@@ -166,10 +166,28 @@ jobs:
         run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
+      # **`cache: gradle` because fetching the distribution is the least
+      # reliable step in this workflow.** `gradlew` downloads
+      # `gradle-8.7-bin.zip` before anything is built, and that download failed
+      # five times across one pull request (#347) — `504` from
+      # `github.com/gradle/gradle-distributions` three times and a 10-second
+      # timeout from `services.gradle.org` twice, so both of the wrapper's
+      # hosts, not one bad mirror. Each failure costs a re-run of a job that
+      # takes minutes and had nothing to do with the change under test.
+      #
+      # What this caches is `~/.gradle/wrapper`, which is where that zip lands,
+      # along with `~/.gradle/caches`. **It does not remove the dependency, it
+      # narrows it**: a cache hit needs neither host, and only a miss — the
+      # first run after a build file or `gradle-wrapper.properties` changes, the
+      # key being hashed over those — still has to fetch. A fix that held under
+      # a miss too would mean vendoring the distribution or wrapping the
+      # download in a retry, neither of which is worth it for a step that is
+      # fine when the hosts are.
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
       # **v4 because v3's default package list asks for `tools`**, which Google
       # has removed from the SDK repository -- `sdkmanager` answers "Failed to
       # find package 'tools'" and the action exits 1 before any of this builds.
@@ -218,10 +236,12 @@ jobs:
         run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
+      # Cached for the reason the `app` job above gives.
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
       - uses: android-actions/setup-android@v4
       # **This job does install an NDK, unlike `app` above, and for the reason
       # that one gives for not installing one.** The hazard there is two NDKs,
