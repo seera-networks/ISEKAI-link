@@ -21,7 +21,8 @@ portal に後から入った機能はそこに入っていない。したがっ�
 
 ## 2. portal の機能一覧
 
-`portal-server` の 47 フラグと `portal-client` の 50 フラグを 9 クラスタに束ねた。
+`portal-server` の 49 フラグと `portal-client` の 52 フラグ
+（`#[argh(option|switch)]` の数。positional は両者 0）を 9 クラスタに束ねた。
 
 | # | クラスタ | 代表フラグ |
 | --- | --- | --- |
@@ -35,7 +36,10 @@ portal に後から入った機能はそこに入っていない。したがっ�
 | H | 接続と転送 | `--peer`, `--listener`, `--capability`, `--map`, `--bind`, `--relay-only`, `--gateway`, `--task`, `--config`, `--gateway-config` |
 | I | 観測・同意 | `--relays`, `--accept-privacy-policy`, `--show-privacy-policy`, `--withdraw-privacy-consent`, `--version` |
 
-FFI の 4 概念が覆っているのは **D の一部（受け取り側）と H の一部**だけ。
+FFI の 4 概念が覆っているのは **A の鍵の部分、D の受け取り側、H の一部**、
+および `isekai-client-ffi` だけが持つ **I の同意**（`privacy_policy()`,
+`lib.rs:245`）。A の鍵生成は両 FFI にある
+（`portal-client-ffi/src/lib.rs:81`, `:88`; `isekai-client-ffi/src/lib.rs:737`, `:746`）。
 
 ## 3. 各クラスタが要求する API と、その所在
 
@@ -49,11 +53,11 @@ FFI の 4 概念が覆っているのは **D の一部（受け取り側）と H
 | B | `endpoints::{list, get, revoke}`, `membership::{me, describe}` | **[p2p]** |
 | C | `enrollment::{Identity::new, issue, list, enrollments, revoke}` | **[p2p]** |
 | D | 発行側 `create_pairing_code` → `ListenerSession::show_pairing_code` **[p2p]** / 受け取り側 `pair_with_code` → `PeerDirectory` **[p2p]** |
-| E | `create_grant` **[raw]**, `list_grants` **[p2p+raw]**, `revoke_grant` **[p2p+raw]**, `issue_capability` **[p2p+raw]**, upsert の判定 `already_existed` **[app]** |
-| F | `create_ticket` **[raw]**, `list_tickets` **[raw]**, `revoke_ticket` **[raw]**, `redeem_ticket` **[p2p+raw]** |
-| G | `create_provisioning_key` **[raw]**, `list_provisioning_keys` **[raw]**, `provisioning_redemptions` **[raw]**, `revoke_provisioning_key` **[raw]**, `redeem_provisioning_key` **[p2p+raw]** |
+| E | `create_grant` **[raw]**, `list_grants` **[p2p+raw]**, `revoke_grant` **[p2p+raw]**, `issue_capability` **[p2p]**, upsert の判定 `already_existed` **[app]** |
+| F | `create_ticket` **[raw]**, `list_tickets` **[raw]**, `revoke_ticket` **[raw]**, `redeem_ticket` **[p2p]** |
+| G | `create_provisioning_key` **[raw]**, `list_provisioning_keys` **[raw]**, `provisioning_redemptions` **[raw]**, `revoke_provisioning_key` **[raw]**, `redeem_provisioning_key` **[p2p]** |
 | H | `ListenerSession`, `InitiatorSession`, `RelayOptions`, `listener::run`, `direct_path`, `legs()`, `observed_address()`, `Narrowing`（`--gateway`）, `device_name`（`--task`） | **[p2p]** + 転送・ルーティングは **[app]** |
-| I | `relay_rtt::{measure, observe_families}` + `list_relays` **[p2p]** / 同意は **[app]** |
+| I | `relay_rtt::{measure, observe_families}` **[p2p]** + `list_relays` **[raw]** / 同意は **[app]** |
 
 ## 4. 逆算で出てきた構造 — 「発行側」の面がない
 
@@ -69,12 +73,12 @@ FFI の 4 概念が覆っているのは **D の一部（受け取り側）と H
 | `create_ticket` | **なし** | `portal-server/src/main.rs` |
 | `list_tickets` | **なし** | `portal-server/src/main.rs` |
 | `revoke_ticket` | **なし** | `portal-server/src/main.rs` |
-| `redeem_ticket` | `initiator.rs` | `portal-client/src/main.rs` |
+| `redeem_ticket` | `initiator.rs` (`PeerDirectory`) | — |
 | `create_provisioning_key` | **なし** | `portal-server/src/main.rs` |
 | `list_provisioning_keys` | **なし** | `portal-server/src/main.rs` |
 | `provisioning_redemptions` | **なし** | `portal-server/src/main.rs` |
 | `revoke_provisioning_key` | **なし** | `portal-server/src/main.rs` |
-| `redeem_provisioning_key` | `initiator.rs` | `portal-client/src/main.rs` |
+| `redeem_provisioning_key` | `initiator.rs` (`PeerDirectory`) | — |
 
 **`isekai-p2p` が包んでいるのは「引き換える側」と、Grant の「読む／取り消す」だけ。
 資格情報を発行・一覧する面は 8 メソッド分まるごと無く**、portal-server は
@@ -93,6 +97,15 @@ Identity 側の管理（クラスタ B・C）は**すでに包まれている**:
 `isekai_p2p::enrollment::{Identity::new, issue, list, enrollments, revoke}`、
 `isekai_p2p::membership::{me, describe}`。portal-client はこれを使っている
 （`main.rs:1537`, `:1559`, `:1605`, `:1682`, `:1721`, `:1754`, `:1021`）。
+
+さらに、**資格情報の操作でも包みは既に機能している**: 引き換え 2 件は
+portal のどこからも生クライアントで呼ばれず、`isekai_p2p::PeerDirectory` 経由
+（`portal-client/src/main.rs:1240`, `:1291`, `portal-core/src/grant.rs:101`）。
+`issue_capability` も `portal_core::session::Session`（`session.rs:107`）が
+`ListenerCommand::IssueCapability` を `listener::run` に送る形で、
+**portal が完全に包み越しで届いている唯一の資格情報メソッド**
+（`portal-server/src/main.rs:1940`）。発行側だけが素通しなのは、
+包めないからではない。
 
 形は「クライアントとトークンを取る薄いモジュール関数」。発行側に足すべき面も
 **この先例に倣えばよく、新しい設計を要らない**。欠けているのは
@@ -135,7 +148,7 @@ SDK がその API を出すなら一緒に出す対象になる。
 したがって発行側（§4）とは事情が違い、**面が無いのではなく、面を出す必要がない**。
 一方で portal が実際に API として使っているのは**点検の面**だった:
 `--relays` が `relay_rtt::{measure, observe_families}` と `list_relays` を直接呼び、
-RTT とアドレスファミリの観測を表に出す（`portal-client/src/main.rs:1074`, `:1085`）。
+RTT とアドレスファミリの観測を表に出す（`portal-client/src/main.rs:1075`, `:1085`）。
 
 SDK に要るのはこちら側 —— **何が観測されたかを読む面と、`ProbeOptions` を
 調整する面**。自動の経路を呼び出し側に駆動させる面は要らない。
@@ -153,8 +166,15 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
   `portal-client-ffi` は `narrowing: Default::default()` 固定
   （`lib.rs:109`）＝ 上限のまま、`device_name` も
   `"portal-client-android"` 固定（`:106`）。
-- **イベント** — `is_closed()` のポーリングだけ。Grant が取り消された、
-  レグが張り替わった、といった通知の面がない。
+- **イベント** — ここは「無い」のではなく、**FFI 2 本の間で非対称**だった。
+  `isekai-client-ffi` は `#[uniffi::export(callback_interface)]` の
+  `FrameSink`（`lib.rs:205`）を持ち、`on_state`（接続状態の遷移）、
+  `on_path`（経路が増えた／移った）、`on_rtt`、`on_frame`、`on_log` を
+  境界の向こうへ渡す。Kotlin 側（`ViewerModel.kt`）と Swift 側
+  （`ViewerSink.swift:33`, `:41`）に実装がある。
+  一方 `portal-client-ffi` は `is_closed()` のポーリングだけで、
+  自身のコメントがそう明言している。
+  つまり **§4.1 と同じ形の非対称**で、設計の先例はすでに存在する。
 
 逆に、FFI にあって Rust 層に面が無いものもある: **締め切り**
 （`APP_PAIR_DEADLINE` / `APP_CONNECT_DEADLINE`）。
@@ -178,13 +198,17 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
    relay-only の選択。クラスタ H。`isekai-p2p` にあるが、転送そのものは app。
 6. **点検** — リレーの RTT とアドレスファミリの観測、観測アドレス、
    経路（レグ／直結）の状態。クラスタ I ＋ H の一部。**面はあるが低位**（§5）。
-7. **寿命と締め切り** — 終了順序、締め切り、セッションが死んだ通知。
-   **現状どこにも面が無く、FFI が各自で被せている**（§6 末尾）。
+7. **寿命と締め切り** — 終了順序、締め切り、セッションの状態通知。
+   **締め切りはどこにも面が無く**、FFI が各自で被せている（§6 末尾、
+   `p2p_sdk_api_review.md` §5.3）。終了順序も型に現れない（同 §5.2）。
+   一方**通知の面は `isekai-client-ffi` の `FrameSink` に既にある**ので、
+   ここで新規に設計すべきなのは「締め切りと終了順序」だけで、
+   通知は先例を広げる話になる（§6）。
 
 ## 8. SDK に出さない候補 — 消費者ゼロの面
 
-逆算の副産物として、**production の消費者が一つも無い**制御プレーン API が出た。
-定義と自分の単体テストだけのもの:
+逆算の副産物として、**定義と自分の単体テストしか無い**制御プレーン API が出た。
+「クレート外に消費者がいない」より強い条件で、内部利用も無いもの:
 
 | API | 出現 |
 | --- | --- |
@@ -193,10 +217,14 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
 | `peer_connect_with_grant` | 定義（`:2295`）＋自分のテスト 1（`_measured` 版だけが使われている） |
 | `ProxyClient::get_certificate` | 定義（`:2331`）＋自分のテスト 2 |
 
-`p2p_sdk_api_review.md` §3.4 の消費者ゼロ一覧
-（`poll_signaling`, `ListenerEvent`, `measure_for_connect`, `open_public_bind_session`）
-に続くもの。なお同一覧の `RelayRttReporter` は**内部で使われている**
-（§5 のとおり `ListenerSession` が spawn する）ので、面を畳む対象ではない。
+`p2p_sdk_api_review.md` §3.4 の一覧とは**条件が違う**ので、混ぜてはいけない。
+あちらは「クレート外の参照 0」で、内部利用は除いていない。実際その 5 件は
+すべて内部で使われている: `measure_for_connect` は接続経路から
+（`initiator.rs:1049`、§5）、`RelayRttReporter` は `ListenerSession` から
+（`listener.rs:429`、§5）、`poll_signaling` と `ListenerEvent` は
+`listener::run` から、`open_public_bind_session` は `public.rs:286` から。
+**どれも面を畳む対象ではない** —— 外部に出すかどうかの判断材料であって、
+消せる面の一覧ではない。畳める候補は上の表の 4 件だけ。
 
 ## 9. Q2 への入力 — 区別が要るエラー
 

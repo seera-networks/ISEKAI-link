@@ -376,9 +376,10 @@ clippy も通るため検出されなかった。**終了順序（§5.2）を説
    FFI 2 本が収斂している 4 概念（鍵 / ペアリング / 接続 / ローカルポート）で
    足りるのか、`DatapathHook` や `legs()` のような低位の面も要るのか。
    → **4 概念では足りない。** portal の機能から逆算した結果は
-   `docs/p2p_sdk_surface_from_portal.md`。資格情報の**発行側**（Grant /
-   Ticket / Provisioning Key の作成・一覧）が 8 メソッド分まるごと
-   `isekai-p2p` に面を持たず、portal-server が生クライアントを直叩きしている。
+   `docs/p2p_sdk_surface_from_portal.md`。Grant / Ticket / Provisioning Key を
+   **作る・一覧する・取り消す**面が 8 メソッド分まるごと `isekai-p2p` に無く
+   （作成 3・一覧 3・取り消し 2）、portal-server が生クライアントを
+   直叩きしている。必要な領域は 4 ではなく 7 群。
 2. **エラーの型**: SDK 境界で何を分類可能にするか（必要な区別 8 種の一覧は
    `docs/p2p_sdk_surface_from_portal.md` §9）。少なくとも
    「再試行可能か」「再認証が必要か」「相手に拒否されたか」は区別が要るはず。
