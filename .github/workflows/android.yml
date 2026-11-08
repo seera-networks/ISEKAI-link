@@ -166,28 +166,48 @@ jobs:
         run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
-      # **`cache: gradle` because fetching the distribution is the least
-      # reliable step in this workflow.** `gradlew` downloads
-      # `gradle-8.7-bin.zip` before anything is built, and that download failed
-      # five times across one pull request (#347) — `504` from
-      # `github.com/gradle/gradle-distributions` three times and a 10-second
-      # timeout from `services.gradle.org` twice, so both of the wrapper's
-      # hosts, not one bad mirror. Each failure costs a re-run of a job that
-      # takes minutes and had nothing to do with the change under test.
+      # **Fetching the distribution is the least reliable step in this
+      # workflow.** `gradlew` downloads `gradle-8.7-bin.zip` before anything is
+      # built, and that download failed five times across one pull request
+      # (#347) — `504` from `github.com/gradle/gradle-distributions` three
+      # times and a 10-second timeout from `services.gradle.org` twice, so both
+      # of the wrapper's hosts rather than one bad mirror. Each failure cost a
+      # re-run of a job that had nothing to do with the change under test.
       #
-      # What this caches is `~/.gradle/wrapper`, which is where that zip lands,
-      # along with `~/.gradle/caches`. **It does not remove the dependency, it
-      # narrows it**: a cache hit needs neither host, and only a miss — the
-      # first run after a build file or `gradle-wrapper.properties` changes, the
-      # key being hashed over those — still has to fetch. A fix that held under
-      # a miss too would mean vendoring the distribution or wrapping the
-      # download in a retry, neither of which is worth it for a step that is
-      # fine when the hosts are.
+      # **Not `setup-java`'s `cache: gradle`**, which would also store
+      # `~/.gradle/caches` — the whole AGP/Compose dependency cache, hundreds of
+      # megabytes per entry, per job, against the 10GB the repository shares
+      # with the rust-cache and vcpkg stores (`camera-apps.yml` reasons about
+      # exactly that quota). Its key is also hashed over every `*.gradle*` in
+      # the tree with no job discriminator, so editing `android-portal`'s build
+      # files would miss `android`'s cache and re-fetch the zip this exists to
+      # stop fetching.
+      #
+      # So: just the distribution, keyed on the two files that decide which one
+      # is wanted. Both apps pin the same version and the entry is the same
+      # distribution, so they share it deliberately rather than storing it
+      # twice.
+      #
+      # **No `restore-keys`**, unlike the vcpkg store next door: an old
+      # distribution contributes nothing towards fetching a new one, so seeding
+      # from it would only carry ~130MB forward per version bump. A bump costs
+      # one download.
+      #
+      # **A miss is still a fetch, and a failed job saves nothing** —
+      # `actions/cache@v4` is `post-if: success()`, and `save-always` is
+      # deprecated as not working. That is why the wrapper's own
+      # `networkTimeout` is raised alongside this: the cache makes the usual run
+      # not need these hosts, and the timeout gives the run that does a fair
+      # chance.
+      - name: Cache the Gradle distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-dist-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android-portal/gradle/wrapper/gradle-wrapper.properties') }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
       # **v4 because v3's default package list asks for `tools`**, which Google
       # has removed from the SDK repository -- `sdkmanager` answers "Failed to
       # find package 'tools'" and the action exits 1 before any of this builds.
@@ -236,12 +256,16 @@ jobs:
         run: scripts/prepare-machine.ps1 -Tls ${{ runner.os == 'Windows' && 'schannel' || 'quictls' }} -ForBuild
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
-      # Cached for the reason the `app` job above gives.
+      # Cached for the reason, and in the shape, the `app` job above gives.
+      - name: Cache the Gradle distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-dist-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android-portal/gradle/wrapper/gradle-wrapper.properties') }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
       - uses: android-actions/setup-android@v4
       # **This job does install an NDK, unlike `app` above, and for the reason
       # that one gives for not installing one.** The hazard there is two NDKs,
