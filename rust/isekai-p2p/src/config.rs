@@ -868,9 +868,14 @@ fn is_permanent(error: &anyhow::Error) -> bool {
 /// call a different token. On a path renewing a lease the same answer is a
 /// wait, which is the distinction `initiator::renewal_verdict` warns about.
 ///
-/// `missing` is unused — nothing here reads a `404`/`409` — and
-/// `retryable_kinds` is empty, since `429` and `503` are already waits by
-/// status and no kind on this route asks to be retried against its own.
+/// **`missing` is not inert**, though it changes nothing today: a `409` does
+/// reach here — `explain_issue_failure` says "a `409` lands here too", and that
+/// one is the cross-tenant collision — and `Vanished` is what keeps it out of
+/// the permanent bucket, which is where it was before. Setting it to `Done`
+/// would read a cross-tenant collision as "already gone".
+///
+/// `retryable_kinds` and `fixable_kinds` are empty: `429` and `503` are already
+/// waits by status, and no kind on this route asks to be read against its own.
 ///
 /// **The `401 pop-signature-invalid` this used to name here moved into
 /// [`Outcome`]**, which reads it status-independently with the reason recorded
@@ -884,6 +889,7 @@ const ISSUING: Reading = Reading {
     missing: Missing::Vanished,
     token_self_replacing: false,
     retryable_kinds: &[],
+    fixable_kinds: &[],
 };
 
 /// Keep `proxy`'s Endpoint Token current for as long as the returned guard

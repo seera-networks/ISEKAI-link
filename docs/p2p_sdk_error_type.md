@@ -1,9 +1,12 @@
 # SDK 境界のエラー型（§9 Q2 の答え）
 
-- status: 実装済み（v0.4）。§3.4 の 2 点は実装して設計を正した — 下記
-- version: 0.4（実装: `isekai-p2p-core::outcome`。設計の 2 点を訂正）
+- status: 実装済み（`isekai-p2p-core::outcome`）。実装して設計を 3 点正した — §0
+- version: 0.4
+- 対象: `9ac0ee4`（`main`）。§7.1 の実装は #345、本体は #347
+- 前提: `docs/p2p_sdk_error_classification.md` — 8 種の失敗の判定材料。
+  本文書はその確定結果に型を与える
 
-## 0. 実装で正した設計の 2 点
+## 0. 実装で正した設計の 3 点
 
 1. **`Unreachable::Transport` は `anyhow::Error` を持たない。** §2 はそう書いて
    いたが、既存の分類器はすべてエラーを**参照**で受ける述語である
@@ -16,9 +19,11 @@
 2. **`Missing::NotDeployed` は到達不能なので落とした。** §3.4 に挙げていたが、
    `list_relays` は `404` をエラーが作られる前に `Ok(None)` へ変えるので
    `outcome()` が見ることはない。
-- 対象: `e6ac864`（`main`）。§7.1 の実装は #345
-- 前提: `docs/p2p_sdk_error_classification.md` — 8 種の失敗の判定材料。
-  本文書はその確定結果に型を与える
+3. **仕様が許した kind のうち「直して出し直せる」側に経路が無かった。**
+   §3.2 は `403 protocol-not-allowed` を `Rejected` にすべきと書いていたのに、
+   `Reading` には `retryable_kinds`（→ `Busy`）しか無く、`Refused` に潰れていた。
+   **まだ使える Ticket を捨てさせる**読みである。`fixable_kinds` を足した ——
+   2 つの指示（待って同じものを出す／直して出す）は 1 本のリストでは言えない。
 
 ## 1. 軸は「何が起きたか」ではなく「呼び出し側に何ができるか」
 
@@ -103,9 +108,9 @@ pub enum Unreachable {
     /// こちらが課した締め切りを超えた（§3.4-8）。
     #[error("no answer within {waited:?}")]
     Deadline { waited: Duration },
-    /// それ以外。中身は当面 `anyhow`。
-    #[error("transport: {0}")]
-    Transport(anyhow::Error),
+    /// それ以外。**メッセージを持つ（§0-1）。**
+    #[error("transport: {explain}")]
+    Transport { explain: String },
 }
 ```
 
@@ -246,8 +251,6 @@ pub enum Missing {
     /// 名指したものが消えた。呼び出し側が次を決める
     /// （`is_listener_not_found`, `relay_lease`）。
     Vanished,
-    /// この配備にその機能が無い。**エラーにしない**（`list_relays`、§2.1）。
-    NotDeployed,
 }
 
 /// この呼び出し箇所が応答をどう読むか。
@@ -257,11 +260,14 @@ pub struct Reading {
     /// このトークンは数分で差し替わるか（§3.3）。
     /// `true` なら `401`/`403 insufficient-permission` は `Busy` に落ちる。
     pub token_self_replacing: bool,
-    /// 仕様が分岐を許した kind のうち、この経路で再試行してよいもの（§3.2）。
+    /// 仕様が分岐を許した kind のうち、**待って同じものを出し直せる**もの（§3.2）。
     pub retryable_kinds: &'static [&'static str],
+    /// 同じく許された kind のうち、**直して出し直せる**もの（§0-3）。
+    pub fixable_kinds: &'static [&'static str],
 }
 
-pub fn outcome(error: ProxyError, reading: &Reading) -> Outcome;
+// 実装は `Outcome::of_proxy` / `Outcome::of_identity`。借用で受ける（§0-1）。
+pub fn of_proxy(error: &ProxyError, reading: &Reading) -> Outcome;
 ```
 
 `Reading` が無ければ決まる部分だけを表にすると:

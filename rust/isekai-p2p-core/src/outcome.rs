@@ -1,5 +1,6 @@
-//! What a control-plane call did not do, said in terms of what the caller can
-//! do about it (`docs/p2p_sdk_error_type.md`).
+//! What a call did not do, in terms of what the caller can do about it.
+//!
+//! Designed in `docs/p2p_sdk_error_type.md`.
 //!
 //! [`ProxyError`] and [`IdentityError`] say what the wire said: a status, a
 //! problem kind, a detail, a `Retry-After`. That is the right thing for them to
@@ -12,7 +13,7 @@
 //! what went wrong, and that is the axis here.
 //!
 //! **The reading is not a function of the answer alone.** Three kinds of
-//! context decide it, which is why [`Outcome::from_proxy`] takes a [`Reading`]
+//! context decide it, which is why [`Outcome::of_proxy`] takes a [`Reading`]
 //! rather than being a `From` impl — see [`Reading`] for each.
 
 use std::time::Duration;
@@ -163,7 +164,7 @@ pub struct Reading {
     /// a permission on this route".
     pub token_self_replacing: bool,
 
-    /// Kinds this route may retry.
+    /// Kinds this route may retry **as sent**, after `after`.
     ///
     /// **An allowlist, not a denylist**, because the two existing defaults
     /// point opposite ways and this one is the safe direction:
@@ -172,6 +173,22 @@ pub struct Reading {
     /// seconds". Retrying an unknown kind risks hammering a days-long wait;
     /// not retrying one costs a failure returned early.
     pub retryable_kinds: &'static [&'static str],
+
+    /// Kinds that mean the request did not stand up, so it can be **corrected**
+    /// and sent again.
+    ///
+    /// The other half of the exceptions `ProxyError::kind`'s documentation
+    /// sanctions, and the half a refusal must not swallow: `redeem_ticket`
+    /// answers `403 protocol-not-allowed` for a protocol the ceiling does not
+    /// hold and **leaves the Ticket unspent**. Read as
+    /// [`Refused`](Outcome::Refused) a caller gives up and throws the Ticket
+    /// away; read as [`Busy`](Outcome::Busy) it resends the same wrong protocol
+    /// forever. Neither is what the answer said.
+    ///
+    /// Separate from `retryable_kinds` because the two prescribe different
+    /// things — wait and resend, versus fix and resend — and a single list
+    /// could only mean one of them.
+    pub fixable_kinds: &'static [&'static str],
 }
 
 impl Outcome {
@@ -179,7 +196,14 @@ impl Outcome {
     pub fn of_proxy(error: &ProxyError, reading: &Reading) -> Self {
         let explain = error.to_string();
         match error {
-            ProxyError::Transport(_) => Outcome::Unreachable(Unreachable::Transport { explain }),
+            // **The whole chain, not just the outermost message.** `{0}` prints
+            // one line of an `anyhow::Error`, and `HttpsTransport::send` wraps
+            // every failure in the same `"HTTPS request failed"` — so a name
+            // that would not resolve, a refused connection and a rejected
+            // certificate all read identically without this.
+            ProxyError::Transport(inner) => Outcome::Unreachable(Unreachable::Transport {
+                explain: format!("{inner:#}"),
+            }),
             ProxyError::Decode(_) => Outcome::Malformed { explain },
             ProxyError::Problem {
                 status,
@@ -197,7 +221,10 @@ impl Outcome {
     pub fn of_identity(error: &IdentityError, reading: &Reading) -> Self {
         let explain = error.to_string();
         match error {
-            IdentityError::Transport(_) => Outcome::Unreachable(Unreachable::Transport { explain }),
+            // The chain, for the reason [`Self::of_proxy`] gives.
+            IdentityError::Transport(inner) => Outcome::Unreachable(Unreachable::Transport {
+                explain: format!("{inner:#}"),
+            }),
             IdentityError::Time => Outcome::Malformed { explain },
             IdentityError::Api {
                 status,
@@ -230,6 +257,9 @@ fn read(
             after: retry_after,
             explain,
         };
+    }
+    if kind.is_some_and(|kind| reading.fixable_kinds.contains(&kind)) {
+        return Outcome::Rejected { explain };
     }
     // **Two kinds are settled whatever the status says**, and both are
     // exceptions `kind()`'s own documentation sanctions — cases of "recognising
@@ -280,6 +310,7 @@ mod tests {
         missing: Missing::Vanished,
         token_self_replacing: false,
         retryable_kinds: &[],
+        fixable_kinds: &[],
     };
 
     /// A call site whose token is replaced on a timer by somebody else.
@@ -287,6 +318,7 @@ mod tests {
         missing: Missing::Vanished,
         token_self_replacing: true,
         retryable_kinds: &[],
+        fixable_kinds: &[],
     };
 
     fn problem(status: u16, kind: Option<&str>) -> ProxyError {
@@ -416,6 +448,48 @@ mod tests {
             ),
             "an unknown kind gets its status, not the benefit of the doubt",
         );
+    }
+
+    /// **The other sanctioned half: fix it and send it again.**
+    ///
+    /// `redeem_ticket` answers `403 protocol-not-allowed` for a protocol the
+    /// ceiling does not hold, and **leaves the Ticket unspent**. Read as a
+    /// refusal the caller throws a spendable Ticket away; read as a wait it
+    /// resends the same wrong protocol forever. Both lists are needed because
+    /// they prescribe different things.
+    #[test]
+    fn a_fixable_kind_is_rejected_not_refused() {
+        let redeeming = Reading {
+            fixable_kinds: &["protocol-not-allowed"],
+            ..ISSUING
+        };
+        assert!(matches!(
+            read_as(403, Some("protocol-not-allowed"), &redeeming),
+            Outcome::Rejected { .. }
+        ));
+        assert!(
+            matches!(
+                read_as(403, Some("ticket-invalid"), &redeeming),
+                Outcome::Refused { .. }
+            ),
+            "and the uniform refusal on the same route stays a refusal",
+        );
+    }
+
+    /// A kind in neither list gets its status, and a route that names a kind in
+    /// both would be saying two things — so `retryable_kinds` is read first and
+    /// the ordering is pinned rather than left to the reader.
+    #[test]
+    fn waiting_outranks_fixing_when_a_route_names_both() {
+        let both = Reading {
+            retryable_kinds: &["ambiguous"],
+            fixable_kinds: &["ambiguous"],
+            ..ISSUING
+        };
+        assert!(matches!(
+            read_as(403, Some("ambiguous"), &both),
+            Outcome::Busy { .. }
+        ));
     }
 
     /// What the server asked to wait is carried, because a wait the caller
