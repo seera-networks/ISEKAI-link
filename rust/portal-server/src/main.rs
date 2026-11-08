@@ -413,15 +413,12 @@ fn grant_lifetime_lines(
     if asked.is_some() && grant.expires_at.is_none() {
         lines.push("              NOTE: asked for an expiry and the proxy named none".to_owned());
     }
-    // **The status if the proxy gave one, the age if it did not.** An operator
-    // reading this line is being told which of two things their run did, and
-    // the age is a guess that gets it wrong when a round trip was slow.
-    let existed = match made {
-        Made::Existing => true,
-        Made::Fresh => false,
-        Made::Unknown => portal_core::gateway::grants::already_existed(grant.created_at.as_deref()),
-    };
-    if existed {
+    // **The same reading the ledger uses, from the same function.** An operator
+    // is being told which of two things their run did, and the ledger is
+    // deciding whether it may remove this later; the two disagreeing about one
+    // create is the confusion neither would survive. `existed_before` also
+    // carries why a `201` is believed and a `200` is not.
+    if portal_core::gateway::grants::existed_before(made, grant.created_at.as_deref()) {
         lines.push(
             "              NOTE: this pair already had a grant -- the create UPDATED it, \
              label and expiry included. If something else made it (a --gateway-config run, \
@@ -2401,15 +2398,14 @@ mod tests {
         );
     }
 
-    /// **What the operator is told comes from the status, not the clock.**
+    /// **A `201` silences the note; a `200` leaves the age to decide.**
     ///
-    /// The age heuristic is wrong in both directions, and both directions
-    /// mislead: a slow round trip would tell an operator their fresh grant
-    /// "UPDATED" somebody else's, and an operator's own grant created seconds
-    /// before this run would be reported as freshly made -- the case where the
-    /// warning about another owner being able to revoke it actually matters.
+    /// The operator's line and the ledger's bookkeeping read the same create
+    /// through the same `existed_before`, so this pins the operator-visible
+    /// half of that asymmetry: a slow round trip no longer tells an operator
+    /// their fresh grant "UPDATED" somebody else's.
     #[test]
-    fn the_note_follows_the_status_not_the_age() {
+    fn the_note_follows_a_fresh_status_and_otherwise_the_age() {
         let dated = |created: Option<&str>| isekai_p2p::agent::Grant {
             grant_id: "gr_1".to_owned(),
             owner_endpoint: "ep:b".to_owned(),
@@ -2429,9 +2425,14 @@ mod tests {
         let lines = grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Fresh, None);
         assert_eq!(lines.len(), 1, "a 201 silences the note: {lines:?}");
 
-        // Looks new, but the proxy said it was already there.
+        // A `200` with a fresh timestamp: the age decides, and says ours.
         let lines = grant_lifetime_lines(&dated(Some(&fresh)), Made::Existing, None);
-        assert_eq!(lines.len(), 2, "a 200 raises it: {lines:?}");
+        assert_eq!(lines.len(), 1, "a 200 defers to the age: {lines:?}");
+
+        // A `200` with an old one: the two agree, and the note is raised.
+        let lines =
+            grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Existing, None);
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[1].contains("UPDATED it"), "{}", lines[1]);
     }
 }

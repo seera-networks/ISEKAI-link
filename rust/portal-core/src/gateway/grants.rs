@@ -58,6 +58,35 @@ impl ExistedBefore {
 /// different purpose — telling the operator which of the two happened — and a
 /// second copy of the window would be a constant free to drift from the one
 /// the ledger decides by.
+/// Whether a create answered with a grant that was **already there**, from
+/// everything the answer said.
+///
+/// **The two readings are not trusted equally, and the asymmetry is the
+/// point.** Which success status this route uses is the proxy's to choose, and
+/// nothing outside this workspace's own notes establishes that a fresh create
+/// answers `201` — so:
+///
+/// * [`Made::Fresh`] **is** believed. A `201` cannot plausibly mean "already
+///   there", and believing it fixes the case the age gets wrong in the
+///   dangerous direction: a grant we just made whose round trip was slow looks
+///   old, lands in `theirs`, and then nothing refreshes it — so the grant our
+///   own create wrote a 60-second TTL onto lapses, and the policy it serves
+///   goes unserved until a restart re-lists.
+/// * [`Made::Existing`] is **not**. If the proxy answers `200` on a fresh
+///   create too, believing it would put *every* grant this process makes into
+///   `theirs` — same starvation, on every create rather than in a race. So it
+///   defers to the age, which is what decided this before the status was kept.
+/// * [`Made::Unknown`] defers for the same reason.
+///
+/// Promoting `Existing` to authoritative needs the control plane's fresh-create
+/// status confirmed first.
+pub fn existed_before(made: Made, created_at: Option<&str>) -> bool {
+    match made {
+        Made::Fresh => false,
+        Made::Existing | Made::Unknown => already_existed(created_at),
+    }
+}
+
 pub fn already_existed(created_at: Option<&str>) -> bool {
     created_at
         .and_then(|text| OffsetDateTime::parse(text, &Rfc3339).ok())
@@ -228,11 +257,9 @@ impl Ledger {
     /// grant the operator created after it is invisible to [`note_existing`],
     /// so the create upserts theirs and the ledger would claim it.
     ///
-    /// `made` is the proxy's own answer and is believed when it gives one.
-    /// [`Made::Unknown`] falls back to the age of `created_at`, which the proxy
-    /// leaves untouched on an update — the reading this used before the status
-    /// was kept, and a guess: a slow round trip makes a fresh grant look like
-    /// an update.
+    /// `made` is what the create's status said, read by [`existed_before`] —
+    /// which believes a `201` and defers to the age of `created_at` otherwise,
+    /// for the reasons recorded there.
     ///
     /// A pair already recorded as ours keeps its record whatever either says,
     /// since `created_at` is the *original* creation and ours will look old
@@ -249,12 +276,7 @@ impl Ledger {
             ours.insert(grant_id);
             return true;
         }
-        let existed = match made {
-            Made::Existing => true,
-            Made::Fresh => false,
-            Made::Unknown => already_existed(created_at),
-        };
-        if existed {
+        if existed_before(made, created_at) {
             self.theirs.insert(key);
             return false;
         }
@@ -581,19 +603,21 @@ mod tests {
         assert!(!ledger.is_operators(&key));
     }
 
-    /// **The status beats the age, in both directions.**
+    /// **A `201` beats the age. A `200` does not.**
     ///
-    /// These are the two cases the age heuristic gets wrong: a grant we just
-    /// made whose round trip was slow enough to look old, and an operator's
-    /// grant created seconds before our create upserted it. The proxy's own
-    /// answer settles both, and the window never gets a say.
+    /// The asymmetry is the whole policy, so it is pinned rather than left to
+    /// the reader of [`existed_before`]: believing a `201` fixes the case the
+    /// age gets wrong in the direction that starves a grant, and believing a
+    /// `200` would risk starving every grant this process makes if the proxy
+    /// turns out to answer `200` on a fresh create too.
     #[test]
-    fn the_status_beats_a_misleading_age() {
+    fn a_fresh_status_beats_the_age_and_an_existing_one_defers_to_it() {
         let old = (OffsetDateTime::now_utc() - time::Duration::hours(2))
             .format(&Rfc3339)
             .expect("formats");
         let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("formats");
 
+        // Looks old because the round trip was slow; the `201` says otherwise.
         let mut ledger = Ledger::new();
         let slow = ("ep:a7".to_owned(), "pg-sales-ro-v1".to_owned());
         assert!(
@@ -602,16 +626,30 @@ mod tests {
         );
         assert!(!ledger.is_operators(&slow));
 
-        let theirs = ("ep:b8".to_owned(), "pg-sales-ro-v1".to_owned());
+        // A `200` with a fresh timestamp reads as ours, exactly as it did
+        // before the status was kept: the age still decides this one.
+        let mut ledger = Ledger::new();
+        let fresh = ("ep:b8".to_owned(), "pg-sales-ro-v1".to_owned());
         assert!(
-            !ledger.record(
-                theirs.clone(),
-                "gr_theirs".to_owned(),
+            ledger.record(
+                fresh.clone(),
+                "gr_ours".to_owned(),
                 Made::Existing,
                 Some(&now)
             ),
-            "a 200 says it was already there, however fresh the timestamp looks",
+            "a 200 defers to the age, which says this one is ours",
         );
+        assert!(!ledger.is_operators(&fresh));
+
+        // And with an old timestamp the two agree.
+        let mut ledger = Ledger::new();
+        let theirs = ("ep:c9".to_owned(), "pg-sales-ro-v1".to_owned());
+        assert!(!ledger.record(
+            theirs.clone(),
+            "gr_theirs".to_owned(),
+            Made::Existing,
+            Some(&old)
+        ));
         assert!(ledger.is_operators(&theirs));
     }
 

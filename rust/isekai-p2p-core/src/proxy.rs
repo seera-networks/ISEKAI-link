@@ -569,11 +569,15 @@ pub struct IssuedCertificate {
 /// created seconds ago looks like ours
 /// (`portal_core::gateway::grants::already_existed`).
 ///
-/// [`Unknown`](Self::Unknown) is not a failure. The upsert answer is the
-/// documented `200` and a fresh row a `201`, but which success status a route
-/// uses is the proxy's to choose — so anything else leaves the caller on
-/// whatever it did before rather than asserting a reading the wire did not
-/// support.
+/// **This reports the status; it does not decide what the status means.** The
+/// upsert answer is the documented `200`; that a fresh row is a `201` is this
+/// workspace's assumption and is written down nowhere outside its own notes.
+/// So a caller that acts on the difference has to weigh the two readings
+/// separately — `portal_core::gateway::grants::existed_before` is where that
+/// weighing lives, and why.
+///
+/// [`Unknown`](Self::Unknown) is not a failure: which success status a route
+/// uses is the proxy's to choose, and anything else simply says nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Made {
     /// `201` — this call created it.
