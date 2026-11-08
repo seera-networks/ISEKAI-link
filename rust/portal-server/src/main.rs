@@ -625,10 +625,22 @@ async fn follow_policies(
 ) {
     let mut table = portal_core::gateway::Table::new();
     let mut ledger = portal_core::gateway::Ledger::new();
+    // **Outlives a pass, for the reason [`Reported`] gives.**
+    let mut reported = Reported::default();
     let mut backoff = POLICY_RETRY_MIN;
     loop {
         let began = tokio::time::Instant::now();
-        match follow_once(&cfg, &policy, &mut table, &mut ledger, &limits, &shutdown).await {
+        match follow_once(
+            &cfg,
+            &policy,
+            &mut table,
+            &mut ledger,
+            &mut reported,
+            &limits,
+            &shutdown,
+        )
+        .await
+        {
             Ok(()) => {
                 backoff = POLICY_RETRY_MIN;
                 // **A floor even on success.** The reader turns a mid-stream
@@ -692,6 +704,7 @@ async fn follow_once(
     policy: &portal_core::gateway::GatewayPolicy,
     table: &mut portal_core::gateway::Table,
     ledger: &mut portal_core::gateway::Ledger,
+    reported: &mut Reported,
     limits: &tokio::sync::watch::Sender<PolicyLimits>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
@@ -707,8 +720,7 @@ async fn follow_once(
     // already has one is an update that answers with the operator's grant id.
     note_existing_grants(&proxy, ledger).await;
 
-    let mut reported = Reported::default();
-    settle_grants(&proxy, table, ledger, &mut reported).await;
+    settle_grants(&proxy, table, ledger, reported).await;
     publish_limits(limits, table);
     let mut stream = isekai_p2p::policy_stream(cfg, &token, Some(cursor)).await?;
 
@@ -732,7 +744,7 @@ async fn follow_once(
                     // lapsed lease is ever noticed, so leaving the grant to the
                     // next stream event would let it stand for up to a token
                     // lifetime with nothing behind it.
-                    settle_grants(&proxy, table, ledger, &mut reported).await;
+                    settle_grants(&proxy, table, ledger, reported).await;
                     publish_limits(limits, table);
                 }
             }
@@ -743,7 +755,7 @@ async fn follow_once(
                     // order -- validate, write the table, then the grant --
                     // because the other way round leaves a grant live with no
                     // scope describing it.
-                    settle_grants(&proxy, table, ledger, &mut reported).await;
+                    settle_grants(&proxy, table, ledger, reported).await;
                     // **The path that carries almost everything.** Without
                     // this, a lease granted over the stream did not reach the
                     // connection side until something else happened to expire
@@ -984,16 +996,31 @@ fn publish_limits(
 
 /// What this process has already said about the policy.
 ///
-/// **Both halves are stable across passes, and each is worth one line when it
-/// appears.** A row that can never be served and a pair served by a grant this
-/// process did not make are both invisible in the pass's other output; saying
-/// either on every policy event teaches whoever reads the log to skip the line.
+/// **Both halves stand for as long as the policy does, and each is worth one
+/// line when it appears.** A row that can never be served and a pair served by
+/// a grant this process did not make are both invisible in the pass's other
+/// output; saying either on every policy event teaches whoever reads the log to
+/// skip the line.
+///
+/// **Held by [`follow_policies`], not by a pass.** `follow_once` returns every
+/// time the stream ends, which Identity does at each token expiry — and a
+/// stream that dies on connect is only throttled to `POLICY_MIN_STREAM`, not
+/// prevented. Built per pass, this would re-emit every standing line once a
+/// token lifetime at best and every five seconds at worst, which is the exact
+/// failure it exists to prevent. `table` and `ledger` are threaded in for the
+/// same reason.
+///
+/// **Keyed on what would be said, not on what it is about.** A lease whose
+/// refusal changes reason — gaining an `expires_at` too short to use turns
+/// `NoDeadline` into `LeaseTooShort` — and a pair whose lease count grows are
+/// both news, and keying on the id alone would leave the log stating something
+/// that has stopped being true.
 #[derive(Default)]
 struct Reported {
-    /// Access-lease ids whose rows could not be turned into a grant.
-    refused: BTreeSet<String>,
-    /// Pairs already covered by a grant this process did not make.
-    served: BTreeSet<(String, String)>,
+    /// Access-lease id and the refusal as it reads.
+    refused: BTreeSet<(String, String)>,
+    /// Endpoint, protocol, and how many leases ride on the operator's grant.
+    served: BTreeSet<(String, String, usize)>,
 }
 
 /// Which of `now` has not been said yet, remembering the whole set.
@@ -1032,10 +1059,14 @@ async fn settle_grants(
     // Only when the set changes, though -- see [`newly`].
     let fresh = newly(
         &mut reported.refused,
-        changes.refused.iter().map(|(id, _)| id.clone()).collect(),
+        changes
+            .refused
+            .iter()
+            .map(|(id, why)| (id.clone(), why.to_string()))
+            .collect(),
     );
     for (lease, why) in &changes.refused {
-        if fresh.contains(lease) {
+        if fresh.contains(&(lease.clone(), why.to_string())) {
             tracing::warn!(lease, "policy: no grant made: {why}");
         }
     }
@@ -1050,10 +1081,25 @@ async fn settle_grants(
     // `portal_core::gateway::grants`), not a problem to fix.
     let fresh = newly(
         &mut reported.served,
-        changes.served.iter().map(|w| w.key()).collect(),
+        changes
+            .served
+            .iter()
+            .map(|w| {
+                (
+                    w.allowed_endpoint.clone(),
+                    w.protocol.clone(),
+                    w.leases.len(),
+                )
+            })
+            .collect(),
     );
     for wanted in &changes.served {
-        if fresh.contains(&wanted.key()) {
+        let said = (
+            wanted.allowed_endpoint.clone(),
+            wanted.protocol.clone(),
+            wanted.leases.len(),
+        );
+        if fresh.contains(&said) {
             tracing::info!(
                 allowed = %wanted.allowed_endpoint,
                 protocol = %wanted.protocol,
@@ -2534,6 +2580,30 @@ mod tests {
             newly(&mut said, one),
             ["al_1"].into_iter().collect::<BTreeSet<_>>(),
             "but its return is",
+        );
+    }
+
+    /// **What the line would say is part of the key, so a change to it is news.**
+    ///
+    /// This is why `Reported` holds `(lease, reason)` and
+    /// `(endpoint, protocol, leases)` rather than the id or the pair alone: a
+    /// refusal that changes reason, and a pair whose lease count grows, would
+    /// otherwise leave the log stating something that has stopped being true —
+    /// and the served line's whole point is the blast radius of revoking that
+    /// grant.
+    #[test]
+    fn the_same_subject_saying_something_new_is_said_again() {
+        let mut said = BTreeSet::new();
+        assert!(!newly(&mut said, [("al_1", "no deadline")].into_iter().collect()).is_empty());
+        assert_eq!(
+            newly(
+                &mut said,
+                [("al_1", "lease too short")].into_iter().collect()
+            ),
+            [("al_1", "lease too short")]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "the same lease with a different reason is a new line",
         );
     }
 }
