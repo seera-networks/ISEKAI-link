@@ -557,6 +557,7 @@ const REGISTERING: Reading = Reading {
     token_self_replacing: false,
     retryable_kinds: &[],
     fixable_kinds: &[],
+    gone_kinds: &[],
 };
 
 /// §8.8.4 → §8.8.5: a challenge, then registration and the first token.
@@ -907,6 +908,7 @@ const ISSUING: Reading = Reading {
     token_self_replacing: false,
     retryable_kinds: &[],
     fixable_kinds: &[],
+    gone_kinds: &[],
 };
 
 /// Keep `proxy`'s Endpoint Token current for as long as the returned guard

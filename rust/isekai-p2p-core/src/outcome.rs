@@ -148,11 +148,16 @@ pub enum Missing {
 
 /// What this call site knows that the answer does not say.
 ///
-/// Three things, each of which the design found a live counter-example for:
+/// Each field answers something the answer itself does not say, and each has a
+/// live counter-example in the tree:
 ///
-/// 1. `missing` — a `404`/`409` means different things on different routes.
-/// 2. `token_self_replacing` — whether a `403` here is settled or stale.
-/// 3. `retryable_kinds` — which sanctioned kind branches apply here.
+/// * `not_found`, `conflict` — a `404` and a `409` mean different things on
+///   different routes, and a route that gives one of them a meaning usually
+///   gives the other none.
+/// * `token_self_replacing` — whether a `403` here is settled or stale.
+/// * `retryable_kinds`, `fixable_kinds`, `gone_kinds` — which of the kind
+///   branches the spec sanctions apply here, and what each of them prescribes:
+///   wait and resend, fix and resend, or stop because it is not there.
 ///
 /// No `Default`: a call site that has not decided these has not decided what
 /// its failures mean, and a default would let it skip that silently.
@@ -201,6 +206,19 @@ pub struct Reading {
     /// things — wait and resend, versus fix and resend — and a single list
     /// could only mean one of them.
     pub fixable_kinds: &'static [&'static str],
+
+    /// Kinds that mean what was asked for is **already not there**.
+    ///
+    /// **Why a kind list and not `not_found: Done`.** `problem_error` keeps
+    /// `problem: from_slice(..).ok()`, so *any* `404` whose body is not
+    /// problem+json — an intermediary's HTML page, a wrong base path, a proxy
+    /// built without the route — arrives as `Problem { status: 404, problem:
+    /// None }`. Reading that by status would call a missing route "already
+    /// gone": `portal-server`'s delete would drop the grant from its ledger
+    /// while it still stands at the proxy, and the warning that would have
+    /// surfaced the misconfiguration would stop. Naming the slugs keeps the
+    /// bodiless answer a failure, which is what it is.
+    pub gone_kinds: &'static [&'static str],
 }
 
 impl Outcome {
@@ -282,6 +300,22 @@ fn read(
     if kind.is_some_and(|kind| reading.fixable_kinds.contains(&kind)) {
         return Outcome::Rejected { explain };
     }
+    if kind.is_some_and(|kind| reading.gone_kinds.contains(&kind)) {
+        return Outcome::AlreadyGone { explain };
+    }
+    // **A route's reading of its own status outranks the general kind rule
+    // below.** `already_registered` says its `409` means "already there", and
+    // that has to hold for a `409` whose slug happens to be one of the two —
+    // re-registering a revoked Endpoint's key is a plausible
+    // `409 endpoint-revoked` (one key is one Endpoint, so it cannot register
+    // again), and reading it as a refusal returns the error to a
+    // `get_or_try_init` that does not remember failures, which enrols again
+    // and takes the same `409` for the life of the process.
+    match missing_of(status, reading) {
+        Missing::Done => return Outcome::AlreadyGone { explain },
+        Missing::Vanished => return Outcome::Vanished { explain },
+        Missing::Unremarkable => {}
+    }
     // **Two kinds are settled whatever the status says**, and both are
     // exceptions `kind()`'s own documentation sanctions — cases of "recognising
     // a message whose cause is on *this* side" rather than of telling refusals
@@ -293,14 +327,6 @@ fn read(
         return Outcome::Refused { explain };
     }
     match status {
-        // The route decides; there is no general reading.
-        404 | 409 if missing_of(status, reading) != Missing::Unremarkable => {
-            match missing_of(status, reading) {
-                Missing::Done => Outcome::AlreadyGone { explain },
-                Missing::Vanished => Outcome::Vanished { explain },
-                Missing::Unremarkable => unreachable!("guarded above"),
-            }
-        }
         // A credential somebody else replaces on a timer is a wait, not an
         // answer — see [`Reading::token_self_replacing`].
         401 | 403 if reading.token_self_replacing => Outcome::Busy {
@@ -336,6 +362,7 @@ mod tests {
         token_self_replacing: false,
         retryable_kinds: &[],
         fixable_kinds: &[],
+        gone_kinds: &[],
     };
 
     /// A call site whose token is replaced on a timer by somebody else.
@@ -345,6 +372,7 @@ mod tests {
         token_self_replacing: true,
         retryable_kinds: &[],
         fixable_kinds: &[],
+        gone_kinds: &[],
     };
 
     fn problem(status: u16, kind: Option<&str>) -> ProxyError {
@@ -552,6 +580,52 @@ mod tests {
             read_as(403, Some("ambiguous"), &both),
             Outcome::Busy { .. }
         ));
+    }
+
+    /// **A route's reading of its own status outranks the settled-kind rule.**
+    ///
+    /// `already_registered` says its `409` means "already there". A revoked
+    /// Endpoint's key cannot register again — one key is one Endpoint — so a
+    /// `409 endpoint-revoked` is plausible, and reading it as a refusal returns
+    /// the error to a `get_or_try_init` that does not remember failures: it
+    /// enrols again, takes the same `409`, and does that for the life of the
+    /// process.
+    #[test]
+    fn a_routes_own_status_outranks_a_settled_kind() {
+        let registering = Reading {
+            conflict: Missing::Done,
+            ..ISSUING
+        };
+        assert!(matches!(
+            read_as(409, Some("endpoint-revoked"), &registering),
+            Outcome::AlreadyGone { .. }
+        ));
+        assert!(
+            matches!(
+                read_as(409, Some("endpoint-revoked"), &ISSUING),
+                Outcome::Refused { .. }
+            ),
+            "and a route that claims nothing about its 409 still gets the rule",
+        );
+    }
+
+    /// **"Already gone" is named by slug, not read from a status.** A `404`
+    /// with no problem body is an intermediary's page or a missing route, not
+    /// an answer about the thing asked after.
+    #[test]
+    fn gone_is_named_by_slug_so_a_bodiless_status_is_not_it() {
+        let deleting = Reading {
+            gone_kinds: &["grant-not-found"],
+            ..ISSUING
+        };
+        assert!(matches!(
+            read_as(404, Some("grant-not-found"), &deleting),
+            Outcome::AlreadyGone { .. }
+        ));
+        assert!(
+            !matches!(read_as(404, None, &deleting), Outcome::AlreadyGone { .. }),
+            "a bodiless 404 is not an answer about it",
+        );
     }
 
     /// What the server asked to wait is carried, because a wait the caller

@@ -301,6 +301,7 @@ const REVOKING: Reading = Reading {
     token_self_replacing: false,
     retryable_kinds: &[],
     fixable_kinds: &[],
+    gone_kinds: &[],
 };
 
 /// How long to wait for the revocation before calling it failed.
