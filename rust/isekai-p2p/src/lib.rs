@@ -88,6 +88,11 @@ pub mod agent {
         Membership, PolicyConstraints, PolicyEvent, PolicySnapshot,
     };
     pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
+    // **The reading, not a replacement for `ProxyError`.** Both go out: an
+    // `Outcome` says what a caller can do, and the error it was read from is
+    // what `explain` came from and what the in-crate classifiers still need
+    // (`docs/p2p_sdk_error_type.md` §4.2).
+    pub use isekai_p2p_core::outcome::{Missing, Outcome, Reading, Unreachable};
     pub use isekai_p2p_core::proxy::{
         pairing_code_from_input, pairing_code_in_uri, pairing_uri, proxy_authority, redact_secrets,
         secret_prefix, ticket_from_transfer, ticket_transfer, BindingView, Candidate,

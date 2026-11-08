@@ -27,6 +27,7 @@ pub mod hostname;
 pub mod https;
 pub mod identity;
 pub mod mtu;
+pub mod outcome;
 pub mod pop;
 pub mod proxy;
 mod redact;
