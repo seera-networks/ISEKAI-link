@@ -33,6 +33,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use isekai_p2p::agent::Made;
+
 use super::{Refusal, Table};
 
 /// How old a freshly returned grant may be and still be one we just made.
@@ -219,25 +221,40 @@ impl Ledger {
         true
     }
 
-    /// Record what a create answered, deciding from its age whether we made it.
+    /// Record what a create answered, from what its status said — or, failing
+    /// that, from how old it looks.
     ///
     /// **The listing at the top of a pass can be a quarter of an hour old.** A
     /// grant the operator created after it is invisible to [`note_existing`],
-    /// so the create upserts theirs and the ledger would claim it. The answer
-    /// carries `created_at`, and the proxy leaves that untouched on an
-    /// update — so a grant that reports being older than this call is one that
-    /// was already there.
+    /// so the create upserts theirs and the ledger would claim it.
     ///
-    /// A pair already recorded as ours keeps its record whatever the age says,
+    /// `made` is the proxy's own answer and is believed when it gives one.
+    /// [`Made::Unknown`] falls back to the age of `created_at`, which the proxy
+    /// leaves untouched on an update — the reading this used before the status
+    /// was kept, and a guess: a slow round trip makes a fresh grant look like
+    /// an update.
+    ///
+    /// A pair already recorded as ours keeps its record whatever either says,
     /// since `created_at` is the *original* creation and ours will look old
     /// from the second pass onwards.
-    pub fn record(&mut self, key: GrantKey, grant_id: String, created_at: Option<&str>) -> bool {
+    pub fn record(
+        &mut self,
+        key: GrantKey,
+        grant_id: String,
+        made: Made,
+        created_at: Option<&str>,
+    ) -> bool {
         if let std::collections::btree_map::Entry::Occupied(mut ours) = self.made.entry(key.clone())
         {
             ours.insert(grant_id);
             return true;
         }
-        if already_existed(created_at) {
+        let existed = match made {
+            Made::Existing => true,
+            Made::Fresh => false,
+            Made::Unknown => already_existed(created_at),
+        };
+        if existed {
             self.theirs.insert(key);
             return false;
         }
@@ -524,6 +541,7 @@ mod tests {
         );
     }
 
+    /// The age fallback, for a proxy whose success status says nothing.
     #[test]
     fn a_grant_that_answers_with_an_age_was_already_there() {
         // The listing at the top of a pass can be a quarter of an hour old, so
@@ -536,7 +554,12 @@ mod tests {
             .expect("formats");
 
         assert!(
-            !ledger.record(key.clone(), "gr_theirs".to_owned(), Some(&old)),
+            !ledger.record(
+                key.clone(),
+                "gr_theirs".to_owned(),
+                Made::Unknown,
+                Some(&old)
+            ),
             "an existing grant was claimed",
         );
         assert!(ledger.is_operators(&key));
@@ -547,15 +570,49 @@ mod tests {
         let mut ledger = Ledger::new();
         let key = ("ep:a7".to_owned(), "pg-sales-ro-v1".to_owned());
         let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("formats");
-        assert!(ledger.record(key.clone(), "gr_ours".to_owned(), Some(&now)));
+        assert!(ledger.record(key.clone(), "gr_ours".to_owned(), Made::Unknown, Some(&now)));
 
         // And on a later pass its `created_at` is old -- the proxy keeps the
         // original -- which must not turn it into somebody else's.
         let old = (OffsetDateTime::now_utc() - time::Duration::hours(2))
             .format(&Rfc3339)
             .expect("formats");
-        assert!(ledger.record(key.clone(), "gr_ours".to_owned(), Some(&old)));
+        assert!(ledger.record(key.clone(), "gr_ours".to_owned(), Made::Unknown, Some(&old)));
         assert!(!ledger.is_operators(&key));
+    }
+
+    /// **The status beats the age, in both directions.**
+    ///
+    /// These are the two cases the age heuristic gets wrong: a grant we just
+    /// made whose round trip was slow enough to look old, and an operator's
+    /// grant created seconds before our create upserted it. The proxy's own
+    /// answer settles both, and the window never gets a say.
+    #[test]
+    fn the_status_beats_a_misleading_age() {
+        let old = (OffsetDateTime::now_utc() - time::Duration::hours(2))
+            .format(&Rfc3339)
+            .expect("formats");
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("formats");
+
+        let mut ledger = Ledger::new();
+        let slow = ("ep:a7".to_owned(), "pg-sales-ro-v1".to_owned());
+        assert!(
+            ledger.record(slow.clone(), "gr_ours".to_owned(), Made::Fresh, Some(&old)),
+            "a 201 says we made it, however old the timestamp looks",
+        );
+        assert!(!ledger.is_operators(&slow));
+
+        let theirs = ("ep:b8".to_owned(), "pg-sales-ro-v1".to_owned());
+        assert!(
+            !ledger.record(
+                theirs.clone(),
+                "gr_theirs".to_owned(),
+                Made::Existing,
+                Some(&now)
+            ),
+            "a 200 says it was already there, however fresh the timestamp looks",
+        );
+        assert!(ledger.is_operators(&theirs));
     }
 
     #[test]

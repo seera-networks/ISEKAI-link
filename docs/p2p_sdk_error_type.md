@@ -1,7 +1,7 @@
 # SDK 境界のエラー型（§9 Q2 の答え）
 
 - status: 設計。実装はまだ無い
-- version: 0.2（v0.1 の中心的な誤りをコードレビューで正した。§3.3 を参照）
+- version: 0.3（§7 の 2 材料のうち 1 を実装し、2 の見立てを訂正）
 - 対象: `4d12141`（`main`）
 - 前提: `docs/p2p_sdk_error_classification.md` — 8 種の失敗の判定材料。
   本文書はその確定結果に型を与える
@@ -336,15 +336,38 @@ RefreshError  ─┘
 `Unreachable::Deadline` と upsert の成功側表現は、**今の下層に材料が無い**
 （`p2p_sdk_error_classification.md` §6）。型だけ作っても埋まらない。
 
-1. **成功時の status を残す。** `request_json_with`（`proxy.rs:2480`）が
-   `(200..300)` の判定の後に status を捨てるので、`200`（既存）と
-   `201`（新規）が届かない。全メソッドに波及するので、
-   作成系だけ status を返す内部経路を分けるのが小さい。
-2. **締め切りを `Unreachable::Deadline` に落とす。** 超過は今日も起きていて
-   （`relay_rtt.rs:954` ほか 4 箇所）、`relay_rtt.rs:965` は debug ログに
-   捨て、auth0/oidc 側は不透明な `Transport` に畳む。
+### 7.1 成功時の status — **入れた**
 
-**どちらも型と独立に先に入れられる。** 順序としてはこの 2 つが先。
+`request_json_with`（`proxy.rs:2480`）が `(200..300)` の判定の後に status を
+捨てるので、`200`（既存）と `201`（新規）が届かなかった。
+
+`request_json_status_with` を 1 本足し、`request_json_with` をその上に
+載せ替えた（2xx の判定は 1 箇所のまま）。`create_grant` は
+`Result<(Grant, Made), ProxyError>` を返し、`Made` は
+`Fresh`（`201`）/ `Existing`（`200`）/ `Unknown`（その他の成功）。
+
+消費側 2 つが推定をやめた: `Ledger::record` と
+`portal-server` の `grant_lifetime_lines`。どちらも `Unknown` のときだけ
+`already_existed` の 30 秒窓に落ちる。**窓は消していない** ——
+どの成功 status を使うかはプロキシの裁量で、ワイヤが支持していない読みを
+主張するより、前の挙動に留まるほうが安全である。
+
+### 7.2 締め切り — **半分だけ入れた。自分の主張を訂正する**
+
+v0.1/v0.2 は「どちらも型と独立に先に入れられる」と書いたが、
+**締め切りについてはそうではなかった。** `Unreachable::Deadline` という腕の
+消費者は `Outcome` 自身だけで、今それを作るのは使われない型を先に置くことになる。
+
+一方で**型と無関係に直せる半分があった**: 超過が既定のログレベルから
+見えないこと。本番で超過が黙って消える箇所は 1 つだけで
+（`relay_rtt.rs` の `measure_for_connect`。他の `timeout` は probe ごとの
+期待された失効か、終了処理で、どれも別の腕で扱われている）、
+そこは `debug!` だった —— **リレー選択が静かに止まっても、
+リレーが無い配備と見分けがつかない**。`warn!` に上げ、`waited` を添えた。
+この経路の欠陥がこれまで毎回テストではなく本番で見つかっているのは、
+ここが静かだからである。
+
+**腕そのものは `Outcome` と一緒に入れる。**
 
 ## 8. 残る判断
 
