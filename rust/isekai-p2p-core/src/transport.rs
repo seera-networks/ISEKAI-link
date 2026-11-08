@@ -433,19 +433,6 @@ fn shared_registration() -> anyhow::Result<Arc<msquic_async::Registration>> {
     Ok(registration)
 }
 
-/// Shut the msquic registration down and wait until every connection and stream
-/// derived from it has been closed. Returns `false` if `timeout` elapsed first.
-///
-/// Call this once, after everything holding an msquic handle has been dropped
-/// and before leaving `main`. `shutdown()` asks the connections to go away,
-/// which ends the background h3 drivers holding them; `wait_idle()` then
-/// resolves once the last handle is closed, which is exactly the condition
-/// under which `RegistrationClose` returns promptly instead of blocking in
-/// `CxPlatRundownReleaseAndWait`.
-///
-/// On timeout the registration is deliberately **leaked** rather than dropped:
-/// something still holds a handle, so `RegistrationClose` would block forever,
-/// and the caller is expected to fall back to a hard exit.
 /// Drain the registration without closing it, for a caller that is about to
 /// leave the process without running destructors.
 ///
@@ -477,6 +464,19 @@ pub async fn drain_msquic(timeout: Duration) -> bool {
     drained
 }
 
+/// Shut the msquic registration down and wait until every connection and stream
+/// derived from it has been closed. Returns `false` if `timeout` elapsed first.
+///
+/// Call this once, after everything holding an msquic handle has been dropped
+/// and before leaving `main`. `shutdown()` asks the connections to go away,
+/// which ends the background h3 drivers holding them; `wait_idle()` then
+/// resolves once the last handle is closed, which is exactly the condition
+/// under which `RegistrationClose` returns promptly instead of blocking in
+/// `CxPlatRundownReleaseAndWait`.
+///
+/// On timeout the registration is deliberately **leaked** rather than dropped:
+/// something still holds a handle, so `RegistrationClose` would block forever,
+/// and the caller is expected to fall back to a hard exit.
 pub async fn shutdown_msquic(timeout: Duration) -> bool {
     let registration = REGISTRATION
         .lock()
