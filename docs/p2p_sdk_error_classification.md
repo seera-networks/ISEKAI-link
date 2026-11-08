@@ -21,7 +21,10 @@
   列挙オラクルを作り直すことになる。
 - **#5（upsert）は材料が消えている**（§6.1）。成功時に HTTP status が
   捨てられるため、`200`（既存）と `201`（新規）が呼び出し側に届かない。
-- **#8（締め切り超過）は材料が存在しない**（§6.2）。下にタイムアウトが無い。
+- **#8（締め切り超過）は材料が捨てられている**（§6.2）。制御プレーンの
+  *トランスポート*に要求タイムアウトが無いのは事実だが、**呼び出し側は
+  その上で締め切りを課している**ので超過は今日も起きる。起きた結果が
+  debug ログに落とされるか、不透明な `Transport` に畳まれる。
 
 そしてプロトコル自身が別の線を引いていた（§3）。「期限切れ／取り消し」ではなく
 **「拒否された」か「要求が成立しなかった」か**で、
@@ -63,6 +66,13 @@ Time
 `kind()` は呼ばれるたびに JSON を再パースして `Option<String>` を返す。
 `ProxyError::Problem` がパース済みの `Problem` を持ち `&str` を返すのと非対称で、
 横断する分類を作るならここを橋渡しする必要がある。
+
+**`Decode` に相当する腕が無い。** 本文のデコード失敗は
+`Api { status: resp.status, body: format!("invalid response JSON: {e}"), .. }`
+に畳まれる（`identity.rs:1737`）。この `status` は **2xx**（成功）なので、
+`status()` は成功コードを返し、`kind()` は `None` を返す。
+`ProxyError` には `Decode` 腕があるのに対し、Identity 側では
+**デコード失敗が「要求は成功した」に見える**。
 
 `retry_after` を落とす経路が 2 つあり、どちらも理由つき:
 
@@ -115,7 +125,10 @@ if (200..300).contains(&resp.status) {
 > branches on these has rebuilt the oracle.
 
 正当な用途として挙げられているのは、
-**原因がこちら側にあるメッセージを認識して説明すること**。実例が
+**原因がこちら側にあるメッセージを認識して説明すること**。doc が名指しする実例は
+`pop-signature-invalid`（サーバーが署名不正と Endpoint が見つからないの
+両方に同じ答えを返すため）で、実装は `config::explain_pop_failure`
+（`config.rs:719`）。同じ形がもう一つあり、
 `config.rs:734` の「`enrollment-key-invalid` が何を含むのかを、サーバーが
 言わないので代わりに言う」——4 つの原因を、期限切れを先頭にして並べる
 （7 日既定・最長 30 日で、カウントダウンが無いため期限切れが最も多い）。
@@ -127,12 +140,29 @@ if (200..300).contains(&resp.status) {
 - **容量と可用性**: `IdentityError::status()` の doc（`identity.rs:77`）—
   「分岐の根拠になる少数は `429` と `503` で、これらは認可ではなく
   容量と可用性の話である」。
-- **要求that成立しなかった場合**: `ProxyError::kind()` の doc（`proxy.rs:193`）—
+- **要求が成立しなかった場合**: `ProxyError::kind()` の doc（`proxy.rs:193`）—
   「分岐してよいのは §8.13.6 が挙げる例外で、それらは
   *拒否された* ではなく *要求が成立しなかった* と言っている」。
   `redeem_ticket` の doc（`proxy.rs:1930`）が 3 つを具体的に挙げる:
   `400`、`403 protocol-not-allowed`、`429 grant-quota-exceeded` ——
   いずれも **Ticket を未使用のまま残す**。
+
+そして **status のクラスで分岐する実装が既にある。**
+`config::is_permanent`（`config.rs:856`）は
+
+```rust
+e.status() == Some(403) || e.kind().as_deref() == Some("pop-signature-invalid")
+```
+
+で永続的な拒否と一時的な失敗を分ける。doc が理由を書いている ——
+`403` は `protocol-not-allowed` / `insufficient-permission` /
+`endpoint-revoked` のいずれであれ「ここから呼び出し側にできることは無い」、
+それ以外は再試行可能（`429`/`503` は戻る時刻を言い、`401` は
+差し替え直前のトークンが多く、transport はネットワーク）。
+
+**これが一様化を壊さずに分類している唯一の既存実装である** ——
+*どの*拒否かではなく *status のクラス*で分岐しているから。
+§8-1 の答えはここにある。
 
 **つまりプロトコルの線は「期限切れ／取り消し」ではなく、
 「拒否された」対「要求が成立しなかった（＝状態が動いていない）」である。**
@@ -141,9 +171,11 @@ if (200..300).contains(&resp.status) {
 `p2p_sdk_surface_from_portal.md` §9 が挙げた #1 のような
 「期限切れか取り消しか」を型にすると、仕様が否定しているものを作ることになる。
 
-## 4. すでにある 3 つの分類器
+## 4. すでにある分類器 — 少なくとも 7 つ
 
-Q2 は白紙ではない。production で動いているものが 3 つある。
+Q2 は白紙ではない。production で動いているものが少なくとも 7 つある。
+下で詳しく見るのは判定の幅が広い 3 つだが、残り 4 つが
+**未知の kind の既定で食い違っている**（§4.4）。
 
 ### 4.1 `initiator::renewal_verdict`（`initiator.rs:255`）
 
@@ -188,9 +220,30 @@ Identity 側。`membership-expired` / `membership-revoked` は kind で一意
 Some("insufficient-permission") if error.to_string().contains("guests cannot") =>
 ```
 
-**`insufficient-permission` だけは kind では足りず、detail を読んでいる。**
+**`insufficient-permission` だけは kind では足りない。**
 「サーバーがゲストの話だと言ったときに限る」とコメントが明記している。
-分類に detail が要る実例。
+
+ただし読んでいるのは `detail` フィールド**ではない**。
+`IdentityError::Api` の `Display` は
+`"Identity API returned {status}: {body}"`（`identity.rs:45`）なので、
+これは **status と本文全体（type URI・title・detail をまとめて）に対する
+部分文字列走査**である。Identity 側にはパース済みの `detail` が
+そもそも存在しない（§2.2）。`Problem.detail` だけを露出させる SDK では
+今の挙動を再現できない。
+
+### 4.4 残りの 4 つ — 未知の既定が逆を向いている
+
+| 分類器 | 判定 | 未知の kind のとき |
+| --- | --- | --- |
+| `config::is_permanent`（`config.rs:856`） | status クラスで永続／一時 | 一時（再試行） |
+| `endpoint_cert` の `retryable`（`endpoint_cert.rs:265`） | `certificate-unavailable` のみ再試行 | **`return Err(error)`** — 再試行しない |
+| `is_already_gone`（`portal-server/src/main.rs:1082`） | `grant-not-found` / `not-found` なら「もう無い」 | `false` — 削除を再試行し続ける |
+| `is_listener_not_found`（`public.rs:239`） | `listener-not-found` なら作り直す | `false` — 作り直さない |
+
+**未知の扱いに 2 つの流派がある。** §4.1 と §4.2 は `_ => Retry` で
+安全側に倒すが、`endpoint_cert` は許可リスト方式で、知らない kind は
+即座に失敗させる。どちらも「安全側」と呼べるが向きが逆で、
+§8-5 はこの食い違いの上で決める必要がある。
 
 ## 5. 8 種の確定表
 
@@ -198,8 +251,9 @@ Some("insufficient-permission") if error.to_string().contains("guests cannot") =
 | --- | --- | --- | --- | --- |
 | 1 | 資格情報が期限切れか取り消しか | 資格情報の引き換えでは **1 つの kind に潰されている**（`enrollment-key-invalid` / `ticket-invalid`(§7.2) / `provisioning-key-invalid`） | **意図的に不可**（§3） | §8.8.4, §8.12.4, §8.13.6 |
 | 1b | （同）「使えない」ことだけ | 上の kind の存在そのもの。Endpoint とメンバーシップは例外で `endpoint-revoked`, `membership-expired`, `membership-revoked` が一意 | **可** | §4.1, §4.3 |
-| 2 | 相手が拒否した | `kind()`: `capability-invalid`, `grant-invalid`, `listener-not-found`, `grant-not-found` / narrowing は Identity の `insufficient-permission` | **可**。`insufficient-permission` は **detail 必須**（§4.3） | `public.rs:243`, `portal-server/src/main.rs:1083` |
-| 3 | 枠が尽きた | `status == 429` ＋ `provisioning-slots-exhausted` / `grant-quota-exceeded` ＋ `retry_after` | **可**（§3.2 が明示的に許す） | `tests/provisioning_flow.rs:418`, `proxy.rs:1930` |
+| 2 | 相手が拒否した | `kind()`: `capability-invalid`, `grant-invalid` / narrowing は Identity の `insufficient-permission`（`403`） | **可**。`insufficient-permission` は **本文の走査が必要**（§4.3） | §4.3, `config.rs:856` |
+| 2b | 相手の状態が思っていたものと違った（拒否ではない） | `kind()`: `grant-not-found` / `not-found`（TTL で自然に消えた）、`listener-not-found`（作り直せばよい） | **可**。§3.2 の「要求が成立しなかった」側 | `portal-server/src/main.rs:1082`, `public.rs:239` |
+| 3 | 枠が尽きた | `status == 429` ＋ `provisioning-slots-exhausted` ＋ `retry_after`。`grant-quota-exceeded` は **§7.2（コメントのみ）** なので材料に数えない | **可**（§3.2 が明示的に許す） | `tests/provisioning_flow.rs:418` |
 | 4 | 一時的に落ちている | `status == 503` ＋ `provisioning-unavailable` ＋ `retry_after` | **可**。ただし `policy-stream-capacity` は `retry_after` が**読めない**（§2.2） | 同上 |
 | 5 | 作ろうとしたものが既にあった（upsert） | `created_at` の経過時間のみ。**status は成功時に消える**（§2.3） | **不可** — 30 秒窓の推定（§6.1） | `grants.rs:59` |
 | 6 | 認証のやり直しが必要 | `kind()`: `pop-signature-invalid` ＋ `IdentityError::status()` | **可**。ただし「鍵が無効」の内訳は §3 の一様化対象 | `config.rs:720`, `:751`, `:871` |
@@ -233,15 +287,38 @@ OffsetDateTime::now_utc() - at > ExistedBefore::WINDOW   // WINDOW = 30 秒
 `200` で日付そのままに返り、Ticket は同じように消費される」と書いている。
 つまり upsert は Grant 作成だけの話ではない。
 
-### 6.2 締め切り超過（#8）
+### 6.2 締め切り超過（#8）— 材料は「無い」のではなく「捨てられている」
 
-下層にタイムアウトが一つもない（`p2p_sdk_api_review.md` §5.3）。
-したがって「締め切りを超えた」という失敗は**発生しない**ので分類もできない。
-FFI は自前で `APP_PAIR_DEADLINE`（30 秒）と `APP_CONNECT_DEADLINE`（60 秒）を
-被せ、`tokio::time::timeout` の `Err` を自分のエラーに変換している。
+`p2p_sdk_api_review.md` §5.3 の引用は、**ペアリング／接続の 1 本の呼び出し鎖**
+について言ったもので（`issue_endpoint_token` / `PeerDirectory::open` / `pair` /
+`ProxyClient::request_json` / `send` を読み下した結論）、
+下層全体の話に広げてはいけなかった。確定させた姿はこうである。
 
-**これは分類の問題ではなく面の問題。** §9 Q3（締め切りの所在）が決まれば
-自動的に材料ができる。
+**制御プレーンのトランスポートに要求タイムアウトが無いのは事実。**
+`relay_rtt.rs:951` のコメントがそう明言している ——
+「The control-plane transport has no request timeout of its own, so an
+unanswered read here is bounded only by QUIC's 30-second idle timeout」。
+
+**しかし呼び出し側はその上で締め切りを課している。**
+
+| 場所 | 締め切り | 対象 |
+| --- | --- | --- |
+| `relay_rtt.rs:954` | `opts.budget / 2` | **制御プレーン呼び出し**（`list_relays`） |
+| `auth0.rs:1050`, `:1051` | 15 秒 / 接続 10 秒 | Auth0 のトークン取得（`reqwest`） |
+| `oidc.rs:58` | 20 秒 | ワークロード ID トークンの発行 |
+| `listener.rs:47`, `initiator.rs:275`, `:480`, `bind.rs:407`, `transport.rs:606` | 3〜10 秒 | 終了処理の各段 |
+
+**つまり超過は今日も起きている。** 問題は起きた後で:
+
+- `relay_rtt.rs:965` は `Err(_)` を **debug ログ 1 行に落として捨て**、
+  計測なしで接続を続ける。呼び出し側にはエラーとして届かない。
+- `auth0` / `oidc` 側の超過は `reqwest` のエラーから `anyhow` を経て
+  不透明な `Transport` 腕に入り、**ネットワークが死んでいる場合と区別できない**（#7）。
+
+したがって #8 が判定不可なのは「失敗が存在しないから」ではなく
+**「存在する失敗の情報が破棄されているから」**。
+面の問題（§9 Q3）**と** 分類の問題の両方であり、
+`Transport` に腕を足す話（§8-7）と地続きである。
 
 ## 7. kind 語彙 — 出典つき
 
@@ -285,22 +362,34 @@ kind が、**このワークスペースでは一度も判定されていない*
 1. **一様化をどう型で守るか**（§3）。分類の型に
    「期限切れ」「取り消し済み」を別の値として持たせると、
    仕様が否定しているものを API が約束してしまう。
-   「使えない」1 つに潰した型にするのが素直だが、
-   そうすると `endpoint-revoked` や `membership-revoked` のように
-   仕様が区別を許している場所の情報を落とすことになる。どちらを採るか。
+   **`config::is_permanent`（§3.2）が答えの形を示している** —— *どの*拒否かでは
+   なく *status のクラス*で分岐する。ただしこれは、潰した型が
+   **status クラスを保持しなければならない**ことも意味する:
+   `403` を隠すと `is_permanent` は拒否と `401`/`429`/`503` を
+   区別できなくなり、その誤分類は「プロセスの寿命のあいだ数分おきに
+   同じ警告を出し直す」と doc に書かれている状態を招く（`config.rs:866`）。
 2. **`kind()` の正当な用途（説明）を型でどう残すか**（§3.1）。
    分岐には使わせず、しかし人に見せる文を作るには要る。
    分類とは別に「説明用の文字列」を併走させるのが近い形になる。
 3. **文脈依存をどう表すか**（§4.2）。同じ `connection-not-found` が
    `Over` と `LegGone` に分かれる。1 つの分類 enum に潰すとこれが消える。
-4. **detail をどう扱うか**（§4.3）。`insufficient-permission` は detail を
-   読まないと意味が決まらない。
-5. **未知の kind をどう置くか。** 制御プレーンは別リポジトリで語彙は増える。
-   既存の分類器はどちらも `_ => Retry` で未知を安全側に倒している。
+4. **detail をどう扱うか**（§4.3）。`insufficient-permission` は
+   kind だけでは意味が決まらない。しかも今の実装は `detail` フィールドでは
+   なく **Display 文字列全体の走査**で、Identity 側にはパース済みの
+   `detail` が存在しない。`Problem.detail` を露出させるだけでは
+   現状の挙動を再現できない。
+5. **未知の kind をどう置くか**（§4.4）。制御プレーンは別リポジトリで
+   語彙は増える。**既存の先例が 2 つに割れている**: §4.1/§4.2 は
+   `_ => Retry` で倒し、`endpoint_cert.rs:265` は許可リスト方式で
+   知らない kind を即座に失敗させる。どちらも「安全側」だが向きが逆。
 6. **2 層の形の非対称を埋めるか**（§2.2）。横断の分類を作るなら
-   `IdentityError` 側も `Problem` を持つのが素直。
-7. **`Transport` の中身を開けるか**（#7）。今は「名前が引けない」と
-   「繋がらない」と「TLS が拒否された」を区別できない。
+   `IdentityError` 側も `Problem` を持つのが素直だが、
+   **それだけでは足りない**: `IdentityError` には `Decode` に当たる腕が無く、
+   デコード失敗が `status` 2xx の `Api` に畳まれるため、
+   今は「要求は成功した」に見える。足りないのは payload ではなく**腕**。
+7. **`Transport` の中身を開けるか**（#7、§6.2）。今は「名前が引けない」と
+   「繋がらない」と「TLS が拒否された」を区別できず、
+   **呼び出し側が課した締め切りの超過も同じ腕に入る**。
 8. **upsert を直すなら成功時の status をどう残すか**（§6.1）。
    `request_json_with` の戻りを変えるのは全メソッドに波及する。
 
