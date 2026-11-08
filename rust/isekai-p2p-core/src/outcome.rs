@@ -122,19 +122,28 @@ pub enum Unreachable {
     Transport { explain: String },
 }
 
-/// How this call site reads a `404` or a `409`.
+/// How this call site reads one status that can mean "it is not there".
 ///
 /// There is no general answer. `list_relays` turns its `404` into `Ok(None)`
 /// before any error exists — "a fact about the deployment and not an error" —
 /// a bodiless `404` means the route is absent, `already_registered` reads `409`
 /// as "proceed", and `is_already_gone` and `is_listener_not_found` read two
 /// different `404`s two different ways.
+///
+/// **`404` and `409` are read separately**, because a route that gives one of
+/// them a meaning usually gives the other none: `already_registered`'s own
+/// comment is that "`409` is the only one that route answers", and `not_found`
+/// on a revocation wants `404` exactly — reading its `409` as "already done"
+/// would report a revocation that had not happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Missing {
     /// Whatever was asked for has already happened.
     Done,
     /// What was named is gone, and the caller decides what that means.
     Vanished,
+    /// Nothing special on this route: read it like any other refusal of a
+    /// request that did not stand up.
+    Unremarkable,
 }
 
 /// What this call site knows that the answer does not say.
@@ -149,8 +158,11 @@ pub enum Missing {
 /// its failures mean, and a default would let it skip that silently.
 #[derive(Debug, Clone, Copy)]
 pub struct Reading {
-    /// How to read a `404` or `409` (see [`Missing`]).
-    pub missing: Missing,
+    /// How to read a `404` (see [`Missing`]).
+    pub not_found: Missing,
+
+    /// How to read a `409`.
+    pub conflict: Missing,
 
     /// Whether the credential this call carries is replaced on a timer.
     ///
@@ -241,6 +253,15 @@ impl Outcome {
     }
 }
 
+/// Which of the two readings applies to this status.
+fn missing_of(status: u16, reading: &Reading) -> Missing {
+    match status {
+        404 => reading.not_found,
+        409 => reading.conflict,
+        _ => Missing::Unremarkable,
+    }
+}
+
 /// The shared reading, once both error types have been reduced to what the wire
 /// said.
 fn read(
@@ -273,10 +294,13 @@ fn read(
     }
     match status {
         // The route decides; there is no general reading.
-        404 | 409 => match reading.missing {
-            Missing::Done => Outcome::AlreadyGone { explain },
-            Missing::Vanished => Outcome::Vanished { explain },
-        },
+        404 | 409 if missing_of(status, reading) != Missing::Unremarkable => {
+            match missing_of(status, reading) {
+                Missing::Done => Outcome::AlreadyGone { explain },
+                Missing::Vanished => Outcome::Vanished { explain },
+                Missing::Unremarkable => unreachable!("guarded above"),
+            }
+        }
         // A credential somebody else replaces on a timer is a wait, not an
         // answer — see [`Reading::token_self_replacing`].
         401 | 403 if reading.token_self_replacing => Outcome::Busy {
@@ -307,7 +331,8 @@ mod tests {
 
     /// A call site that obtains its own credentials: a `403` here is settled.
     const ISSUING: Reading = Reading {
-        missing: Missing::Vanished,
+        not_found: Missing::Vanished,
+        conflict: Missing::Unremarkable,
         token_self_replacing: false,
         retryable_kinds: &[],
         fixable_kinds: &[],
@@ -315,7 +340,8 @@ mod tests {
 
     /// A call site whose token is replaced on a timer by somebody else.
     const RENEWING: Reading = Reading {
-        missing: Missing::Vanished,
+        not_found: Missing::Vanished,
+        conflict: Missing::Unremarkable,
         token_self_replacing: true,
         retryable_kinds: &[],
         fixable_kinds: &[],
@@ -412,7 +438,8 @@ mod tests {
     #[test]
     fn the_call_site_reads_a_missing_thing() {
         let gone = Reading {
-            missing: Missing::Done,
+            not_found: Missing::Done,
+            conflict: Missing::Done,
             ..ISSUING
         };
         for status in [404, 409] {
@@ -420,11 +447,46 @@ mod tests {
                 read_as(status, None, &gone),
                 Outcome::AlreadyGone { .. }
             ));
-            assert!(matches!(
-                read_as(status, None, &ISSUING),
-                Outcome::Vanished { .. }
-            ));
         }
+        assert!(matches!(
+            read_as(404, None, &ISSUING),
+            Outcome::Vanished { .. }
+        ));
+    }
+
+    /// **The two statuses are read separately**, because a route that gives one
+    /// of them a meaning usually gives the other none. Reading a revocation's
+    /// `409` as "already done" would report a revocation that had not happened.
+    #[test]
+    fn a_route_can_read_one_of_the_two_and_not_the_other() {
+        let revoking = Reading {
+            not_found: Missing::Done,
+            conflict: Missing::Unremarkable,
+            ..ISSUING
+        };
+        assert!(matches!(
+            read_as(404, None, &revoking),
+            Outcome::AlreadyGone { .. }
+        ));
+        assert!(
+            matches!(read_as(409, None, &revoking), Outcome::Rejected { .. }),
+            "a 409 here says nothing, so it reads like any other request that \
+             did not stand up",
+        );
+
+        let registering = Reading {
+            not_found: Missing::Unremarkable,
+            conflict: Missing::Done,
+            ..ISSUING
+        };
+        assert!(matches!(
+            read_as(409, None, &registering),
+            Outcome::AlreadyGone { .. }
+        ));
+        assert!(matches!(
+            read_as(404, None, &registering),
+            Outcome::Rejected { .. }
+        ));
     }
 
     /// **A sanctioned kind outranks its status.** `certificate-unavailable`

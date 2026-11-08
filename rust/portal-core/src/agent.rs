@@ -14,6 +14,7 @@
 //! them.
 
 use anyhow::Context as _;
+use isekai_p2p::agent::{Missing, Outcome, Reading};
 
 /// Which of the flags agent mode cares about were given.
 ///
@@ -279,8 +280,28 @@ fn not_found(error: &anyhow::Error) -> bool {
     error
         .chain()
         .filter_map(|e| e.downcast_ref::<isekai_p2p::agent::IdentityError>())
-        .any(|e| e.status() == Some(404))
+        .any(|e| {
+            matches!(
+                Outcome::of_identity(e, &REVOKING),
+                Outcome::AlreadyGone { .. }
+            )
+        })
 }
+
+/// How the revocation reads an answer: its `404` is "there was no such
+/// Endpoint".
+///
+/// **The `409` is deliberately nothing in particular.** Reading it as `Done`
+/// too would let an answer that is not about absence report a revocation that
+/// never happened — and this predicate's whole job is to tell "the
+/// registration never landed" from "it landed and this failed".
+const REVOKING: Reading = Reading {
+    not_found: Missing::Done,
+    conflict: Missing::Unremarkable,
+    token_self_replacing: false,
+    retryable_kinds: &[],
+    fixable_kinds: &[],
+};
 
 /// How long to wait for the revocation before calling it failed.
 ///

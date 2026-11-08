@@ -32,7 +32,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use argh::FromArgs;
-use isekai_p2p::agent::{BindingView, Made, ProvisioningBinding};
+use isekai_p2p::agent::{BindingView, Made, Missing, Outcome, ProvisioningBinding, Reading};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -1191,8 +1191,29 @@ async fn settle_grants(
 /// A grant that lapsed on its own TTL is not there to delete, and retrying that
 /// forever would log the same warning for the life of the process.
 fn is_already_gone(e: &isekai_p2p::agent::ProxyError) -> bool {
-    matches!(e.kind(), Some("grant-not-found") | Some("not-found"))
+    matches!(Outcome::of_proxy(e, &DELETING), Outcome::AlreadyGone { .. })
 }
+
+/// How the delete reads an answer: any `404` means the grant is not there.
+///
+/// **Wider than the two kinds this used to name**, and deliberately. A delete
+/// asking after something absent is what a `404` is, whatever slug comes with
+/// it — and a bodiless one, which the proxy sends when no handler ran, used to
+/// read as "still there" and had this retrying a doomed delete, and logging the
+/// same warning, for the life of the process.
+///
+/// **The `409` is left alone.** The route is not known to answer one, and
+/// reading an unknown answer as "already gone" would have the ledger forget a
+/// grant that is still standing — the one direction this module exists to avoid
+/// (`portal_core::gateway::grants`: removing too much takes away an operator's
+/// own).
+const DELETING: Reading = Reading {
+    not_found: Missing::Done,
+    conflict: Missing::Unremarkable,
+    token_self_replacing: false,
+    retryable_kinds: &[],
+    fixable_kinds: &[],
+};
 
 /// Note which pairs already carry a grant this process did not make.
 ///
@@ -2531,6 +2552,52 @@ mod tests {
             grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Existing, None);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[1].contains("UPDATED it"), "{}", lines[1]);
+    }
+
+    fn problem(status: u16, kind: Option<&str>) -> isekai_p2p::agent::ProxyError {
+        isekai_p2p::agent::ProxyError::Problem {
+            status,
+            problem: kind.map(|kind| isekai_p2p::agent::Problem {
+                type_uri: format!("https://proxy.test/problems/{kind}"),
+                title: String::new(),
+                status,
+                detail: None,
+            }),
+            retry_after: None,
+        }
+    }
+
+    /// **A delete that answers `404` is a grant that is not there**, whatever
+    /// slug comes with it — including none.
+    ///
+    /// The bodiless one is the case this used to get wrong: the proxy sends it
+    /// when no handler ran, the two named slugs did not match, and the delete
+    /// was retried with the same warning for the life of the process.
+    #[test]
+    fn any_not_found_on_a_delete_means_the_grant_is_gone() {
+        for kind in [
+            Some("grant-not-found"),
+            Some("not-found"),
+            Some("whatever"),
+            None,
+        ] {
+            assert!(
+                is_already_gone(&problem(404, kind)),
+                "404 with kind {kind:?}",
+            );
+        }
+    }
+
+    /// **And nothing else is read that way.** Forgetting a grant that is still
+    /// standing is the direction `portal_core::gateway::grants` exists to
+    /// avoid, so a refusal and an unknown conflict both stay failures.
+    #[test]
+    fn only_not_found_means_gone() {
+        assert!(!is_already_gone(&problem(403, Some("grant-invalid"))));
+        assert!(!is_already_gone(&problem(409, None)));
+        assert!(!is_already_gone(&isekai_p2p::agent::ProxyError::Transport(
+            anyhow::anyhow!("no route to host")
+        )));
     }
 
     /// The once-only rule: said once when it appears, silent while it stands.

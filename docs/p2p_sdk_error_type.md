@@ -6,7 +6,7 @@
 - 前提: `docs/p2p_sdk_error_classification.md` — 8 種の失敗の判定材料。
   本文書はその確定結果に型を与える
 
-## 0. 実装で正した設計の 3 点
+## 0. 実装で正した設計の 4 点
 
 1. **`Unreachable::Transport` は `anyhow::Error` を持たない。** §2 はそう書いて
    いたが、既存の分類器はすべてエラーを**参照**で受ける述語である
@@ -19,6 +19,13 @@
 2. **`Missing::NotDeployed` は到達不能なので落とした。** §3.4 に挙げていたが、
    `list_relays` は `404` をエラーが作られる前に `Ok(None)` へ変えるので
    `outcome()` が見ることはない。
+4. **`Missing` が `404` と `409` を一括りにしていたので、ルートごとの読みを
+   表せなかった。** 変換を進めて出た穴である: `already_registered` は
+   「`409` だけ」（その doc が「`409` is the only one that route answers」と
+   書いている）、`not_found` は「`404` だけ」（revoke の `409` を
+   「もう済んだ」と読むと、起きていない取り消しを報告する）。
+   `Reading` を `not_found` と `conflict` に分け、`Missing::Unremarkable`
+   （このルートでは特別な意味を持たない）を足した。
 3. **仕様が許した kind のうち「直して出し直せる」側に経路が無かった。**
    §3.2 は `403 protocol-not-allowed` を `Rejected` にすべきと書いていたのに、
    `Reading` には `retryable_kinds`（→ `Busy`）しか無く、`Refused` に潰れていた。
@@ -244,19 +251,23 @@ seconds, and `csr-invalid` is a fault on this side」。
 純粋な `From` ではなく、**呼び出し箇所の読み方を受け取る関数**にする。
 
 ```rust
-/// この呼び出し箇所が `404` / `409` をどう読むか（§3.1）。
+/// この呼び出し箇所が 1 つの status をどう読むか（§3.1、§0-4）。
 pub enum Missing {
     /// もう無い、で済む（`is_already_gone`, `not_found`）。
     Done,
     /// 名指したものが消えた。呼び出し側が次を決める
     /// （`is_listener_not_found`, `relay_lease`）。
     Vanished,
+    /// このルートでは特別な意味を持たない。通常の status 規則で読む。
+    Unremarkable,
 }
 
 /// この呼び出し箇所が応答をどう読むか。
 pub struct Reading {
-    /// `404` / `409` をどう読むか（§3.1）。
-    pub missing: Missing,
+    /// `404` をどう読むか（§3.1）。
+    pub not_found: Missing,
+    /// `409` をどう読むか。**別の軸である**（§0-4）。
+    pub conflict: Missing,
     /// このトークンは数分で差し替わるか（§3.3）。
     /// `true` なら `401`/`403 insufficient-permission` は `Busy` に落ちる。
     pub token_self_replacing: bool,
@@ -299,11 +310,11 @@ pub fn of_proxy(error: &ProxyError, reading: &Reading) -> Outcome;
 
 | 分類器 | `Outcome` 導入後 |
 | --- | --- |
-| `config::is_permanent`（`config.rs:856`） | `matches!(o, Refused { .. })`、`Reading { token_self_replacing: false, .. }` |
-| `auth0::RefreshError`（`auth0.rs:801`） | `SignInRequired` → `Reauthenticate`、`Transient` → `Busy`/`Unreachable` |
-| `is_already_gone`（`portal-server/src/main.rs:1082`） | `matches!(o, AlreadyGone { .. })`、`Reading::missing` で指定 |
-| `already_registered`（`config.rs:538`） | 成功側（§2.1） |
-| `not_found`（`portal-core/agent.rs:278`） | `matches!(o, AlreadyGone { .. })` |
+| `config::is_permanent` | **変換済み**。`matches!(o, Refused { .. })` ＋ `ISSUING`（両 status を `Unremarkable`） |
+| `is_already_gone`（portal-server） | **変換済み**。`matches!(o, AlreadyGone { .. })` ＋ `DELETING`（`not_found: Done`）。**挙動が広がった** —— kind 2 種から「あらゆる `404`」へ。本文のない `404` で永久に delete を再試行していたのが止まる |
+| `already_registered`（config.rs） | **変換済み**。`REGISTERING`（`conflict: Done`、`not_found` は `Unremarkable`） |
+| `not_found`（portal-core/agent.rs） | **変換済み**。`REVOKING`（`not_found: Done`、`conflict` は `Unremarkable`） |
+| `auth0::RefreshError` | 未変換。`reqwest` のエラーから組むので `ProxyError`/`IdentityError` を経由しない |
 
 ### 4.2 `Outcome` に畳めないもの — `ProxyError` を読み続ける
 

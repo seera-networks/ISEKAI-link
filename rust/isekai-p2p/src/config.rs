@@ -534,14 +534,30 @@ async fn unattended<T: ControlPlaneTransport>(
 /// Whether this failure is the Identity API saying the Endpoint is already
 /// registered (§8.8.5).
 ///
-/// Looked at by status rather than by the problem's slug: `409` is the only one
-/// that route answers, and the body is not worth parsing twice.
+/// Read by status rather than by the problem's slug: `409` is the only one that
+/// route answers, which is also why [`REGISTERING`] reads the `404` as nothing
+/// in particular — giving it a meaning here would invent one the route never
+/// sends.
 fn already_registered(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<isekai_p2p_core::identity::IdentityError>()
-        .and_then(|e| e.status())
-        == Some(409)
+        .downcast_ref::<IdentityError>()
+        .map(|e| {
+            matches!(
+                Outcome::of_identity(e, &REGISTERING),
+                Outcome::AlreadyGone { .. }
+            )
+        })
+        .unwrap_or(false)
 }
+
+/// How the register call reads an answer: its `409` is "already there".
+const REGISTERING: Reading = Reading {
+    not_found: Missing::Unremarkable,
+    conflict: Missing::Done,
+    token_self_replacing: false,
+    retryable_kinds: &[],
+    fixable_kinds: &[],
+};
 
 /// §8.8.4 → §8.8.5: a challenge, then registration and the first token.
 async fn enrol<T: ControlPlaneTransport>(
@@ -868,11 +884,11 @@ fn is_permanent(error: &anyhow::Error) -> bool {
 /// call a different token. On a path renewing a lease the same answer is a
 /// wait, which is the distinction `initiator::renewal_verdict` warns about.
 ///
-/// **`missing` is not inert**, though it changes nothing today: a `409` does
-/// reach here — `explain_issue_failure` says "a `409` lands here too", and that
-/// one is the cross-tenant collision — and `Vanished` is what keeps it out of
-/// the permanent bucket, which is where it was before. Setting it to `Done`
-/// would read a cross-tenant collision as "already gone".
+/// **A `409` does reach here** — `explain_issue_failure` says "a `409` lands
+/// here too", and that one is the cross-tenant collision. `Unremarkable` keeps
+/// it out of the permanent bucket, which is where it was before; reading it as
+/// `Done` would call a cross-tenant collision "already gone". The `404` is the
+/// same, and neither is what this predicate is about.
 ///
 /// `retryable_kinds` and `fixable_kinds` are empty: `429` and `503` are already
 /// waits by status, and no kind on this route asks to be read against its own.
@@ -886,7 +902,8 @@ fn is_permanent(error: &anyhow::Error) -> bool {
 /// `warn` every few minutes for the life of the process, since an in-memory
 /// token source never notices a re-login elsewhere.
 const ISSUING: Reading = Reading {
-    missing: Missing::Vanished,
+    not_found: Missing::Unremarkable,
+    conflict: Missing::Unremarkable,
     token_self_replacing: false,
     retryable_kinds: &[],
     fixable_kinds: &[],
