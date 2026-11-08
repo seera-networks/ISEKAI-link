@@ -27,6 +27,8 @@ pub mod hostname;
 pub mod https;
 pub mod identity;
 pub mod mtu;
+/// What a call did not do, in terms of what the caller can do about it.
+pub mod outcome;
 pub mod pop;
 pub mod proxy;
 mod redact;

@@ -16,6 +16,7 @@ use isekai_p2p_core::identity::Narrowing;
 use isekai_p2p_core::identity::{
     EndpointToken, IdentityAuth, IdentityClient, IdentityError, RevokeAuth,
 };
+use isekai_p2p_core::outcome::{Missing, Outcome, Reading};
 use isekai_p2p_core::proxy::{ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
@@ -857,20 +858,33 @@ fn is_permanent(error: &anyhow::Error) -> bool {
     error
         .chain()
         .filter_map(|e| e.downcast_ref::<IdentityError>())
-        .any(|e| {
-            e.status() == Some(403)
-                // **And the `401` that means "not in this tenant".** Identity
-                // answers it for an Endpoint it cannot find as well as for a
-                // bad signature, and neither becomes true by asking again: one
-                // needs a key registered where the token points, the other a
-                // different key. Left in the transient bucket, the explanation
-                // this file attaches would be re-read out at `warn` every few
-                // minutes for the life of the process — an in-memory token
-                // source never notices a re-login elsewhere, so nothing would
-                // ever change.
-                || e.kind().as_deref() == Some("pop-signature-invalid")
-        })
+        .any(|e| matches!(Outcome::of_identity(e, &ISSUING), Outcome::Refused { .. }))
 }
+
+/// How this path reads an answer (`docs/p2p_sdk_error_type.md` §3.4).
+///
+/// **`token_self_replacing` is false because this *is* the path that replaces
+/// it.** A `403` here is settled: there is no other loop about to hand this
+/// call a different token. On a path renewing a lease the same answer is a
+/// wait, which is the distinction `initiator::renewal_verdict` warns about.
+///
+/// `missing` is unused — nothing here reads a `404`/`409` — and
+/// `retryable_kinds` is empty, since `429` and `503` are already waits by
+/// status and no kind on this route asks to be retried against its own.
+///
+/// **The `401 pop-signature-invalid` this used to name here moved into
+/// [`Outcome`]**, which reads it status-independently with the reason recorded
+/// alongside: Identity answers it for an Endpoint it cannot find as well as for
+/// a bad signature, and neither becomes true by asking again — one needs a key
+/// registered where the token points, the other a different key. Left in the
+/// transient bucket, the explanation this file attaches would be re-read out at
+/// `warn` every few minutes for the life of the process, since an in-memory
+/// token source never notices a re-login elsewhere.
+const ISSUING: Reading = Reading {
+    missing: Missing::Vanished,
+    token_self_replacing: false,
+    retryable_kinds: &[],
+};
 
 /// Keep `proxy`'s Endpoint Token current for as long as the returned guard
 /// lives.

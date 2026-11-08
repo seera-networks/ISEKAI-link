@@ -1,7 +1,21 @@
 # SDK 境界のエラー型（§9 Q2 の答え）
 
-- status: 設計。§7.1 は実装済み、§7.2 は半分
-- version: 0.3（§7 の 2 材料のうち 1 を実装し、2 の見立てを訂正）
+- status: 実装済み（v0.4）。§3.4 の 2 点は実装して設計を正した — 下記
+- version: 0.4（実装: `isekai-p2p-core::outcome`。設計の 2 点を訂正）
+
+## 0. 実装で正した設計の 2 点
+
+1. **`Unreachable::Transport` は `anyhow::Error` を持たない。** §2 はそう書いて
+   いたが、既存の分類器はすべてエラーを**参照**で受ける述語である
+   （`is_permanent`, `is_already_gone`, `is_listener_not_found`,
+   `endpoint_cert` の `retryable`）。所有する型は噛み合わない。
+   `Outcome` は答えの*読み*で、原因を所有する必要がない ——
+   呼び出し側は元の `ProxyError` を持ったままである。
+   `Transport { explain: String }` にしたことで入口が借用になり、
+   §8-3 で諦めると書いた `PartialEq` も導出できるようになった。
+2. **`Missing::NotDeployed` は到達不能なので落とした。** §3.4 に挙げていたが、
+   `list_relays` は `404` をエラーが作られる前に `Ok(None)` へ変えるので
+   `outcome()` が見ることはない。
 - 対象: `e6ac864`（`main`）。§7.1 の実装は #345
 - 前提: `docs/p2p_sdk_error_classification.md` — 8 種の失敗の判定材料。
   本文書はその確定結果に型を与える
