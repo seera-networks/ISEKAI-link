@@ -559,6 +559,46 @@ pub struct IssuedCertificate {
     pub not_after: Option<String>,
 }
 
+/// Whether a create answered with something it just made, or with what was
+/// already there.
+///
+/// **The status is the only place this is stated.** `request_json_with` drops
+/// it on every success, which is why the grant ledger had to infer it from how
+/// old `created_at` looked — a guess that is wrong in both directions: a slow
+/// round trip makes a fresh grant look like an update, and an operator's grant
+/// created seconds ago looks like ours
+/// (`portal_core::gateway::grants::already_existed`).
+///
+/// **This reports the status; it does not decide what the status means.** The
+/// upsert answer is the documented `200`; that a fresh row is a `201` is this
+/// workspace's assumption and is written down nowhere outside its own notes.
+/// So a caller that acts on the difference has to weigh the two readings
+/// separately — `portal_core::gateway::grants::existed_before` is where that
+/// weighing lives, and why.
+///
+/// [`Unknown`](Self::Unknown) is not a failure: which success status a route
+/// uses is the proxy's to choose, and anything else simply says nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    /// `201` — this call created it.
+    Fresh,
+    /// `200` — it was already there, and came back unchanged.
+    Existing,
+    /// Some other success. Nothing to read; fall back to whatever the caller
+    /// did before this existed.
+    Unknown,
+}
+
+impl Made {
+    fn from_status(status: u16) -> Self {
+        match status {
+            201 => Made::Fresh,
+            200 => Made::Existing,
+            _ => Made::Unknown,
+        }
+    }
+}
+
 /// A standing authorization for one Endpoint to reach one listener (spec §8.8).
 ///
 /// Where a [`Capability`] is a one-shot token the owner has to carry to the
@@ -1810,21 +1850,30 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     ///
     /// `ttl` omitted means the grant stands until revoked, which is the usual
     /// case — a dated grant is closer to a capability.
+    ///
+    /// **This is an upsert, and the [`Made`] says which happened.** A pair that
+    /// already has a grant for this protocol gets the existing id back with its
+    /// `created_at` untouched, and the `ttl` and `label` asked for here written
+    /// onto it. Whether that was a creation or an edit matters to a caller
+    /// keeping a ledger of what it made — adopting somebody else's grant means
+    /// revoking it later — and the status is the only place the answer appears.
     pub async fn create_grant(
         &self,
         allowed_endpoint: &str,
         protocol: &str,
         ttl: Option<u64>,
         label: Option<&str>,
-    ) -> Result<Grant, ProxyError> {
+    ) -> Result<(Grant, Made), ProxyError> {
         let body = serde_json::json!({
             "allowed_endpoint": allowed_endpoint,
             "protocol": protocol,
             "ttl": ttl,
             "label": label,
         });
-        self.request_json("POST", "/v1/peer/grants", to_vec(&body))
-            .await
+        let (grant, status) = self
+            .request_json_status_with("POST", "/v1/peer/grants", to_vec(&body), &[])
+            .await?;
+        Ok((grant, Made::from_status(status)))
     }
 
     /// `GET /v1/peer/grants` (spec §8.8.2) — everyone this Endpoint has let in.
@@ -2484,9 +2533,29 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         body: Vec<u8>,
         extra: &[(String, String)],
     ) -> Result<R, ProxyError> {
+        self.request_json_status_with(method, path, body, extra)
+            .await
+            .map(|(value, _status)| value)
+    }
+
+    /// As [`request_json_with`](Self::request_json_with), keeping the status.
+    ///
+    /// **Only the routes that upsert have any use for it.** Everywhere else a
+    /// success status says nothing a caller can act on, which is why
+    /// [`request_json_with`] drops it — but on `POST /v1/peer/grants` it is the
+    /// difference between having created a grant and having edited somebody
+    /// else's, and nothing else in the answer states that (see [`Made`]).
+    async fn request_json_status_with<R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        extra: &[(String, String)],
+    ) -> Result<(R, u16), ProxyError> {
         let resp = self.send_with(method, path, body, extra).await?;
         if (200..300).contains(&resp.status) {
-            serde_json::from_slice(&resp.body).map_err(ProxyError::Decode)
+            let value = serde_json::from_slice(&resp.body).map_err(ProxyError::Decode)?;
+            Ok((value, resp.status))
         } else {
             Err(problem_error(&resp))
         }
@@ -3016,10 +3085,11 @@ mod tests {
             "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
             "created_at":"2026-11-05T09:00:00Z","expires_at":"2026-11-05T10:00:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
-        let grant = client
+        let (grant, made) = client
             .create_grant("ep:A", "mjpeg", Some(7200), None)
             .await
             .unwrap();
+        assert_eq!(made, Made::Fresh, "a 201 says this call made it");
         assert_eq!(
             grant.expires_at.as_deref(),
             Some("2026-11-05T10:00:00Z"),
@@ -3028,6 +3098,46 @@ mod tests {
         let sent = last_body(&client);
         assert_eq!(sent["ttl"], 7200, "the seconds asked for go on the wire");
         assert!(sent["label"].is_null(), "no label means none is sent");
+    }
+    /// A create that upserts says so in its status, which is the whole reason
+    /// the status is kept here and nowhere else.
+    ///
+    /// **`created_at` cannot answer this.** The grant below reports being made
+    /// a minute ago, which the ledger's 30-second window would read as "already
+    /// there" — correct here by luck, and wrong for a fresh grant whose round
+    /// trip was slow. The `200` says it outright.
+    #[tokio::test]
+    async fn a_create_that_upserts_says_so_in_its_status() {
+        let body = r#"{"grant_id":"gr_3","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
+            "created_at":"2026-11-05T09:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(200, body));
+        let (grant, made) = client
+            .create_grant("ep:A", "mjpeg", None, None)
+            .await
+            .unwrap();
+        assert_eq!(made, Made::Existing, "a 200 is the upsert answer");
+        assert_eq!(
+            grant.grant_id, "gr_3",
+            "and the existing id comes back, not a new one"
+        );
+    }
+
+    /// Any other success leaves the caller where it was.
+    ///
+    /// **Not a failure.** Which success status a route uses is the proxy's to
+    /// choose, and a reading the wire did not support is worse than no reading:
+    /// the ledger falls back to the age heuristic it used before this existed.
+    #[tokio::test]
+    async fn an_unexpected_success_status_reads_as_unknown() {
+        let body = r#"{"grant_id":"gr_4","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual"}"#;
+        let (client, _key) = client(MockTransport::with_response(202, body));
+        let (_grant, made) = client
+            .create_grant("ep:A", "mjpeg", None, None)
+            .await
+            .unwrap();
+        assert_eq!(made, Made::Unknown);
     }
 
     /// The shape of what goes out matters more than the plumbing: the server
@@ -3238,7 +3348,7 @@ mod tests {
             "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
             "created_at":"2026-08-02T09:00:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
-        let grant = client
+        let (grant, _made) = client
             .create_grant("ep:A", "mjpeg", None, Some("phone"))
             .await
             .unwrap();

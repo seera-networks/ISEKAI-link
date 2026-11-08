@@ -963,7 +963,18 @@ pub async fn measure_for_connect(
             return (Vec::new(), Vec::new());
         }
         Err(_) => {
-            tracing::debug!(
+            // **Louder than its two siblings above, on purpose.** Those say
+            // something about the deployment -- no relay registry, or none
+            // registered -- and a listener that warned about either would warn
+            // on every connect for the life of the process. This one says the
+            // control plane did not answer within half the connect budget, so
+            // relay selection silently stopped working: the connect still
+            // succeeds unmeasured, which is why nothing else reports it, and
+            // every one of this path's defects so far was found in production
+            // rather than by a test. An operator at the default level has to be
+            // able to see it.
+            tracing::warn!(
+                waited = ?opts.budget / 2,
                 "reading the relay candidates outran the budget; connecting unmeasured"
             );
             return (Vec::new(), Vec::new());

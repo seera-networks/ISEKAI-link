@@ -32,7 +32,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use argh::FromArgs;
-use isekai_p2p::agent::{BindingView, ProvisioningBinding};
+use isekai_p2p::agent::{BindingView, Made, ProvisioningBinding};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -398,7 +398,11 @@ struct Args {
 /// `asked` is carried only to notice the proxy ignoring it: a `ttl` that
 /// produced no `expires_at` would otherwise look honoured, and the operator
 /// learns of it when the access does not lapse.
-fn grant_lifetime_lines(grant: &isekai_p2p::agent::Grant, asked: Option<u64>) -> Vec<String> {
+fn grant_lifetime_lines(
+    grant: &isekai_p2p::agent::Grant,
+    made: Made,
+    asked: Option<u64>,
+) -> Vec<String> {
     let mut lines = vec![match &grant.expires_at {
         Some(at) => format!("              until {at}  (--revoke {})", grant.grant_id),
         None => format!(
@@ -409,7 +413,12 @@ fn grant_lifetime_lines(grant: &isekai_p2p::agent::Grant, asked: Option<u64>) ->
     if asked.is_some() && grant.expires_at.is_none() {
         lines.push("              NOTE: asked for an expiry and the proxy named none".to_owned());
     }
-    if portal_core::gateway::grants::already_existed(grant.created_at.as_deref()) {
+    // **The same reading the ledger uses, from the same function.** An operator
+    // is being told which of two things their run did, and the ledger is
+    // deciding whether it may remove this later; the two disagreeing about one
+    // create is the confusion neither would survive. `existed_before` also
+    // carries why a `201` is believed and a `200` is not.
+    if portal_core::gateway::grants::existed_before(made, grant.created_at.as_deref()) {
         lines.push(
             "              NOTE: this pair already had a grant -- the create UPDATED it, \
              label and expiry included. If something else made it (a --gateway-config run, \
@@ -1040,17 +1049,22 @@ async fn settle_grants(
             )
             .await
         {
-            Ok(grant) => {
+            Ok((grant, made)) => {
                 // **The ledger decides whether this is ours to remove later.**
                 // Creating over a pair the operator already had succeeds and
                 // answers with *their* id, so recording the result blindly is
                 // how their grant ends up in a later removal.
                 // **Decided from what came back, not from a listing that may
                 // be a quarter of an hour old.** A grant the operator created
-                // since that read is invisible to `note_existing`, and the
-                // proxy leaves `created_at` untouched on an update -- so an
-                // answer reporting an age is one that was already there.
-                let ours = ledger.record(key, grant.grant_id.clone(), grant.created_at.as_deref());
+                // since that read is invisible to `note_existing`. The status
+                // says which happened; `created_at`'s age is the fallback for a
+                // success status that does not.
+                let ours = ledger.record(
+                    key,
+                    grant.grant_id.clone(),
+                    made,
+                    grant.created_at.as_deref(),
+                );
                 tracing::info!(
                     grant = %grant.grant_id,
                     allowed = %wanted.allowed_endpoint,
@@ -1324,7 +1338,7 @@ async fn grant_admin(
         // to date one; the `--grant-ttl` flag next to it is *not* it -- that is
         // the life of the grant a redeemed `--ticket` or `--provisioning-key`
         // makes, which clamps differently and is set in a different flow.
-        let grant = proxy
+        let (grant, made) = proxy
             .create_grant(
                 allowed,
                 &args.protocol,
@@ -1359,7 +1373,7 @@ async fn grant_admin(
         // made. `note_existing` marks anything it finds as "served but never
         // removed", so this survives a `--gateway-config` run and `--revoke` is
         // how it goes.
-        for line in grant_lifetime_lines(&grant, args.grant_expires_in) {
+        for line in grant_lifetime_lines(&grant, made, args.grant_expires_in) {
             println!("{line}");
         }
     }
@@ -2317,7 +2331,11 @@ mod tests {
         };
 
         // Asked two hours, clamped to one: the line says the hour.
-        let lines = grant_lifetime_lines(&grant(Some("2026-11-05T10:00:00Z")), Some(7200));
+        let lines = grant_lifetime_lines(
+            &grant(Some("2026-11-05T10:00:00Z")),
+            Made::Unknown,
+            Some(7200),
+        );
         assert_eq!(lines.len(), 1);
         assert!(
             lines[0].contains("2026-11-05T10:00:00Z") && !lines[0].contains("7200"),
@@ -2326,12 +2344,12 @@ mod tests {
         );
 
         // No request and no expiry: standing access.
-        let lines = grant_lifetime_lines(&grant(None), None);
+        let lines = grant_lifetime_lines(&grant(None), Made::Unknown, None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("stands until revoked"), "{}", lines[0]);
 
         // Asked and ignored: said out loud, because nothing else would show it.
-        let lines = grant_lifetime_lines(&grant(None), Some(60));
+        let lines = grant_lifetime_lines(&grant(None), Made::Unknown, Some(60));
         assert_eq!(lines.len(), 2, "the note is the second line");
         assert!(lines[1].contains("asked for an expiry"), "{}", lines[1]);
     }
@@ -2357,7 +2375,7 @@ mod tests {
         let fresh = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .expect("format");
-        let lines = grant_lifetime_lines(&dated(Some(&fresh)), None);
+        let lines = grant_lifetime_lines(&dated(Some(&fresh)), Made::Unknown, None);
         assert_eq!(
             lines.len(),
             1,
@@ -2365,7 +2383,7 @@ mod tests {
         );
 
         // Older than the window: this run updated what was already there.
-        let lines = grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), None);
+        let lines = grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Unknown, None);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
             lines[1].contains("UPDATED it") && lines[1].contains("revoke it"),
@@ -2374,6 +2392,47 @@ mod tests {
         );
 
         // No `created_at` at all: nothing to judge by, so no claim either way.
-        assert_eq!(grant_lifetime_lines(&dated(None), None).len(), 1);
+        assert_eq!(
+            grant_lifetime_lines(&dated(None), Made::Unknown, None).len(),
+            1
+        );
+    }
+
+    /// **A `201` silences the note; a `200` leaves the age to decide.**
+    ///
+    /// The operator's line and the ledger's bookkeeping read the same create
+    /// through the same `existed_before`, so this pins the operator-visible
+    /// half of that asymmetry: a slow round trip no longer tells an operator
+    /// their fresh grant "UPDATED" somebody else's.
+    #[test]
+    fn the_note_follows_a_fresh_status_and_otherwise_the_age() {
+        let dated = |created: Option<&str>| isekai_p2p::agent::Grant {
+            grant_id: "gr_1".to_owned(),
+            owner_endpoint: "ep:b".to_owned(),
+            allowed_endpoint: Some("ep:a".to_owned()),
+            protocol: Some("pg".to_owned()),
+            origin: None,
+            provisioning_key_id: None,
+            label: None,
+            created_at: created.map(str::to_owned),
+            expires_at: None,
+        };
+        let fresh = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format");
+
+        // Looks old, but the proxy said we made it.
+        let lines = grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Fresh, None);
+        assert_eq!(lines.len(), 1, "a 201 silences the note: {lines:?}");
+
+        // A `200` with a fresh timestamp: the age decides, and says ours.
+        let lines = grant_lifetime_lines(&dated(Some(&fresh)), Made::Existing, None);
+        assert_eq!(lines.len(), 1, "a 200 defers to the age: {lines:?}");
+
+        // A `200` with an old one: the two agree, and the note is raised.
+        let lines =
+            grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Existing, None);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("UPDATED it"), "{}", lines[1]);
     }
 }
