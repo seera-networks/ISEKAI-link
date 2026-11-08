@@ -102,8 +102,13 @@ pub mod agent {
         RedeemedTicket, Ticket, TicketListener, TicketRecord, TicketRedemption, TicketTransfer,
         ENROLLMENT_KEY_PREFIX, PROVISIONING_KEY_PREFIX, TICKET_PREFIX, TICKET_TRANSFER_PREFIX,
     };
+    // `Problem` among them: it is the type of a field of `ProxyError::Problem`,
+    // a public variant, and without it no caller outside this crate can name
+    // what that variant holds -- or build one, which a test of a classifier has
+    // to.
     pub use isekai_p2p_core::proxy::{
-        CachedCertificate, CertificateParameters, IssuedCertificate, ProxyClient, ProxyError,
+        CachedCertificate, CertificateParameters, IssuedCertificate, Problem, ProxyClient,
+        ProxyError,
     };
     pub use isekai_p2p_core::proxy::{RelayCandidate, RelayRttSample};
     // **A public address is reached from outside this crate.** The example
