@@ -24,6 +24,8 @@ pub mod config;
 pub mod endpoints;
 /// Managing Enrollment Keys from the owner's side (§8.8.2 / §8.8.9).
 pub mod enrollment;
+/// The bookkeeping that creating grants on a schedule needs.
+pub mod grants;
 pub mod initiator;
 pub mod listener;
 /// What the signed-in person is in this tenant (`GET /v1/me`).

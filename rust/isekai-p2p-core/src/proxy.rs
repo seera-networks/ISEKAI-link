@@ -567,13 +567,13 @@ pub struct IssuedCertificate {
 /// old `created_at` looked — a guess that is wrong in both directions: a slow
 /// round trip makes a fresh grant look like an update, and an operator's grant
 /// created seconds ago looks like ours
-/// (`portal_core::gateway::grants::already_existed`).
+/// (`isekai_p2p::grants::already_existed`).
 ///
 /// **This reports the status; it does not decide what the status means.** The
 /// upsert answer is the documented `200`; that a fresh row is a `201` is this
 /// workspace's assumption and is written down nowhere outside its own notes.
 /// So a caller that acts on the difference has to weigh the two readings
-/// separately — `portal_core::gateway::grants::existed_before` is where that
+/// separately — `isekai_p2p::grants::existed_before` is where that
 /// weighing lives, and why.
 ///
 /// [`Unknown`](Self::Unknown) is not a failure: which success status a route

@@ -273,7 +273,7 @@ Some("insufficient-permission") if error.to_string().contains("guests cannot") =
 `200` と `201` の区別は届かない。
 
 残る材料は `created_at` だけで、だから
-`portal_core::gateway::grants::already_existed`（`grants.rs:59`）は
+`isekai_p2p::grants::already_existed` は
 
 ```rust
 OffsetDateTime::now_utc() - at > ExistedBefore::WINDOW   // WINDOW = 30 秒
