@@ -90,6 +90,22 @@ FFI の 4 概念が覆っているのは **A の鍵の部分、D の受け取り
 コード上の裏付けである。しかも Grant 単体ではなく、**Ticket と
 Provisioning Key を含む発行側すべて**が同じ穴に落ちている。
 
+### 4.0 ただし「面が無い」は言い過ぎだった（#351 で確認）
+
+この節の `[raw]` は「`portal-server` が `ProxyClient` のメソッドを直接呼んで
+いる」という**形**の記述で、**届かない**という意味ではなかった。実際には:
+
+- 発行側の戻り値型 10 個（`Grant`, `Made`, `Ticket`, `TicketRecord`,
+  `ProvisioningKey`, `ProvisioningKeyRecord`, `ProvisioningRedemption`,
+  `ProvisioningBinding`, `TicketRedemption`, `TicketTransfer`）はすべて
+  `isekai_p2p::agent` から再輸出されている。
+- `portal-server` は **`isekai-p2p-core` に一度も依存していない**
+  （`Cargo.toml` に記載が 0）。にもかかわらず 8 メソッドすべてを呼べている。
+  これが「`isekai-p2p` だけで届く」ことの証明である。
+
+つまり面はある。形がモジュール関数ではなく、再輸出されたクライアントの
+メソッド、というだけだった。
+
 ### 4.1 先例は同じクレートの中にある
 
 Identity 側の管理（クラスタ B・C）は**すでに包まれている**:
@@ -107,9 +123,17 @@ portal のどこからも生クライアントで呼ばれず、`isekai_p2p::Pee
 （`portal-server/src/main.rs:1940`）。発行側だけが素通しなのは、
 包めないからではない。
 
-形は「クライアントとトークンを取る薄いモジュール関数」。発行側に足すべき面も
-**この先例に倣えばよく、新しい設計を要らない**。欠けているのは
-proxy 側だけで、Identity 側との非対称は歴史的なものに見える。
+形は「クライアントとトークンを取る薄いモジュール関数」。
+
+**ただしこの先例の値打ちは proxy 側に移らない（#351）。**
+`endpoints`/`enrollment` が存在する理由は `enrollment.rs` の `on_transport!`
+マクロが示している —— Identity API は HTTP/1.1+2 と H3 の 2 系統があり、
+どちらで喋るかを呼び出し側から隠すのが包みの仕事である。加えて
+`RevokeAuth` のような認証の形を組み立て、`IdentityError` を `anyhow` に変える。
+
+proxy 側にはそのどれも無い: トランスポートは常に `MasqueH3Transport` の 1 つで、
+呼び出し側は `proxy_client(cfg, &token)` で得た `ProxyClient` を既に持っている。
+Identity 側との非対称は歴史ではなく、**解くべき問題の違い**だった。
 
 ### 4.2 発行側には「素通しでは足りない」意味論がある
 
@@ -132,6 +156,55 @@ proxy 側だけで、Identity 側との非対称は歴史的なものに見え�
 
 **これらはすべて「Grant を作る」という 1 行の API の外側に積まれた知識**で、
 SDK がその API を出すなら一緒に出す対象になる。
+
+### 4.3 素通しの包みは何も足さない（#351 で確認）
+
+`portal-server` の 7 箇所（`create_ticket`, `list_tickets`, `revoke_ticket`,
+`create_provisioning_key`, `list_provisioning_keys`,
+`provisioning_redemptions`, `revoke_provisioning_key`）を実際に読むと、
+**すべてが同じ形**だった:
+
+```rust
+proxy.method(args...).await.context("…")?
+```
+
+に続いて `println!`。持ち上げられるアプリ側ロジックは無く、包みが足せるのは
+`anyhow::Result` への変換と 2 つ目の名前だけである。それは #350 で
+`already_existed` を portal-core から再輸出しないと決めた理由 ——
+「そのクレートが呼ばない関数への 2 本目の経路は、同期を取り続ける名前が
+増えるだけ」—— に正面から反する。
+
+**§4.2 が挙げた「素通しでは表せない意味論」は、別の形で全部入った:**
+
+| 意味論 | どこに入ったか |
+| --- | --- |
+| upsert を新規作成と見分ける | `Made`（#345）。成功時も status を残す内部経路つき |
+| 自分が作ったものだけ消す台帳 | `isekai_p2p::grants::Ledger`（#350） |
+| 3 通りの「期限」を運用者に説明する | `grant_lifetime_lines`（#337） |
+| 答えを呼び出し側の行動に翻訳する | `Outcome` と `Reading`（#347, #349） |
+
+残っていたのは**モジュール関数という形**だけで、それは価値ではなかった。
+
+### 4.4 では発行側に残る問題は何か
+
+1 つある。**隣り合う `Option<u64>` の取り違え**で、API の形の問題である:
+
+```rust
+create_ticket(protocol, ttl, grant_ttl, label)
+create_provisioning_key(protocol, ttl, grant_ttl, max_live_grants, binding, label)
+```
+
+`ttl` は券そのものの寿命、`grant_ttl` は引き換えが作る Grant の寿命で、
+意味が違うのに型が同じで隣に並んでいる。**この混同は実際に起きている**:
+`portal-server` は `--grant` のヘルプに「NOT --grant-ttl」と書き、さらに
+実行時のガード `check_grant_options`（`main.rs:441`）を置いている。
+その理由がコメントに残っている ——「`--grant-ttl` は `--ticket` と
+`--provisioning-key` の経路でだけ読まれるので、`--grant` と一緒に渡すと
+**日付のない Grant を作って何も言わなかった**」。
+
+`p2p_sdk_api_review.md` §6-6（enum であるべきものが `Option<&str>`）と
+同じ種類の摩擦で、直し方も同じ: 名前のある型にする。ただしそれは
+`isekai-p2p-core` の署名を変える話で、**2 本目の経路を足すのとは逆方向**である。
 
 ## 5. リレー計測について — 必要なのは「駆動」ではなく「点検」
 
@@ -192,7 +265,8 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
    クラスタ B・C。`isekai-p2p` にあるが FFI に出ていない。
 3. **アクセスを与える（発行側）** — Grant / Ticket / Provisioning Key の
    作成・一覧・取り消し、ラベル、3 種の期限、upsert の意味論、方針からの調停。
-   クラスタ E・F・G。**面が無い（§4）。ここが最大の欠落。**
+   クラスタ E・F・G。**面はある（§4.0）。意味論も入った（§4.3）。**
+   残るのは隣り合う `Option<u64>` の取り違え（§4.4）だけ。
 4. **アクセスを受け取る（引き換え側）** — ペアリングコード、Ticket、
    Provisioning Key の引き換え。クラスタ D。`isekai-p2p` にある。
 5. **繋ぐ** — Listener / Initiator、ローカルの待受けと転送先、
@@ -253,8 +327,11 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
 本文書は面の広さ（Q1）の下敷きで、**面の確定はしていない**。逆算の結果として
 新たに決める必要が出たもの:
 
-1. **発行側（§7-3）をどの層に置くか** — §4.1 の先例に倣って `isekai-p2p` に
-   薄いモジュールを足すか、SDK のハンドルの一部にするか。
+1. ~~**発行側（§7-3）をどの層に置くか**~~ — **決着（#351）**。足さない。
+   面は再輸出された `ProxyClient` として既にあり（§4.0）、素通しの
+   モジュール関数は 2 つ目の名前しか足さない（§4.3）。§4.2 が
+   「素通しでは表せない」と挙げた意味論は #337 / #345 / #347 / #349 / #350 で
+   全部別の形で入った。残るのは API の形の問題 1 件（§4.4）。
 2. ~~**upsert と方針調停（§4.2）は誰のものか**~~ — **決着（#350）**。
    `already_existed` / `existed_before` / `Ledger` は `isekai_p2p::grants` に
    移した。分割点は方針テーブルが始まるところで、`Table` を読む
