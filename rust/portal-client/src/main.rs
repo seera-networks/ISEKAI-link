@@ -1954,8 +1954,11 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
         println!("bound to    : not reported -- check with --enrollment-keys");
         return;
     };
-    match binding.kind.as_str() {
-        "oidc" => {
+    // The reading is `bound_to`'s, the same as the server's twin of this
+    // function: `"none" | ""` was right here and was *not* there, so the two
+    // binaries disagreed about a binding object that arrived without a `type`.
+    match isekai_p2p::agent::bound_to(Some(binding)) {
+        isekai_p2p::agent::Bound::Oidc { .. } => {
             println!(
                 "bound to    : {} / {}",
                 binding.issuer.as_deref().unwrap_or("?"),
@@ -1969,11 +1972,11 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
                 None => println!("audience    : not reported -- ask the Identity operator"),
             }
         }
-        "none" | "" => {
+        isekai_p2p::agent::Bound::Nothing => {
             println!("bound to    : nothing -- the key alone can register Endpoints.");
             println!("              Never do this for a public repository's CI.");
         }
-        other => println!("bound to    : {other}"),
+        isekai_p2p::agent::Bound::Other(kind) => println!("bound to    : {kind}"),
     }
 }
 

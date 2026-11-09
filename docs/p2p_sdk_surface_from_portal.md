@@ -244,6 +244,20 @@ proxy 側の `ProvisioningKeyRecord.binding` と Identity 側の
 「束縛済み」と言い、未知の種別を `Nothing` に落とすと束縛済みを素と言う。
 どちらの改変でも対応するテストが落ちる。
 
+**写しは 2 つではなく 4 つあった。** 一覧の 2 つに加えて、発行の応答を表示する
+`print_binding`（portal-server）と `print_enrollment_binding`（portal-client）が
+同じ分類を別に書いていて、**しかも食い違っていた**: client は `"none" | ""` を
+見ていたのに server は `"none"` だけで、空の `kind`（`#[serde(default)]` が
+まさにその発行応答のために存在する入力）が最後の腕に落ち、
+`bound to    : ` と**何も続かない行**を出していた。素のキーを束縛名らしきものに
+見せる向きの誤りである。4 箇所すべて `bound_to` にした。
+
+**不在の読みはルートで違っていて、それは保った。** 一覧では `binding` が無い
+= 束縛が無い。発行の応答では「答えが言わなかった」で、
+`--binding-oidc` を渡した運用者が沈黙を「通った」と読まないよう
+「not reported」と報告する。だから発行側の 2 つは `None` を自分で扱い、
+`bound_to` は `Some` で呼ぶ。
+
 残っている重複は**枠の表示**（`(Some(live), Some(max)) => "{live}/{max} slots"`）
 だが、こちらはフィールド名も予備語も違う（`live_grants`/`live_endpoints`、
 `"grants"`/`"live"`）ので、同じ形をした別のコードである。持ち上げるなら

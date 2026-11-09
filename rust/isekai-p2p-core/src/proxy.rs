@@ -839,9 +839,13 @@ pub enum Bound<'a> {
     /// A workload identity token, and the subject it must carry when the answer
     /// named one.
     Oidc { subject: Option<&'a str> },
-    /// A kind this build does not know about. Shown as it arrived rather than
-    /// guessed at: a binding nobody here recognises is still a binding, and
-    /// calling it unbound would be the one wrong answer.
+    /// A kind this reading does not break out. **Not "unknown to this
+    /// build"**: `sub` and `tenant` are kinds it asks for
+    /// ([`ProvisioningBinding`]) and they land here, because nothing branches
+    /// on them -- every caller prints them as they arrived.
+    ///
+    /// Shown rather than guessed at: a binding nobody here recognises is still
+    /// a binding, and calling it unbound would be the one wrong answer.
     Other(&'a str),
 }
 
@@ -853,6 +857,13 @@ pub enum Bound<'a> {
 /// fail the whole response -- which means an empty string reaches here. Reading
 /// either as "bound to something" would tell an operator a bare bearer secret
 /// is safe to commit.
+///
+/// **One route reads absence differently, on purpose.** In a *listing* an
+/// absent `binding` means the key has none. In an *issue* response it means the
+/// answer did not say, which `portal-server` reports as "not reported" rather
+/// than as "nothing" -- an operator who passed `--binding-oidc` must not read
+/// silence as "it took". Those sites answer `None` themselves and call this
+/// with `Some`.
 pub fn bound_to(binding: Option<&BindingView>) -> Bound<'_> {
     match binding {
         None => Bound::Nothing,

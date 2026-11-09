@@ -1413,8 +1413,15 @@ fn print_binding(binding: Option<&BindingView>) {
         println!("bound to    : not reported -- check with --provisioning-keys");
         return;
     };
-    match binding.kind.as_str() {
-        "oidc" => {
+    // **The reading is [`bound_to`]'s**, and before it was not: this matched
+    // `"none"` alone, so a `binding` object that arrived without a `type` --
+    // the case `BindingView::kind`'s `#[serde(default)]` exists for, on exactly
+    // this issue response -- fell through to the last arm and printed
+    // `bound to    : ` with nothing after it. An empty name where the answer is
+    // "nothing is holding this key" is the wrong direction to be wrong in, and
+    // `portal-client`'s twin of this function already read it correctly.
+    match bound_to(Some(binding)) {
+        Bound::Oidc { .. } => {
             println!(
                 "bound to    : {} / {}",
                 binding.issuer.as_deref().unwrap_or("?"),
@@ -1429,11 +1436,11 @@ fn print_binding(binding: Option<&BindingView>) {
                 None => println!("audience    : not reported -- ask the proxy's operator"),
             }
         }
-        "none" => {
+        Bound::Nothing => {
             println!("bound to    : nothing -- the key alone is enough to get in.");
             println!("              Use --binding-oidc for a public repository's CI.");
         }
-        other => println!("bound to    : {other}"),
+        Bound::Other(kind) => println!("bound to    : {kind}"),
     }
 }
 
