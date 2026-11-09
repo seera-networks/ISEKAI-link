@@ -90,6 +90,30 @@ FFI の 4 概念が覆っているのは **A の鍵の部分、D の受け取り
 コード上の裏付けである。しかも Grant 単体ではなく、**Ticket と
 Provisioning Key を含む発行側すべて**が同じ穴に落ちている。
 
+### 4.0 ただし「面が無い」は言い過ぎだった（#351 で確認）
+
+この節の `[raw]` は「`portal-server` が `ProxyClient` のメソッドを直接呼んで
+いる」という**形**の記述で、**届かない**という意味ではなかった。実際には:
+
+- 発行側が使う型 10 個はすべて `isekai_p2p::agent` から再輸出されている ——
+  戻り値（`Grant`, `Made`, `Ticket`, `TicketRecord`, `ProvisioningKey`,
+  `ProvisioningKeyRecord`, `ProvisioningRedemption`）、入力
+  （`ProvisioningBinding`）、戻り値の中の型（`TicketRedemption`）、
+  引き換え側の `TicketTransfer`。
+- `portal-server` は **`isekai-p2p-core` に一度も依存していない**
+  （`Cargo.toml` に記載が 0）。にもかかわらず 8 メソッドすべてを呼べている。
+  これが「`isekai-p2p` だけで届く」ことの証明である。
+
+つまり面はある。形がモジュール関数ではなく、再輸出されたクライアントの
+メソッド、というだけだった。
+
+**ただし 1 つ欠けている**: `ControlPlaneTransport` が `agent` から再輸出されて
+いない（出現 0）。`ProxyClient<T>` はこのトレイトにジェネリックなので、
+外から「トランスポートに対してジェネリックな関数」を書こうとすると
+**境界を名指せない**。`p2p_sdk_api_review.md` §6-10 が
+「`ControlPlaneTransport` という継ぎ目は既にあるのに使われていない」と
+書いているのと同じ話で、名指せないことがその一因である。#351 で再輸出した。
+
 ### 4.1 先例は同じクレートの中にある
 
 Identity 側の管理（クラスタ B・C）は**すでに包まれている**:
@@ -107,9 +131,25 @@ portal のどこからも生クライアントで呼ばれず、`isekai_p2p::Pee
 （`portal-server/src/main.rs:1940`）。発行側だけが素通しなのは、
 包めないからではない。
 
-形は「クライアントとトークンを取る薄いモジュール関数」。発行側に足すべき面も
-**この先例に倣えばよく、新しい設計を要らない**。欠けているのは
-proxy 側だけで、Identity 側との非対称は歴史的なものに見える。
+形は「クライアントとトークンを取る薄いモジュール関数」。
+
+**ただしこの先例の値打ちは、proxy 側にはそのままの形では移らない（#351）。**
+`endpoints`/`enrollment` が存在する一番の理由は `enrollment.rs` の
+`on_transport!` マクロが示している —— Identity API は HTTP/1.1+2 と H3 の
+2 系統があり、**どちらで喋るかを呼び出し側から隠す**のが包みの仕事である。
+加えて `IdentityError` を `anyhow` に変え、`endpoints::revoke` のように
+`RevokeAuth` を組み立てる（`endpoints.rs:75`。`enrollment.rs` ではない）。
+
+proxy 側で対応するのは、**実務上は**トランスポートの選択が無いことである:
+`proxy_client(cfg, &token)` は `ProxyClient<MasqueH3Transport>` を具体型で返し、
+呼び出し側はそれを持っている。
+
+**「常に 1 つ」は型の上では誤り。** `ControlPlaneTransport` は
+`MasqueH3Transport` と `HttpsTransport`（`https.rs:97`）の 2 つが実装していて、
+Identity 側と同じ二択が型としては存在する。違うのは、
+`ProxyClient<HttpsTransport>` を組む production のコードが 1 つも無いことで、
+だから隠すべき選択が今はない。Identity 側との非対称は歴史でも
+問題の違いでもなく、**同じ継ぎ目が使われていない**というだけである。
 
 ### 4.2 発行側には「素通しでは足りない」意味論がある
 
@@ -132,6 +172,93 @@ proxy 側だけで、Identity 側との非対称は歴史的なものに見え�
 
 **これらはすべて「Grant を作る」という 1 行の API の外側に積まれた知識**で、
 SDK がその API を出すなら一緒に出す対象になる。
+
+### 4.3 素通しは足さない。ただし足す価値のあるものが 2 つある（#351）
+
+**8 メソッドのうち 7 つ**（`create_grant` を除く —— それは下記）を
+`portal-server` で読むと、**すべてが同じ形**だった:
+
+```rust
+proxy.method(args...).await.context("…")?
+```
+
+に続いて `println!`。呼び出しの直前後に持ち上げられるロジックは無く、
+その 7 つに素通しの関数を足して得られるのは `anyhow::Result` への変換と
+2 つ目の名前だけである。それは #350 で `already_existed` を portal-core から
+再輸出しないと決めた理由 ——「そのクレートが呼ばない関数への 2 本目の経路は、
+同期を取り続ける名前が増えるだけ」—— に正面から反する。
+
+**除いた 1 つが反例である。** `create_grant` の周りには実際にロジックがあり、
+それは `settle_grants`（`main.rs:982`）、`note_existing_grants`（`:1093`）、
+`grant_lifetime_lines`（`:401`）、そして `DELETING` の読み（`:1194`）として
+すでに別の形で入っている。だから結論は「発行側に何も足さない」ではなく
+**「素通しは足さない」**である。
+
+**§4.2 が挙げた意味論のうち 3 つは入り、1 つはアプリ側に残った:**
+
+| 意味論 | どこに入ったか |
+| --- | --- |
+| upsert を新規作成と見分ける | `Made`（#345）。成功時も status を残す内部経路つき |
+| 自分が作ったものだけ消す台帳 | `isekai_p2p::grants::Ledger`（#350） |
+| 3 通りの「期限」を運用者に説明する | `grant_lifetime_lines`（#337） |
+| 答えを呼び出し側の行動に翻訳する | `Outcome` と `Reading`（#347, #349） |
+| **方針から Grant を調停する** | **入っていない**。`Wanted` / `Changes` / `plan` / `plan_now` は `portal-core` に残る（#350 の分割点。§9-2 のとおり意図的） |
+
+#### 足す価値があるもの 1 — ルートの `Reading`
+
+3 つの revoke が**同じ形の答えを別に扱っている**。`is_already_gone` は
+grant の delete を `Outcome::of_proxy(e, &DELETING)` で読むのに
+（`main.rs:1194`）、`revoke_ticket`（`:1531`）と
+`revoke_provisioning_key`（`:1613`）は `?` で落とすだけで、
+`ProxyError` は非 2xx を一律 `Err` にする。
+`--revoke-ticket` のコメント自身が「the id may never have existed」を
+受け入れられる結末として挙げているのに、それが届いたら run は失敗する。
+
+**到達可能性は確かめられていない**（プロキシが存在しない id に `204` を返すなら
+そもそも起きない。コメントの「`204` says almost nothing」はそう読める）。
+それでも 3 経路が食い違っていること自体は限界として記録に値する。
+
+#### 足す価値があるもの 2 — 一覧の行の読み方
+
+これは**すでに重複している**。provisioning key の binding 種別の分類が
+`portal-server/src/main.rs:1699` と `portal-client/src/main.rs:1742` に
+**逐語で同じもの**として存在し、client 側のコメントが
+「the same as on the server's side」と書いている:
+
+```rust
+Some("none") | Some("") | None => "UNBOUND".to_owned(),
+```
+
+枠の表示（`(Some(live), Some(max)) => "{live}/{max} slots"`）と
+`redemption_count.unwrap_or(0)` / `redeem_count.unwrap_or(1)` の約束も同じく
+2 箇所にある。**§4.2 が `grant_lifetime_lines` を「持ち上げられる意味論」と
+数えたのと同じ種類**で、しかも「このキーは素の bearer secret なのか」という
+問いの答えでもある。2 つの binary が別々に持つべき知識ではない。
+
+### 4.4 API の形の問題 — `ttl` がメソッドを跨いで意味を変える
+
+```rust
+create_grant(allowed_endpoint, protocol, ttl, label)
+create_ticket(protocol, ttl, grant_ttl, label)
+create_provisioning_key(protocol, ttl, grant_ttl, max_live_grants, binding, label)
+```
+
+`create_grant` の `ttl` は **Grant** の寿命である（`main.rs:1463` が
+`args.grant_expires_in` を渡している）。`create_ticket` の `ttl` は
+**券**の寿命で、Grant の寿命は隣の `grant_ttl`。つまり
+**同じ名前が隣接するメソッドで別のものを指す**。
+さらに `create_provisioning_key` は `Option<u64>` を **3 つ**並べる
+（`ttl` / `grant_ttl` / `max_live_grants`）。
+
+`p2p_sdk_api_review.md` §6-6（enum であるべきものが `Option<&str>`）と
+同じ種類の摩擦で、直し方も同じ: 名前のある型にする。ただしそれは
+`isekai-p2p-core` の署名を変える話で、**2 本目の経路を足すのとは逆方向**である。
+
+**CLI 側の混同はこれとは別の話。** `check_grant_options`（`main.rs:441`）が
+守っているのは `--grant-ttl` と `--grant-expires-in` という**2 つのフラグ**の
+取り違えで、位置引数の転置ではない。ただし根は同じ —— `--grant-ttl` が
+どの寿命なのかが名前から決まらないこと —— で、「`--grant` と一緒に渡すと
+**日付のない Grant を作って何も言わなかった**」という代償が記録されている。
 
 ## 5. リレー計測について — 必要なのは「駆動」ではなく「点検」
 
@@ -192,7 +319,9 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
    クラスタ B・C。`isekai-p2p` にあるが FFI に出ていない。
 3. **アクセスを与える（発行側）** — Grant / Ticket / Provisioning Key の
    作成・一覧・取り消し、ラベル、3 種の期限、upsert の意味論、方針からの調停。
-   クラスタ E・F・G。**面が無い（§4）。ここが最大の欠落。**
+   クラスタ E・F・G。**面はある（§4.0）。意味論は 4 つのうち 3 つ入った（§4.3）。**
+   残るのは素通しではない 2 つ（ルートの `Reading`、一覧の行の読み方）と、
+   `ttl` がメソッドを跨いで意味を変えること（§4.4）。
 4. **アクセスを受け取る（引き換え側）** — ペアリングコード、Ticket、
    Provisioning Key の引き換え。クラスタ D。`isekai-p2p` にある。
 5. **繋ぐ** — Listener / Initiator、ローカルの待受けと転送先、
@@ -253,8 +382,15 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
 本文書は面の広さ（Q1）の下敷きで、**面の確定はしていない**。逆算の結果として
 新たに決める必要が出たもの:
 
-1. **発行側（§7-3）をどの層に置くか** — §4.1 の先例に倣って `isekai-p2p` に
-   薄いモジュールを足すか、SDK のハンドルの一部にするか。
+1. **発行側（§7-3）をどの層に置くか** — **半分決着（#351）**。
+   面は再輸出された `ProxyClient` として既にあり（§4.0）、8 メソッドのうち
+   7 つに素通しの関数を足しても 2 つ目の名前しか増えない（§4.3）。
+   §4.2 の意味論は 4 つのうち 3 つが #337 / #345 / #347 / #349 / #350 で
+   入り、方針調停だけが意図的に `portal-core` に残った。
+   **未決のまま残るのは、素通しではない 2 つ**: ルートの `Reading`
+   （3 つの revoke が食い違っている。到達可能性は未確認）と、
+   一覧の行の読み方（**既に 2 つの binary に逐語で重複している**）。
+   それに API の形の問題 1 件（§4.4）。
 2. ~~**upsert と方針調停（§4.2）は誰のものか**~~ — **決着（#350）**。
    `already_existed` / `existed_before` / `Ledger` は `isekai_p2p::grants` に
    移した。分割点は方針テーブルが始まるところで、`Table` を読む

@@ -108,9 +108,14 @@ pub mod agent {
     // a public variant, and without it no caller outside this crate can name
     // what that variant holds -- or build one, which a test of a classifier has
     // to.
+    // `ControlPlaneTransport` among them: `ProxyClient<T>` is generic over it,
+    // so without the re-export nothing outside this crate can name the bound --
+    // which means no caller can write a function over the transport, and the
+    // seam `p2p_sdk_api_review.md` §6-10 says exists but goes unused cannot be
+    // reached from here either.
     pub use isekai_p2p_core::proxy::{
-        CachedCertificate, CertificateParameters, IssuedCertificate, Problem, ProxyClient,
-        ProxyError,
+        CachedCertificate, CertificateParameters, ControlPlaneTransport, IssuedCertificate,
+        Problem, ProxyClient, ProxyError,
     };
     pub use isekai_p2p_core::proxy::{RelayCandidate, RelayRttSample};
     // **A public address is reached from outside this crate.** The example
