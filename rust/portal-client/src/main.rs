@@ -1736,11 +1736,15 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
                 _ => "slots unknown".to_owned(),
             };
             // Which of these is a bare bearer credential is the question worth
-            // answering here, the same as on the server's side.
-            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
-                Some("oidc") => "oidc".to_owned(),
-                Some("none") | Some("") | None => "UNBOUND".to_owned(),
-                Some(other) => other.to_owned(),
+            // answering here, the same as on the server's side -- which is why
+            // the reading is [`isekai_p2p::agent::bound_to`] rather than a
+            // second copy of it. The subject is not shown: this listing is
+            // about which keys are bare, and an enrollment key's subject is a
+            // detail `--enrollment-key-enrollments` reports per registration.
+            let bound = match isekai_p2p::agent::bound_to(key.binding.as_ref()) {
+                isekai_p2p::agent::Bound::Nothing => "UNBOUND".to_owned(),
+                isekai_p2p::agent::Bound::Oidc { .. } => "oidc".to_owned(),
+                isekai_p2p::agent::Bound::Other(kind) => kind.to_owned(),
             };
             println!(
                 "key         : {}  {bound}, {slots}, {}{label}",

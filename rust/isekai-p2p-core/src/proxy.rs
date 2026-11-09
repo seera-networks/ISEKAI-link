@@ -823,6 +823,49 @@ pub struct BindingView {
     pub audience: Option<String>,
 }
 
+/// What a key is tied to, if anything.
+///
+/// **The question a key listing exists to answer.** An unbound key is a bare
+/// bearer secret -- fine on a machine you own, wrong in a public repository --
+/// and an operator cannot act on that without being told which is which. Both
+/// `portal-server`'s `--provisioning-keys` and `portal-client`'s
+/// `--enrollment-keys` had the same classification written out by hand, the
+/// second commented "the same as on the server's side", over the same
+/// [`BindingView`] reached from two different records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound<'a> {
+    /// Nothing. **Whoever holds the secret can use it.**
+    Nothing,
+    /// A workload identity token, and the subject it must carry when the answer
+    /// named one.
+    Oidc { subject: Option<&'a str> },
+    /// A kind this build does not know about. Shown as it arrived rather than
+    /// guessed at: a binding nobody here recognises is still a binding, and
+    /// calling it unbound would be the one wrong answer.
+    Other(&'a str),
+}
+
+/// Read what a key is tied to.
+///
+/// **Absent and empty both read as [`Bound::Nothing`], and that is the point.**
+/// `binding` is `Option` because a key may have none, and `BindingView::kind`
+/// is `#[serde(default)]` so that an object arriving without a `type` cannot
+/// fail the whole response -- which means an empty string reaches here. Reading
+/// either as "bound to something" would tell an operator a bare bearer secret
+/// is safe to commit.
+pub fn bound_to(binding: Option<&BindingView>) -> Bound<'_> {
+    match binding {
+        None => Bound::Nothing,
+        Some(binding) => match binding.kind.as_str() {
+            "" | "none" => Bound::Nothing,
+            "oidc" => Bound::Oidc {
+                subject: binding.subject.as_deref(),
+            },
+            other => Bound::Other(other),
+        },
+    }
+}
+
 /// A Provisioning Key as issued (spec §8.13.3).
 ///
 /// **`key` is the only required field**, for the reason [`Ticket`] gives: it is
@@ -3099,6 +3142,58 @@ mod tests {
         assert_eq!(sent["ttl"], 7200, "the seconds asked for go on the wire");
         assert!(sent["label"].is_null(), "no label means none is sent");
     }
+    fn binding(kind: &str, subject: Option<&str>) -> BindingView {
+        BindingView {
+            kind: kind.to_owned(),
+            issuer: None,
+            subject: subject.map(str::to_owned),
+            audience: None,
+        }
+    }
+
+    /// **Absent, empty and `"none"` all mean a bare bearer secret.**
+    ///
+    /// The three are not interchangeable on the wire -- a key may have no
+    /// `binding` at all, and `kind` is `#[serde(default)]` so an object without
+    /// a `type` yields an empty string -- but they are the same answer to the
+    /// question a listing asks. Reading any of them as "bound to something"
+    /// would tell an operator a secret is safe to commit.
+    #[test]
+    fn nothing_absent_and_empty_all_read_as_unbound() {
+        assert_eq!(bound_to(None), Bound::Nothing);
+        assert_eq!(bound_to(Some(&binding("", None))), Bound::Nothing);
+        assert_eq!(bound_to(Some(&binding("none", None))), Bound::Nothing);
+    }
+
+    #[test]
+    fn an_oidc_binding_carries_its_subject_when_there_is_one() {
+        assert_eq!(
+            bound_to(Some(&binding(
+                "oidc",
+                Some("repo:acme/app:ref:refs/heads/main")
+            ))),
+            Bound::Oidc {
+                subject: Some("repo:acme/app:ref:refs/heads/main")
+            },
+        );
+        assert_eq!(
+            bound_to(Some(&binding("oidc", None))),
+            Bound::Oidc { subject: None },
+            "a binding whose subject the answer did not name is still bound",
+        );
+    }
+
+    /// **An unrecognised kind is not unbound.** A binding nobody here knows
+    /// about is still a binding, and calling it unbound is the one wrong answer
+    /// -- it would tell an operator to treat a tied key as a bare secret.
+    #[test]
+    fn an_unknown_kind_is_reported_rather_than_guessed_at() {
+        assert_eq!(
+            bound_to(Some(&binding("spiffe", Some("spiffe://acme/sa/app")))),
+            Bound::Other("spiffe"),
+        );
+    }
+
     /// A create that upserts says so in its status, which is the whole reason
     /// the status is kept here and nowhere else.
     ///

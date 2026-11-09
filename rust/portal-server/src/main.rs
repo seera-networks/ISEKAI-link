@@ -32,7 +32,9 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use argh::FromArgs;
-use isekai_p2p::agent::{BindingView, Made, Missing, Outcome, ProvisioningBinding, Reading};
+use isekai_p2p::agent::{
+    bound_to, BindingView, Bound, Made, Missing, Outcome, ProvisioningBinding, Reading,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -1695,15 +1697,16 @@ async fn grant_admin(
             // an unbound one is fine on a machine you own and wrong for a
             // public repository, and an operator cannot act on that without
             // being told which is which.
-            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
-                Some("none") | Some("") | None => "UNBOUND".to_owned(),
-                Some("oidc") => key
-                    .binding
-                    .as_ref()
-                    .and_then(|b| b.subject.as_deref())
-                    .map(|subject| format!("oidc {subject}"))
-                    .unwrap_or_else(|| "oidc".to_owned()),
-                Some(other) => other.to_owned(),
+            //
+            // Which inputs mean "unbound" is [`bound_to`]'s to know: it is the
+            // same answer `portal-client` needs over the same `BindingView`,
+            // and the two had it written out separately. What stays here is
+            // how to say it, which differs -- this listing names the subject.
+            let bound = match bound_to(key.binding.as_ref()) {
+                Bound::Nothing => "UNBOUND".to_owned(),
+                Bound::Oidc { subject: Some(s) } => format!("oidc {s}"),
+                Bound::Oidc { subject: None } => "oidc".to_owned(),
+                Bound::Other(kind) => kind.to_owned(),
             };
             println!(
                 "key         : {}  {bound}, {slots}, {} redemptions, expires {}{label}",

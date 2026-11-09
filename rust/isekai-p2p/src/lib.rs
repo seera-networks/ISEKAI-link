@@ -96,12 +96,13 @@ pub mod agent {
     // (`docs/p2p_sdk_error_type.md` §4.2).
     pub use isekai_p2p_core::outcome::{Missing, Outcome, Reading, Unreachable};
     pub use isekai_p2p_core::proxy::{
-        pairing_code_from_input, pairing_code_in_uri, pairing_uri, proxy_authority, redact_secrets,
-        secret_prefix, ticket_from_transfer, ticket_transfer, BindingView, Candidate,
-        CandidateType, Capability, CertBundle, ConnectionStateFilter, Grant, ListenerConnections,
-        ListenerEvent, Made, PairingCode, PeerConnection, ProvisioningBinding, ProvisioningKey,
-        ProvisioningKeyRecord, ProvisioningRedemption, ReachableListener, RedeemedProvisioningKey,
-        RedeemedTicket, Ticket, TicketListener, TicketRecord, TicketRedemption, TicketTransfer,
+        bound_to, pairing_code_from_input, pairing_code_in_uri, pairing_uri, proxy_authority,
+        redact_secrets, secret_prefix, ticket_from_transfer, ticket_transfer, BindingView, Bound,
+        Candidate, CandidateType, Capability, CertBundle, ConnectionStateFilter, Grant,
+        ListenerConnections, ListenerEvent, Made, PairingCode, PeerConnection, ProvisioningBinding,
+        ProvisioningKey, ProvisioningKeyRecord, ProvisioningRedemption, ReachableListener,
+        RedeemedProvisioningKey, RedeemedTicket, Ticket, TicketListener, TicketRecord,
+        TicketRedemption, TicketTransfer,
         ENROLLMENT_KEY_PREFIX, PROVISIONING_KEY_PREFIX, TICKET_PREFIX, TICKET_TRANSFER_PREFIX,
     };
     // `Problem` among them: it is the type of a field of `ProxyError::Problem`,
