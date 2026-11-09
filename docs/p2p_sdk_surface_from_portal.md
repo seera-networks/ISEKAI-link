@@ -53,7 +53,7 @@ FFI の 4 概念が覆っているのは **A の鍵の部分、D の受け取り
 | B | `endpoints::{list, get, revoke}`, `membership::{me, describe}` | **[p2p]** |
 | C | `enrollment::{Identity::new, issue, list, enrollments, revoke}` | **[p2p]** |
 | D | 発行側 `create_pairing_code` → `ListenerSession::show_pairing_code` **[p2p]** / 受け取り側 `pair_with_code` → `PeerDirectory` **[p2p]** |
-| E | `create_grant` **[raw]**, `list_grants` **[p2p+raw]**, `revoke_grant` **[p2p+raw]**, `issue_capability` **[p2p]**, upsert の判定 `already_existed` **[app]** |
+| E | `create_grant` **[raw]**, `list_grants` **[p2p+raw]**, `revoke_grant` **[p2p+raw]**, `issue_capability` **[p2p]**, upsert の判定 `already_existed` と台帳 `Ledger` **[p2p]**（#350 で移した。方針からの調停 `plan` は **[app]** のまま） |
 | F | `create_ticket` **[raw]**, `list_tickets` **[raw]**, `revoke_ticket` **[raw]**, `redeem_ticket` **[p2p]** |
 | G | `create_provisioning_key` **[raw]**, `list_provisioning_keys` **[raw]**, `provisioning_redemptions` **[raw]**, `revoke_provisioning_key` **[raw]**, `redeem_provisioning_key` **[p2p]** |
 | H | `ListenerSession`, `InitiatorSession`, `RelayOptions`, `listener::run`, `direct_path`, `legs()`, `observed_address()`, `Narrowing`（`--gateway`）, `device_name`（`--task`） | **[p2p]** + 転送・ルーティングは **[app]** |
@@ -255,9 +255,12 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
 
 1. **発行側（§7-3）をどの層に置くか** — §4.1 の先例に倣って `isekai-p2p` に
    薄いモジュールを足すか、SDK のハンドルの一部にするか。
-2. **upsert と方針調停（§4.2）は誰のものか** — `already_existed` と `Ledger` は
-   今アプリ側にある。SDK が `create_grant` を出すなら、これも一緒に出るのか、
-   アプリに残すのか。
+2. ~~**upsert と方針調停（§4.2）は誰のものか**~~ — **決着（#350）**。
+   `already_existed` / `existed_before` / `Ledger` は `isekai_p2p::grants` に
+   移した。分割点は方針テーブルが始まるところで、`Table` を読む
+   `plan` / `plan_now` / `Wanted` / `Changes` はアプリ側に残る。
+   `plan` がレジャーから必要とするのは「自分が作った全部」だけで、
+   `Ledger::ours()` がそれを出す。
 3. **点検の面（§7-6）をどこまで下げるか** — `FamilyProbe` や `legs()` のような
    低位の型をそのまま見せるか、要約を見せるか。
 4. **§8 の消費者ゼロの面を畳むか** — 面を狭める好機だが、

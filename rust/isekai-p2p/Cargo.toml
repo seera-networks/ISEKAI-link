@@ -22,7 +22,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 # The Auth0 device-authorization flow and refresh (`auth`).
 reqwest = { workspace = true }
-# Reading the `expires_at` the proxy puts on a lease (`initiator`).
+# Reading the `expires_at` the proxy puts on a lease (`initiator`), and the
+# `created_at` a created grant answers with (`grants`) -- both Rfc3339, which
+# is what the workspace entry's `parsing`/`formatting` features are for.
 time = { workspace = true }
 # Winding the relay leg down when a renewal says this Endpoint is refused
 # (`initiator`).

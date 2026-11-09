@@ -103,15 +103,6 @@ impl Ledger {
         Self::default()
     }
 
-    /// How many grants this process is tracking.
-    pub fn len(&self) -> usize {
-        self.made.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.made.is_empty()
-    }
-
     /// The pairs this process made a grant for, and the ids.
     ///
     /// **For working out what to remove**, which is the one thing a caller
