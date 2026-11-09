@@ -389,7 +389,7 @@ struct Args {
 /// `expires_at`, which the proxy decided, or `--grant-expires-in`, which is
 /// only what was asked for; the proxy clamps, so echoing the request can print
 /// a time that is not when this grant ends. The second is
-/// [`portal_core::gateway::grants::already_existed`]:
+/// [`isekai_p2p::grants::already_existed`]:
 /// claiming a grant "stands until revoked" when the create merely updated the
 /// Gateway's would promise access that `settle_grants` takes away when the
 /// lease ends — and the create will have overwritten its label and expiry on
@@ -418,7 +418,7 @@ fn grant_lifetime_lines(
     // deciding whether it may remove this later; the two disagreeing about one
     // create is the confusion neither would survive. `existed_before` also
     // carries why a `201` is believed and a `200` is not.
-    if portal_core::gateway::grants::existed_before(made, grant.created_at.as_deref()) {
+    if isekai_p2p::grants::existed_before(made, grant.created_at.as_deref()) {
         lines.push(
             "              NOTE: this pair already had a grant -- the create UPDATED it, \
              label and expiry included. If something else made it (a --gateway-config run, \
@@ -1050,7 +1050,7 @@ async fn settle_grants(
     ledger: &mut portal_core::gateway::Ledger,
     reported: &mut Reported,
 ) {
-    let changes = ledger.plan_now(table);
+    let changes = portal_core::gateway::grants::plan_now(ledger, table);
 
     // **Before anything else, and before any chance of returning early.** A row
     // that can never be served is the one thing that must not go unsaid, and
@@ -1078,7 +1078,7 @@ async fn settle_grants(
     // goes, with the table still listing the lease that wanted it.
     //
     // `info`, not `warn`: this is the ledger working as intended (see
-    // `portal_core::gateway::grants`), not a problem to fix.
+    // `isekai_p2p::grants`), not a problem to fix.
     let fresh = newly(
         &mut reported.served,
         changes
@@ -1202,7 +1202,7 @@ fn is_already_gone(e: &isekai_p2p::agent::ProxyError) -> bool {
 /// as "already gone" would call [`Ledger::removed`] on a grant still standing
 /// at the proxy: it would keep its TTL with nothing tracking it, and the
 /// `warn!` that would have surfaced the misconfiguration would stop. Removing
-/// too much is the direction `portal_core::gateway::grants` exists to avoid.
+/// too much is the direction `isekai_p2p::grants` exists to avoid.
 ///
 /// So a bodiless `404` stays a failure, which is what it is, and both statuses
 /// are left `Unremarkable`.

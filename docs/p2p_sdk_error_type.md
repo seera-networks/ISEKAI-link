@@ -398,7 +398,7 @@ RefreshError  ─┘
 そこは `settle_grants` が何もしない区分なので、
 自分の create が書いた 60 秒の TTL で枯れる。
 
-そこで判断を 1 箇所（`portal_core::gateway::grants::existed_before`）に集め、
+そこで判断を 1 箇所（`isekai_p2p::grants::existed_before`）に集め、
 **非対称**にした:
 
 - `Fresh`（`201`）は**信じる**。`201` が「既にあった」を意味することは

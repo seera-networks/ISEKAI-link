@@ -118,7 +118,8 @@ proxy 側だけで、Identity 側との非対称は歴史的なものに見え�
 - **`create_grant` は upsert**。プロキシは既存 id を `200` で返し `created_at` を
   据え置く。新規作成と再作成の区別は `created_at` の経過時間を
   30 秒の窓（`ExistedBefore::WINDOW`）と比べて推定するしかなく、その判定は
-  `portal_core::gateway::grants::already_existed` に**アプリ側で**実装された。
+  `already_existed` として実装された（当時はアプリ側の
+  `portal-core`。#350 で `isekai_p2p::grants` に移した）。
 - **Gateway は Grant を方針から調停する**。`portal-core` の `Ledger` が
   `Wanted` / `Changes` を計画し（`gateway/grants.rs`）、
   `portal-server` の `settle_grants`（`main.rs:982`）が

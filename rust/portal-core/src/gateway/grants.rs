@@ -1,112 +1,26 @@
-//! Which grants this Gateway made, and which it must not touch.
+//! Which grants a policy wants, and what has to change at the proxy to match.
 //!
 //! **P3 of `docs/portal_gateway_plan.md`.** The table says what the control
-//! plane wants; this works out what has to change at the proxy to match, and —
-//! more importantly — what has to be left alone.
+//! plane wants; this works out what has to change — and, more importantly,
+//! what has to be left alone.
 //!
-//! # A grant is keyed by the pair, not by the lease
-//!
-//! The proxy keys a grant on `(owner, allowed_endpoint, protocol)` and
-//! re-creating one answers `200` with the same id. So **two leases for the same
-//! pair are one grant**, which the draft calls the normal case for an agent
-//! running two tasks. A ledger that assumed one grant per lease would delete a
-//! grant the other lease still needs the moment either ended.
-//!
-//! Carrying the lease id in the grant's key is what would fix that properly,
-//! and it needs a change at the proxy (draft §3.4.2, stage 6). Until then the
-//! ledger counts: a grant goes when the last lease wanting it goes.
-//!
-//! # It only removes what it made
-//!
-//! An operator's hand-made grant for the same pair is indistinguishable from
-//! ours — same `origin`, and the label is overwritten by any re-creation. So
-//! the rule is not "recognise ours" but **"only remove what this process
-//! created"**. On a restart the ledger is empty, so nothing is removed until it
-//! has been created again, and a grant that is no longer wanted lapses on its
-//! own TTL instead.
-//!
-//! That is the safe direction: **forgetting to remove costs a grant that
-//! expires anyway; removing too much takes away an operator's own.**
+//! **The ledger itself is [`isekai_p2p::grants`]**, because the bookkeeping a
+//! grant upsert needs is not specific to this Gateway: anything creating grants
+//! on a schedule needs it. The rules that live there — a grant is keyed by the
+//! pair, and only what this process made may be removed — are what [`plan`]
+//! reads. What stays here is the half that knows about access leases, windows
+//! and refusals, which is this crate's business and nobody else's.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use isekai_p2p::agent::Made;
+// `GrantKey` and `Ledger` because [`plan`]'s signature and [`Changes`] name
+// them. Not `already_existed`/`existed_before`: a second path to a function
+// this crate does not itself call is just a name to keep in step.
+pub use isekai_p2p::grants::{GrantKey, Ledger};
 
 use super::{Refusal, Table};
-
-/// How old a freshly returned grant may be and still be one we just made.
-///
-/// Generous, because it covers a round trip and any clock skew between here and
-/// the proxy — and being wrong in this direction costs a grant we decline to
-/// track rather than one we delete.
-struct ExistedBefore;
-impl ExistedBefore {
-    const WINDOW: time::Duration = time::Duration::seconds(30);
-}
-
-/// Whether a create answered with a grant that was **already there**.
-///
-/// **Creating a grant for a pair that has one is an update, not a refusal**
-/// (see [`Ledger::note_existing`]). The proxy answers `200` with the existing
-/// id and leaves `created_at` untouched, so the age of what came back is the
-/// only thing separating "I made this" from "I edited somebody else's".
-///
-/// Public because `portal-server`'s `--grant` needs the same answer for a
-/// different purpose — telling the operator which of the two happened — and a
-/// second copy of the window would be a constant free to drift from the one
-/// the ledger decides by.
-/// Whether a create answered with a grant that was **already there**, from
-/// everything the answer said.
-///
-/// **The two readings are not trusted equally, and the asymmetry is the
-/// point.** Which success status this route uses is the proxy's to choose, and
-/// nothing outside this workspace's own notes establishes that a fresh create
-/// answers `201` — so:
-///
-/// * [`Made::Fresh`] **is** believed. A `201` cannot plausibly mean "already
-///   there", and believing it fixes the case the age gets wrong in the
-///   dangerous direction: a grant we just made whose round trip was slow looks
-///   old, lands in `theirs`, and then nothing refreshes it — so the grant our
-///   own create wrote a 60-second TTL onto lapses, and the policy it serves
-///   goes unserved until a restart re-lists.
-/// * [`Made::Existing`] is **not**. If the proxy answers `200` on a fresh
-///   create too, believing it would put *every* grant this process makes into
-///   `theirs` — same starvation, on every create rather than in a race. So it
-///   defers to the age, which is what decided this before the status was kept.
-/// * [`Made::Unknown`] defers for the same reason.
-///
-/// Promoting `Existing` to authoritative needs the control plane's fresh-create
-/// status confirmed first.
-pub fn existed_before(made: Made, created_at: Option<&str>) -> bool {
-    match made {
-        Made::Fresh => false,
-        Made::Existing | Made::Unknown => already_existed(created_at),
-    }
-}
-
-pub fn already_existed(created_at: Option<&str>) -> bool {
-    created_at
-        .and_then(|text| OffsetDateTime::parse(text, &Rfc3339).ok())
-        .is_some_and(|at| OffsetDateTime::now_utc() - at > ExistedBefore::WINDOW)
-}
-
-/// A grant's identity at the proxy.
-pub type GrantKey = (String, String);
-
-/// What this process has created, and for whom.
-#[derive(Debug, Clone, Default)]
-pub struct Ledger {
-    /// The grant id for each pair we made one for.
-    made: BTreeMap<GrantKey, String>,
-    /// Pairs that already had a grant before we touched them.
-    ///
-    /// Held separately because these are served and never removed — see
-    /// [`note_existing`](Ledger::note_existing).
-    theirs: BTreeSet<GrantKey>,
-}
 
 /// One grant to create.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,185 +72,68 @@ pub struct Changes {
     pub refused: Vec<(String, Refusal)>,
 }
 
-impl Ledger {
-    pub fn new() -> Self {
-        Self::default()
+/// What the proxy would have to do to match `table`.
+///
+/// **Nothing is done here.** The caller performs the changes and reports back
+/// what succeeded, so a failure cannot leave the ledger claiming a grant that
+/// was never made.
+///
+/// A free function rather than a method on [`Ledger`]: the ledger lives in
+/// `isekai-p2p` and knows nothing of a policy table, which is the split that
+/// lets anything else creating grants reuse it.
+pub fn plan(ledger: &Ledger, table: &Table, now: OffsetDateTime) -> Changes {
+    let mut wanted: BTreeMap<GrantKey, Wanted> = BTreeMap::new();
+    let mut refused = Vec::new();
+
+    for entry in table.entries() {
+        let ttl = match entry.grant_ttl(now) {
+            Ok(ttl) => ttl,
+            Err(why) => {
+                refused.push((entry.access_lease_id.clone(), why));
+                continue;
+            }
+        };
+        let (endpoint, protocol) = entry.grant_key();
+        let key = (endpoint.to_owned(), protocol.to_owned());
+        let slot = wanted.entry(key).or_insert_with(|| Wanted {
+            allowed_endpoint: endpoint.to_owned(),
+            protocol: protocol.to_owned(),
+            ttl,
+            leases: BTreeSet::new(),
+        });
+        // **The shortest wins.** Two leases on one pair share a grant, and it
+        // must not outlive the one that ends first.
+        slot.ttl = slot.ttl.min(ttl);
+        slot.leases.insert(entry.access_lease_id.clone());
     }
 
-    pub fn len(&self) -> usize {
-        self.made.len()
+    let remove = ledger
+        .ours()
+        .filter(|(key, _)| !wanted.contains_key(*key))
+        .map(|(key, id)| (key.clone(), id.clone()))
+        .collect();
+
+    // **A pair the operator already covers is not created either.** Re-creating
+    // is an upsert: it would write *our* TTL and label onto their grant, so an
+    // indefinite one they made would acquire an expiry and then die when the
+    // lease stopped refreshing it. That destroys it more completely than the
+    // revocation the ledger already refuses, and silently. Their grant permits
+    // the connection already, so there is nothing this pass needs to add.
+    let (served, create): (Vec<_>, Vec<_>) = wanted
+        .into_values()
+        .partition(|w| ledger.is_operators(&w.key()));
+
+    Changes {
+        create,
+        served,
+        remove,
+        refused,
     }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.made.is_empty()
-    }
-
-    /// What the proxy would have to do to match `table`.
-    ///
-    /// **Nothing is done here.** The caller performs the changes and reports
-    /// back what succeeded, so a failure cannot leave the ledger claiming a
-    /// grant that was never made.
-    pub fn plan(&self, table: &Table, now: OffsetDateTime) -> Changes {
-        let mut wanted: BTreeMap<GrantKey, Wanted> = BTreeMap::new();
-        let mut refused = Vec::new();
-
-        for entry in table.entries() {
-            let ttl = match entry.grant_ttl(now) {
-                Ok(ttl) => ttl,
-                Err(why) => {
-                    refused.push((entry.access_lease_id.clone(), why));
-                    continue;
-                }
-            };
-            let (endpoint, protocol) = entry.grant_key();
-            let key = (endpoint.to_owned(), protocol.to_owned());
-            let slot = wanted.entry(key).or_insert_with(|| Wanted {
-                allowed_endpoint: endpoint.to_owned(),
-                protocol: protocol.to_owned(),
-                ttl,
-                leases: BTreeSet::new(),
-            });
-            // **The shortest wins.** Two leases on one pair share a grant, and
-            // it must not outlive the one that ends first.
-            slot.ttl = slot.ttl.min(ttl);
-            slot.leases.insert(entry.access_lease_id.clone());
-        }
-
-        let remove = self
-            .made
-            .iter()
-            .filter(|(key, _)| !wanted.contains_key(*key))
-            .map(|(key, id)| (key.clone(), id.clone()))
-            .collect();
-
-        // **A pair the operator already covers is not created either.**
-        // Re-creating is an upsert: it would write *our* TTL and label onto
-        // their grant, so an indefinite one they made would acquire an expiry
-        // and then die when the lease stopped refreshing it. That destroys it
-        // more completely than the revocation the ledger already refuses, and
-        // silently. Their grant permits the connection already, so there is
-        // nothing this pass needs to add.
-        let (served, create): (Vec<_>, Vec<_>) = wanted
-            .into_values()
-            .partition(|w| self.theirs.contains(&w.key()));
-
-        Changes {
-            create,
-            served,
-            remove,
-            refused,
-        }
-    }
-
-    /// [`plan`](Self::plan) against the clock now.
-    pub fn plan_now(&self, table: &Table) -> Changes {
-        self.plan(table, OffsetDateTime::now_utc())
-    }
-
-    /// Record a grant this process created.
-    ///
-    /// **A pair the operator already had is not recorded**, whatever the proxy
-    /// answered. Creating over an existing grant succeeds and returns *their*
-    /// id, so a caller that recorded the result would adopt it — and this is
-    /// the only place that can be stopped without every caller remembering to
-    /// ask first.
-    ///
-    /// Returns whether it was recorded.
-    pub fn made(&mut self, key: GrantKey, grant_id: String) -> bool {
-        if self.theirs.contains(&key) {
-            return false;
-        }
-        self.made.insert(key, grant_id);
-        true
-    }
-
-    /// Record what a create answered, from what its status said — or, failing
-    /// that, from how old it looks.
-    ///
-    /// **The listing at the top of a pass can be a quarter of an hour old.** A
-    /// grant the operator created after it is invisible to [`note_existing`],
-    /// so the create upserts theirs and the ledger would claim it.
-    ///
-    /// `made` is what the create's status said, read by [`existed_before`] —
-    /// which believes a `201` and defers to the age of `created_at` otherwise,
-    /// for the reasons recorded there.
-    ///
-    /// A pair already recorded as ours keeps its record whatever either says,
-    /// since `created_at` is the *original* creation and ours will look old
-    /// from the second pass onwards.
-    pub fn record(
-        &mut self,
-        key: GrantKey,
-        grant_id: String,
-        made: Made,
-        created_at: Option<&str>,
-    ) -> bool {
-        if let std::collections::btree_map::Entry::Occupied(mut ours) = self.made.entry(key.clone())
-        {
-            ours.insert(grant_id);
-            return true;
-        }
-        if existed_before(made, created_at) {
-            self.theirs.insert(key);
-            return false;
-        }
-        self.made(key, grant_id)
-    }
-
-    /// Note a pair that already had a grant when we first looked.
-    ///
-    /// **Creating a grant for an existing pair is an update, not a refusal.**
-    /// The proxy answers `200` with the *operator's* grant id — so recording
-    /// that as ours would adopt their grant, and the last lease ending would
-    /// then revoke it. That is the accident the ledger exists to prevent, and
-    /// counting alone does not prevent it.
-    ///
-    /// A pair marked here is served but never removed: the policy still gets
-    /// its grant, and what the operator made stays theirs.
-    ///
-    /// **A pair this process already made is not marked**, because it would
-    /// otherwise become un-removable on the second pass: our own grant appears
-    /// in the proxy's list like any other, and calling this on it would make it
-    /// permanent.
-    ///
-    /// Returns whether it was marked.
-    pub fn note_existing(&mut self, key: GrantKey) -> bool {
-        if self.made.contains_key(&key) || self.theirs.contains(&key) {
-            return false;
-        }
-        self.theirs.insert(key);
-        true
-    }
-
-    /// Whether this pair is one the operator already had.
-    pub fn is_operators(&self, key: &GrantKey) -> bool {
-        self.theirs.contains(key)
-    }
-
-    /// Forget every pair the operator no longer has a grant for.
-    ///
-    /// **Insert-only was a trap.** If the operator deletes their grant, the
-    /// mark would outlive it: a later lease for that pair would be refused a
-    /// record, so `plan` could never remove what we then made, and the log
-    /// would call it theirs when it was not.
-    ///
-    /// `present` is what a **successful** listing said. Nothing is pruned from
-    /// a failed one — not knowing is not the same as their being none, which
-    /// is the distinction that runs through all of this.
-    pub fn prune_theirs(&mut self, present: &BTreeSet<GrantKey>) -> usize {
-        let before = self.theirs.len();
-        self.theirs.retain(|key| present.contains(key));
-        before - self.theirs.len()
-    }
-
-    /// Forget one that was removed.
-    ///
-    /// **Only on success.** A delete that failed leaves the grant standing, and
-    /// forgetting it here would mean never trying again — the grant would sit
-    /// until its TTL with nothing tracking it.
-    pub fn removed(&mut self, key: &GrantKey) {
-        self.made.remove(key);
-    }
+/// [`plan`] against the clock now.
+pub fn plan_now(ledger: &Ledger, table: &Table) -> Changes {
+    plan(ledger, table, OffsetDateTime::now_utc())
 }
 
 #[cfg(test)]
@@ -347,7 +144,7 @@ mod tests {
     #[test]
     fn a_lease_asks_for_a_grant() {
         let table = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 1800)]);
-        let changes = Ledger::new().plan_now(&table);
+        let changes = plan_now(&Ledger::new(), &table);
         assert_eq!(changes.create.len(), 1);
         assert_eq!(changes.create[0].allowed_endpoint, "ep:a7");
         assert!(changes.create[0].ttl < 1800);
@@ -362,7 +159,7 @@ mod tests {
             ("al_1", "ep:a7", "pg-sales-ro-v1", 1800),
             ("al_2", "ep:a7", "pg-sales-ro-v1", 1800),
         ]);
-        let changes = Ledger::new().plan_now(&table);
+        let changes = plan_now(&Ledger::new(), &table);
         assert_eq!(changes.create.len(), 1, "{:?}", changes.create);
         assert_eq!(changes.create[0].leases.len(), 2);
     }
@@ -374,7 +171,7 @@ mod tests {
             ("al_1", "ep:a7", "pg-sales-ro-v1", 1800),
             ("al_2", "ep:a7", "pg-sales-ro-v1", 600),
         ]);
-        let changes = Ledger::new().plan_now(&table);
+        let changes = plan_now(&Ledger::new(), &table);
         assert!(changes.create[0].ttl < 600, "{:?}", changes.create[0]);
     }
 
@@ -390,13 +187,13 @@ mod tests {
 
         // One lease left: the grant stays.
         let one = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 1800)]);
-        assert!(ledger.plan_now(&one).remove.is_empty());
-        assert!(ledger.plan_now(&both).remove.is_empty());
+        assert!(plan_now(&ledger, &one).remove.is_empty());
+        assert!(plan_now(&ledger, &both).remove.is_empty());
 
         // None left: now it goes.
         let none = table_with(&[]);
         assert_eq!(
-            ledger.plan_now(&none).remove,
+            plan_now(&ledger, &none).remove,
             vec![(key, "gr_1".to_owned())]
         );
     }
@@ -407,14 +204,14 @@ mod tests {
         // proxy, so the rule is "only remove what we created" -- and an empty
         // ledger, which is what a restart leaves, removes nothing at all.
         let ledger = Ledger::new();
-        assert!(ledger.plan_now(&table_with(&[])).remove.is_empty());
+        assert!(plan_now(&ledger, &table_with(&[])).remove.is_empty());
     }
 
     #[test]
     fn a_lease_too_short_to_serve_is_reported_rather_than_skipped() {
         // Silently making no grant would look identical to making one.
         let table = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 30)]);
-        let changes = Ledger::new().plan_now(&table);
+        let changes = plan_now(&Ledger::new(), &table);
         assert!(changes.create.is_empty());
         assert_eq!(changes.refused.len(), 1);
         assert!(matches!(
@@ -437,13 +234,13 @@ mod tests {
         // It is served by the grant that is already there -- and **not
         // re-created**, since that would upsert our TTL onto it.
         let table = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 1800)]);
-        let changes = ledger.plan_now(&table);
+        let changes = plan_now(&ledger, &table);
         assert!(changes.create.is_empty(), "{:?}", changes.create);
         assert_eq!(changes.served.len(), 1);
 
         // ...and when every lease goes, nothing is removed, because the ledger
         // never recorded it as ours.
-        assert!(ledger.plan_now(&table_with(&[])).remove.is_empty());
+        assert!(plan_now(&ledger, &table_with(&[])).remove.is_empty());
     }
 
     #[test]
@@ -461,11 +258,11 @@ mod tests {
             !ledger.made(key.clone(), "gr_theirs".to_owned()),
             "the operator's grant was adopted",
         );
-        assert!(ledger.plan_now(&table_with(&[])).remove.is_empty());
+        assert!(plan_now(&ledger, &table_with(&[])).remove.is_empty());
         // And it is not offered for creation either, which is the stronger
         // guarantee: an upsert would rewrite its TTL.
         let table = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 1800)]);
-        assert!(ledger.plan_now(&table).create.is_empty());
+        assert!(plan_now(&ledger, &table).create.is_empty());
     }
 
     #[test]
@@ -479,7 +276,7 @@ mod tests {
 
         assert!(!ledger.note_existing(key.clone()), "ours was marked theirs");
         assert_eq!(
-            ledger.plan_now(&table_with(&[])).remove,
+            plan_now(&ledger, &table_with(&[])).remove,
             vec![(key, "gr_ours".to_owned())],
         );
     }
@@ -497,14 +294,14 @@ mod tests {
 
         let mut table = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 1800)]);
         assert!(
-            ledger.plan_now(&table).remove.is_empty(),
+            plan_now(&ledger, &table).remove.is_empty(),
             "removed too soon"
         );
 
         // What `policy.revoked` does to the table, and only then the plan.
         assert!(table.withdraw("al_1", 2));
         assert_eq!(
-            ledger.plan_now(&table).remove,
+            plan_now(&ledger, &table).remove,
             vec![(key, "gr_1".to_owned())],
         );
     }
@@ -519,8 +316,8 @@ mod tests {
         let mut table = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 1800)]);
 
         assert!(!table.withdraw("al_never", 9));
-        assert!(ledger.plan_now(&table).remove.is_empty());
-        assert_eq!(ledger.plan_now(&table).create.len(), 1);
+        assert!(plan_now(&ledger, &table).remove.is_empty());
+        assert_eq!(plan_now(&ledger, &table).create.len(), 1);
     }
 
     #[test]
@@ -535,7 +332,7 @@ mod tests {
         ledger.note_existing(key);
 
         let table = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 1800)]);
-        let changes = ledger.plan_now(&table);
+        let changes = plan_now(&ledger, &table);
         assert!(changes.create.is_empty(), "their grant would be rewritten");
         assert_eq!(
             changes.served.len(),
@@ -558,105 +355,15 @@ mod tests {
         assert!(!ledger.is_operators(&key));
         assert!(ledger.made(key.clone(), "gr_ours".to_owned()));
         assert_eq!(
-            ledger.plan_now(&table_with(&[])).remove,
+            plan_now(&ledger, &table_with(&[])).remove,
             vec![(key, "gr_ours".to_owned())],
         );
-    }
-
-    /// The age fallback, for a proxy whose success status says nothing.
-    #[test]
-    fn a_grant_that_answers_with_an_age_was_already_there() {
-        // The listing at the top of a pass can be a quarter of an hour old, so
-        // a grant the operator made since then is invisible to `note_existing`.
-        // The proxy leaves `created_at` alone on an update, so the answer says.
-        let mut ledger = Ledger::new();
-        let key = ("ep:a7".to_owned(), "pg-sales-ro-v1".to_owned());
-        let old = (OffsetDateTime::now_utc() - time::Duration::hours(2))
-            .format(&Rfc3339)
-            .expect("formats");
-
-        assert!(
-            !ledger.record(
-                key.clone(),
-                "gr_theirs".to_owned(),
-                Made::Unknown,
-                Some(&old)
-            ),
-            "an existing grant was claimed",
-        );
-        assert!(ledger.is_operators(&key));
-    }
-
-    #[test]
-    fn a_grant_we_just_made_is_ours() {
-        let mut ledger = Ledger::new();
-        let key = ("ep:a7".to_owned(), "pg-sales-ro-v1".to_owned());
-        let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("formats");
-        assert!(ledger.record(key.clone(), "gr_ours".to_owned(), Made::Unknown, Some(&now)));
-
-        // And on a later pass its `created_at` is old -- the proxy keeps the
-        // original -- which must not turn it into somebody else's.
-        let old = (OffsetDateTime::now_utc() - time::Duration::hours(2))
-            .format(&Rfc3339)
-            .expect("formats");
-        assert!(ledger.record(key.clone(), "gr_ours".to_owned(), Made::Unknown, Some(&old)));
-        assert!(!ledger.is_operators(&key));
-    }
-
-    /// **A `201` beats the age. A `200` does not.**
-    ///
-    /// The asymmetry is the whole policy, so it is pinned rather than left to
-    /// the reader of [`existed_before`]: believing a `201` fixes the case the
-    /// age gets wrong in the direction that starves a grant, and believing a
-    /// `200` would risk starving every grant this process makes if the proxy
-    /// turns out to answer `200` on a fresh create too.
-    #[test]
-    fn a_fresh_status_beats_the_age_and_an_existing_one_defers_to_it() {
-        let old = (OffsetDateTime::now_utc() - time::Duration::hours(2))
-            .format(&Rfc3339)
-            .expect("formats");
-        let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("formats");
-
-        // Looks old because the round trip was slow; the `201` says otherwise.
-        let mut ledger = Ledger::new();
-        let slow = ("ep:a7".to_owned(), "pg-sales-ro-v1".to_owned());
-        assert!(
-            ledger.record(slow.clone(), "gr_ours".to_owned(), Made::Fresh, Some(&old)),
-            "a 201 says we made it, however old the timestamp looks",
-        );
-        assert!(!ledger.is_operators(&slow));
-
-        // A `200` with a fresh timestamp reads as ours, exactly as it did
-        // before the status was kept: the age still decides this one.
-        let mut ledger = Ledger::new();
-        let fresh = ("ep:b8".to_owned(), "pg-sales-ro-v1".to_owned());
-        assert!(
-            ledger.record(
-                fresh.clone(),
-                "gr_ours".to_owned(),
-                Made::Existing,
-                Some(&now)
-            ),
-            "a 200 defers to the age, which says this one is ours",
-        );
-        assert!(!ledger.is_operators(&fresh));
-
-        // And with an old timestamp the two agree.
-        let mut ledger = Ledger::new();
-        let theirs = ("ep:c9".to_owned(), "pg-sales-ro-v1".to_owned());
-        assert!(!ledger.record(
-            theirs.clone(),
-            "gr_theirs".to_owned(),
-            Made::Existing,
-            Some(&old)
-        ));
-        assert!(ledger.is_operators(&theirs));
     }
 
     #[test]
     fn the_label_says_where_the_grant_came_from() {
         let table = table_with(&[("al_1", "ep:a7", "pg-sales-ro-v1", 1800)]);
-        let changes = Ledger::new().plan_now(&table);
+        let changes = plan_now(&Ledger::new(), &table);
         assert_eq!(changes.create[0].label(), "gw:al_1");
     }
 }
