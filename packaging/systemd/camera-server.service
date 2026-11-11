@@ -1,0 +1,116 @@
+# Leave a camera running.
+#
+# **This file ships inside the Linux release archive**, at
+# `camera-apps-ubuntu-latest/systemd/camera-server.service`. It runs the
+# ordinary camera-server window on a virtual display, with
+# `--accept-privacy-policy`: the consent screen is answered by whoever installs
+# this unit, and the window opens the listener and starts the camera by itself.
+# Sign-in and pairing are done in the window, once, before enabling it.
+#
+# 1. Unpack the release, and install a virtual display.
+#
+#      unzip camera-apps-ubuntu-latest.zip
+#      sudo mv camera-apps-ubuntu-latest /usr/local/camera-apps
+#      sudo chown -R root:root /usr/local/camera-apps
+#      sudo chmod -R go-w /usr/local/camera-apps
+#      sudo cp /usr/local/camera-apps/systemd/camera-server.service /etc/systemd/system/
+#      sudo apt install xvfb
+#
+#    **The chown is not tidiness**: left owned by your account, the binary a
+#    system service runs is one that account can replace.
+#
+# 2. An account for it: `video` to open the camera, `render` for the GPU.
+#
+#      sudo useradd --system --home-dir /var/lib/camera-server \
+#          --shell /usr/sbin/nologin --groups video,render camera
+#      sudo install -d -o camera -g camera -m 0700 /var/lib/camera-server
+#
+# 3. Sign in and pair, once, in the window, as that account and in that
+#    directory -- the window keeps its key and sign-in in the directory it
+#    starts in. From a desktop session on the machine, or over `ssh -X`:
+#
+#      cd /var/lib/camera-server
+#      sudo -u camera XDG_CONFIG_HOME=/var/lib/camera-server \
+#          /usr/local/camera-apps/camera-server
+#
+#    Agree to the policy, sign in, press Open, show a pairing code and redeem
+#    it on the viewer, then close the window. A pairing is a grant on the
+#    Endpoint, so it holds across every restart after. Skipping the sign-in
+#    leaves a service that starts and opens nothing, and says so in the journal.
+#
+# 4. Then:
+#
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now camera-server
+#      journalctl -u camera-server -f
+
+[Unit]
+Description=ISEKAI camera server
+Documentation=https://github.com/seera-networks/ISEKAI-link/blob/main/docs/camera.md
+Wants=network-online.target
+After=network-online.target
+# No start limit: a camera nobody is watching should keep trying, and a burst
+# limit is spent in seconds when the network turns up late after a reboot.
+StartLimitIntervalSec=0
+
+[Service]
+# **A fixed user.** The Endpoint key must survive restarts: a new key is a new
+# Endpoint ID, and every paired viewer would have to pair again.
+User=camera
+Group=camera
+# video for the camera; render for the GPU the window draws with.
+SupplementaryGroups=video render
+
+StateDirectory=camera-server
+StateDirectoryMode=0700
+# The window writes camera-server-endpoint.pem, its video TLS key and
+# camera-server-auth0.json into the directory it starts in.
+WorkingDirectory=%S/camera-server
+# Where the agreement to the privacy policy is recorded.
+Environment=XDG_CONFIG_HOME=%S/camera-server
+# **The GPU, through Xvfb.** The window draws through wgpu, and without the
+# render nodes (`render` group) it cannot reach the GPU and exits with `WGPU
+# error: Parent device is lost` (measured on a Jetson Orin). On a machine with
+# no usable GPU, software rendering works instead -- uncomment the line below
+# -- at the cost of several cores: it redraws the whole window continuously.
+#Environment=WGPU_BACKEND=gl LIBGL_ALWAYS_SOFTWARE=1
+
+# **Two paints a second, not thirty.** Nobody looks at this window, and each
+# frame painted costs about 2.5% of a core (Jetson Orin): 1.1 cores at the
+# default 30, 0.4 at 2, most of which is the capture itself. What is streamed
+# to viewers is the same either way.
+Environment=CAMERA_PREVIEW_FPS=2
+
+# Without it only errors reach the journal, and an outage is warnings first:
+# the reconnects that failed before the listener gave up.
+Environment=RUST_LOG=info
+
+# **--accept-privacy-policy on every start**, not once: the policy is revised
+# from time to time, and a window relying on the record alone would come up on
+# the consent screen that day, with nobody to see it.
+#
+# --auto-servernum so another X server on the machine (:99 is a common choice)
+# cannot stop this one starting.
+ExecStart=/usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1400x1000x24" \
+    /usr/local/camera-apps/camera-server --accept-privacy-policy
+
+# Restarted when it exits with an error or is killed. A `systemctl stop` is
+# left stopped. With --accept-privacy-policy the window closes itself, with an
+# error, when its listener could not start or gave up on the control plane
+# (#179); xvfb-run passes that exit status on, and this brings it back.
+Restart=on-failure
+RestartSec=30
+RestartSteps=5
+RestartMaxDelaySec=600
+TimeoutStopSec=20
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

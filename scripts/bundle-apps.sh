@@ -300,11 +300,10 @@ Linux)
     # The unit is part of what the bundle promises, so it is checked like the
     # libraries are, rather than trusted to a `cp` nobody watches.
     #
-    # **Say when there is nothing to check.** This is vacuous for every camera
-    # bundle, because no camera app has a unit -- and `camera-apps.yml` is the
-    # only workflow that runs this script on an ordinary push. So the branch
-    # that copies is first exercised by a tag or a `workflow_dispatch`, and a
-    # silent pass here would read as coverage it is not.
+    # **Say when there is nothing to check.** A bundle of apps none of which
+    # has a unit passes vacuously, and a silent pass would read as coverage it
+    # is not. `camera-server` has one, so `camera-apps.yml` exercises the copy
+    # on every ordinary push.
     shipped=0
     for app in "${apps[@]}"; do
         [ -f "${units}/${app}.service" ] || continue
