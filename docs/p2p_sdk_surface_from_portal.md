@@ -218,22 +218,50 @@ grant の delete を `Outcome::of_proxy(e, &DELETING)` で読むのに
 そもそも起きない。コメントの「`204` says almost nothing」はそう読める）。
 それでも 3 経路が食い違っていること自体は限界として記録に値する。
 
-#### 足す価値があるもの 2 — 一覧の行の読み方
+#### 足す価値があるもの 2 — 一覧の行の読み方（#352 で入れた）
 
-これは**すでに重複している**。provisioning key の binding 種別の分類が
-`portal-server/src/main.rs:1699` と `portal-client/src/main.rs:1742` に
-**逐語で同じもの**として存在し、client 側のコメントが
-「the same as on the server's side」と書いている:
+これは**すでに重複していた**。binding 種別の分類が
+`portal-server/src/main.rs` と `portal-client/src/main.rs` に**逐語で同じもの**
+として存在し、client 側のコメントが「the same as on the server's side」と
+書いていた:
 
 ```rust
 Some("none") | Some("") | None => "UNBOUND".to_owned(),
 ```
 
-枠の表示（`(Some(live), Some(max)) => "{live}/{max} slots"`）と
-`redemption_count.unwrap_or(0)` / `redeem_count.unwrap_or(1)` の約束も同じく
-2 箇所にある。**§4.2 が `grant_lifetime_lines` を「持ち上げられる意味論」と
-数えたのと同じ種類**で、しかも「このキーは素の bearer secret なのか」という
-問いの答えでもある。2 つの binary が別々に持つべき知識ではない。
+**2 つの record が同じ型を持っていた**のが決め手である:
+proxy 側の `ProvisioningKeyRecord.binding` と Identity 側の
+`EnrollmentKeyRecord.binding` はどちらも `Option<BindingView>`。
+だから読み方は `BindingView` の隣の 1 箇所に置ける ——
+`Bound` と `bound_to(Option<&BindingView>)`。
+
+**分類だけを持ち上げ、表示は残した。** どの入力が「素の bearer secret」を
+意味するか（不在・空文字・`"none"` の 3 つ）は 1 箇所に集め、
+未知の種別を `Other` として報告する。一方で表示は 2 つで違っていて
+正しい —— server は subject を出し、client は出さない。
+
+危険な向きは両方テストで固定した: 空文字を `Other` に落とすと素の secret を
+「束縛済み」と言い、未知の種別を `Nothing` に落とすと束縛済みを素と言う。
+どちらの改変でも対応するテストが落ちる。
+
+**写しは 2 つではなく 4 つあった。** 一覧の 2 つに加えて、発行の応答を表示する
+`print_binding`（portal-server）と `print_enrollment_binding`（portal-client）が
+同じ分類を別に書いていて、**しかも食い違っていた**: client は `"none" | ""` を
+見ていたのに server は `"none"` だけで、空の `kind`（`#[serde(default)]` が
+まさにその発行応答のために存在する入力）が最後の腕に落ち、
+`bound to    : ` と**何も続かない行**を出していた。素のキーを束縛名らしきものに
+見せる向きの誤りである。4 箇所すべて `bound_to` にした。
+
+**不在の読みはルートで違っていて、それは保った。** 一覧では `binding` が無い
+= 束縛が無い。発行の応答では「答えが言わなかった」で、
+`--binding-oidc` を渡した運用者が沈黙を「通った」と読まないよう
+「not reported」と報告する。だから発行側の 2 つは `None` を自分で扱い、
+`bound_to` は `Some` で呼ぶ。
+
+残っている重複は**枠の表示**（`(Some(live), Some(max)) => "{live}/{max} slots"`）
+だが、こちらはフィールド名も予備語も違う（`live_grants`/`live_endpoints`、
+`"grants"`/`"live"`）ので、同じ形をした別のコードである。持ち上げるなら
+記録の型ごとのメソッドになる。
 
 ### 4.4 API の形の問題 — `ttl` がメソッドを跨いで意味を変える
 
@@ -387,10 +415,10 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
    7 つに素通しの関数を足しても 2 つ目の名前しか増えない（§4.3）。
    §4.2 の意味論は 4 つのうち 3 つが #337 / #345 / #347 / #349 / #350 で
    入り、方針調停だけが意図的に `portal-core` に残った。
-   **未決のまま残るのは、素通しではない 2 つ**: ルートの `Reading`
-   （3 つの revoke が食い違っている。到達可能性は未確認）と、
-   一覧の行の読み方（**既に 2 つの binary に逐語で重複している**）。
-   それに API の形の問題 1 件（§4.4）。
+   **素通しではない 2 つのうち 1 つは入れた**（#352、§4.3）: 一覧行の
+   binding 種別の分類を `Bound` / `bound_to` として `BindingView` の隣へ。
+   残るのはルートの `Reading`（3 つの revoke が食い違っている。到達可能性は
+   未確認）と、API の形の問題 1 件（§4.4）。
 2. ~~**upsert と方針調停（§4.2）は誰のものか**~~ — **決着（#350）**。
    `already_existed` / `existed_before` / `Ledger` は `isekai_p2p::grants` に
    移した。分割点は方針テーブルが始まるところで、`Table` を読む
