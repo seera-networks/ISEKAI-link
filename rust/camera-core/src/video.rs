@@ -163,14 +163,26 @@ pub async fn serve_frames_with(
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok(conn) => {
+                    // **A child token, not a clone of this loop's.**
+                    // `advertise` watches this connection's leg for as long as
+                    // its token is live and holds a `Connection` clone while it
+                    // does, so on the server's own token it would outlive the
+                    // client it was advertising to — one task and one live
+                    // msquic handle per client ever served. The guard below
+                    // ends it with the push.
+                    let serving = shutdown.child_token();
                     if let Some(legs) = &opts.legs {
                         isekai_p2p::direct_path::advertise(
                             conn.clone(),
                             legs.clone(),
-                            shutdown.clone(),
+                            serving.clone(),
                         );
                     }
-                    tokio::spawn(push_frames(conn, frames.subscribe()));
+                    let pushing = frames.subscribe();
+                    tokio::spawn(async move {
+                        let _serving = serving.drop_guard();
+                        push_frames(conn, pushing).await;
+                    });
                 }
                 Err(e) => {
                     tracing::error!("video accept failed: {e}");
@@ -477,10 +489,17 @@ pub async fn receive_frames_with(
     // Keep the offer current for the life of the receive: a renewed DHCP
     // lease or a SLAAC renumbering moves the relay leg, and the candidate
     // offered above then names an address this host no longer has.
-    // Gated on the candidate as well: without one the configuration was built
-    // with migration off, and a candidate offered later has nothing to act on.
-    if let (Some(watch), Some(_)) = (observed, candidate) {
-        isekai_p2p::direct_path::reoffer(conn.clone(), watch, shutdown.clone());
+    //
+    // **A child token with a guard, as the heartbeat above has.** `session`
+    // owns the configuration this connection may not outlive, and it is
+    // dropped when this function returns; the caller's token is not
+    // necessarily cancelled then (`isekai-client-ffi` cancels only when the
+    // *session* ends), so a task holding a `Connection` clone on that token
+    // would go on holding it against a released configuration.
+    let renewing = shutdown.child_token();
+    let _renewing = renewing.clone().drop_guard();
+    if let (Some(watch), Some(candidate)) = (observed, candidate) {
+        isekai_p2p::direct_path::reoffer(conn.clone(), watch, candidate, renewing);
     }
 
     let relay_path = (conn.get_local_addr()?, conn.get_remote_addr()?);

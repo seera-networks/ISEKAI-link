@@ -157,35 +157,48 @@ fn offer(conn: &Connection, UnconnectedLeg(candidate): UnconnectedLeg) -> anyhow
     Ok(())
 }
 
+/// The QUIC status behind a failure, where there is one. `None` for the
+/// variants that report a connection going away rather than a parameter being
+/// refused.
+fn status_of(e: &ConnectionError) -> Option<msquic::StatusCode> {
+    let ConnectionError::OtherError(status) = e else {
+        return None;
+    };
+    status.try_as_status_code().ok()
+}
+
 /// `ADDRESS_IN_USE`, which from every add-address parameter in this module
 /// means "msquic already has this".
 ///
 /// That is success here, not failure: what the caller wanted the connection to
 /// know, it knows. It is also not a corner case — it is the ordinary answer
-/// when a leg returns to an address it held before, and when [`reoffer`] reads
-/// the same report [`prepare`] already acted on. Treated as an error it
-/// produces a warning saying the session is stuck on the relay, about a
-/// candidate that is sitting on the connection.
+/// when a leg returns to an address it held before on an IP of its own, which
+/// [`withdraw`] leaves in place. Treated as an error it produces a warning
+/// saying the session is stuck on the relay, about a candidate that is sitting
+/// on the connection.
 fn already_there(e: &ConnectionError) -> bool {
-    let ConnectionError::OtherError(status) = e else {
-        return false;
-    };
-    status.try_as_status_code() == Ok(msquic::StatusCode::QUIC_STATUS_ADDRESS_IN_USE)
+    status_of(e) == Some(msquic::StatusCode::QUIC_STATUS_ADDRESS_IN_USE)
+}
+
+/// `NOT_FOUND` from `remove_candidate_addr`: the pair is not on the
+/// connection, which is the state the removal was asking for.
+fn not_there(e: &ConnectionError) -> bool {
+    status_of(e) == Some(msquic::StatusCode::QUIC_STATUS_NOT_FOUND)
 }
 
 /// The candidate pair on its own, without any of [`offer`]'s pre-`start`
-/// setup. `true` when the pair was new to the connection.
+/// setup.
 ///
 /// Split out because this is the whole of what a *later* offer may do: the
 /// three setters above are configuration a connection only accepts before it
 /// starts, and a candidate is the one part of the offer a running connection
 /// can still be told about — which is what [`reoffer`] rests on.
-fn add_candidates(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<bool> {
-    let added = match conn.add_candidate_addr(candidate.local, candidate.observed) {
-        Ok(()) => true,
-        Err(e) if already_there(&e) => false,
-        Err(e) => anyhow::bail!("could not offer a direct-path candidate: {e}"),
-    };
+fn add_candidates(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
+    if let Err(e) = conn.add_candidate_addr(candidate.local, candidate.observed) {
+        if !already_there(&e) {
+            anyhow::bail!("could not offer a direct-path candidate: {e}");
+        }
+    }
     // Also offer the host address itself. A peer on the same LAN can reach it
     // directly, while the observed one is only reachable from outside the NAT —
     // and a NAT that does not hairpin (most of them) drops a packet sent from
@@ -214,10 +227,65 @@ fn add_candidates(conn: &Connection, candidate: ObservedAddress) -> anyhow::Resu
     // the next reader assume the LAN case is covered from this side.
     if candidate.local != candidate.observed {
         if let Err(e) = conn.add_candidate_addr(candidate.local, candidate.local) {
-            tracing::debug!("could not offer the host candidate: {e}");
+            if !already_there(&e) {
+                tracing::debug!("could not offer the host candidate: {e}");
+            }
         }
     }
-    Ok(added)
+    Ok(())
+}
+
+/// Take a superseded candidate off the connection — **only ever the one a new
+/// pair would be shadowed by.**
+///
+/// msquic reads the *first* candidate whose host address matches the pair it
+/// is considering, compared **by IP alone**: `QuicConnPunchableClientAddress`
+/// uses `QuicAddrCompareIp`, and a table pair's local address carries no port
+/// at all. A stale entry on the same IP is therefore not inert — it goes on
+/// answering for that IP, and the pair appended behind it is never read. That
+/// is what would otherwise make a leg rebinding onto a new port, or a NAT
+/// mapping moving while the host address stays, a change no amount of offering
+/// could fix: the punch request would keep naming the old observed address and
+/// the probe would keep leaving from the old port.
+///
+/// **An entry on a different IP is left alone, and that is the whole of the
+/// rule.** It answers for an IP of its own, so it shadows nothing; and on a
+/// host that gained an address while keeping the old one, it is the candidate
+/// a live path is running on. Withdrawing it would be deciding that an address
+/// is gone, which this has no business deciding — what it does know is that
+/// the leg reported a different binding on the *same* IP, and a leg has one
+/// binding at a time.
+fn withdraw(conn: &Connection, superseded: ObservedAddress, keeping: ObservedAddress) {
+    // What the offer being kept consists of. A leg that moved only its
+    // observed address — the NAT mapping changing under a binding that stayed
+    // put — leaves `local` identical, so the host entry `(local, local)` is
+    // one and the same entry in both offers. Removing it would take back half
+    // of the offer this withdrawal exists to make effective. (A moved port
+    // makes them different entries, and the old one does go.)
+    let keep = [
+        (keeping.local, keeping.observed),
+        (keeping.local, keeping.local),
+    ];
+    // Both of what [`add_candidates`] may have added. The host entry is only
+    // added when it differs, and the pair may have been withdrawn already, so
+    // `not_there` is the ordinary answer rather than a problem.
+    for (host, observed) in [
+        (superseded.local, superseded.observed),
+        (superseded.local, superseded.local),
+    ] {
+        if keep.contains(&(host, observed)) {
+            continue;
+        }
+        if let Err(e) = conn.remove_candidate_addr(host, observed) {
+            if !not_there(&e) {
+                tracing::debug!(
+                    %host,
+                    %observed,
+                    "could not withdraw the superseded direct-path candidate: {e}",
+                );
+            }
+        }
+    }
 }
 
 /// Keep the offer current as the leg's address changes, for the life of
@@ -233,65 +301,88 @@ fn add_candidates(conn: &Connection, candidate: ObservedAddress) -> anyhow::Resu
 /// dies, and the session carries every byte over the relay for the rest of its
 /// life with nothing in either log to say why.
 ///
-/// # Why one `add_candidate_addr` is the whole of the fix
+/// `candidate` is the one [`prepare`] was given, and is checked again here for
+/// the reason the check inside says: a leg that cannot carry a direct path did
+/// not get [`offer`]'s three pre-`start` settings either, and a candidate
+/// added to a connection without those is probe packets that cannot validate.
+///
+/// # Why a candidate is nearly the whole of the fix
 ///
 /// msquic does not punch towards a candidate; it punches towards the candidate
 /// belonging to the pair it is considering, found by that pair's **local**
-/// address (`QuicConnPunchableClientAddress`, comparing with
-/// `QuicAddrCompareIp`). The pair table is rebuilt from the addresses the host
-/// currently has, so after renumbering every pair in it names the new local
-/// address while the only candidate on the connection names the old one.
-/// Nothing matches, NAT traversal refuses the pair, and no punch is requested
-/// — a silence rather than an error. Adding the new pair restores the match,
-/// and `QuicConnAddCandidateAddress` both accepts the call on a started
-/// connection and ends in `QuicConnQueueReconcile`, so the pair it unblocks is
-/// reconsidered at once instead of at the next unrelated event.
+/// address (`QuicConnPunchableClientAddress`). The pair table is rebuilt from
+/// the addresses the host currently has, so after renumbering every pair in it
+/// names the new local address while the only candidate on the connection
+/// names the old one. Nothing matches, NAT traversal refuses the pair, and no
+/// punch is requested — a silence rather than an error. Adding the new pair
+/// restores the match, and `QuicConnAddCandidateAddress` both accepts the call
+/// on a started connection and ends in `QuicConnQueueReconcile`, so the pair
+/// it unblocks is reconsidered at once instead of at the next unrelated event.
 ///
-/// # Nothing is withdrawn
+/// # And why it is only nearly
 ///
-/// That same lookup is why the stale candidate costs nothing: it names an
-/// address this host no longer has, so no pair the table can hold will match
-/// it and it is never read again. `remove_candidate_addr` does exist, and
-/// calling it would mean deciding that an address is gone — on a host that
-/// holds two, or that reports the old one once more while both are up, that is
-/// a decision which tears down a path that works. The price of not making it
-/// is one list entry per change of address, unbounded across a very long
-/// session; the entries are small and inert, and that is much the cheaper of
-/// the two failures.
-pub fn reoffer(conn: Connection, mut observed: ObservedAddressWatch, shutdown: CancellationToken) {
+/// That lookup takes the *first* matching candidate and matches **by IP**, so
+/// an offer is not enough on its own when the host address did not change —
+/// a leg rebinding onto a new port, or a NAT mapping moving underneath it. The
+/// stale entry keeps answering for that IP and the new pair is never read.
+/// [`withdraw`] is that half, and its rule is narrow by design: the entry for
+/// this same IP goes, and nothing else does.
+pub fn reoffer(
+    conn: Connection,
+    mut observed: ObservedAddressWatch,
+    candidate: ObservedAddress,
+    shutdown: CancellationToken,
+) {
+    // The same question [`prepare`] asked, of the same value, so the two agree
+    // by construction — which is what the gate at the call sites could not do
+    // for itself: a report existing is not the connection having been set up
+    // for a direct path.
+    let Some(UnconnectedLeg(mut last)) = UnconnectedLeg::check(candidate, "offer again later")
+    else {
+        return;
+    };
     tokio::spawn(async move {
         loop {
             // Read before waiting, because the watch may already have moved
             // on: the handshake rides across the peer's relay-bind gap and can
             // take minutes, and the address can change inside it.
             if let Some(address) = *observed.borrow_and_update() {
-                // Kept watching where [`prepare`] gives up: what is being
-                // watched for is the leg's binding changing, and it can change
-                // into one no direct path can run over and back again.
-                if let Some(UnconnectedLeg(address)) = UnconnectedLeg::check(address, "offer again")
-                {
-                    match add_candidates(&conn, address) {
-                        // Already offered — this report changed something the
-                        // candidate does not carry, or is the one `prepare`
-                        // acted on. Said at debug because "the leg moved" at
-                        // info would be a lie.
-                        Ok(false) => tracing::debug!(
-                            local = %address.local,
-                            observed = %address.observed,
-                            "the relay leg reported an address already offered",
-                        ),
-                        Ok(true) => tracing::info!(
-                            local = %address.local,
-                            observed = %address.observed,
-                            "the relay leg moved; offered its new address as a direct-path \
-                             candidate",
-                        ),
-                        Err(e) => tracing::warn!(
-                            local = %address.local,
-                            observed = %address.observed,
-                            "could not offer the relay leg's new address, so this session \
-                             stays on the relay: {e:#}",
-                        ),
+                // Only the pair matters. A report that carries the same pair
+                // with a different binding kind has nothing for msquic, and
+                // acting on it would re-send what it already knows.
+                let moved = (address.local, address.observed) != (last.local, last.observed);
+                // Kept watching where [`prepare`] gives up: the leg's binding
+                // can change into one no direct path can run over, and back
+                // again.
+                if moved {
+                    if let Some(UnconnectedLeg(address)) =
+                        UnconnectedLeg::check(address, "offer again")
+                    {
+                        match add_candidates(&conn, address) {
+                            Ok(()) => {
+                                // Added first, withdrawn second: a removal
+                                // queues a reconciliation pass of its own, so
+                                // the order costs at most one pass that reads
+                                // the stale entry, where the other order has a
+                                // window with no candidate for this IP at all.
+                                if address.local.ip() == last.local.ip() {
+                                    withdraw(&conn, last, address);
+                                }
+                                last = address;
+                                tracing::info!(
+                                    local = %address.local,
+                                    observed = %address.observed,
+                                    "the relay leg moved; offered its new address as a \
+                                     direct-path candidate",
+                                );
+                            }
+                            Err(e) => tracing::warn!(
+                                local = %address.local,
+                                observed = %address.observed,
+                                "could not offer the relay leg's new address, so this session \
+                                 stays on the relay: {e:#}",
+                            ),
+                        }
                     }
                 }
             }
@@ -347,8 +438,13 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
         // advertisement is a frame, and `add_observed_addr` would send another
         // one saying what the peer was told last time.
         //
-        // Nothing is withdrawn, for [`reoffer`]'s reasons and one more: a
-        // bound address is a UDP binding this connection holds and may have a
+        // Nothing is withdrawn, and unlike on the initiator's side nothing
+        // needs to be: a bound address is advertised to the peer, which looks
+        // an advertised address up by matching it whole rather than by taking
+        // the first entry on an IP, so a stale one shadows nothing — see
+        // [`withdraw`] for the asymmetry. It costs the peer a pair it will
+        // probe once and fail. What a withdrawal would cost is worse: a bound
+        // address is a UDP binding this connection holds and may have a
         // validated path running over. The list is capped at
         // `QUIC_MAX_LOCAL_ADDRESS_COUNT` (128), so the growth is bounded
         // rather than merely slow.
@@ -841,35 +937,44 @@ mod tests {
         );
     }
 
-    fn status(code: msquic::StatusCode) -> ConnectionError {
+    fn refused(code: msquic::StatusCode) -> ConnectionError {
         ConnectionError::OtherError(msquic::Status::new(code))
     }
 
-    /// The one piece of judgement in re-offering, and the only one of these
-    /// functions that can be tested at all — the rest need a live msquic
-    /// connection. Both directions matter: a status this does not recognise
-    /// becomes a warning about a session stuck on the relay, and a status it
-    /// recognises too widely swallows a real refusal and reports a direct path
-    /// that was never offered.
+    /// The two pieces of judgement in renewing an offer, and the only part of
+    /// it that can be tested at all — everything else here needs a live msquic
+    /// connection. Both directions matter: a status these fail to recognise
+    /// becomes a warning about a session stuck on the relay, and one they
+    /// recognise too widely swallows a real refusal and claims an offer that
+    /// was never made.
     #[test]
     fn an_address_already_on_the_connection_is_not_a_failure() {
-        assert!(already_there(&status(
-            msquic::StatusCode::QUIC_STATUS_ADDRESS_IN_USE
-        )));
+        use msquic::StatusCode::*;
+
+        assert!(already_there(&refused(QUIC_STATUS_ADDRESS_IN_USE)));
+        assert!(not_there(&refused(QUIC_STATUS_NOT_FOUND)));
+        // Each predicate answers for its own status and no other — including
+        // the other's, which is what keeps a refused *addition* from being
+        // read as an already-absent removal.
+        assert!(!already_there(&refused(QUIC_STATUS_NOT_FOUND)));
+        assert!(!not_there(&refused(QUIC_STATUS_ADDRESS_IN_USE)));
         for other in [
-            msquic::StatusCode::QUIC_STATUS_INVALID_STATE,
-            msquic::StatusCode::QUIC_STATUS_INVALID_PARAMETER,
-            msquic::StatusCode::QUIC_STATUS_OUT_OF_MEMORY,
-            msquic::StatusCode::QUIC_STATUS_NOT_FOUND,
+            QUIC_STATUS_INVALID_STATE,
+            QUIC_STATUS_INVALID_PARAMETER,
+            QUIC_STATUS_OUT_OF_MEMORY,
         ] {
             assert!(
-                !already_there(&status(other.clone())),
+                !already_there(&refused(other.clone())) && !not_there(&refused(other.clone())),
                 "{other:?} is a refusal and has to stay one",
             );
         }
         // Not every `ConnectionError` carries a status, and the ones that do
         // not are connections going away rather than addresses already held.
-        assert!(!already_there(&ConnectionError::ConnectionClosed));
-        assert!(!already_there(&ConnectionError::ShutdownByLocal));
+        for gone in [
+            ConnectionError::ConnectionClosed,
+            ConnectionError::ShutdownByLocal,
+        ] {
+            assert!(!already_there(&gone) && !not_there(&gone), "{gone:?}");
+        }
     }
 }

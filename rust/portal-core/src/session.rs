@@ -257,7 +257,16 @@ pub async fn serve(
                 accepted = listener.accept() => match accepted {
                     Ok(conn) => {
                         let catalogue = catalogue.clone();
-                        let serving = accepting.clone();
+                        // **A child token, not a clone of the accept loop's.**
+                        // `advertise` watches this connection's leg for as
+                        // long as its token is live, and holds a `Connection`
+                        // clone while it does. Given the loop's own token it
+                        // would outlive the peer it was advertising to, so a
+                        // server that had served a long succession of clients
+                        // would hold a task and a live msquic handle for every
+                        // one of them until the process stopped. The guard
+                        // below ends it with the connection.
+                        let serving = accepting.child_token();
                         // **Both ends have to stay quiet for a session to
                         // really be relay-only.** A client that offers no
                         // candidate still gets a direct path if this side
@@ -275,6 +284,7 @@ pub async fn serve(
                         // One task per peer: a forward that stalls must not
                         // stop the next peer being accepted.
                         tokio::spawn(async move {
+                            let _ended = serving.clone().drop_guard();
                             if let Err(e) = crate::server::serve(conn, catalogue, serving).await {
                                 tracing::warn!("portal connection ended: {e:#}");
                             }
@@ -822,13 +832,17 @@ async fn open_the_peer_connection(
     // The address offered above is the one the leg had a moment ago, and this
     // end's address moves: a renewed DHCP lease, SLAAC, a different network.
     // Without this the session drops to the relay at the first such change and
-    // stays there (#358). Gated on the candidate because without one the
-    // configuration was built with migration off, and a candidate offered
-    // later would have nothing to act on.
-    if candidate.is_some() {
+    // stays there (#358).
+    //
+    // On this session's own token, which is what `Connected::close` cancels
+    // before it drains — the same arrangement `Sessions::start` below has, and
+    // for the same reason: the task holds a `Connection` clone, and the drain
+    // is a wait for msquic to have no live handles left.
+    if let Some(candidate) = candidate {
         direct_path::reoffer(
             peer.connection().clone(),
             session.observed_address(),
+            candidate,
             shutdown.clone(),
         );
     }
