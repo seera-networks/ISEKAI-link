@@ -116,6 +116,19 @@ jobs:
       - name: Install the build and runtime dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
+          # `prepare-machine.ps1` above adds the lttng stable-2.13 PPA, whose
+          # own description says it supports 18.04 and 20.04 — and the
+          # `ubuntu-latest` image moved to 26.04 "resolute" on 2026-11-14. So
+          # the PPA answers 404, `apt-get update` exits 100, and this step
+          # fails on a repository nothing here installs from.
+          #
+          # Dropped rather than tolerated with `|| true`: a genuine failure of
+          # this step has to stay a failure. Nothing is lost by dropping it —
+          # `prepare-machine.ps1` has already run, and it takes
+          # `liblttng-ust-dev` from the Ubuntu archive, which is why the other
+          # Linux jobs build msquic successfully with the same 404 in their
+          # logs.
+          sudo rm -f /etc/apt/sources.list.d/*lttng*
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev build-essential cmake pkg-config \
             libavcodec-dev libavformat-dev libswscale-dev libv4l-dev
