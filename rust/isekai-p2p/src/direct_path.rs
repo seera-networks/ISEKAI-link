@@ -9,7 +9,15 @@
 //!   prepare()   ── candidate: its own leg's binding ──▶
 //!               ◀── ADD_ADDRESS: this leg's binding ──   advertise()
 //!                        …path validation…
+//!   reoffer()   ── candidate: the leg's new binding ──▶
+//!               ◀── ADD_ADDRESS: the new binding ─────   advertise(), again
 //! ```
+//!
+//! **And both ends have to keep doing it.** Addresses move — a renewed DHCP
+//! lease, SLAAC, a laptop changing network — and an offer naming the one the
+//! leg used to have names nothing msquic can punch towards. So neither half
+//! acts once: each watches its own leg for the life of the connection, which
+//! is #358 and the reason the bottom two lines of the diagram exist.
 //!
 //! **Neither half is any use alone**, which is why they are one module. The
 //! initiator's candidate tells the peer where to send; the listener's
@@ -34,7 +42,7 @@ use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use msquic_async::Connection;
+use msquic_async::{msquic, Connection, ConnectionError};
 use tokio_util::sync::CancellationToken;
 
 use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
@@ -140,8 +148,44 @@ fn offer(conn: &Connection, UnconnectedLeg(candidate): UnconnectedLeg) -> anyhow
         .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
     conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
-    conn.add_candidate_addr(candidate.local, candidate.observed)
-        .map_err(|e| anyhow::anyhow!("could not offer a direct-path candidate: {e}"))?;
+    add_candidates(conn, candidate)?;
+    tracing::info!(
+        local = %candidate.local,
+        observed = %candidate.observed,
+        "offered direct-path candidates to the peer",
+    );
+    Ok(())
+}
+
+/// `ADDRESS_IN_USE`, which from every add-address parameter in this module
+/// means "msquic already has this".
+///
+/// That is success here, not failure: what the caller wanted the connection to
+/// know, it knows. It is also not a corner case — it is the ordinary answer
+/// when a leg returns to an address it held before, and when [`reoffer`] reads
+/// the same report [`prepare`] already acted on. Treated as an error it
+/// produces a warning saying the session is stuck on the relay, about a
+/// candidate that is sitting on the connection.
+fn already_there(e: &ConnectionError) -> bool {
+    let ConnectionError::OtherError(status) = e else {
+        return false;
+    };
+    status.try_as_status_code() == Ok(msquic::StatusCode::QUIC_STATUS_ADDRESS_IN_USE)
+}
+
+/// The candidate pair on its own, without any of [`offer`]'s pre-`start`
+/// setup. `true` when the pair was new to the connection.
+///
+/// Split out because this is the whole of what a *later* offer may do: the
+/// three setters above are configuration a connection only accepts before it
+/// starts, and a candidate is the one part of the offer a running connection
+/// can still be told about — which is what [`reoffer`] rests on.
+fn add_candidates(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<bool> {
+    let added = match conn.add_candidate_addr(candidate.local, candidate.observed) {
+        Ok(()) => true,
+        Err(e) if already_there(&e) => false,
+        Err(e) => anyhow::bail!("could not offer a direct-path candidate: {e}"),
+    };
     // Also offer the host address itself. A peer on the same LAN can reach it
     // directly, while the observed one is only reachable from outside the NAT —
     // and a NAT that does not hairpin (most of them) drops a packet sent from
@@ -173,12 +217,94 @@ fn offer(conn: &Connection, UnconnectedLeg(candidate): UnconnectedLeg) -> anyhow
             tracing::debug!("could not offer the host candidate: {e}");
         }
     }
-    tracing::info!(
-        local = %candidate.local,
-        observed = %candidate.observed,
-        "offered direct-path candidates to the peer",
-    );
-    Ok(())
+    Ok(added)
+}
+
+/// Keep the offer current as the leg's address changes, for the life of
+/// `conn`. The initiator's other half, and the one [`prepare`] cannot be.
+///
+/// [`prepare`] offers the address the leg had just before the handshake, and
+/// for a host whose addresses never move that is the whole story. They move: a
+/// DHCP lease is renewed onto a different address, SLAAC renumbers, a laptop
+/// leaves one network for another. The relay leg follows — it rebinds and
+/// reports the new `(local, observed)` pair on the very watch [`prepare`]'s
+/// candidate was read from — and until this, nothing on the initiator side
+/// read that pair. #358 is what that cost: at the first change the direct path
+/// dies, and the session carries every byte over the relay for the rest of its
+/// life with nothing in either log to say why.
+///
+/// # Why one `add_candidate_addr` is the whole of the fix
+///
+/// msquic does not punch towards a candidate; it punches towards the candidate
+/// belonging to the pair it is considering, found by that pair's **local**
+/// address (`QuicConnPunchableClientAddress`, comparing with
+/// `QuicAddrCompareIp`). The pair table is rebuilt from the addresses the host
+/// currently has, so after renumbering every pair in it names the new local
+/// address while the only candidate on the connection names the old one.
+/// Nothing matches, NAT traversal refuses the pair, and no punch is requested
+/// — a silence rather than an error. Adding the new pair restores the match,
+/// and `QuicConnAddCandidateAddress` both accepts the call on a started
+/// connection and ends in `QuicConnQueueReconcile`, so the pair it unblocks is
+/// reconsidered at once instead of at the next unrelated event.
+///
+/// # Nothing is withdrawn
+///
+/// That same lookup is why the stale candidate costs nothing: it names an
+/// address this host no longer has, so no pair the table can hold will match
+/// it and it is never read again. `remove_candidate_addr` does exist, and
+/// calling it would mean deciding that an address is gone — on a host that
+/// holds two, or that reports the old one once more while both are up, that is
+/// a decision which tears down a path that works. The price of not making it
+/// is one list entry per change of address, unbounded across a very long
+/// session; the entries are small and inert, and that is much the cheaper of
+/// the two failures.
+pub fn reoffer(conn: Connection, mut observed: ObservedAddressWatch, shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        loop {
+            // Read before waiting, because the watch may already have moved
+            // on: the handshake rides across the peer's relay-bind gap and can
+            // take minutes, and the address can change inside it.
+            if let Some(address) = *observed.borrow_and_update() {
+                // Kept watching where [`prepare`] gives up: what is being
+                // watched for is the leg's binding changing, and it can change
+                // into one no direct path can run over and back again.
+                if let Some(UnconnectedLeg(address)) = UnconnectedLeg::check(address, "offer again")
+                {
+                    match add_candidates(&conn, address) {
+                        // Already offered — this report changed something the
+                        // candidate does not carry, or is the one `prepare`
+                        // acted on. Said at debug because "the leg moved" at
+                        // info would be a lie.
+                        Ok(false) => tracing::debug!(
+                            local = %address.local,
+                            observed = %address.observed,
+                            "the relay leg reported an address already offered",
+                        ),
+                        Ok(true) => tracing::info!(
+                            local = %address.local,
+                            observed = %address.observed,
+                            "the relay leg moved; offered its new address as a direct-path \
+                             candidate",
+                        ),
+                        Err(e) => tracing::warn!(
+                            local = %address.local,
+                            observed = %address.observed,
+                            "could not offer the relay leg's new address, so this session \
+                             stays on the relay: {e:#}",
+                        ),
+                    }
+                }
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                changed = observed.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Tell `conn` about the binding of the leg **it** arrived on, so the peer can
@@ -205,19 +331,41 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
         let Some(mut observed) = leg_of(&conn, &legs, &shutdown).await else {
             return;
         };
-        // Applied once, and the `break` is what says so. Not because a later
-        // address might be somebody else's — this now knows whose leg it is
-        // watching — but because the binding is by then attached to the
-        // connection, and a second `add_bound_addr` fails with
-        // `QUIC_STATUS_ADDRESS_IN_USE`. So a leg that reconnects onto a new
-        // binding is not re-advertised; the peer keeps the path it validated.
+        // Re-applied as the leg's binding moves, where this used to `break`
+        // out after the first one. The reason given was that "a second
+        // `add_bound_addr` fails with `QUIC_STATUS_ADDRESS_IN_USE`" — which is
+        // true of the *same* address and of nothing else:
+        // `QuicConnAddBoundAddress` compares the full address against the ones
+        // the connection already has and refuses only a duplicate. A leg that
+        // rebinds onto a different address is therefore added as a second
+        // bound address, given its observed address, and advertised in an
+        // ADD_ADDRESS frame of its own. What the `break` cost is the listener
+        // half of #358 — the peer renumbers and re-offers while this end
+        // renumbers and says nothing, so there is nowhere left to punch to.
+        //
+        // The pair is tracked so an unchanged report does no work: the
+        // advertisement is a frame, and `add_observed_addr` would send another
+        // one saying what the peer was told last time.
+        //
+        // Nothing is withdrawn, for [`reoffer`]'s reasons and one more: a
+        // bound address is a UDP binding this connection holds and may have a
+        // validated path running over. The list is capped at
+        // `QUIC_MAX_LOCAL_ADDRESS_COUNT` (128), so the growth is bounded
+        // rather than merely slow.
+        let mut applied: Option<(SocketAddr, SocketAddr)> = None;
         loop {
             if let Some(address) = *observed.borrow_and_update() {
-                let Some(leg) = UnconnectedLeg::check(address, "advertise") else {
-                    return;
-                };
-                apply(&conn, leg);
-                break;
+                if applied != Some((address.local, address.observed)) {
+                    // Kept watching where this used to `return`, for
+                    // [`reoffer`]'s reason: a leg that comes back on a
+                    // connected socket can come back again on an unconnected
+                    // one.
+                    if let Some(leg) = UnconnectedLeg::check(address, "advertise") {
+                        if apply(&conn, leg) {
+                            applied = Some((address.local, address.observed));
+                        }
+                    }
+                }
             }
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -287,14 +435,23 @@ async fn leg_of(
     }
 }
 
-fn apply(conn: &Connection, UnconnectedLeg(address): UnconnectedLeg) {
+/// Advertise one `(local, observed)` pair on `conn`. `false` means it was not
+/// advertised, and the caller has nothing to record.
+fn apply(conn: &Connection, UnconnectedLeg(address): UnconnectedLeg) -> bool {
+    // An `already_there` here is the leg reporting a *new observed address*
+    // for a local address this connection is already bound to. That is
+    // something to advertise, and `add_observed_addr` below is what advertises
+    // it — one bound address holds one observed address, and the second call
+    // replaces what the first one said. Any other status is a refusal.
     if let Err(e) = conn.add_bound_addr(address.local) {
-        tracing::warn!(
-            local = %address.local,
-            "could not add the relay leg's binding to the peer connection; \
-             staying relay-only: {e}",
-        );
-        return;
+        if !already_there(&e) {
+            tracing::warn!(
+                local = %address.local,
+                "could not add the relay leg's binding to the peer connection; \
+                 staying relay-only: {e}",
+            );
+            return false;
+        }
     }
     if let Err(e) = conn.add_observed_addr(address.local, address.observed) {
         tracing::warn!(
@@ -302,7 +459,7 @@ fn apply(conn: &Connection, UnconnectedLeg(address): UnconnectedLeg) {
             observed = %address.observed,
             "could not advertise the observed address; staying relay-only: {e}",
         );
-        return;
+        return false;
     }
     // **The host address is deliberately not advertised here, unlike in
     // [`prepare`].** The two msquic parameters these use look alike and are
@@ -341,6 +498,7 @@ fn apply(conn: &Connection, UnconnectedLeg(address): UnconnectedLeg) {
         observed = %address.observed,
         "advertised a direct path to the peer",
     );
+    true
 }
 
 /// The connection's first path — the relay one — as msquic numbers it.
@@ -681,5 +839,37 @@ mod tests {
             preference_for(pair(9999), relay(), &direct),
             PathPreference::Switch,
         );
+    }
+
+    fn status(code: msquic::StatusCode) -> ConnectionError {
+        ConnectionError::OtherError(msquic::Status::new(code))
+    }
+
+    /// The one piece of judgement in re-offering, and the only one of these
+    /// functions that can be tested at all — the rest need a live msquic
+    /// connection. Both directions matter: a status this does not recognise
+    /// becomes a warning about a session stuck on the relay, and a status it
+    /// recognises too widely swallows a real refusal and reports a direct path
+    /// that was never offered.
+    #[test]
+    fn an_address_already_on_the_connection_is_not_a_failure() {
+        assert!(already_there(&status(
+            msquic::StatusCode::QUIC_STATUS_ADDRESS_IN_USE
+        )));
+        for other in [
+            msquic::StatusCode::QUIC_STATUS_INVALID_STATE,
+            msquic::StatusCode::QUIC_STATUS_INVALID_PARAMETER,
+            msquic::StatusCode::QUIC_STATUS_OUT_OF_MEMORY,
+            msquic::StatusCode::QUIC_STATUS_NOT_FOUND,
+        ] {
+            assert!(
+                !already_there(&status(other.clone())),
+                "{other:?} is a refusal and has to stay one",
+            );
+        }
+        // Not every `ConnectionError` carries a status, and the ones that do
+        // not are connections going away rather than addresses already held.
+        assert!(!already_there(&ConnectionError::ConnectionClosed));
+        assert!(!already_there(&ConnectionError::ShutdownByLocal));
     }
 }

@@ -443,10 +443,12 @@ pub async fn receive_frames_with(
     let _heartbeat = heartbeat.clone().drop_guard();
     spawn_heartbeat(heartbeat);
 
-    // Resolve the candidate before dialing: `add_candidate_addr` has to be in
-    // place before `start`, and a handshake here can take a minute (it rides
-    // across the peer's relay-bind gap), so there is no useful "add it later".
-    let candidate = match observed {
+    // Resolve the candidate before dialing: the connection has to be
+    // *configured* for a direct path before `start`, and a handshake here can
+    // take a minute (it rides across the peer's relay-bind gap). A later
+    // candidate is another matter — the watch is kept rather than consumed, so
+    // `reoffer` below can renew the offer when the leg's address moves (#358).
+    let candidate = match observed.clone() {
         Some(watch) => wait_for_observed(watch, &shutdown).await,
         None => None,
     };
@@ -471,6 +473,15 @@ pub async fn receive_frames_with(
     )
     .await?;
     let conn = session.connection().clone();
+
+    // Keep the offer current for the life of the receive: a renewed DHCP
+    // lease or a SLAAC renumbering moves the relay leg, and the candidate
+    // offered above then names an address this host no longer has.
+    // Gated on the candidate as well: without one the configuration was built
+    // with migration off, and a candidate offered later has nothing to act on.
+    if let (Some(watch), Some(_)) = (observed, candidate) {
+        isekai_p2p::direct_path::reoffer(conn.clone(), watch, shutdown.clone());
+    }
 
     let relay_path = (conn.get_local_addr()?, conn.get_remote_addr()?);
     report_path(

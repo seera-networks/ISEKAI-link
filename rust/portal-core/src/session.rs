@@ -781,9 +781,10 @@ async fn open_the_peer_connection(
         }
     };
 
-    // Resolved before the dial: a candidate has to be offered before `start`,
-    // and the handshake can take a long time by design, so there is no useful
-    // "add it later".
+    // Resolved before the dial: the connection has to be *configured* for a
+    // direct path before `start`, and the handshake can take a long time by
+    // design. A later candidate is another matter — see the `reoffer` below,
+    // which is what carries a direct path across a change of address.
     //
     // **And it is probed, as of phase 4.** `serve` above advertises the other
     // end's leg binding, which is the half this offer was waiting for — until
@@ -817,6 +818,20 @@ async fn open_the_peer_connection(
         shutdown,
     )
     .await?;
+
+    // The address offered above is the one the leg had a moment ago, and this
+    // end's address moves: a renewed DHCP lease, SLAAC, a different network.
+    // Without this the session drops to the relay at the first such change and
+    // stays there (#358). Gated on the candidate because without one the
+    // configuration was built with migration off, and a candidate offered
+    // later would have nothing to act on.
+    if candidate.is_some() {
+        direct_path::reoffer(
+            peer.connection().clone(),
+            session.observed_address(),
+            shutdown.clone(),
+        );
+    }
 
     let sessions = crate::udp::Sessions::start(peer.connection().clone(), shutdown.clone());
     Ok(Connected {
