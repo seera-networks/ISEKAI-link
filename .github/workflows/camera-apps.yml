@@ -133,6 +133,34 @@ jobs:
           sudo apt-get install -y clang libclang-dev build-essential cmake pkg-config \
             libavcodec-dev libavformat-dev libswscale-dev libv4l-dev
 
+      # **The OpenCV caches hold binaries linked against the image's own
+      # libraries, so their keys have to name the image.** `runner.os` does
+      # not: it is `Linux` for both Ubuntu 24.04 and 26.04, and
+      # `ubuntu-latest` moved from one to the other on 2026-11-14. The cache
+      # built on 24.04 was then restored on 26.04, where `libopencv_videoio`
+      # still wanted `libavcodec.so.60`, `libavformat.so.60`,
+      # `libavutil.so.58` and `libswscale.so.7` — sonames that image does not
+      # carry — and the bundle check failed with four libraries "not installed
+      # here". Exactly the class of failure the comment on the dependency step
+      # above describes, arriving by the other route.
+      #
+      # Read here rather than from `${{ env.ImageOS }}`, which is a variable
+      # the runner image sets in its environment and not one the `env` context
+      # carries. macOS is keyed on the major version alone, so a patch bump
+      # does not throw away a cache that is still correct.
+      - name: Name the image the OpenCV caches are keyed on
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux) tag="$(. /etc/os-release && echo "$ID-$VERSION_ID")" ;;
+            macOS) tag="macos-$(sw_vers -productVersion | cut -d. -f1)" ;;
+            *)     tag="$RUNNER_OS" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "the caches are keyed on $tag"
+
       # Ubuntu packages OpenCV 4.6 and the crate wants 4.11+, so it is built
       # here. `opencv-extra-modules: false` matters: the camera apps use
       # core/imgproc/imgcodecs/videoio only, and contrib roughly doubles the
@@ -146,7 +174,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/opencv-install
-          key: opencv-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+          key: opencv-${{ steps.image.outputs.tag }}-${{ env.OPENCV_VERSION }}
       # Built here rather than through `Dovyski/setup-opencv-action`, which was
       # the obvious choice and does not work: its dependency install adds an
       # Ubuntu Xenial repository — the action still targets 18.04 — and on a
@@ -195,7 +223,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/opencv-install
-          key: opencv-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+          key: opencv-${{ steps.image.outputs.tag }}-${{ env.OPENCV_VERSION }}
       - name: Install the build tools (macOS)
         if: runner.os == 'macOS'
         run: |
