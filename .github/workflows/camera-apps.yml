@@ -93,8 +93,19 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      # **Ubuntu is pinned, and to 24.04 rather than to whatever is latest.**
+      # `ubuntu-latest` became 26.04 on 2026-11-14, whose FFmpeg 8 dropped
+      # `avcodec_close` and `av_stream_get_side_data` — both of which OpenCV
+      # 4.11.0 calls from `cap_ffmpeg_impl.hpp`, so `opencv_videoio` does not
+      # compile there at all. 4.11.0 is not an arbitrary choice either: it is
+      # what the `opencv` crate this workspace pins is used with, so moving off
+      # it is a dependency bump and not a CI repair.
+      #
+      # Pinning also makes the Linux bundle a better artifact than the rolling
+      # label did: it is built against the older glibc, so it runs on both.
+      # `android.yml` pins the same way, for its own reasons.
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-15]
+        os: [ubuntu-24.04, windows-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/submodules
