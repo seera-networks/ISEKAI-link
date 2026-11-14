@@ -128,7 +128,7 @@ portal のどこからも生クライアントで呼ばれず、`isekai_p2p::Pee
 `issue_capability` も `portal_core::session::Session`（`session.rs:107`）が
 `ListenerCommand::IssueCapability` を `listener::run` に送る形で、
 **portal が完全に包み越しで届いている唯一の資格情報メソッド**
-（`portal-server/src/main.rs:1940`）。発行側だけが素通しなのは、
+（`portal-server/src/main.rs:2087`）。発行側だけが素通しなのは、
 包めないからではない。
 
 形は「クライアントとトークンを取る薄いモジュール関数」。
@@ -263,7 +263,7 @@ proxy 側の `ProvisioningKeyRecord.binding` と Identity 側の
 `"grants"`/`"live"`）ので、同じ形をした別のコードである。持ち上げるなら
 記録の型ごとのメソッドになる。
 
-### 4.4 API の形の問題 — `ttl` がメソッドを跨いで意味を変える
+### 4.4 API の形の問題 — `ttl` がメソッドを跨いで意味を変えた（#356 で直した）
 
 ```rust
 create_grant(allowed_endpoint, protocol, ttl, label)
@@ -271,7 +271,7 @@ create_ticket(protocol, ttl, grant_ttl, label)
 create_provisioning_key(protocol, ttl, grant_ttl, max_live_grants, binding, label)
 ```
 
-`create_grant` の `ttl` は **Grant** の寿命である（`main.rs:1463` が
+`create_grant` の `ttl` は **Grant** の寿命である（`main.rs:1473` が
 `args.grant_expires_in` を渡している）。`create_ticket` の `ttl` は
 **券**の寿命で、Grant の寿命は隣の `grant_ttl`。つまり
 **同じ名前が隣接するメソッドで別のものを指す**。
@@ -279,14 +279,36 @@ create_provisioning_key(protocol, ttl, grant_ttl, max_live_grants, binding, labe
 （`ttl` / `grant_ttl` / `max_live_grants`）。
 
 `p2p_sdk_api_review.md` §6-6（enum であるべきものが `Option<&str>`）と
-同じ種類の摩擦で、直し方も同じ: 名前のある型にする。ただしそれは
-`isekai-p2p-core` の署名を変える話で、**2 本目の経路を足すのとは逆方向**である。
+同じ種類の摩擦で、直し方も同じ: 名前のある型にする。
 
-**CLI 側の混同はこれとは別の話。** `check_grant_options`（`main.rs:441`）が
+**#356 で入れた形**は、新しい型ではなく**引数の構造体**だった。隣接だけでなく
+`None` 5 連の読めなさも同時に消えるのが理由で、`portal-client` の `Mapped`
+（「4 引数のタプルは `bool` が間違った位置に入る道」）と同じ判断である:
+
+```rust
+create_grant(allowed_endpoint, protocol, expires_in: Option<u64>, label)
+create_ticket(protocol, TicketBounds { ticket_ttl, grant_ttl }, label)
+create_provisioning_key(protocol, ProvisioningBounds { key_ttl, grant_ttl, max_live_grants },
+                        binding, label)
+```
+
+`create_grant` の引数は 1 つなので型ではなく**名前**で足りる（`ttl` →
+`expires_in`、`--grant-expires-in` と揃う）。テストの
+`create_provisioning_key("isekai-portal-v1", None, None, None, None, None)` は
+`ProvisioningBounds::default()` になった。
+
+**ワイヤは変えていない。** 構造体は呼び出し側の言い方で、送る内容ではない。
+`ttl` / `grant_ttl` / `max_live_grants` というフィールド名は仕様のもので、
+既存のテストが本文を検査しているので**本文側で入れ替えると落ちる** ——
+ticket 側（`proxy.rs` の `issuing_a_ticket_sends_both_lifetimes_and_no_listener`）と
+provisioning 側（`provisioning_flow.rs:166`）の両方で確認した。
+
+**CLI 側の混同はこれとは別の話。** `check_grant_options`（`main.rs:444`）が
 守っているのは `--grant-ttl` と `--grant-expires-in` という**2 つのフラグ**の
 取り違えで、位置引数の転置ではない。ただし根は同じ —— `--grant-ttl` が
 どの寿命なのかが名前から決まらないこと —— で、「`--grant` と一緒に渡すと
 **日付のない Grant を作って何も言わなかった**」という代償が記録されている。
+こちらはフラグの名前の問題なので #356 は触っていない。
 
 ## 5. リレー計測について — 必要なのは「駆動」ではなく「点検」
 
@@ -348,8 +370,8 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
 3. **アクセスを与える（発行側）** — Grant / Ticket / Provisioning Key の
    作成・一覧・取り消し、ラベル、3 種の期限、upsert の意味論、方針からの調停。
    クラスタ E・F・G。**面はある（§4.0）。意味論は 4 つのうち 3 つ入った（§4.3）。**
-   残るのは素通しではない 2 つ（ルートの `Reading`、一覧の行の読み方）と、
-   `ttl` がメソッドを跨いで意味を変えること（§4.4）。
+   残るのはルートの `Reading` だけ（一覧の行の読み方は #352、
+   `ttl` の名前付けは #356 で入れた）。
 4. **アクセスを受け取る（引き換え側）** — ペアリングコード、Ticket、
    Provisioning Key の引き換え。クラスタ D。`isekai-p2p` にある。
 5. **繋ぐ** — Listener / Initiator、ローカルの待受けと転送先、
@@ -417,8 +439,8 @@ SDK に要るのはこちら側 —— **何が観測されたかを読む面と
    入り、方針調停だけが意図的に `portal-core` に残った。
    **素通しではない 2 つのうち 1 つは入れた**（#352、§4.3）: 一覧行の
    binding 種別の分類を `Bound` / `bound_to` として `BindingView` の隣へ。
-   残るのはルートの `Reading`（3 つの revoke が食い違っている。到達可能性は
-   未確認）と、API の形の問題 1 件（§4.4）。
+   残るのはルートの `Reading` だけ（3 つの revoke が食い違っている。
+   到達可能性は未確認）。API の形の問題（§4.4）は #356 で直した。
 2. ~~**upsert と方針調停（§4.2）は誰のものか**~~ — **決着（#350）**。
    `already_existed` / `existed_before` / `Ledger` は `isekai_p2p::grants` に
    移した。分割点は方針テーブルが始まるところで、`Table` を読む
