@@ -100,10 +100,10 @@ pub mod agent {
         redact_secrets, secret_prefix, ticket_from_transfer, ticket_transfer, BindingView, Bound,
         Candidate, CandidateType, Capability, CertBundle, ConnectionStateFilter, Grant,
         ListenerConnections, ListenerEvent, Made, PairingCode, PeerConnection, ProvisioningBinding,
-        ProvisioningKey, ProvisioningKeyRecord, ProvisioningRedemption, ReachableListener,
-        RedeemedProvisioningKey, RedeemedTicket, Ticket, TicketListener, TicketRecord,
-        TicketRedemption, TicketTransfer,
-        ENROLLMENT_KEY_PREFIX, PROVISIONING_KEY_PREFIX, TICKET_PREFIX, TICKET_TRANSFER_PREFIX,
+        ProvisioningBounds, ProvisioningKey, ProvisioningKeyRecord, ProvisioningRedemption,
+        ReachableListener, RedeemedProvisioningKey, RedeemedTicket, Ticket, TicketBounds,
+        TicketListener, TicketRecord, TicketRedemption, TicketTransfer, ENROLLMENT_KEY_PREFIX,
+        PROVISIONING_KEY_PREFIX, TICKET_PREFIX, TICKET_TRANSFER_PREFIX,
     };
     // `Problem` among them: it is the type of a field of `ProxyError::Problem`,
     // a public variant, and without it no caller outside this crate can name

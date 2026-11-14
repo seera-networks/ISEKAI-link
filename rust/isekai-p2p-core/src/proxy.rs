@@ -663,6 +663,54 @@ pub struct PairingCode {
 }
 crate::redacted_debug!(PairingCode { owner_endpoint, protocol, expires_at } redacting { code });
 
+/// How long a Ticket lasts, and how long what it makes lasts.
+///
+/// **A struct rather than two more positional `Option<u64>`.** These sat side
+/// by side in `create_ticket`, which is how the wrong one gets passed: the
+/// proxy clamps rather than complains, so a transposition shows up as an
+/// access that lasts the wrong length rather than as an error. `create_ticket`
+/// warns in prose that "they are different quantities and the second is not
+/// capped by the first"; this is that warning where the compiler can read it.
+/// Same reasoning as `portal-client`'s `Mapped`, for the same kind of mistake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TicketBounds {
+    /// How long the paper is good for. `None` takes the proxy's default.
+    ///
+    /// Clamps to 60..=86,400.
+    pub ticket_ttl: Option<u64>,
+
+    /// How long whoever presents it may stay — the lifetime of the Grant a
+    /// redemption makes.
+    ///
+    /// **Not capped by `ticket_ttl`**: a 15-minute Ticket making a 1-hour Grant
+    /// is the intended case. Clamps to the same range, and cannot be unlimited
+    /// — a Ticket is for one-off work, and work that ends should not leave
+    /// authorization behind.
+    pub grant_ttl: Option<u64>,
+}
+
+/// What bounds a Provisioning Key: how long, how long for what it makes, and
+/// how many at once.
+///
+/// **A struct for the reason [`TicketBounds`] is one**, and more so: these were
+/// three adjacent `Option<u64>`, and the tests show what that reads like —
+/// `create_provisioning_key("isekai-portal-v1", None, None, None, None, None)`
+/// says nothing about which five things were left to the proxy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProvisioningBounds {
+    /// How long the key may be redeemed. `None` takes the proxy's default.
+    pub key_ttl: Option<u64>,
+
+    /// How long each Grant a redemption makes may stand.
+    pub grant_ttl: Option<u64>,
+
+    /// How many Grants the key may have live at once.
+    ///
+    /// The slot count a `429 provisioning-slots-exhausted` is about: it is what
+    /// makes a standing arrangement bounded rather than open-ended.
+    pub max_live_grants: Option<u64>,
+}
+
 /// A Ticket, as returned by issuing one (spec §8.12.2).
 ///
 /// Where a pairing code names the owner and waits for a person to read it off a
@@ -1902,8 +1950,11 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// it happens to be running. That is what lets an app be restarted without
     /// everyone it let in having to pair again.
     ///
-    /// `ttl` omitted means the grant stands until revoked, which is the usual
-    /// case — a dated grant is closer to a capability.
+    /// `expires_in` omitted means the grant stands until revoked, which is the
+    /// usual case — a dated grant is closer to a capability. Named for what it
+    /// dates rather than `ttl`, because `ttl` means the *Ticket's* lifetime one
+    /// method over and the two were confusable enough to need a guard in
+    /// `portal-server` (`check_grant_options`).
     ///
     /// **This is an upsert, and the [`Made`] says which happened.** A pair that
     /// already has a grant for this protocol gets the existing id back with its
@@ -1915,13 +1966,13 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         &self,
         allowed_endpoint: &str,
         protocol: &str,
-        ttl: Option<u64>,
+        expires_in: Option<u64>,
         label: Option<&str>,
     ) -> Result<(Grant, Made), ProxyError> {
         let body = serde_json::json!({
             "allowed_endpoint": allowed_endpoint,
             "protocol": protocol,
-            "ttl": ttl,
+            "ttl": expires_in,
             "label": label,
         });
         let (grant, status) = self
@@ -1974,23 +2025,22 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// has no listener in it (§8.8). So this works on a node that is about to
     /// be switched off, and the Ticket still does when it comes back.
     ///
-    /// `ttl` is how long the paper is good for and `grant_ttl` is how long
-    /// whoever presents it may stay. **They are different quantities and the
-    /// second is not capped by the first** — a 15-minute Ticket making a
-    /// 1-hour Grant is the intended case. Both clamp to 60..=86,400, and
-    /// `grant_ttl` cannot be unlimited: a Ticket is for one-off work, and work
-    /// that ends should not leave authorization behind.
+    /// The two lifetimes are [`TicketBounds`], which is where what each one
+    /// means is written down — they are different quantities, the second is not
+    /// capped by the first, and they used to be adjacent `Option<u64>`.
     pub async fn create_ticket(
         &self,
         protocol: &str,
-        ttl: Option<u64>,
-        grant_ttl: Option<u64>,
+        bounds: TicketBounds,
         label: Option<&str>,
     ) -> Result<Ticket, ProxyError> {
+        // **The wire is unchanged**: the struct is how a caller says it, not a
+        // change to what is said. `ttl` and `grant_ttl` are the field names
+        // §8.12.2 names, and a test pins them.
         let body = serde_json::json!({
             "protocol": protocol,
-            "ttl": ttl,
-            "grant_ttl": grant_ttl,
+            "ttl": bounds.ticket_ttl,
+            "grant_ttl": bounds.grant_ttl,
             "label": label,
         });
         self.request_json("POST", "/v1/peer/tickets", to_vec(&body))
@@ -2068,20 +2118,20 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     pub async fn create_provisioning_key(
         &self,
         protocol: &str,
-        ttl: Option<u64>,
-        grant_ttl: Option<u64>,
-        max_live_grants: Option<u64>,
+        bounds: ProvisioningBounds,
         binding: Option<&ProvisioningBinding>,
         label: Option<&str>,
     ) -> Result<ProvisioningKey, ProxyError> {
+        // Omitted rather than null, unlike the Ticket route above, and the
+        // field names are §8.13.3's. The struct changes neither.
         let mut body = serde_json::json!({ "protocol": protocol });
-        if let Some(v) = ttl {
+        if let Some(v) = bounds.key_ttl {
             body["ttl"] = serde_json::json!(v);
         }
-        if let Some(v) = grant_ttl {
+        if let Some(v) = bounds.grant_ttl {
             body["grant_ttl"] = serde_json::json!(v);
         }
-        if let Some(v) = max_live_grants {
+        if let Some(v) = bounds.max_live_grants {
             body["max_live_grants"] = serde_json::json!(v);
         }
         if let Some(binding) = binding {
@@ -3288,7 +3338,14 @@ mod tests {
             "created_at":"2026-08-28T08:30:00Z","expires_at":"2026-08-28T08:45:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
         let ticket = client
-            .create_ticket("mjpeg", Some(900), Some(3600), Some("ci"))
+            .create_ticket(
+                "mjpeg",
+                TicketBounds {
+                    ticket_ttl: Some(900),
+                    grant_ttl: Some(3600),
+                },
+                Some("ci"),
+            )
             .await
             .unwrap();
         assert_eq!(ticket.ticket, "tkt1_secret");

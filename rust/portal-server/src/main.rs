@@ -33,7 +33,8 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use argh::FromArgs;
 use isekai_p2p::agent::{
-    bound_to, BindingView, Bound, Made, Missing, Outcome, ProvisioningBinding, Reading,
+    bound_to, BindingView, Bound, Made, Missing, Outcome, ProvisioningBinding, ProvisioningBounds,
+    Reading, TicketBounds,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -1582,8 +1583,10 @@ async fn grant_admin(
         let ticket = proxy
             .create_ticket(
                 &cfg.protocol,
-                args.ticket_ttl,
-                args.grant_ttl,
+                TicketBounds {
+                    ticket_ttl: args.ticket_ttl,
+                    grant_ttl: args.grant_ttl,
+                },
                 args.ticket_label.as_deref(),
             )
             .await
@@ -1639,9 +1642,11 @@ async fn grant_admin(
         let key = proxy
             .create_provisioning_key(
                 &cfg.protocol,
-                args.provisioning_ttl,
-                args.grant_ttl,
-                args.max_live_grants,
+                ProvisioningBounds {
+                    key_ttl: args.provisioning_ttl,
+                    grant_ttl: args.grant_ttl,
+                    max_live_grants: args.max_live_grants,
+                },
                 binding,
                 args.provisioning_label.as_deref(),
             )
