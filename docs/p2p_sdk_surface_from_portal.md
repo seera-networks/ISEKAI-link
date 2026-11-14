@@ -128,7 +128,7 @@ portal のどこからも生クライアントで呼ばれず、`isekai_p2p::Pee
 `issue_capability` も `portal_core::session::Session`（`session.rs:107`）が
 `ListenerCommand::IssueCapability` を `listener::run` に送る形で、
 **portal が完全に包み越しで届いている唯一の資格情報メソッド**
-（`portal-server/src/main.rs:1940`）。発行側だけが素通しなのは、
+（`portal-server/src/main.rs:2087`）。発行側だけが素通しなのは、
 包めないからではない。
 
 形は「クライアントとトークンを取る薄いモジュール関数」。
@@ -271,7 +271,7 @@ create_ticket(protocol, ttl, grant_ttl, label)
 create_provisioning_key(protocol, ttl, grant_ttl, max_live_grants, binding, label)
 ```
 
-`create_grant` の `ttl` は **Grant** の寿命である（`main.rs:1463` が
+`create_grant` の `ttl` は **Grant** の寿命である（`main.rs:1473` が
 `args.grant_expires_in` を渡している）。`create_ticket` の `ttl` は
 **券**の寿命で、Grant の寿命は隣の `grant_ttl`。つまり
 **同じ名前が隣接するメソッドで別のものを指す**。
@@ -303,7 +303,7 @@ create_provisioning_key(protocol, ProvisioningBounds { key_ttl, grant_ttl, max_l
 ticket 側（`proxy.rs` の `issuing_a_ticket_sends_both_lifetimes_and_no_listener`）と
 provisioning 側（`provisioning_flow.rs:166`）の両方で確認した。
 
-**CLI 側の混同はこれとは別の話。** `check_grant_options`（`main.rs:441`）が
+**CLI 側の混同はこれとは別の話。** `check_grant_options`（`main.rs:444`）が
 守っているのは `--grant-ttl` と `--grant-expires-in` という**2 つのフラグ**の
 取り違えで、位置引数の転置ではない。ただし根は同じ —— `--grant-ttl` が
 どの寿命なのかが名前から決まらないこと —— で、「`--grant` と一緒に渡すと
