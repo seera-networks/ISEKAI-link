@@ -605,6 +605,29 @@ const RELAY_LEG_KEEPALIVE: u32 = 2_000;
 /// See [`RELAY_LEG_KEEPALIVE`].
 const RELAY_LEG_DISCONNECT_TIMEOUT: u32 = 6_000;
 
+/// How long a **path** on one of these connections may go without sending
+/// before it gets a PING.
+///
+/// `PathKeepAliveIntervalMs`, and deliberately not the `KeepAliveIntervalMs`
+/// above. The two look interchangeable and are not: the connection keepalive
+/// is re-armed by activity anywhere on the connection, so once a connection
+/// has two paths and the traffic is on one of them it never fires — and the
+/// other path decays, taking its NAT mapping with it.
+/// `isekai_p2p::peer::DIRECT_PATH_KEEPALIVE` documents that distinction at
+/// length, and it cost a field test to learn; it is the reason this is here
+/// and not a second connection keepalive.
+///
+/// Ten seconds, matching that constant and the listener's
+/// (`isekai_link_utils::PATH_KEEP_ALIVE_INTERVAL_MS`): well inside the 30 s
+/// idle timeout, and a path carrying traffic of its own never gets a redundant
+/// PING.
+///
+/// **This covers only our own paths.** The timer runs off each connection's
+/// settings and defaults to 0, so whether the proxy pings is the proxy's
+/// business. What this holds open is the mapping *our* paths own, which is the
+/// half that matters to a client behind a NAT.
+const PATH_KEEPALIVE: u32 = 10_000;
+
 /// Build an msquic client registration + configuration (ALPN `h3` or `h3qx-01`
 /// for qmux), mirroring the `agent` crate's client setup.
 ///
@@ -707,7 +730,47 @@ pub(crate) fn make_client_config(
         // names as a direct-path candidate
         // (docs/p2p_mode_migration_plan.md §2.2.3). Harmless on the
         // control-plane connections, which simply never look at it.
-        .set_ReceiveObservedAddressReports();
+        .set_ReceiveObservedAddressReports()
+        // **Several local addresses at once, instead of one at a time.** A
+        // phone holds Wi-Fi and cellular together, a laptop holds Ethernet and
+        // Wi-Fi, and until this a connection to the proxy used exactly one of
+        // them: the other was somewhere to migrate to if the first went away.
+        //
+        // The groundwork was already here, and that is what makes this a
+        // settings change rather than an API one. `AddAddressMode` defaults to
+        // `AUTO` -- "the connection manages its own paths" -- so every
+        // connection built here already assembles a candidate pair table from
+        // *every* address the host has (`QuicLibraryGetLocalAddresses`) and
+        // already reconciles it. What multipath changes is what the reconciler
+        // may then do with a second address, in two places:
+        //
+        // * `QuicConnReconcileCreatePaths` skips a pair whose remote already
+        //   has a path, and says why -- "without multipath a second local
+        //   address to it would be a migration". With multipath it opens the
+        //   path instead.
+        // * `QuicConnReconcileMigrate` returns immediately once multipath is
+        //   negotiated. There is no migration step left to take.
+        //
+        // So a relay leg whose address changes now **gains a path beside the
+        // old one** rather than moving onto it. That is a different shape from
+        // what v0.9.0 measured on the testbed, where the leg migrated -- and
+        // where a defect in exactly that migration (a migrated path landing on
+        // a connected socket, seera-networks/msquic#203) is what kept IPv4
+        // direct paths from validating. Make-before-break with both paths live
+        // does not go through that code at all, and `addrchange-check` is what
+        // can say what it does go through.
+        //
+        // **It is an offer, not a switch.** `MultipathNegotiated` is set only
+        // where the peer offered the transport parameter back, so against a
+        // proxy or a relay that does not, every connection here is the one it
+        // was before. Two things do follow from negotiating it: the
+        // reconciler's "has this path id an unused destination CID" gate is
+        // multipath-only, so the `PATH_CIDS_BLOCKED` machinery v0.9.0 brought
+        // in starts applying to these connections; and a leg with two paths
+        // reports an observed address for each, while [`crate::observed`]'s
+        // watch holds one at a time.
+        .set_MultipathEnabled()
+        .set_PathKeepAliveIntervalMs(PATH_KEEPALIVE);
     // **Only the legs**, and `RELAY_LEG_KEEPALIVE` has the arithmetic. Left at
     // msquic's sixteen seconds for the control plane, where a connection that
     // gave up this readily would turn a blip into a failed request.
