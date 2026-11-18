@@ -39,7 +39,7 @@
 //! demands. Phase 4 of `docs/portal_plan.md`.
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use msquic_async::{msquic, Connection, ConnectionError};
@@ -255,6 +255,11 @@ fn add_candidates(conn: &Connection, candidate: ObservedAddress) -> anyhow::Resu
 /// is gone, which this has no business deciding — what it does know is that
 /// the leg reported a different binding on the *same* IP, and a leg has one
 /// binding at a time.
+///
+/// Which entry that is comes from [`reoffer`]'s map, keyed by host address, so
+/// "the one on this IP" is found rather than guessed. It used to be whichever
+/// pair was reported last, which is the same thing only until the reports
+/// leave an address and come back to it.
 fn withdraw(conn: &Connection, superseded: ObservedAddress, keeping: ObservedAddress) {
     // What the offer being kept consists of. A leg that moved only its
     // observed address — the NAT mapping changing under a binding that stayed
@@ -286,6 +291,19 @@ fn withdraw(conn: &Connection, superseded: ObservedAddress, keeping: ObservedAdd
             }
         }
     }
+}
+
+/// Whether this report is already on the connection, asked of the entry for
+/// **its own host address** and of no other.
+///
+/// Separated out because it is the one piece of [`reoffer`]'s bookkeeping that
+/// can be tested, and because getting it wrong is silent: an offer skipped as
+/// "known" leaves the peer punching at a mapping that has moved, and the only
+/// symptom is a session that stays on the relay.
+fn already_offered(offered: &BTreeMap<IpAddr, ObservedAddress>, address: &ObservedAddress) -> bool {
+    offered
+        .get(&address.local.ip())
+        .is_some_and(|held| (held.local, held.observed) == (address.local, address.observed))
 }
 
 /// Keep the offer current as the leg's address changes, for the life of
@@ -337,20 +355,36 @@ pub fn reoffer(
     // by construction — which is what the gate at the call sites could not do
     // for itself: a report existing is not the connection having been set up
     // for a direct path.
-    let Some(UnconnectedLeg(mut last)) = UnconnectedLeg::check(candidate, "offer again later")
+    let Some(UnconnectedLeg(candidate)) = UnconnectedLeg::check(candidate, "offer again later")
     else {
         return;
     };
     tokio::spawn(async move {
+        // What is on the connection, keyed by the host address each entry
+        // answers for — **one entry per IP, because that is how msquic reads
+        // the list.** `QuicConnPunchableClientAddress` takes the first
+        // candidate matching a pair's local address by IP, so a second entry
+        // on an IP is never consulted and a stale one on it hides the new one.
+        //
+        // This was a single "the last pair offered", which is right only while
+        // the reports never leave an address and come back to it. They do:
+        // a leg that moves to another network and returns reports the first
+        // address again on a fresh port, and the withdrawal then compared that
+        // report against the *other* network's pair, found the IPs different,
+        // and left the stale entry in front of the new one — #358's silent
+        // failure again, in the one sequence that looks most like ordinary use.
+        let mut offered: BTreeMap<IpAddr, ObservedAddress> = BTreeMap::new();
+        offered.insert(candidate.local.ip(), candidate);
         loop {
             // Read before waiting, because the watch may already have moved
             // on: the handshake rides across the peer's relay-bind gap and can
             // take minutes, and the address can change inside it.
             if let Some(address) = *observed.borrow_and_update() {
-                // Only the pair matters. A report that carries the same pair
-                // with a different binding kind has nothing for msquic, and
-                // acting on it would re-send what it already knows.
-                let moved = (address.local, address.observed) != (last.local, last.observed);
+                // Only the pair matters, and only against what this IP already
+                // holds. A report carrying the same pair with a different
+                // binding kind has nothing for msquic, and acting on it would
+                // re-send what it already knows.
+                let moved = !already_offered(&offered, &address);
                 // Kept watching where [`prepare`] gives up: the leg's binding
                 // can change into one no direct path can run over, and back
                 // again.
@@ -365,10 +399,17 @@ pub fn reoffer(
                                 // the order costs at most one pass that reads
                                 // the stale entry, where the other order has a
                                 // window with no candidate for this IP at all.
-                                if address.local.ip() == last.local.ip() {
-                                    withdraw(&conn, last, address);
+                                //
+                                // Only this IP's previous entry goes, which is
+                                // the whole of [`withdraw`]'s rule: entries for
+                                // other addresses answer for themselves, and
+                                // one of them may be the candidate a live path
+                                // is running on.
+                                if let Some(superseded) =
+                                    offered.insert(address.local.ip(), address)
+                                {
+                                    withdraw(&conn, superseded, address);
                                 }
-                                last = address;
                                 tracing::info!(
                                     local = %address.local,
                                     observed = %address.observed,
@@ -935,6 +976,49 @@ mod tests {
             preference_for(pair(9999), relay(), &direct),
             PathPreference::Switch,
         );
+    }
+
+    fn report(local: &str, observed: &str) -> ObservedAddress {
+        ObservedAddress {
+            local: local.parse().expect("a local address"),
+            observed: observed.parse().expect("an observed address"),
+            binding: Binding::Unconnected,
+        }
+    }
+
+    /// **The sequence a single `last` got wrong**, which is a leg leaving a
+    /// network and coming back to it: Wi-Fi, then cellular, then Wi-Fi again on
+    /// the same address with a fresh port. The last of those has to read as new,
+    /// and has to supersede the *first* one rather than the cellular pair —
+    /// msquic takes the first candidate matching by IP, so a stale entry left on
+    /// that IP is what the peer keeps being told to punch at.
+    #[test]
+    fn an_address_returned_to_supersedes_its_own_old_entry() {
+        let wifi = report("192.168.1.10:41000", "203.0.113.2:41000");
+        let cell = report("10.4.0.2:52000", "198.51.100.7:52000");
+        // The same address, a new binding: what a leg that rebound reports.
+        let wifi_again = report("192.168.1.10:46000", "203.0.113.2:46000");
+
+        let mut offered = BTreeMap::new();
+        offered.insert(wifi.local.ip(), wifi);
+
+        assert!(
+            already_offered(&offered, &wifi),
+            "the pair `prepare` offered must not be offered twice",
+        );
+        assert!(!already_offered(&offered, &cell), "another address is new");
+        offered.insert(cell.local.ip(), cell);
+        assert!(
+            !already_offered(&offered, &wifi_again),
+            "a new port on a known address is a new candidate",
+        );
+
+        // And what it replaces is the entry for its own IP, with the other
+        // network's left alone: that one answers for an address of its own, and
+        // may be carrying a validated path.
+        let superseded = offered.insert(wifi_again.local.ip(), wifi_again);
+        assert_eq!(superseded, Some(wifi));
+        assert_eq!(offered.get(&cell.local.ip()), Some(&cell));
     }
 
     fn refused(code: msquic::StatusCode) -> ConnectionError {
