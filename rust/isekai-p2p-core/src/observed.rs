@@ -72,10 +72,12 @@ pub type ObservedAddressWatch = watch::Receiver<Option<ObservedAddress>>;
 ///
 /// # One slot, and a leg can now have several paths
 ///
-/// `crate::transport` negotiates multipath on these connections, so a leg on a
-/// host with two usable addresses runs a path on each — and the proxy reports
-/// an observed address per path, each naming its own `local`. This channel
-/// still holds one, so what a reader sees is whichever arrived last.
+/// `crate::transport` *offers* multipath on these connections — whether it is
+/// negotiated is up to the proxy, which has to send `initial_max_path_id` back
+/// — and where it is, a leg on a host with two usable addresses runs a path on
+/// each. The proxy then reports an observed address per path, each naming its
+/// own `local`, and this channel still holds one: what a reader sees is
+/// whichever arrived last.
 ///
 /// **Kept this way on purpose, because the consumer that matters is additive.**
 /// `isekai_p2p::direct_path::reoffer` watches this and offers each new pair as

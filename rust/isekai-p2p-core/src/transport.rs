@@ -730,53 +730,102 @@ pub(crate) fn make_client_config(
         // names as a direct-path candidate
         // (docs/p2p_mode_migration_plan.md §2.2.3). Harmless on the
         // control-plane connections, which simply never look at it.
-        .set_ReceiveObservedAddressReports()
-        // **Several local addresses at once, instead of one at a time.** A
-        // phone holds Wi-Fi and cellular together, a laptop holds Ethernet and
-        // Wi-Fi, and until this a connection to the proxy used exactly one of
-        // them: the other was somewhere to migrate to if the first went away.
-        //
-        // The groundwork was already here, and that is what makes this a
-        // settings change rather than an API one. `AddAddressMode` defaults to
-        // `AUTO` -- "the connection manages its own paths" -- so every
-        // connection built here already assembles a candidate pair table from
-        // *every* address the host has (`QuicLibraryGetLocalAddresses`) and
-        // already reconciles it. What multipath changes is what the reconciler
-        // may then do with a second address, in two places:
-        //
-        // * `QuicConnReconcileCreatePaths` skips a pair whose remote already
-        //   has a path, and says why -- "without multipath a second local
-        //   address to it would be a migration". With multipath it opens the
-        //   path instead.
-        // * `QuicConnReconcileMigrate` returns immediately once multipath is
-        //   negotiated. There is no migration step left to take.
-        //
-        // So a relay leg whose address changes now **gains a path beside the
-        // old one** rather than moving onto it. That is a different shape from
-        // what v0.9.0 measured on the testbed, where the leg migrated -- and
-        // where a defect in exactly that migration (a migrated path landing on
-        // a connected socket, seera-networks/msquic#203) is what kept IPv4
-        // direct paths from validating. Make-before-break with both paths live
-        // does not go through that code at all, and `addrchange-check` is what
-        // can say what it does go through.
-        //
-        // **It is an offer, not a switch.** `MultipathNegotiated` is set only
-        // where the peer offered the transport parameter back, so against a
-        // proxy or a relay that does not, every connection here is the one it
-        // was before. Two things do follow from negotiating it: the
-        // reconciler's "has this path id an unused destination CID" gate is
-        // multipath-only, so the `PATH_CIDS_BLOCKED` machinery v0.9.0 brought
-        // in starts applying to these connections; and a leg with two paths
-        // reports an observed address for each, while [`crate::observed`]'s
-        // watch holds one at a time.
-        .set_MultipathEnabled()
-        .set_PathKeepAliveIntervalMs(PATH_KEEPALIVE);
+        .set_ReceiveObservedAddressReports();
     // **Only the legs**, and `RELAY_LEG_KEEPALIVE` has the arithmetic. Left at
     // msquic's sixteen seconds for the control plane, where a connection that
     // gave up this readily would turn a blip into a failed request.
     let settings = match liveness {
         Liveness::ControlPlane | Liveness::PublicAddress => settings,
         Liveness::RelayLeg => settings.set_DisconnectTimeoutMs(RELAY_LEG_DISCONNECT_TIMEOUT),
+    };
+    // **Several local addresses at once, instead of one at a time.** A
+    // phone holds Wi-Fi and cellular together, a laptop holds Ethernet and
+    // Wi-Fi, and until this a connection to the proxy used exactly one of
+    // them: the other was somewhere to migrate to if the first went away.
+    //
+    // The groundwork was already here, and that is what makes this a
+    // settings change rather than an API one. `AddAddressMode` defaults to
+    // `AUTO` -- "the connection manages its own paths" -- so every
+    // connection built here already assembles a candidate pair table from
+    // *every* address the host has (`QuicLibraryGetLocalAddresses`) and
+    // already reconciles it. What multipath changes is what the reconciler
+    // may then do with a second address, in two places:
+    //
+    // * `QuicConnReconcileCreatePaths` skips a pair whose remote already
+    //   has a path, and says why -- "without multipath a second local
+    //   address to it would be a migration". With multipath it opens the
+    //   path instead.
+    // * `QuicConnReconcileMigrate` returns immediately once multipath is
+    //   negotiated. There is no migration step left to take.
+    //
+    // So a relay leg whose address changes now **gains a path beside the
+    // old one** rather than moving onto it. That is a different shape from
+    // what v0.9.0 measured on the testbed, where the leg migrated -- and
+    // where a defect in exactly that migration (a migrated path landing on
+    // a connected socket, seera-networks/msquic#203) is what kept IPv4
+    // direct paths from validating. Make-before-break with both paths live
+    // does not go through that code at all, and `addrchange-check` is what
+    // can say what it does go through.
+    //
+    // **It is an offer, not a switch.** `MultipathNegotiated` is set only
+    // where the peer offered the transport parameter back, so against a
+    // proxy or a relay that does not, every connection here is the one it
+    // was before. Two things do follow from negotiating it: the
+    // reconciler's "has this path id an unused destination CID" gate is
+    // multipath-only, so the `PATH_CIDS_BLOCKED` machinery v0.9.0 brought
+    // in starts applying to these connections; and a leg with two paths
+    // reports an observed address for each, while [`crate::observed`]'s
+    // watch holds one at a time.
+    //
+    // # What this costs, chosen rather than missed
+    //
+    // **Every viable address gets a path, and "viable" is a low bar.**
+    // `QuicCandidatePairIsViable` applies two hard filters and no others: the
+    // family must match, and loopback/link-local scope must match in both
+    // directions. A docker bridge address, a VPN address and a stale private
+    // one are all viable against a public proxy, so a host carrying them opens
+    // paths it cannot validate -- each costing a UDP binding and a destination
+    // CID out of `QUIC_MAX_PATH_COUNT`, which is 4 and is also the active CID
+    // limit. msquic rate-limits the resulting churn itself, and says why:
+    // retirement "can outrun the peer's NEW_CONNECTION_ID issuance". No
+    // setting narrows the address set; `AddAddressMode::MANUAL` and a policy
+    // written here is what would, and that is a different change.
+    //
+    // **The single-address case trades an unthrottled migration for a
+    // reconciler pass.** With one address -- a phone, or any host being
+    // renumbered -- the two shapes are not equivalent. Today
+    // `QuicConnProcessLocalAddressChange` finds no validated alternate and
+    // migrates the active path onto the replacement at once, keeping the port:
+    // "a shared binding is keyed on the port, so keep the one the connection
+    // already has". That is what the testbed measured for v0.9.0 -- the leg
+    // moving to the new address *on its own port*. Under multipath only an
+    // already-validated alternate is promoted, so with nothing to promote the
+    // lost path is abandoned and the reconciler opens the new one: rate-limited,
+    // and on a fresh ephemeral port, because a table pair's local address
+    // carries no port at all.
+    //
+    // **And a second path inherits `MinimumMtu`.** `QuicPathInitialize` starts
+    // every path at it and PLPMTUD never probes below it, so on an interface
+    // under the 1350 set above the path validates -- a PATH_CHALLENGE is padded
+    // to 1200 -- and then drops every full-size relayed packet. A cellular IPv6
+    // interface at the 1280 minimum is exactly that. The floor cannot come
+    // down; the sum above it says why.
+    //
+    // **Not on QMux, which can never hold a second path.** `QuicConnQMuxAlloc`
+    // allocates no path ID, so `QuicConnQueueReconcile` and the local-address
+    // change handler both bail out for one -- and the transport-parameter site
+    // is guarded on `MultipathEnabled` alone, so without this a QMux
+    // connection would advertise `initial_max_path_id` and, against a peer that
+    // offered it back, switch on every `MultipathNegotiated` branch in the
+    // stack on the one connection kind the fork keeps clear of path code. The
+    // path keepalive goes with it: there is no second path for it to hold open,
+    // and it is the connection keepalive above that keeps a QMux tunnel warm.
+    let settings = if is_qmux {
+        settings
+    } else {
+        settings
+            .set_MultipathEnabled()
+            .set_PathKeepAliveIntervalMs(PATH_KEEPALIVE)
     };
     let configuration = registration.open_configuration(&alpn, Some(&settings))?;
     // **`USE_TLS_BUILTIN_CERTIFICATE_VALIDATION` is deliberately not set here.**
