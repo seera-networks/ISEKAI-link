@@ -429,6 +429,47 @@ impl AttestedPeer {
     }
 }
 
+/// Refuse a peer connection that would check nothing about who answers.
+///
+/// With no host from the proxy there is no name to hold the certificate
+/// against, so `verify` is off; with no attestation there is no key to pin
+/// (and [`AttestedPeer::from_connection`] pins nothing without a host either).
+/// Both missing means any listener that reaches the relay bridge would be
+/// taken for the peer. Production has relay certificates on, so this only
+/// stops a proxy that has them disabled, or a connect response that lost the
+/// host.
+///
+/// `ISEKAI_INSECURE_SKIP_VERIFY` still lets it through, with a warning: it is
+/// the one dev opt-in for "don't check the certificate", and a dev proxy with
+/// relay certificates off is exactly where it is set.
+///
+/// For the clients' own dials. The loopback tests dial with `verify` off on
+/// purpose, against the self-signed fallback, and don't come through here.
+pub fn require_something_to_check(verify: bool, pinned: bool) -> anyhow::Result<()> {
+    something_to_check(
+        verify,
+        pinned,
+        std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some(),
+    )
+}
+
+fn something_to_check(verify: bool, pinned: bool, insecure_opt_in: bool) -> anyhow::Result<()> {
+    if verify || pinned {
+        return Ok(());
+    }
+    if insecure_opt_in {
+        tracing::warn!(
+            "ISEKAI_INSECURE_SKIP_VERIFY set: the proxy named no host and the peer signed for \
+             no key, so nothing about the peer is checked",
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing the peer connection: the proxy named no host to check its certificate \
+         against, and the peer signed for no key to pin"
+    )
+}
+
 /// Refuse the handshake unless the certificate names `host` and, where the peer
 /// published one, is the key `pin` vouches for.
 ///
@@ -1064,6 +1105,18 @@ mod tests {
 
     fn lost(status: msquic::Status) -> ConnectionStartError {
         ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByTransport(status, 0))
+    }
+
+    /// **Neither a name nor a pin is refused**, unless the dev opt-in is set.
+    /// Either one alone is enough: the name is what production checks, and a
+    /// pin holds even when the name can't be.
+    #[test]
+    fn a_peer_with_nothing_to_check_is_refused() {
+        assert!(something_to_check(false, false, false).is_err());
+        assert!(something_to_check(false, false, true).is_ok(), "dev opt-in");
+        assert!(something_to_check(true, false, false).is_ok(), "name only");
+        assert!(something_to_check(false, true, false).is_ok(), "pin only");
+        assert!(something_to_check(true, true, false).is_ok());
     }
 
     /// The arithmetic that reads an alert back out of a close status, pinned
