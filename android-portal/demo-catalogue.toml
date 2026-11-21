@@ -17,3 +17,9 @@
 [service.ollama]
 protocol = "tcp"
 target = "127.0.0.1:11434"
+
+# Lemonade Server (lemond), the same models through an OpenAI-compatible
+# API (/api/v1/chat/completions). Same no-auth caveat as Ollama above.
+[service.lemonade]
+protocol = "tcp"
+target = "127.0.0.1:13305"
