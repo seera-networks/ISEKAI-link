@@ -38,7 +38,8 @@ data class ViewerSettings(
          *
          * Changing the default alone would not have reached an existing
          * install: [load] falls back to the default only when the key is
-         * absent, and [save] writes it on every commit of the connect screen.
+         * absent, and [save] used to write it on every commit of the connect
+         * screen.
          * An upgraded viewer would keep asking for this one while cameras
          * register under the new one, and the camera would simply never be
          * listed -- the listener's protocol is what identifies it. So a stored
@@ -70,11 +71,19 @@ data class ViewerSettings(
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
+    /**
+     * The server fields are stored only when they differ from the default.
+     * Stored, a default outlives the build it came from: [load] keeps a stored
+     * value, so an install that once connected would keep dialing the old
+     * address after the default moves (#325). Left out, [load] falls back to
+     * whatever the default is then. One typed by hand is kept.
+     */
     fun save(context: Context) {
+        val defaults = ViewerSettings()
         prefs(context).edit()
-            .putString("identityUrl", identityUrl)
-            .putString("proxyUrl", proxyUrl)
-            .putString("protocolName", protocolName)
+            .putOrClear("identityUrl", identityUrl, defaults.identityUrl)
+            .putOrClear("proxyUrl", proxyUrl, defaults.proxyUrl)
+            .putOrClear("protocolName", protocolName, defaults.protocolName)
             .putString("capability", capability)
             .putString("listenerId", listenerId)
             .putString("expectedEndpoint", expectedEndpoint)
@@ -85,3 +94,9 @@ data class ViewerSettings(
             .apply()
     }
 }
+
+private fun SharedPreferences.Editor.putOrClear(
+    key: String,
+    value: String,
+    default: String,
+): SharedPreferences.Editor = if (value == default) remove(key) else putString(key, value)
