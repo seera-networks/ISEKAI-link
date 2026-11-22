@@ -229,7 +229,7 @@ struct Args {
     cert_key: Option<PathBuf>,
     /// path to the service catalogue: what may be reached, and under what
     /// name. See the note below, or --example-config
-    #[argh(option, default = "PathBuf::from(\"portal-server.toml\")")]
+    #[argh(option, default = "PathBuf::from(DEFAULT_CONFIG)")]
     config: PathBuf,
     /// stay on the relay: advertise no direct-path candidate, so no peer
     /// probes this end and every byte crosses the relay. The client has the
@@ -1887,6 +1887,12 @@ async fn terminate_signal() {
     std::future::pending::<()>().await;
 }
 
+/// The path `--config` reads when nothing names one.
+///
+/// Named so the check in [`excluded_local`] can tell "the operator did not ask
+/// for a file" from "the operator named one that is not there".
+const DEFAULT_CONFIG: &str = "portal-server.toml";
+
 /// Everything excluded, from the command line and from the `[network]` section
 /// of `--config`, which is **both** rather than one winning.
 ///
@@ -1895,17 +1901,26 @@ async fn terminate_signal() {
 /// for a single run, and a file that won would mean the flag silently did
 /// nothing.
 fn excluded_local(args: &Args) -> anyhow::Result<ExcludedPrefixes> {
-    let from_file = match args.config.exists() {
-        // The catalogue is loaded again further down, for the services. Read
-        // twice rather than threaded, because the two readers want it at
-        // different points: this one has to run before `--pair` and `--grants`
-        // return, and that one must not make those runs need a catalogue.
-        true => {
-            portal_core::config::load(&args.config)?
-                .network
-                .exclude_local
-        }
-        false => Vec::new(),
+    // **Only the section, and none of the catalogue's own rules.** This runs
+    // before `--login` and the grant administration return, and those have
+    // never needed a catalogue: reading it with `config::load` made a bad
+    // `target` -- or a file holding nothing but `[network]`, which is what the
+    // guide invites a client to write -- fail every one of those runs. The
+    // catalogue is still read strictly further down, where the services are
+    // what it is for.
+    let named = args.config != std::path::Path::new(DEFAULT_CONFIG);
+    let from_file = match (args.config.exists(), named) {
+        (true, _) => portal_core::network::load_section(&args.config)?.exclude_local,
+        // **A path the operator named has to be there.** Absent, the default is
+        // simply "no file", which is how `--grants` has always run; absent
+        // after being asked for by name is a typo, and letting it through would
+        // drop the exclusions silently -- the failure this flag is arranged
+        // against everywhere else.
+        (false, true) => anyhow::bail!(
+            "no configuration file at {} (--config named it)",
+            args.config.display(),
+        ),
+        (false, false) => Vec::new(),
     };
     ExcludedPrefixes::union(&args.exclude_local, &from_file)
 }
@@ -1936,17 +1951,11 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // operation runs -- which, with the PEP deferred, is not in this release at
     // all. What the policy *is* consulted for from the moment it loads is
     // whether each row the control plane sends may be applied.
-    // Here for the reason the comment above gives, and the same argument
-    // applies twice over: `--exclude-local` describes the host rather than this
-    // run, so a `--pair` that accepted it and dialled the control plane from
-    // the very interface it names would be the silent-ignore shape again.
-    //
-    // The file's half is read even on those runs, which is why this reads the
-    // `[network]` section rather than waiting for the catalogue load further
-    // down. A catalogue that is **absent** is not an error here — `--grants`
-    // has never needed one — but one that is present and unreadable is, for
-    // the same reason the policy above is read early: half-applying a
-    // configuration file is worse than refusing it.
+    // **Before every way out, for the reason the gateway policy above is.** The
+    // same argument applies twice over: `--exclude-local` describes the host
+    // rather than this run, so a `--pair` that accepted it and then dialled the
+    // control plane from the very interface it names would be the
+    // silent-ignore shape again.
     let excluded = excluded_local(&args)?;
     set_excluded_local_prefixes(excluded)?;
 

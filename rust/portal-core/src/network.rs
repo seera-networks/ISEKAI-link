@@ -74,6 +74,36 @@ struct File {
     network: Network,
 }
 
+/// Just the `[network]` section, out of a file that may hold anything else.
+///
+/// **For `portal-server`'s catalogue**, which has to be read for this section
+/// before `--login` and the grant administration return — and those have never
+/// needed a catalogue. [`crate::config::parse`]'s rules would make them need
+/// one: at least one `[service.*]`, every target an address. So this applies
+/// none of them and ignores what it does not recognise.
+///
+/// That leniency is why it is a second function rather than what [`parse`]
+/// does. A client's file holds nothing but this section, so an unknown key
+/// there is a typo worth refusing; the catalogue's own strict read still
+/// happens when the server loads it for the services, so a `[netowrk]` in that
+/// file is caught before anything is served.
+pub fn section_of(text: &str) -> anyhow::Result<Network> {
+    #[derive(Deserialize)]
+    struct Section {
+        #[serde(default)]
+        network: Network,
+    }
+    let section: Section = toml::from_str(text).context("the file is not valid TOML")?;
+    Ok(section.network)
+}
+
+/// [`section_of`] from a file.
+pub fn load_section(path: &Path) -> anyhow::Result<Network> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    section_of(&text).with_context(|| format!("in {}", path.display()))
+}
+
 /// Read the configuration from `path`.
 pub fn load(path: &Path) -> anyhow::Result<Network> {
     let text = std::fs::read_to_string(path)
@@ -125,6 +155,34 @@ mod tests {
             parse("[network]\n").expect("bare section"),
             Network::default()
         );
+    }
+
+    /// **The lenient reader ignores what it does not know**, which is the one
+    /// thing it must do differently from [`parse`]: it reads the server's
+    /// catalogue, and a catalogue is full of sections this type knows nothing
+    /// about.
+    #[test]
+    fn the_section_can_be_read_out_of_a_catalogue() {
+        let network = section_of(
+            r#"[service.db]
+               protocol = "tcp"
+               target = "nonsense-that-parse-would-refuse"
+
+               [network]
+               exclude_local = ["172.17.0.0/16"]"#,
+        )
+        .expect("a catalogue's network section");
+        assert_eq!(network.exclude_local, ["172.17.0.0/16"]);
+
+        // And a file with no section at all, which is every catalogue written
+        // before this existed.
+        assert_eq!(
+            section_of("[service.db]\nprotocol = \"tcp\"\ntarget = \"10.0.0.5:5432\"\n")
+                .expect("no section"),
+            Network::default(),
+        );
+        // Still TOML, though.
+        assert!(section_of("[network").is_err());
     }
 
     /// **A mistyped key is refused rather than ignored**, which is the whole

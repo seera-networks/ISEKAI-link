@@ -164,6 +164,16 @@ impl ExcludedPrefixes {
         Ok(Self(prefixes))
     }
 
+    /// Whether these are the same prefixes, whatever order they were written
+    /// in. See [`set`].
+    fn same_set_as(&self, other: &Self) -> bool {
+        let mut mine = self.0.clone();
+        let mut theirs = other.0.clone();
+        mine.sort();
+        theirs.sort();
+        mine == theirs
+    }
+
     /// Nothing excluded, which is what every caller that says nothing gets.
     pub fn none() -> Self {
         Self(Vec::new())
@@ -228,7 +238,13 @@ static EXCLUDED: Mutex<Option<ExcludedPrefixes>> = Mutex::new(None);
 pub fn set(prefixes: ExcludedPrefixes) -> anyhow::Result<()> {
     let mut slot = EXCLUDED.lock().expect("excluded-prefix mutex poisoned");
     match slot.as_ref() {
-        Some(existing) if *existing != prefixes => anyhow::bail!(
+        // **As a set, not in order.** The promise above is that a binary which
+        // settles this on more than one path need not track whether it already
+        // did, and two call sites that build the same prefixes from the file
+        // and the flag in a different order would otherwise hit the refusal
+        // below. What the policies do does not depend on their order, so
+        // neither does this.
+        Some(existing) if !existing.same_set_as(&prefixes) => anyhow::bail!(
             "the excluded local prefixes were already set to `{}` and cannot be changed to \
              `{}`: a connection keeps the policies it started with",
             existing.describe(),
@@ -381,6 +397,23 @@ mod tests {
                 .len(),
             MAX_EXCLUDED_PREFIXES,
         );
+    }
+
+    /// The guarantee [`set`] documents: the same prefixes twice is allowed,
+    /// **whatever order they were written in**, so a binary that settles this
+    /// on two paths need not track whether it already did. A different set is
+    /// still refused, because a connection keeps the policies it started with.
+    #[test]
+    fn the_same_prefixes_in_another_order_are_the_same_answer() {
+        let one = ExcludedPrefixes::union(&strings(&["10.0.0.0/8"]), &strings(&["fd00::/8"]))
+            .expect("two");
+        let other = ExcludedPrefixes::union(&strings(&["fd00::/8"]), &strings(&["10.0.0.0/8"]))
+            .expect("the same two");
+        assert_ne!(one, other, "the written order is kept, which the log wants");
+        assert!(one.same_set_as(&other), "but they are the same policies");
+
+        let fewer = ExcludedPrefixes::union(&strings(&["10.0.0.0/8"]), &[]).expect("one");
+        assert!(!one.same_set_as(&fewer));
     }
 
     /// Nothing said means nothing excluded, which has to stay the shape of the

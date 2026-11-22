@@ -320,7 +320,7 @@ struct Args {
     /// path to this client's configuration: which of the host's own addresses
     /// its connections may use. Only the `[network]` section, and an absent
     /// file means nothing is excluded -- see --example-config
-    #[argh(option, default = "PathBuf::from(\"portal-client.toml\")")]
+    #[argh(option, default = "PathBuf::from(DEFAULT_CONFIG)")]
     config: PathBuf,
     /// print a starter configuration on stdout and exit
     #[argh(switch)]
@@ -504,9 +504,19 @@ async fn run(
     // still does not. One that exists and cannot be read is an error, because
     // half-applying it is worse than refusing it.
     let excluded = {
-        let from_file = match args.config.exists() {
-            true => portal_core::network::load(&args.config)?.exclude_local,
-            false => Vec::new(),
+        // **A path the operator named has to be there.** Absent, the default is
+        // simply "no file", which is how this binary has always run; absent
+        // after being asked for by name is a typo, and letting it through would
+        // drop the exclusions silently -- the failure this flag is arranged
+        // against everywhere else.
+        let named = args.config != std::path::Path::new(DEFAULT_CONFIG);
+        let from_file = match (args.config.exists(), named) {
+            (true, _) => portal_core::network::load(&args.config)?.exclude_local,
+            (false, true) => anyhow::bail!(
+                "no configuration file at {} (--config named it)",
+                args.config.display(),
+            ),
+            (false, false) => Vec::new(),
         };
         ExcludedPrefixes::union(&args.exclude_local, &from_file)?
     };
@@ -1003,11 +1013,32 @@ async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
     }
 }
 
+/// The path `--config` reads when nothing names one.
+///
+/// Named so the check in [`run`] can tell "the operator did not ask for a file"
+/// from "the operator named one that is not there".
+const DEFAULT_CONFIG: &str = "portal-client.toml";
+
+/// Whether this run does nothing but write a starter file.
+///
+/// **Not a use of the service, so not something to ask about**, and
+/// `portal-server`'s copy of this says what goes wrong without it: the gate
+/// prints the policy on stderr and exits non-zero, so
+/// `portal-client --example-config > portal-client.toml` truncates that file to
+/// zero bytes and the *next* step fails on an empty one. Measured on a machine
+/// that had not agreed, which is the only machine where the line is ever run.
+fn prints_a_template_only(args: &Args) -> bool {
+    args.example_config
+}
+
 /// Answer the privacy-policy flags, and refuse a run that has not agreed.
 ///
 /// `Ok(None)` carries on; `Ok(Some(code))` is a run that did what it was asked
 /// and should now stop.
 fn privacy_gate(args: &Args) -> anyhow::Result<Option<i32>> {
+    if prints_a_template_only(args) {
+        return Ok(None);
+    }
     if args.withdraw_privacy_consent {
         portal_core::consent::withdraw(APP)?;
         eprintln!("forgot this machine's agreement to the privacy policy for {APP}");
