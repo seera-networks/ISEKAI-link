@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use argh::FromArgs;
+use isekai_p2p::agent::{set_excluded_local_prefixes, ExcludedPrefixes};
 use isekai_p2p::{load_or_generate_key, P2pConfig};
 use portal_core::server::Protocol;
 use tokio_util::sync::CancellationToken;
@@ -316,6 +317,21 @@ struct Args {
     /// so it is also the answer to "why did my connection go that way"
     #[argh(switch)]
     relays: bool,
+    /// path to this client's configuration: which of the host's own addresses
+    /// its connections may use. Only the `[network]` section, and an absent
+    /// file means nothing is excluded -- see --example-config
+    #[argh(option, default = "PathBuf::from(\"portal-client.toml\")")]
+    config: PathBuf,
+    /// print a starter configuration on stdout and exit
+    #[argh(switch)]
+    example_config: bool,
+    /// an address and prefix this host must not open its own connections from,
+    /// as `172.17.0.0/16`, or a bare address for a single one. Repeatable, and
+    /// **added to** the `[network]` section of --config rather than replacing
+    /// it. For interfaces the proxy and the relay cannot answer on -- a
+    /// container bridge, a VPN that does not route to them
+    #[argh(option)]
+    exclude_local: Vec<String>,
     /// which Endpoints to list: `active` (default), `revoked` or `all`
     #[argh(option)]
     endpoint_status: Option<String>,
@@ -471,6 +487,31 @@ async fn run(
     enrolled: &mut Option<P2pConfig>,
     task: &mut Option<P2pConfig>,
 ) -> anyhow::Result<()> {
+    if args.example_config {
+        // Before the key and the token: this is what somebody runs when they
+        // have neither and want to know what the file can say.
+        print!("{}", portal_core::network::EXAMPLE);
+        return Ok(());
+    }
+
+    // **Before every way out of this function.** `--whoami`, `--relays`,
+    // `--endpoints` and a dozen others return early and all of them dial the
+    // control plane, so a list read further down would be accepted and
+    // silently ignored on exactly the runs that are easiest to debug with it.
+    //
+    // `--config` defaults to a file that need not exist, and an absent one
+    // excludes nothing: this binary has never needed a configuration file and
+    // still does not. One that exists and cannot be read is an error, because
+    // half-applying it is worse than refusing it.
+    let excluded = {
+        let from_file = match args.config.exists() {
+            true => portal_core::network::load(&args.config)?.exclude_local,
+            false => Vec::new(),
+        };
+        ExcludedPrefixes::union(&args.exclude_local, &from_file)?
+    };
+    set_excluded_local_prefixes(excluded)?;
+
     // **First, because the rest of this function reads the key's path.** Agent
     // mode has none, and what the token store defaults to is the first thing
     // that would quietly paper over that.

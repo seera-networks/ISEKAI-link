@@ -289,7 +289,12 @@ impl MasqueH3Transport {
             measuring.is_some(),
             registration,
         )
-        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
+        .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host))
+        // Read as the connector is built rather than passed in: what these
+        // describe is the host's network, and `connect` has a dozen callers
+        // that have no business knowing about it (see
+        // [`crate::local_address`]).
+        .with_local_address_policies(crate::local_address::current().as_policies());
         // Watched only where it is asked for, and read by the caller rather
         // than by a task of our own -- see [`landing`](Self::landing) for why
         // that is what makes it race-free.

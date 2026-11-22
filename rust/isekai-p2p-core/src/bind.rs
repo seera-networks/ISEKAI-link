@@ -187,7 +187,10 @@ fn relay_connector(
         opts.unconnected,
         registration,
     )
-    .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
+    .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host))
+    // The same list the control-plane connection gets: an address the proxy
+    // cannot answer on is no more usable for a leg than for the control plane.
+    .with_local_address_policies(crate::local_address::current().as_policies());
     let (conn_tx, conn_rx) = mpsc::channel(4);
     let observed = spawn_observed_address_watch(conn_rx, shutdown);
     // **The family the control plane chose for *both* ends** (plan Q6). It is

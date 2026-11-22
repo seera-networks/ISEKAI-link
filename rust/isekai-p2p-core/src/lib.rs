@@ -47,3 +47,7 @@ pub mod observed;
 /// Interposing on an inner QUIC connection's packets (feature `msquic`).
 #[cfg(feature = "msquic")]
 pub mod datapath;
+
+/// Which of the host's own addresses the stack may use (feature `msquic`).
+#[cfg(feature = "msquic")]
+pub mod local_address;

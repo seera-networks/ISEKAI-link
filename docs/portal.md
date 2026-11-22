@@ -508,6 +508,48 @@ which is a second door onto the server's services — do it deliberately.
 
 ---
 
+## If the host has addresses that go nowhere useful
+
+Both programs let the QUIC stack decide which of the host's own addresses to
+send from, and it will try all of them: it pairs every address the machine has
+with the proxy and the relay, and opens a path from each. On a machine with one
+network that is exactly right and there is nothing to do here.
+
+On a machine with a container bridge, a VPN that does not route to the proxy, or
+a management interface, those addresses are tried too. They cannot work — the
+proxy's answer has nowhere to come back to — and each attempt costs a socket and
+one of the four connection IDs a connection has to spend. Naming them takes them
+out of the running:
+
+```sh
+portal-server --exclude-local 172.17.0.0/16 --exclude-local 10.8.0.0/24
+portal-client --exclude-local 172.17.0.0/16
+```
+
+Or, for something that should outlast the command line, in the `[network]`
+section — of `portal-server.toml` for the server, and of a file of its own for
+the client:
+
+```sh
+portal-client --example-config > portal-client.toml
+```
+
+```toml
+[network]
+exclude_local = ["172.17.0.0/16", "10.8.0.0/24"]
+```
+
+The flag and the file are **added together**, so a prefix that matters for one
+run does not have to be written into the file. An entry is an address and a
+prefix length; a bare address means the whole of it, so `10.1.2.3` is
+`10.1.2.3/32`. At most 16 entries, and anything that is not an address and
+prefix is refused by name before either program touches the network.
+
+This excludes addresses from being chosen *automatically*. It is not a firewall
+and it is not about what peers may reach — that is the catalogue, above.
+
+---
+
 ## What this does not do
 
 **It does not authenticate the service.** The forward carries whatever the
