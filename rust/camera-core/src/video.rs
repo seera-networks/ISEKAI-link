@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use isekai_p2p::agent::{ObservedAddress, ObservedAddressWatch};
+use isekai_p2p::agent::{ObservedAddressWatch, ObservedAddresses};
 // The path arithmetic and the two ways of moving onto a path went to the
 // layer with the rest of the direct-path machinery in phase 4; what stays
 // here is when this app asks for a move, which is a camera question.
@@ -460,9 +460,9 @@ pub async fn receive_frames_with(
     // take a minute (it rides across the peer's relay-bind gap). A later
     // candidate is another matter — the watch is kept rather than consumed, so
     // `reoffer` below can renew the offer when the leg's address moves (#358).
-    let candidate = match observed.clone() {
+    let candidates = match observed.clone() {
         Some(watch) => wait_for_observed(watch, &shutdown).await,
-        None => None,
+        None => ObservedAddresses::default(),
     };
 
     // Held for the whole receive: it owns the configuration this connection may
@@ -476,7 +476,7 @@ pub async fn receive_frames_with(
             port,
             verify,
             pin,
-            candidate,
+            candidates: candidates.clone(),
             // The video carries frames on unidirectional streams and never a
             // datagram; advertising otherwise would only invite them.
             datagrams: false,
@@ -498,8 +498,8 @@ pub async fn receive_frames_with(
     // would go on holding it against a released configuration.
     let renewing = shutdown.child_token();
     let _renewing = renewing.clone().drop_guard();
-    if let (Some(watch), Some(candidate)) = (observed, candidate) {
-        isekai_p2p::direct_path::reoffer(conn.clone(), watch, candidate, renewing);
+    if let Some(watch) = observed.filter(|_| !candidates.is_empty()) {
+        isekai_p2p::direct_path::reoffer(conn.clone(), watch, &candidates, renewing);
     }
 
     let relay_path = (conn.get_local_addr()?, conn.get_remote_addr()?);
@@ -715,25 +715,39 @@ async fn report_path(events: &Option<mpsc::Sender<PathEvent>>, event: PathEvent)
     }
 }
 
-/// Wait briefly for the relay leg's observed address.
+/// Wait briefly for the relay leg to report an address, and take whatever it
+/// has when it does.
 ///
-/// `None` means carry on relay-only: a missing report costs a direct path, not
-/// the stream, and blocking on it would be the wrong trade.
+/// An empty set means carry on relay-only: a missing report costs a direct
+/// path, not the stream, and blocking on it would be the wrong trade.
+///
+/// **It returns on the first report, not on the set settling.** A leg with a
+/// path per family reports one per path, milliseconds apart, so the set here is
+/// often the first of them alone — which is exactly what #371 was when there
+/// was nowhere else for the rest to go. There is now: `reoffer` reads the whole
+/// set and offers what is new, and the reconciler does not consider a candidate
+/// until the handshake is confirmed, so a report that lands between this and
+/// `reoffer` starting costs at most one extra reconciliation pass. Waiting for
+/// the set to settle would put a grace window on every connect for that.
 async fn wait_for_observed(
     mut watch: ObservedAddressWatch,
     shutdown: &CancellationToken,
-) -> Option<ObservedAddress> {
-    if let Some(address) = *watch.borrow_and_update() {
-        return Some(address);
+) -> ObservedAddresses {
+    let held = watch.borrow_and_update().clone();
+    if !held.is_empty() {
+        return held;
     }
     let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return None,
+                _ = shutdown.cancelled() => return ObservedAddresses::default(),
                 changed = watch.changed() => {
-                    changed.ok()?;
-                    if let Some(address) = *watch.borrow_and_update() {
-                        return Some(address);
+                    if changed.is_err() {
+                        return ObservedAddresses::default();
+                    }
+                    let held = watch.borrow_and_update().clone();
+                    if !held.is_empty() {
+                        return held;
                     }
                 }
             }
@@ -741,13 +755,13 @@ async fn wait_for_observed(
     })
     .await;
     match waited {
-        Ok(address) => address,
+        Ok(addresses) => addresses,
         Err(_) => {
             tracing::warn!(
                 "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
                  streaming over the relay without a direct-path candidate",
             );
-            None
+            ObservedAddresses::default()
         }
     }
 }

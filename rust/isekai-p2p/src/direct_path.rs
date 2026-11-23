@@ -45,7 +45,7 @@ use std::time::Duration;
 use msquic_async::{msquic, Connection, ConnectionError};
 use tokio_util::sync::CancellationToken;
 
-use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
+use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch, ObservedAddresses};
 
 use crate::listener::LegDirectory;
 
@@ -128,18 +128,50 @@ impl UnconnectedLeg {
     }
 }
 
-pub fn prepare(conn: &Connection, candidate: ObservedAddress) -> anyhow::Result<()> {
-    let Some(candidate) = UnconnectedLeg::check(candidate, "offer") else {
+/// Offer a candidate for **every** address the leg has a path in.
+///
+/// **Not the newest one, as of #371.** A leg whose relay advertises
+/// alternative addresses gains a path per family, each with an observed-address
+/// report of its own, and they arrive milliseconds apart and before this runs.
+/// Offering one of them offered an IPv4-only peer an IPv6 address about half the
+/// time, and the half that failed looked exactly like the half that worked: the
+/// candidate was offered, the log said so, and no direct path ever formed.
+///
+/// Offering all of them needs nothing to be decided about the peer. msquic
+/// pairs a candidate with a server address of the **same family** and ignores
+/// the rest (`QuicConnPunchableClientAddress`), so the candidate the peer
+/// cannot use is inert rather than wrong — where choosing for it would mean
+/// knowing what it has, which this end does not.
+pub fn prepare(conn: &Connection, candidates: &ObservedAddresses) -> anyhow::Result<()> {
+    let usable = usable(candidates, "offer");
+    if usable.is_empty() {
         return Ok(());
-    };
-    offer(conn, candidate)
+    }
+    offer(conn, &usable)
 }
 
-/// [`prepare`] once the leg is known to be able to carry a direct path.
+/// The ones a direct path can actually be opened from, with a line about each
+/// that cannot.
+///
+/// **Per address, not per leg.** A leg can hold a path on an unconnected
+/// binding and another that fell back to a connected one — the connector
+/// decides that per connection, and
+/// [`Binding`](isekai_p2p_core::observed::ObservedAddress::binding) carries the
+/// answer — so the check belongs to the address rather than to the set. One
+/// unusable address does not cost the others.
+fn usable(candidates: &ObservedAddresses, side: &str) -> Vec<UnconnectedLeg> {
+    candidates
+        .iter()
+        .filter_map(|candidate| UnconnectedLeg::check(*candidate, side))
+        .collect()
+}
+
+/// [`prepare`] once the leg's addresses are known to be able to carry a direct
+/// path.
 ///
 /// Split out so the check is the only way in: taking [`UnconnectedLeg`] means
 /// deleting it from `prepare` does not compile.
-fn offer(conn: &Connection, UnconnectedLeg(candidate): UnconnectedLeg) -> anyhow::Result<()> {
+fn offer(conn: &Connection, candidates: &[UnconnectedLeg]) -> anyhow::Result<()> {
     // All three are required for a direct path to be validated at all — without
     // them msquic never raises `PathValidated`, whatever candidate is offered.
     conn.set_share_binding(true)
@@ -148,13 +180,30 @@ fn offer(conn: &Connection, UnconnectedLeg(candidate): UnconnectedLeg) -> anyhow
         .map_err(|e| anyhow::anyhow!("could not use an unconnected socket: {e}"))?;
     conn.set_local_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .map_err(|e| anyhow::anyhow!("could not pin the local address: {e}"))?;
-    add_candidates(conn, candidate)?;
+    // **Every address, and a failure on any of them is the whole offer's
+    // failure.** They are all the same leg, and the three settings above have
+    // already been applied: a connection set up for a direct path with half the
+    // candidates it was asked for is a state no caller asked for and none can
+    // see. The one refusal that is not a failure -- a pair msquic already has --
+    // is swallowed inside `add_candidates`.
+    for &UnconnectedLeg(candidate) in candidates {
+        add_candidates(conn, candidate)?;
+    }
     tracing::info!(
-        local = %candidate.local,
-        observed = %candidate.observed,
+        count = candidates.len(),
+        addresses = %describe(candidates),
         "offered direct-path candidates to the peer",
     );
     Ok(())
+}
+
+/// The offered pairs, for one log line rather than one per address.
+fn describe(candidates: &[UnconnectedLeg]) -> String {
+    candidates
+        .iter()
+        .map(|UnconnectedLeg(c)| format!("{} as {}", c.local, c.observed))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The QUIC status behind a failure, where there is one. `None` for the
@@ -348,17 +397,17 @@ fn already_offered(offered: &BTreeMap<IpAddr, ObservedAddress>, address: &Observ
 pub fn reoffer(
     conn: Connection,
     mut observed: ObservedAddressWatch,
-    candidate: ObservedAddress,
+    candidates: &ObservedAddresses,
     shutdown: CancellationToken,
 ) {
     // The same question [`prepare`] asked, of the same value, so the two agree
     // by construction — which is what the gate at the call sites could not do
     // for itself: a report existing is not the connection having been set up
     // for a direct path.
-    let Some(UnconnectedLeg(candidate)) = UnconnectedLeg::check(candidate, "offer again later")
-    else {
+    let seed = usable(candidates, "offer again later");
+    if seed.is_empty() {
         return;
-    };
+    }
     tokio::spawn(async move {
         // What is on the connection, keyed by the host address each entry
         // answers for — **one entry per IP, because that is how msquic reads
@@ -374,12 +423,26 @@ pub fn reoffer(
         // and left the stale entry in front of the new one — #358's silent
         // failure again, in the one sequence that looks most like ordinary use.
         let mut offered: BTreeMap<IpAddr, ObservedAddress> = BTreeMap::new();
-        offered.insert(candidate.local.ip(), candidate);
+        for UnconnectedLeg(candidate) in seed {
+            offered.insert(candidate.local.ip(), candidate);
+        }
         loop {
             // Read before waiting, because the watch may already have moved
             // on: the handshake rides across the peer's relay-bind gap and can
-            // take minutes, and the address can change inside it.
-            if let Some(address) = *observed.borrow_and_update() {
+            // take minutes, and the addresses can change inside it.
+            //
+            // **Every address in the set, not the newest one** (#371). A leg
+            // with a path per family reports one per path, and acting on the
+            // last of them is how an address that was reported and overwritten
+            // was never offered at all.
+            // Copied out rather than iterated through the guard: `borrow` holds
+            // the watch's read lock, and the body below calls into msquic and
+            // logs. Nothing here awaits, so it could not deadlock -- but it
+            // would stall the task publishing the reports for the length of a
+            // set-param call, for no reason.
+            let reported: Vec<ObservedAddress> =
+                observed.borrow_and_update().iter().copied().collect();
+            for address in reported {
                 // Only the pair matters, and only against what this IP already
                 // holds. A report carrying the same pair with a different
                 // binding kind has nothing for msquic, and acting on it would
@@ -489,18 +552,29 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
         // validated path running over. The list is capped at
         // `QUIC_MAX_LOCAL_ADDRESS_COUNT` (128), so the growth is bounded
         // rather than merely slow.
-        let mut applied: Option<(SocketAddr, SocketAddr)> = None;
+        // Keyed by host address, for [`withdraw`]'s reason on the other side:
+        // what the peer does with an advertised address is decided per address,
+        // and a second entry for one of them replaces what the first said.
+        let mut applied: BTreeMap<IpAddr, SocketAddr> = BTreeMap::new();
         loop {
-            if let Some(address) = *observed.borrow_and_update() {
-                if applied != Some((address.local, address.observed)) {
-                    // Kept watching where this used to `return`, for
-                    // [`reoffer`]'s reason: a leg that comes back on a
-                    // connected socket can come back again on an unconnected
-                    // one.
-                    if let Some(leg) = UnconnectedLeg::check(address, "advertise") {
-                        if apply(&conn, leg) {
-                            applied = Some((address.local, address.observed));
-                        }
+            // **Every address, not the newest** (#371). A leg with a path per
+            // family has an address in each, and advertising one of them is
+            // how an IPv4-only peer came to be told only an IPv6 address.
+            // Copied out rather than iterated through the guard, for the
+            // reason [`reoffer`] gives: `apply` below calls into msquic twice.
+            let reported: Vec<ObservedAddress> =
+                observed.borrow_and_update().iter().copied().collect();
+            for address in reported {
+                if applied.get(&address.local.ip()) == Some(&address.observed) {
+                    continue;
+                }
+                // Kept watching where this used to `return`, for
+                // [`reoffer`]'s reason: a leg that comes back on a
+                // connected socket can come back again on an unconnected
+                // one.
+                if let Some(leg) = UnconnectedLeg::check(address, "advertise") {
+                    if apply(&conn, leg) {
+                        applied.insert(address.local.ip(), address.observed);
                     }
                 }
             }
@@ -1019,6 +1093,53 @@ mod tests {
         let superseded = offered.insert(wifi_again.local.ip(), wifi_again);
         assert_eq!(superseded, Some(wifi));
         assert_eq!(offered.get(&cell.local.ip()), Some(&cell));
+    }
+
+    /// **What #371 turns on.** A dual-stack leg's set has an address in each
+    /// family, and every one of them that can carry a direct path is offered —
+    /// where the candidate used to be whichever report landed last, so an
+    /// IPv4-only peer was offered an IPv6 address about half the time.
+    #[test]
+    fn every_address_a_direct_path_can_run_from_is_offered() {
+        let v4 = report("10.0.2.10:37560", "10.0.2.10:37560");
+        let v6 = report("[2001:db8:2::10]:57529", "[2001:db8:2::10]:57529");
+        let both: ObservedAddresses = [v4, v6].into_iter().collect();
+
+        let offered = usable(&both, "offer");
+        let locals: Vec<String> = offered
+            .iter()
+            .map(|UnconnectedLeg(a)| a.local.to_string())
+            .collect();
+        assert_eq!(locals, ["10.0.2.10:37560", "[2001:db8:2::10]:57529"]);
+        // And the log says both, in one line rather than one per address.
+        let said = describe(&offered);
+        assert!(said.contains("10.0.2.10:37560"), "{said}");
+        assert!(said.contains("[2001:db8:2::10]:57529"), "{said}");
+    }
+
+    /// **The check is per address, not per leg.** A leg can report one address
+    /// on an unconnected binding and another that fell back to a connected one;
+    /// offering the second would spend the peer's punch attempts on a mapping
+    /// nothing can validate, and dropping the first with it would cost the
+    /// direct path entirely.
+    #[test]
+    fn an_address_on_a_connected_binding_is_left_out_and_the_others_stay() {
+        let good = report("10.0.2.10:37560", "10.0.2.10:37560");
+        let bad = ObservedAddress {
+            local: "[2001:db8:2::10]:57529".parse().expect("an address"),
+            observed: "[2001:db8:2::10]:57529".parse().expect("an address"),
+            binding: Binding::Connected(Connected::AsAsked),
+        };
+        let mixed: ObservedAddresses = [good, bad].into_iter().collect();
+
+        let offered = usable(&mixed, "offer");
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].0.local, good.local);
+
+        // And a set with nothing usable offers nothing, which is what keeps
+        // `prepare` from applying its three pre-`start` settings for no reason.
+        let none: ObservedAddresses = [bad].into_iter().collect();
+        assert!(usable(&none, "offer").is_empty());
     }
 
     fn refused(code: msquic::StatusCode) -> ConnectionError {

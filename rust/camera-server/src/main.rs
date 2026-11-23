@@ -1040,9 +1040,15 @@ impl MyApp {
                 shared.status.clone(),
                 shared.info.clone(),
                 shared.capability.clone(),
-                // Read through the watch while the lock is held; the value is a
-                // pair of addresses, so copying it out is cheap.
-                shared.observed.as_ref().and_then(|w| *w.borrow()),
+                // Read through the watch while the lock is held; a pair of
+                // addresses is cheap to copy out.
+                //
+                // **One of possibly several** (#371): a leg with a path per
+                // family has an address in each, and this shows the one
+                // reported most recently. It is the mapping the proxy sees,
+                // which is true of it; what the direct path is built from is
+                // every one of them, not this.
+                shared.observed.as_ref().and_then(|w| w.borrow().newest()),
             )
         };
         if !status.is_empty() {

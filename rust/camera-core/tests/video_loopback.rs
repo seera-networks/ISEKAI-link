@@ -110,11 +110,15 @@ async fn frames_keep_flowing_when_the_direct_path_cannot_be_advertised() {
 
     // An address belonging to nothing in this process, published before the
     // first connection arrives.
-    let (observed_tx, observed_rx) = watch::channel(Some(ObservedAddress {
-        local: "192.0.2.1:40000".parse().unwrap(),
-        observed: "203.0.113.5:40000".parse().unwrap(),
-        binding: SocketBinding::Unconnected,
-    }));
+    let (observed_tx, observed_rx) = watch::channel(
+        [ObservedAddress {
+            local: "192.0.2.1:40000".parse().unwrap(),
+            observed: "203.0.113.5:40000".parse().unwrap(),
+            binding: SocketBinding::Unconnected,
+        }]
+        .into_iter()
+        .collect::<isekai_p2p::agent::ObservedAddresses>(),
+    );
 
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(16);
     let serve = tokio::spawn(serve_frames_with(

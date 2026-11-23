@@ -801,7 +801,7 @@ async fn open_the_peer_connection(
     // it landed, this candidate said where we could be reached to a peer with
     // no address to send to. `crate::path` is what happens once a path
     // validates.
-    let candidate = match routing {
+    let candidates = match routing {
         Routing::PreferDirect => wait_for_observed(&session, shutdown).await,
         // **Not even waited for.** The wait is what the leg's observed-address
         // report is for, and asking for it here would cost up to
@@ -812,7 +812,7 @@ async fn open_the_peer_connection(
                  path will be probed. Every byte crosses the relay for the life of this \
                  session",
             );
-            None
+            isekai_p2p::agent::ObservedAddresses::default()
         }
     };
 
@@ -823,7 +823,7 @@ async fn open_the_peer_connection(
         transport::ConnectOptions {
             verify,
             pin,
-            candidate,
+            candidates: candidates.clone(),
         },
         shutdown,
     )
@@ -838,11 +838,11 @@ async fn open_the_peer_connection(
     // before it drains — the same arrangement `Sessions::start` below has, and
     // for the same reason: the task holds a `Connection` clone, and the drain
     // is a wait for msquic to have no live handles left.
-    if let Some(candidate) = candidate {
+    if !candidates.is_empty() {
         direct_path::reoffer(
             peer.connection().clone(),
             session.observed_address(),
-            candidate,
+            &candidates,
             shutdown.clone(),
         );
     }
@@ -863,19 +863,25 @@ async fn open_the_peer_connection(
 async fn wait_for_observed(
     session: &InitiatorSession,
     shutdown: &CancellationToken,
-) -> Option<isekai_p2p::agent::ObservedAddress> {
+) -> isekai_p2p::agent::ObservedAddresses {
+    use isekai_p2p::agent::ObservedAddresses;
+
     let mut watch = session.observed_address();
-    if let Some(address) = *watch.borrow_and_update() {
-        return Some(address);
+    let held = watch.borrow_and_update().clone();
+    if !held.is_empty() {
+        return held;
     }
     let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return None,
+                _ = shutdown.cancelled() => return ObservedAddresses::default(),
                 changed = watch.changed() => {
-                    changed.ok()?;
-                    if let Some(address) = *watch.borrow_and_update() {
-                        return Some(address);
+                    if changed.is_err() {
+                        return ObservedAddresses::default();
+                    }
+                    let held = watch.borrow_and_update().clone();
+                    if !held.is_empty() {
+                        return held;
                     }
                 }
             }
@@ -883,13 +889,13 @@ async fn wait_for_observed(
     })
     .await;
     match waited {
-        Ok(address) => address,
+        Ok(addresses) => addresses,
         Err(_) => {
             tracing::warn!(
                 "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
                  forwarding over the relay without a direct-path candidate",
             );
-            None
+            ObservedAddresses::default()
         }
     }
 }

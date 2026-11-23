@@ -95,7 +95,9 @@ pub mod agent {
     pub use isekai_p2p_core::identity::{
         Membership, PolicyConstraints, PolicyEvent, PolicySnapshot,
     };
-    pub use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
+    pub use isekai_p2p_core::observed::{
+        ObservedAddress, ObservedAddressWatch, ObservedAddresses,
+    };
     // **The reading, not a replacement for `ProxyError`.** Both go out: an
     // `Outcome` says what a caller can do, and the error it was read from is
     // what `explain` came from and what the in-crate classifiers still need

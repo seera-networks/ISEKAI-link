@@ -113,11 +113,13 @@ async fn run() -> anyhow::Result<Vec<&'static str>> {
             transport::ConnectOptions {
                 verify: false,
                 pin: None,
-                candidate: Some(isekai_p2p::agent::ObservedAddress {
+                candidates: [isekai_p2p::agent::ObservedAddress {
                     local: SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
                     observed: UNREACHABLE.parse()?,
                     binding: isekai_p2p::agent::SocketBinding::Unconnected,
-                }),
+                }]
+                .into_iter()
+                .collect(),
             },
             &shutdown,
         ),
