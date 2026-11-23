@@ -26,8 +26,8 @@ Grab the archive for your platform from
 unpack it, and run it from anywhere:
 
 ```sh
-unzip camera-apps-ubuntu-latest.zip
-cd camera-apps-ubuntu-latest
+unzip camera-apps-ubuntu-24.04.zip
+cd camera-apps-ubuntu-24.04
 ./camera-server        # on the machine with the camera
 ./camera-client        # on the machine that watches
 ```

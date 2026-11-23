@@ -72,8 +72,8 @@ Download the archive for your platform from
 unpack it, and run the two halves on the two machines:
 
 ```sh
-unzip camera-apps-ubuntu-latest.zip
-cd camera-apps-ubuntu-latest
+unzip camera-apps-ubuntu-24.04.zip
+cd camera-apps-ubuntu-24.04
 ./camera-server        # the machine with the camera
 ./camera-client        # the machine that watches
 ```

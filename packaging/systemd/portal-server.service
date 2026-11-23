@@ -1,7 +1,7 @@
 # Leave a portal server running.
 #
 # **This file ships inside the Linux release archive**, at
-# `portal-ubuntu-latest/systemd/portal-server.service`, so the copy you have is
+# `portal-ubuntu-24.04/systemd/portal-server.service`, so the copy you have is
 # the one that matches the binaries beside it. Follow the steps below **in this
 # order**: enabling the service before the first three gives you one with no
 # binary, no token store and no registered Endpoint, which fails in a hundredth
@@ -9,8 +9,8 @@
 #
 # 1. Unpack the release where it will live.
 #
-#      unzip portal-ubuntu-latest.zip
-#      sudo mv portal-ubuntu-latest /usr/local/portal
+#      unzip portal-ubuntu-24.04.zip
+#      sudo mv portal-ubuntu-24.04 /usr/local/portal
 #      sudo chown -R root:root /usr/local/portal
 #      sudo chmod -R go-w /usr/local/portal
 #      sudo cp /usr/local/portal/systemd/portal-server.service /etc/systemd/system/

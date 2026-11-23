@@ -57,8 +57,8 @@ Grab the archive for your platform from
 and run it from anywhere:
 
 ```sh
-unzip portal-ubuntu-latest.zip
-cd portal-ubuntu-latest
+unzip portal-ubuntu-24.04.zip
+cd portal-ubuntu-24.04
 ./portal-server --help
 ./portal-client --help
 ```
@@ -360,14 +360,14 @@ against the old one stops applying.
 ### Leaving it running, under systemd
 
 The Linux archive ships the unit it needs, at
-`portal-ubuntu-latest/systemd/portal-server.service` — the same file as
+`portal-ubuntu-24.04/systemd/portal-server.service` — the same file as
 [`packaging/systemd/portal-server.service`](../packaging/systemd/portal-server.service),
 and the copy that matches the binaries beside it. Put the unpacked directory
 where it will stay and install from there:
 
 ```sh
-unzip portal-ubuntu-latest.zip
-sudo mv portal-ubuntu-latest /usr/local/portal
+unzip portal-ubuntu-24.04.zip
+sudo mv portal-ubuntu-24.04 /usr/local/portal
 sudo chown -R root:root /usr/local/portal       # unzip ran as you; mv kept that
 sudo chmod -R go-w /usr/local/portal
 sudo cp /usr/local/portal/systemd/portal-server.service /etc/systemd/system/
