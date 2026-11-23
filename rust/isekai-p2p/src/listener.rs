@@ -26,7 +26,7 @@ use isekai_p2p_core::bind::{
     open_bind_session, BindSession, InboundActivity, MasqueClientEvent, RelayOptions,
 };
 use isekai_p2p_core::endpoint::EndpointKey;
-use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch};
+use isekai_p2p_core::observed::{ObservedAddress, ObservedAddressWatch, ObservedAddresses};
 use isekai_p2p_core::proxy::{
     Capability, ConnectionStateFilter, Grant, ListenerEvent, PairingCode, PeerConnection,
     ProxyClient,
@@ -68,7 +68,7 @@ pub struct ListenerSession {
     /// is the normal order, since binding waits on a connection id pasted by
     /// hand — must keep seeing updates across rebinds. So the leg's watch is
     /// forwarded into this one rather than handed out directly.
-    observed_tx: watch::Sender<Option<ObservedAddress>>,
+    observed_tx: watch::Sender<ObservedAddresses>,
     /// Which leg each accepted local connection came in on, for a caller that
     /// serves more than one peer at a time. See [`LegDirectory`].
     legs: LegDirectory,
@@ -441,7 +441,7 @@ impl ListenerSession {
             protocol: cfg.protocol.clone(),
             binds: std::collections::HashMap::new(),
             opts,
-            observed_tx: watch::channel(None).0,
+            observed_tx: watch::channel(ObservedAddresses::default()).0,
             legs: LegDirectory::default(),
             _renewal: renewal,
             _relay_rtt: relay_rtt,
@@ -509,10 +509,20 @@ impl ListenerSession {
     /// `relay_base_url` is where this connection's relay answers, from the
     /// connection view. `None` — no registered relay — keeps the old
     /// behaviour of binding against the control plane's own data path.
+    ///
+    /// `relay_family` and `info_family` are the two places the chosen family
+    /// lives — `PeerConnection::relay_family` and `RelayInfo::family`. **Both,
+    /// not just the one a listener normally reads**, so that a control plane
+    /// populating one and not the other cannot constrain one end and leave the
+    /// other free: see [`relay_family::chosen`](crate::relay_family::chosen).
+    /// `None` for both — no common family, or a control plane that does not
+    /// choose — leaves the leg picking for itself, exactly as before.
     pub async fn bind(
         &mut self,
         connection_id: &str,
         relay_base_url: Option<&str>,
+        relay_family: Option<&str>,
+        info_family: Option<&str>,
     ) -> anyhow::Result<()> {
         if self.binds.contains_key(connection_id) {
             return Ok(());
@@ -568,6 +578,7 @@ impl ListenerSession {
         // relay, and the data path refuses it — correctly, and confusingly,
         // because the refusal names a ticket problem when the mistake was the
         // host we dialled.
+        let family = crate::relay_family::chosen(info_family, relay_family, connection_id);
         let session = open_bind_session(
             relay_base_url.unwrap_or(&self.proxy_url),
             // The current one, not the one the session started with: a leg
@@ -578,6 +589,7 @@ impl ListenerSession {
             self.forward_to,
             ticket.as_ref().map(|t| t.ticket.as_str()),
             self.opts.clone(),
+            family,
         )
         .await?;
         let inbound = session.inbound_activity();
@@ -769,6 +781,8 @@ impl ListenerSession {
                 .bind(
                     &connection.connection_id,
                     connection.relay_base_url.as_deref(),
+                    connection.relay_family.as_deref(),
+                    connection.relay.as_ref().and_then(|r| r.family.as_deref()),
                 )
                 .await
             {
@@ -934,7 +948,7 @@ impl ListenerSession {
 /// address to advertise.
 async fn drive_bind_session(
     mut session: BindSession,
-    observed_tx: watch::Sender<Option<ObservedAddress>>,
+    observed_tx: watch::Sender<ObservedAddresses>,
     legs: LegDirectory,
 ) {
     let mut leg = session.observed();
@@ -985,20 +999,25 @@ async fn drive_bind_session(
 /// Returns whether the leg's watch is still worth polling: once it has ended
 /// (`changed_ok == false`) there is nothing more to forward.
 ///
-/// Only a `Some` is forwarded. A leg that ends without ever reporting leaves
-/// the session's last known address in place rather than blanking it — the
-/// server would otherwise stop advertising a direct path across a rebind that
-/// has not reported yet.
+/// Only a non-empty set is forwarded. A leg that ends without ever reporting
+/// leaves the session's last known addresses in place rather than blanking
+/// them — the server would otherwise stop advertising a direct path across a
+/// rebind that has not reported yet.
+///
+/// The whole set, since #371: a leg with paths in two families has an address
+/// in each, and forwarding one of them is how a dual-stack end came to offer
+/// an IPv4-only peer nothing it could use.
 fn republish_observed(
     leg: &mut ObservedAddressWatch,
-    out: &watch::Sender<Option<ObservedAddress>>,
+    out: &watch::Sender<ObservedAddresses>,
     changed_ok: bool,
 ) -> bool {
     if !changed_ok {
         return false;
     }
-    if let Some(observed) = *leg.borrow_and_update() {
-        out.send_replace(Some(observed));
+    let observed = leg.borrow_and_update().clone();
+    if !observed.is_empty() {
+        out.send_replace(observed);
     }
     true
 }
@@ -1376,7 +1395,12 @@ pub async fn run(
                     let result = match session.proxy.get_connection(&connection_id).await {
                         Ok(c) => {
                             session
-                                .bind(&connection_id, c.relay_base_url.as_deref())
+                                .bind(
+                                    &connection_id,
+                                    c.relay_base_url.as_deref(),
+                                    c.relay_family.as_deref(),
+                                    c.relay.as_ref().and_then(|r| r.family.as_deref()),
+                                )
                                 .await
                         }
                         Err(e) => Err(anyhow::anyhow!(
@@ -1403,6 +1427,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isekai_p2p_core::transport::Binding;
 
     /// Built from the JSON the proxy actually sends, not from the struct.
     ///
@@ -1490,7 +1515,25 @@ mod tests {
         ObservedAddress {
             local: addr(port),
             observed: addr(port + 1),
+            binding: Binding::Unconnected,
         }
+    }
+
+    fn v6(port: u16) -> ObservedAddress {
+        let local = SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 0x10),
+            port,
+        ));
+        ObservedAddress {
+            local,
+            observed: local,
+            binding: Binding::Unconnected,
+        }
+    }
+
+    /// One report, as a leg's whole set.
+    fn reported(port: u16) -> ObservedAddresses {
+        [observed(port)].into_iter().collect()
     }
 
     /// The point of the session-lifetime watch: a receiver taken *before* any
@@ -1499,54 +1542,72 @@ mod tests {
     /// server started watching.
     #[test]
     fn a_receiver_taken_before_the_first_bind_sees_the_leg_report() {
-        let session = watch::channel(None).0;
+        let session = watch::channel(ObservedAddresses::default()).0;
         let mut early = session.subscribe();
-        assert_eq!(*early.borrow_and_update(), None);
+        assert!(early.borrow_and_update().is_empty());
 
-        let (leg_tx, mut leg_rx) = watch::channel(None);
-        leg_tx.send_replace(Some(observed(1000)));
+        let (leg_tx, mut leg_rx) = watch::channel(ObservedAddresses::default());
+        leg_tx.send_replace(reported(1000));
         assert!(republish_observed(&mut leg_rx, &session, true));
 
-        assert_eq!(*early.borrow_and_update(), Some(observed(1000)));
+        assert_eq!(*early.borrow_and_update(), reported(1000));
     }
 
     /// And it survives the leg being replaced: `bind` can be called again, and
     /// the same receiver picks up the new leg's address.
     #[test]
     fn the_watch_survives_a_rebind() {
-        let session = watch::channel(None).0;
+        let session = watch::channel(ObservedAddresses::default()).0;
         let mut held = session.subscribe();
 
-        let (first_tx, mut first_rx) = watch::channel(None);
-        first_tx.send_replace(Some(observed(1000)));
+        let (first_tx, mut first_rx) = watch::channel(ObservedAddresses::default());
+        first_tx.send_replace(reported(1000));
         republish_observed(&mut first_rx, &session, true);
-        assert_eq!(*held.borrow_and_update(), Some(observed(1000)));
+        assert_eq!(*held.borrow_and_update(), reported(1000));
 
-        // The first leg ends; the session keeps its last known address.
+        // The first leg ends; the session keeps its last known addresses.
         assert!(!republish_observed(&mut first_rx, &session, false));
-        assert_eq!(*held.borrow(), Some(observed(1000)));
+        assert_eq!(*held.borrow(), reported(1000));
 
         // A second leg reports, and the *same* receiver sees it.
-        let (second_tx, mut second_rx) = watch::channel(None);
-        second_tx.send_replace(Some(observed(2000)));
+        let (second_tx, mut second_rx) = watch::channel(ObservedAddresses::default());
+        second_tx.send_replace(reported(2000));
         republish_observed(&mut second_rx, &session, true);
-        assert_eq!(*held.borrow_and_update(), Some(observed(2000)));
+        assert_eq!(*held.borrow_and_update(), reported(2000));
     }
 
-    /// A leg that changes to `None` must not blank an address the server is
-    /// still advertising.
+    /// A leg that reports nothing must not blank addresses the server is still
+    /// advertising — which is what a reconnect does, since the set starts
+    /// again with each connection.
     #[test]
     fn an_empty_leg_report_does_not_clear_the_session_address() {
-        let session = watch::channel(None).0;
+        let session = watch::channel(ObservedAddresses::default()).0;
         let held = session.subscribe();
 
-        let (leg_tx, mut leg_rx) = watch::channel(None);
-        leg_tx.send_replace(Some(observed(1000)));
+        let (leg_tx, mut leg_rx) = watch::channel(ObservedAddresses::default());
+        leg_tx.send_replace(reported(1000));
         republish_observed(&mut leg_rx, &session, true);
 
-        leg_tx.send_replace(None);
+        leg_tx.send_replace(ObservedAddresses::default());
         republish_observed(&mut leg_rx, &session, true);
-        assert_eq!(*held.borrow(), Some(observed(1000)));
+        assert_eq!(*held.borrow(), reported(1000));
+    }
+
+    /// **The whole set is forwarded** (#371). A leg with a path in each family
+    /// reports an address in each, and a session that forwarded one of them is
+    /// how a dual-stack end offered an IPv4-only peer nothing it could use.
+    #[test]
+    fn a_leg_with_two_addresses_republishes_both() {
+        let session = watch::channel(ObservedAddresses::default()).0;
+        let held = session.subscribe();
+
+        let both: ObservedAddresses = [observed(1000), v6(2000)].into_iter().collect();
+        let (leg_tx, mut leg_rx) = watch::channel(ObservedAddresses::default());
+        leg_tx.send_replace(both.clone());
+        republish_observed(&mut leg_rx, &session, true);
+
+        assert_eq!(*held.borrow(), both);
+        assert_eq!(held.borrow().len(), 2);
     }
 
     /// A peer that vanished without reporting stays listed until the proxy
@@ -1579,7 +1640,7 @@ mod tests {
 
     /// A leg that has already reported the binding `port` names.
     fn leg_watch(port: u16) -> ObservedAddressWatch {
-        watch::channel(Some(observed(port))).0.subscribe()
+        watch::channel(reported(port)).0.subscribe()
     }
 
     /// Where a leg's forwarding socket delivers from — loopback, because that
@@ -1600,8 +1661,8 @@ mod tests {
         let first = legs.leg_for(forwarding(40001)).expect("the first leg");
         let second = legs.leg_for(forwarding(40002)).expect("the second leg");
 
-        assert_eq!(first.borrow().expect("reported").local, addr(1));
-        assert_eq!(second.borrow().expect("reported").local, addr(2));
+        assert_eq!(first.borrow().newest().expect("reported").local, addr(1));
+        assert_eq!(second.borrow().newest().expect("reported").local, addr(2));
     }
 
     /// An address no leg forwards from is not this listener's to answer for —
@@ -1624,7 +1685,7 @@ mod tests {
 
         for port in [40001, 40002] {
             let leg = legs.leg_for(forwarding(port)).expect("the leg");
-            assert_eq!(leg.borrow().expect("reported").local, addr(7));
+            assert_eq!(leg.borrow().newest().expect("reported").local, addr(7));
         }
     }
 

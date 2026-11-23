@@ -1,0 +1,70 @@
+name: Cache cargo, keyed on the submodules too
+description: >
+  Swatinem/rust-cache with the submodule pins folded into the key, so moving a
+  submodule misses the cache instead of restoring a build made before it.
+
+inputs:
+  workspaces:
+    description: Passed through to Swatinem/rust-cache.
+    required: false
+    default: rust
+
+runs:
+  using: composite
+  steps:
+    # **A submodule bump was invisible to the cache, and therefore to CI.**
+    # `rust-cache`'s key is built from the runner, the rustc version, the job
+    # and a hash of the lockfiles. A gitlink moving changes none of those, so
+    # the cache restored a `target/` built before the bump -- measured on #308,
+    # where every platform reported `full match: true`, `Compiling
+    # seera-msquic` appeared zero times, no C was compiled, and the jobs went
+    # green against the library from three weeks earlier.
+    #
+    # Cargo cannot save us there: `seera-msquic`'s build script emits no
+    # `rerun-if-changed`, so the only input cargo records for it is
+    # `scripts/build.rs`, and the C sources a bump actually changes are not
+    # inputs at all. `cargo build` reports the crate fresh and relinks the old
+    # `libmsquic`. **The real fix is that build script**, upstream; this makes
+    # the cache stop hiding the problem in the meantime.
+    #
+    # Every gitlink, not just `msquic-async-rs`. Being precise would mean
+    # keeping a list of which submodules carry code cargo cannot see, and a
+    # list like that is wrong the first time somebody adds one. The cost of
+    # being broad is a cache miss on a `tonic-h3` bump, which cargo would have
+    # handled by itself -- minutes, visibly, once. The cost of being narrow is
+    # a green check that means nothing, which is the bug this exists to close.
+    #
+    # `git ls-tree` sorts, so the value is stable for a given set of pins, and
+    # only `substr(...,1,8)` of each goes in: the key is already long and these
+    # only have to differ.
+    - name: Hash the submodule pins
+      id: pins
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Its own case, with its own message. Under `pipefail` a `git ls-tree`
+        # that fails because there is no repository aborts the step on the line
+        # below, so the emptiness check further down could never be the thing
+        # that reported it -- it would have claimed a cause it cannot see.
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          echo "not a git work tree: this step has to run after actions/checkout" >&2
+          exit 1
+        fi
+        # `$2 == "commit"` keeps this to gitlinks, which is what the comment
+        # above promises. Without it every entry directly under `submodules/`
+        # joins the key, so adding a README there -- and then editing it --
+        # would evict the cargo cache on every platform in every workflow.
+        pins=$(git ls-tree HEAD submodules/ | awk '$2 == "commit" { printf "%s", substr($3, 1, 8) }')
+        # Empty would key everything the same and quietly restore the old
+        # behaviour, so it is a failure rather than a default. Reachable only
+        # when the repository is there and has no submodules left.
+        if [ -z "${pins}" ]; then
+          echo "no submodule gitlinks under submodules/ at HEAD; if they are gone, so is the reason for this action" >&2
+          exit 1
+        fi
+        echo "submodules=${pins}" >> "$GITHUB_OUTPUT"
+        echo "keying the cargo cache on submodules=${pins}"
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ inputs.workspaces }}
+        key: ${{ steps.pins.outputs.submodules }}

@@ -257,7 +257,16 @@ pub async fn serve(
                 accepted = listener.accept() => match accepted {
                     Ok(conn) => {
                         let catalogue = catalogue.clone();
-                        let serving = accepting.clone();
+                        // **A child token, not a clone of the accept loop's.**
+                        // `advertise` watches this connection's leg for as
+                        // long as its token is live, and holds a `Connection`
+                        // clone while it does. Given the loop's own token it
+                        // would outlive the peer it was advertising to, so a
+                        // server that had served a long succession of clients
+                        // would hold a task and a live msquic handle for every
+                        // one of them until the process stopped. The guard
+                        // below ends it with the connection.
+                        let serving = accepting.child_token();
                         // **Both ends have to stay quiet for a session to
                         // really be relay-only.** A client that offers no
                         // candidate still gets a direct path if this side
@@ -275,6 +284,7 @@ pub async fn serve(
                         // One task per peer: a forward that stalls must not
                         // stop the next peer being accepted.
                         tokio::spawn(async move {
+                            let _ended = serving.clone().drop_guard();
                             if let Err(e) = crate::server::serve(conn, catalogue, serving).await {
                                 tracing::warn!("portal connection ended: {e:#}");
                             }
@@ -781,16 +791,17 @@ async fn open_the_peer_connection(
         }
     };
 
-    // Resolved before the dial: a candidate has to be offered before `start`,
-    // and the handshake can take a long time by design, so there is no useful
-    // "add it later".
+    // Resolved before the dial: the connection has to be *configured* for a
+    // direct path before `start`, and the handshake can take a long time by
+    // design. A later candidate is another matter — see the `reoffer` below,
+    // which is what carries a direct path across a change of address.
     //
     // **And it is probed, as of phase 4.** `serve` above advertises the other
     // end's leg binding, which is the half this offer was waiting for — until
     // it landed, this candidate said where we could be reached to a peer with
     // no address to send to. `crate::path` is what happens once a path
     // validates.
-    let candidate = match routing {
+    let candidates = match routing {
         Routing::PreferDirect => wait_for_observed(&session, shutdown).await,
         // **Not even waited for.** The wait is what the leg's observed-address
         // report is for, and asking for it here would cost up to
@@ -801,7 +812,7 @@ async fn open_the_peer_connection(
                  path will be probed. Every byte crosses the relay for the life of this \
                  session",
             );
-            None
+            isekai_p2p::agent::ObservedAddresses::default()
         }
     };
 
@@ -812,11 +823,29 @@ async fn open_the_peer_connection(
         transport::ConnectOptions {
             verify,
             pin,
-            candidate,
+            candidates: candidates.clone(),
         },
         shutdown,
     )
     .await?;
+
+    // The address offered above is the one the leg had a moment ago, and this
+    // end's address moves: a renewed DHCP lease, SLAAC, a different network.
+    // Without this the session drops to the relay at the first such change and
+    // stays there (#358).
+    //
+    // On this session's own token, which is what `Connected::close` cancels
+    // before it drains — the same arrangement `Sessions::start` below has, and
+    // for the same reason: the task holds a `Connection` clone, and the drain
+    // is a wait for msquic to have no live handles left.
+    if !candidates.is_empty() {
+        direct_path::reoffer(
+            peer.connection().clone(),
+            session.observed_address(),
+            &candidates,
+            shutdown.clone(),
+        );
+    }
 
     let sessions = crate::udp::Sessions::start(peer.connection().clone(), shutdown.clone());
     Ok(Connected {
@@ -834,19 +863,25 @@ async fn open_the_peer_connection(
 async fn wait_for_observed(
     session: &InitiatorSession,
     shutdown: &CancellationToken,
-) -> Option<isekai_p2p::agent::ObservedAddress> {
+) -> isekai_p2p::agent::ObservedAddresses {
+    use isekai_p2p::agent::ObservedAddresses;
+
     let mut watch = session.observed_address();
-    if let Some(address) = *watch.borrow_and_update() {
-        return Some(address);
+    let held = watch.borrow_and_update().clone();
+    if !held.is_empty() {
+        return held;
     }
     let waited = tokio::time::timeout(OBSERVED_ADDRESS_WAIT, async {
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return None,
+                _ = shutdown.cancelled() => return ObservedAddresses::default(),
                 changed = watch.changed() => {
-                    changed.ok()?;
-                    if let Some(address) = *watch.borrow_and_update() {
-                        return Some(address);
+                    if changed.is_err() {
+                        return ObservedAddresses::default();
+                    }
+                    let held = watch.borrow_and_update().clone();
+                    if !held.is_empty() {
+                        return held;
                     }
                 }
             }
@@ -854,13 +889,13 @@ async fn wait_for_observed(
     })
     .await;
     match waited {
-        Ok(address) => address,
+        Ok(addresses) => addresses,
         Err(_) => {
             tracing::warn!(
                 "no observed address from the relay leg within {OBSERVED_ADDRESS_WAIT:?}; \
                  forwarding over the relay without a direct-path candidate",
             );
-            None
+            ObservedAddresses::default()
         }
     }
 }

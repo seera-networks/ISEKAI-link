@@ -517,7 +517,7 @@ pub async fn create_masque_channel(
     config: Arc<msquic::Configuration>,
     config_qmux: Arc<msquic::Configuration>,
     is_unconnected: bool,
-    conn_tx: Option<mpsc::Sender<msquic_async::Connection>>,
+    conn_tx: Option<mpsc::Sender<h3_util::msquic_async::Established>>,
 ) -> anyhow::Result<
     channel_masque::H3Channel<
         h3_util::msquic_async::H3MsQuicAsyncConnector,

@@ -443,6 +443,9 @@ async fn run_bind(a: Bind) -> anyhow::Result<()> {
         // The CLI does not migrate paths, so the leg keeps its plain connected
         // socket and its own registration.
         isekai_p2p_core::bind::RelayOptions::default(),
+        // No family either: with no unconnected binding there is no direct
+        // path for a family to be agreed for.
+        None,
     )
     .await?;
     eprintln!(

@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 // Reached through `h3-util` rather than depended on directly, like the rest of
 // this crate's msquic usage (see `crate::transport`).
 use h3_util::msquic_async::h3_msquic_async::msquic_async::{Connection, ConnectionEvent};
+use h3_util::msquic_async::{Binding, Established};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -34,11 +35,95 @@ pub struct ObservedAddress {
     /// The address the proxy observes that binding at: the NAT mapping to
     /// advertise to the peer.
     pub observed: SocketAddr,
+    /// The socket mode the leg actually ended up on.
+    ///
+    /// **Carried because asking for an unconnected binding is not getting
+    /// one.** `RelayOptions { unconnected: true }` is a request; the connector
+    /// answers it with an ordinary connected socket on a CLAT/464XLAT host,
+    /// when nothing resolved can be bound, or when the QMUX fallback takes
+    /// over. A report from such a leg is still a true NAT mapping and worth
+    /// showing — `camera-server` prints it — but there is no shared binding
+    /// behind it for a direct path to be opened from, which is the one thing a
+    /// consumer must not assume. See [`Binding`].
+    pub binding: Binding,
 }
 
-/// The receiving half of an observed-address watch. `None` until the first
+/// Every address the leg currently has a path in, in the order they were
+/// reported.
+///
+/// **One entry per local IP, because that is the unit msquic acts on.** A
+/// direct-path candidate is found by the local address of the pair being
+/// considered, compared by IP alone and taking the first match
+/// (`QuicConnPunchableClientAddress`), so two entries on one IP would mean the
+/// second is never read. A second report for an IP therefore replaces the
+/// first, in place, keeping the order the leg reported them in.
+///
+/// **A set rather than the latest one, as of #371.** This held a single value,
+/// and a leg with paths in two families reports one per path: whichever landed
+/// last was the only candidate offered, so a dual-stack end facing an
+/// IPv4-only peer offered it an IPv6 address about half the time and no direct
+/// path formed. The reports arrive milliseconds apart and before anything acts
+/// on them, so there was nothing to notice and nothing to retry — the
+/// behaviour depended on the order they happened to arrive in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedAddresses(Vec<ObservedAddress>);
+
+impl ObservedAddresses {
+    /// Record a report, replacing whatever this IP had.
+    fn record(&mut self, address: ObservedAddress) {
+        match self
+            .0
+            .iter_mut()
+            .find(|held| held.local.ip() == address.local.ip())
+        {
+            Some(held) => *held = address,
+            None => self.0.push(address),
+        }
+    }
+
+    /// Nothing has been reported yet.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many addresses the leg has a path in.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Every one of them, in the order they were first reported.
+    pub fn iter(&self) -> impl Iterator<Item = &ObservedAddress> {
+        self.0.iter()
+    }
+
+    /// The one reported most recently, for a caller that can show or use only
+    /// one.
+    ///
+    /// **Say "one of several" where this is displayed.** A dual-stack leg has
+    /// two, and which is newest is a race; `camera-server` prints this as the
+    /// mapping the proxy sees, which is true of it and not the whole answer.
+    /// Anything *choosing a path* wants [`iter`](Self::iter) instead — that is
+    /// what #371 was.
+    pub fn newest(&self) -> Option<ObservedAddress> {
+        self.0.last().copied()
+    }
+}
+
+impl FromIterator<ObservedAddress> for ObservedAddresses {
+    /// In the order given, one entry per local IP — the last of a repeated IP
+    /// wins, as a later report does.
+    fn from_iter<I: IntoIterator<Item = ObservedAddress>>(iter: I) -> Self {
+        let mut addresses = Self::default();
+        for address in iter {
+            addresses.record(address);
+        }
+        addresses
+    }
+}
+
+/// The receiving half of an observed-address watch. Empty until the first
 /// report arrives.
-pub type ObservedAddressWatch = watch::Receiver<Option<ObservedAddress>>;
+pub type ObservedAddressWatch = watch::Receiver<ObservedAddresses>;
 
 /// Watch every connection `conn_rx` yields for observed-address reports.
 ///
@@ -51,21 +136,57 @@ pub type ObservedAddressWatch = watch::Receiver<Option<ObservedAddress>>;
 /// including any reconnect. Reports from whichever connection is current
 /// overwrite the previous value, which is the behaviour wanted — a stale NAT
 /// mapping is worse than none.
+///
+/// Each report carries the socket mode its connection ended up on, rather than
+/// being filtered on it here. The two consumers want different things: a
+/// direct path can only be opened from an unconnected binding and must check,
+/// while a display of "this is the mapping the proxy sees" is true and useful
+/// either way. Filtering here would answer one of them by lying to the other.
+///
+/// # One slot, and a leg can now have several paths
+///
+/// `crate::transport` *offers* multipath on these connections — whether it is
+/// negotiated is up to the proxy, which has to send `initial_max_path_id` back
+/// — and where it is, a leg on a host with two usable addresses runs a path on
+/// each. The proxy then reports an observed address per path, each naming its
+/// own `local`, and this channel still holds one: what a reader sees is
+/// whichever arrived last.
+///
+/// **Kept this way on purpose, because the consumer that matters is additive.**
+/// `isekai_p2p::direct_path::reoffer` watches this and offers each new pair as
+/// a direct-path candidate, withdrawing only the entry a new one would be
+/// shadowed by — the one on the same address. Reports for genuinely different
+/// addresses therefore accumulate as candidates rather than replacing each
+/// other, which is what punching wants: more places the peer may reach this
+/// Endpoint at.
+///
+/// What it does cost is the two readers that take a single value. The candidate
+/// `prepare` offers before the handshake is whichever path reported first, and
+/// a display of "the mapping the proxy sees" shows one of several without
+/// saying so. Holding a report per local address would answer both, and would
+/// change every consumer's shape; it is worth doing when something needs the
+/// set rather than when it first becomes possible.
 pub fn spawn_observed_address_watch(
-    mut conn_rx: mpsc::Receiver<Connection>,
+    mut conn_rx: mpsc::Receiver<Established>,
     shutdown: CancellationToken,
 ) -> ObservedAddressWatch {
-    let (tx, rx) = watch::channel(None);
+    let (tx, rx) = watch::channel(ObservedAddresses::default());
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = tx.closed() => break,
                 conn = conn_rx.recv() => match conn {
-                    Some(conn) => {
+                    Some(Established { conn, binding }) => {
+                        // **The set starts again with each connection.** A leg
+                        // that reconnects has new bindings, and an address the
+                        // old connection had a path in is not one this one
+                        // does -- offering it would be the stale candidate
+                        // #358 was about, arriving by another route.
+                        tx.send_replace(ObservedAddresses::default());
                         // Poll this connection until it ends, then go back to
                         // waiting for the next one.
-                        watch_connection(conn, &tx, &shutdown).await;
+                        watch_connection(conn, binding, &tx, &shutdown).await;
                     }
                     None => break,
                 },
@@ -77,7 +198,8 @@ pub fn spawn_observed_address_watch(
 
 async fn watch_connection(
     conn: Connection,
-    tx: &watch::Sender<Option<ObservedAddress>>,
+    binding: Binding,
+    tx: &watch::Sender<ObservedAddresses>,
     shutdown: &CancellationToken,
 ) {
     // The video connection opens its direct path *on this leg's binding*. If
@@ -110,10 +232,13 @@ async fn watch_connection(
                         observed = %observed_address,
                         "relay leg observed-address report",
                     );
-                    if tx.send(Some(ObservedAddress {
+                    let mut addresses = tx.borrow().clone();
+                    addresses.record(ObservedAddress {
                         local: local_address,
                         observed: observed_address,
-                    })).is_err() {
+                        binding,
+                    });
+                    if tx.send(addresses).is_err() {
                         // Every receiver is gone; nothing left to tell.
                         break;
                     }
@@ -139,7 +264,76 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let watch = spawn_observed_address_watch(rx, CancellationToken::new());
         drop(tx);
-        assert_eq!(*watch.borrow(), None);
+        assert!(watch.borrow().is_empty());
+    }
+
+    fn report(local: &str) -> ObservedAddress {
+        let local: SocketAddr = local.parse().expect("an address");
+        ObservedAddress {
+            local,
+            observed: local,
+            binding: Binding::Unconnected,
+        }
+    }
+
+    /// **#371's own sequence.** A dual-stack leg against a relay that
+    /// advertises alternative addresses reported three times, 3 ms apart: two
+    /// IPv4 paths and one IPv6. Holding the last of them is what offered an
+    /// IPv4-only peer an IPv6 address and nothing else.
+    ///
+    /// What the set has to keep is one entry per IP — the second IPv4 report
+    /// replaces the first, because msquic reads a candidate by IP and takes the
+    /// first match, so two entries on one IP would mean the second is never
+    /// read — and both families, in the order they arrived.
+    #[test]
+    fn a_dual_stack_leg_keeps_an_address_in_each_family() {
+        let addresses: ObservedAddresses = [
+            report("10.0.2.10:33705"),
+            report("10.0.2.10:37560"),
+            report("[2001:db8:2::10]:57529"),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(addresses.len(), 2, "one per IP, both families");
+        let locals: Vec<String> = addresses.iter().map(|a| a.local.to_string()).collect();
+        assert_eq!(
+            locals,
+            ["10.0.2.10:37560", "[2001:db8:2::10]:57529"],
+            "the newer IPv4 report replaced the older one, in its place",
+        );
+        assert_eq!(
+            addresses.newest().expect("two").local.to_string(),
+            "[2001:db8:2::10]:57529",
+            "and `newest` is still the last reported, which is what a display shows",
+        );
+    }
+
+    /// A report for an address already held replaces it **in place**, so the
+    /// order the leg reported its paths in survives. A set that reordered would
+    /// make which candidate a one-value reader picks depend on the last
+    /// re-report rather than on the leg.
+    #[test]
+    fn a_repeat_does_not_reorder_the_set() {
+        let mut addresses: ObservedAddresses = [report("10.0.0.1:1"), report("10.0.0.2:2")]
+            .into_iter()
+            .collect();
+        addresses.record(report("10.0.0.1:3"));
+
+        let locals: Vec<String> = addresses.iter().map(|a| a.local.to_string()).collect();
+        assert_eq!(locals, ["10.0.0.1:3", "10.0.0.2:2"]);
+        assert_eq!(addresses.len(), 2);
+    }
+
+    /// Nothing reported is an empty set, not an entry that means nothing: every
+    /// reader asks `is_empty` and the ones that act on addresses iterate.
+    #[test]
+    fn nothing_reported_is_empty() {
+        let none = ObservedAddresses::default();
+        assert!(none.is_empty());
+        assert_eq!(none.len(), 0);
+        assert_eq!(none.newest(), None);
+        assert_eq!(none.iter().count(), 0);
     }
 
     /// A cancelled token ends the task even while it is waiting for a
@@ -154,8 +348,8 @@ mod tests {
         let mut watch = watch;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), watch.changed()).await;
         assert!(
-            watch.has_changed().is_err() || *watch.borrow() == None,
-            "the watch must not report a value nobody published"
+            watch.has_changed().is_err() || watch.borrow().is_empty(),
+            "the watch must not report an address nobody published"
         );
     }
 }

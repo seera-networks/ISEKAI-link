@@ -68,6 +68,26 @@ val generateJniLibs by tasks.registering(Exec::class) {
         "-o", file("src/main/jniLibs").absolutePath,
         "build", "-p", "isekai-client-ffi",
     )
+    doLast {
+        // cargo-ndk only copies isekai-client-ffi's own cdylib. seera-msquic's
+        // build.rs produces msquic as a *separate* shared object beside it
+        // rather than linking it statically, and libisekai_client_ffi.so
+        // dlopens that at runtime -- confirmed the hard way by a `library
+        // "libmsquic.so" not found` UnsatisfiedLinkError crashing the app on
+        // launch. Same fix as android-portal/app/build.gradle.kts's
+        // generateJniLibs task; mirrored here since this workspace-level
+        // build shares rustDir's target/ directly rather than a per-crate one.
+        val libmsquic = fileTree("$rustDir/target/aarch64-linux-android/debug/build") {
+            include("**/out/lib/libmsquic.so")
+        }.files.maxByOrNull { it.lastModified() }
+            ?: throw GradleException(
+                "libmsquic.so not found under target/aarch64-linux-android's build output"
+            )
+        copy {
+            from(libmsquic)
+            into(file("src/main/jniLibs/arm64-v8a"))
+        }
+    }
 }
 
 android {

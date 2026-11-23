@@ -21,6 +21,13 @@ on:
       # here and a glob never matches the pointer moving.
       - 'submodules/msquic-async-rs'
       - 'submodules/tonic-h3'
+      # **The composite actions these steps call.** Both of them decide what a
+      # job actually does -- `submodules` what gets fetched, `rust-cache` what
+      # gets restored -- and neither was watched, so a change to either would
+      # have run no workflow that uses it. The same hole as `scripts/**` and
+      # for the same reason: a path filter has to cover the inputs, not just
+      # the file it is written in.
+      - '.github/actions/**'
       - '.github/workflows/mutants.yml'
   workflow_dispatch:
     inputs:
@@ -51,7 +58,7 @@ jobs:
         shell: pwsh
         working-directory: submodules/msquic-async-rs/seera-msquic
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
           workspaces: rust
 

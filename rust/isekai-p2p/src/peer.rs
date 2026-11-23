@@ -40,7 +40,7 @@ use time::OffsetDateTime;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::ObservedAddress;
+use crate::agent::ObservedAddresses;
 
 /// How long a video connection may carry nothing before it is closed.
 ///
@@ -705,9 +705,14 @@ pub struct DialOptions<'a> {
     /// anything. `None` leaves the connection on name validation alone, which
     /// is the ordinary case while this is being adopted.
     pub pin: Option<AttestedPeer>,
-    /// How the proxy sees this session's relay leg. `Some` offers it as a
+    /// How the proxy sees this session's relay leg — **every address it has a
+    /// path in**, which is one per family where the relay advertises
+    /// alternative addresses. A non-empty set offers each of them as a
     /// direct-path candidate and turns migration on.
-    pub candidate: Option<ObservedAddress>,
+    ///
+    /// All of them rather than one: offering the newest is how a dual-stack end
+    /// came to offer an IPv4-only peer an IPv6 address and nothing else (#371).
+    pub candidates: ObservedAddresses,
     /// Receive QUIC datagrams — see [`ClientOptions::datagrams`].
     pub datagrams: bool,
 }
@@ -769,7 +774,7 @@ pub async fn dial(
         port,
         verify,
         pin,
-        candidate,
+        candidates,
         datagrams,
     } = opts;
     // Both flags are read off the same options the loop below reads, rather
@@ -781,7 +786,7 @@ pub async fn dial(
         ClientOptions {
             alpn,
             verify,
-            enable_migration: candidate.is_some(),
+            enable_migration: !candidates.is_empty(),
             pinning: pin.is_some(),
             datagrams,
         },
@@ -795,8 +800,8 @@ pub async fn dial(
         // redone on each one.
         conn.set_remote_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
             .map_err(|e| anyhow::anyhow!("could not pin the relay bridge address: {e}"))?;
-        if let Some(candidate) = candidate {
-            crate::direct_path::prepare(&conn, candidate)?;
+        if !candidates.is_empty() {
+            crate::direct_path::prepare(&conn, &candidates)?;
         }
         // One slot per attempt: a verdict from a connection that has been
         // dropped says nothing about this one.

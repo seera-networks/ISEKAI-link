@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use isekai_p2p_core::endpoint::EndpointKey;
 use isekai_p2p_core::proxy::{
-    ControlPlaneTransport, HttpResponse, ProvisioningBinding, ProxyClient, ProxyError,
+    ControlPlaneTransport, HttpResponse, ProvisioningBinding, ProvisioningBounds, ProxyClient,
+    ProxyError,
 };
 use serde_json::{Value, json};
 
@@ -134,9 +135,11 @@ async fn issuing_a_key_sends_the_binding_and_reads_back_the_secret() {
     let issued = client(mock.clone())
         .create_provisioning_key(
             "isekai-portal-v1",
-            None,
-            Some(1800),
-            Some(8),
+            ProvisioningBounds {
+                grant_ttl: Some(1800),
+                max_live_grants: Some(8),
+                ..ProvisioningBounds::default()
+            },
             Some(&ProvisioningBinding::Oidc {
                 issuer: "https://token.actions.githubusercontent.com".to_owned(),
                 subject: "repo:o/r:ref:refs/heads/main".to_owned(),
@@ -176,7 +179,12 @@ async fn issuing_a_key_sends_the_binding_and_reads_back_the_secret() {
 async fn a_minimal_issue_response_still_yields_the_key() {
     let mock = MockProxy::answering(201, json!({ "key": "pvk1_SECRET" }));
     let issued = client(mock)
-        .create_provisioning_key("isekai-portal-v1", None, None, None, None, None)
+        .create_provisioning_key(
+            "isekai-portal-v1",
+            ProvisioningBounds::default(),
+            None,
+            None,
+        )
         .await
         .expect("a lost field is not worth losing a key over");
     assert_eq!(issued.key, "pvk1_SECRET");
@@ -225,7 +233,12 @@ async fn a_binding_without_a_type_does_not_lose_the_key() {
         json!({ "key": "pvk1_SECRET", "binding": { "issuer": "https://issuer.test" } }),
     );
     let issued = client(mock)
-        .create_provisioning_key("isekai-portal-v1", None, None, None, None, None)
+        .create_provisioning_key(
+            "isekai-portal-v1",
+            ProvisioningBounds::default(),
+            None,
+            None,
+        )
         .await
         .expect("a malformed binding is not worth losing a key over");
     assert_eq!(issued.key, "pvk1_SECRET");

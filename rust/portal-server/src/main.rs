@@ -32,10 +32,14 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use argh::FromArgs;
-use isekai_p2p::agent::{BindingView, ProvisioningBinding};
+use isekai_p2p::agent::{
+    bound_to, BindingView, Bound, Made, Missing, Outcome, ProvisioningBinding, ProvisioningBounds,
+    Reading, TicketBounds,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use isekai_p2p::agent::{set_excluded_local_prefixes, ExcludedPrefixes};
 use isekai_p2p::agent::{MasqueH3Transport, ProxyClient};
 use isekai_p2p::{load_or_generate_key, AcceptPolicy, P2pConfig};
 use tokio_util::sync::CancellationToken;
@@ -53,6 +57,8 @@ portal-server --login
 portal-server --key ./portal-server.pem --register --pair
 
 portal-server --key ./portal-server.pem --config ./portal-server.toml
+
+portal-server --grant ep:1a2b... --grants
 
 portal-server --grants",
     note = "\
@@ -92,9 +98,15 @@ expiry unless one is set, and -- because a Grant's key does not name a listener
 That is what an installation should run on. Use --grants to see who is in and
 --revoke to take it away.
 
+--grant is the same standing access when you already know the peer's Endpoint ID
+-- nothing to hand over and nothing to redeem. It stands until revoked, and a
+--gateway-config run leaves it alone: that loop only takes away grants it made
+itself.
+
 Everything to do with authorising somebody answers and exits without serving:
---pair, --ticket, --tickets, --revoke-ticket, --grants and --revoke all act on
-the Endpoint rather than on a listener, so a code can be issued while a server
+--pair, --ticket, --tickets, --revoke-ticket, --grant, --grants and --revoke
+all act on the Endpoint rather than on a listener, so a code can be issued
+while a server
 is already running rather than only by starting one. --allow is the exception;
 a capability is issued against the listener it is for.
 
@@ -217,7 +229,7 @@ struct Args {
     cert_key: Option<PathBuf>,
     /// path to the service catalogue: what may be reached, and under what
     /// name. See the note below, or --example-config
-    #[argh(option, default = "PathBuf::from(\"portal-server.toml\")")]
+    #[argh(option, default = "PathBuf::from(DEFAULT_CONFIG)")]
     config: PathBuf,
     /// stay on the relay: advertise no direct-path candidate, so no peer
     /// probes this end and every byte crosses the relay. The client has the
@@ -228,6 +240,13 @@ struct Args {
     /// print a starter catalogue on stdout and exit
     #[argh(switch)]
     example_config: bool,
+    /// an address and prefix this host must not open its own connections from,
+    /// as `172.17.0.0/16`, or a bare address for a single one. Repeatable, and
+    /// **added to** the `[network]` section of --config rather than replacing
+    /// it. For interfaces the proxy and the relay cannot answer on -- a
+    /// container bridge, a VPN that does not route to them
+    #[argh(option)]
+    exclude_local: Vec<String>,
     /// path to the gateway policy: which protocol classes this server serves
     /// as a Gateway, and what the control plane may say about them. Checked at
     /// startup; nothing is enforced yet. See --example-gateway-config
@@ -245,6 +264,25 @@ struct Args {
     /// how long the pairing code lasts, in seconds. Clamped to 60..=300
     #[argh(option)]
     pairing_ttl: Option<u64>,
+    /// an Endpoint ID to let in, as a GRANT, and exit. Standing access that
+    /// survives this server restarting -- `--pair` and `--ticket` are the same
+    /// thing arranged by handing something over, and this is for when you
+    /// already know the ID. IT IS GRANTED OVER --protocol, because a grant is
+    /// the pair AND the protocol -- one for a protocol this server does not
+    /// serve reaches nothing. Take it away with --revoke
+    #[argh(option)]
+    grant: Option<String>,
+    /// what a --grant is for. Shown in --grants. The proxy's own length limit
+    /// applies
+    #[argh(option)]
+    grant_label: Option<String>,
+    /// how long a --grant lasts, in seconds. Omitted means until revoked,
+    /// which is what standing access usually wants. NOT --grant-ttl, which is
+    /// the life of the grant a redeemed --ticket or --provisioning-key makes.
+    /// The proxy clamps this and the line printed shows what it decided, not
+    /// what was asked for
+    #[argh(option)]
+    grant_expires_in: Option<u64>,
     /// print who may reach this Endpoint, and exit
     #[argh(switch)]
     grants: bool,
@@ -354,6 +392,133 @@ struct Args {
     oidc_token_file: Vec<String>,
 }
 
+/// The lines a `--grant` prints after the first: when it ends, how to end it
+/// early, and whether it was this run that made it.
+///
+/// **A function so the decisions can be tested.** Two of them are the kind a
+/// `println!` in `main` hides. The first is which of two things to believe —
+/// `expires_at`, which the proxy decided, or `--grant-expires-in`, which is
+/// only what was asked for; the proxy clamps, so echoing the request can print
+/// a time that is not when this grant ends. The second is
+/// [`isekai_p2p::grants::already_existed`]:
+/// claiming a grant "stands until revoked" when the create merely updated the
+/// Gateway's would promise access that `settle_grants` takes away when the
+/// lease ends — and the create will have overwritten its label and expiry on
+/// the way past.
+///
+/// `asked` is carried only to notice the proxy ignoring it: a `ttl` that
+/// produced no `expires_at` would otherwise look honoured, and the operator
+/// learns of it when the access does not lapse.
+fn grant_lifetime_lines(
+    grant: &isekai_p2p::agent::Grant,
+    made: Made,
+    asked: Option<u64>,
+) -> Vec<String> {
+    let mut lines = vec![match &grant.expires_at {
+        Some(at) => format!("              until {at}  (--revoke {})", grant.grant_id),
+        None => format!(
+            "              stands until revoked (--revoke {})",
+            grant.grant_id
+        ),
+    }];
+    if asked.is_some() && grant.expires_at.is_none() {
+        lines.push("              NOTE: asked for an expiry and the proxy named none".to_owned());
+    }
+    // **The same reading the ledger uses, from the same function.** An operator
+    // is being told which of two things their run did, and the ledger is
+    // deciding whether it may remove this later; the two disagreeing about one
+    // create is the confusion neither would survive. `existed_before` also
+    // carries why a `201` is believed and a `200` is not.
+    if isekai_p2p::grants::existed_before(made, grant.created_at.as_deref()) {
+        lines.push(
+            "              NOTE: this pair already had a grant -- the create UPDATED it, \
+             label and expiry included. If something else made it (a --gateway-config run, \
+             a redeemed ticket) that owner may still revoke it"
+                .to_owned(),
+        );
+    }
+    lines
+}
+
+/// Refuse `--grant-expires-in` and `--grant-label` where there is no `--grant`.
+///
+/// **A run that dropped them quietly would leave the operator believing they
+/// had dated an access that in fact stands until revoked** — the direction that
+/// matters, because that mistake is discovered by nothing happening. Same
+/// reason the binding flags are refused without `--provisioning-key`.
+///
+/// Its own function so it can be tested: the sibling guard for the binding
+/// flags is inline in `main`, which is why nothing pins it.
+fn check_grant_options(args: &Args) -> anyhow::Result<()> {
+    if args.grant.is_none() && (args.grant_expires_in.is_some() || args.grant_label.is_some()) {
+        anyhow::bail!(
+            "--grant-expires-in and --grant-label describe a --grant, and this run is not \
+             making one"
+        );
+    }
+    // **The mirror, and the help predicts the mistake it catches.** `--grant`'s
+    // own text says "NOT --grant-ttl", which is where an operator learns the
+    // two exist -- and `--grant-ttl` is read only on the `--ticket` and
+    // `--provisioning-key` paths, so passing it with `--grant` made an undated
+    // grant and said nothing. Use `--grant-expires-in` there.
+    if args.grant.is_some() && args.grant_ttl.is_some() && !args.ticket && !args.provisioning_key {
+        anyhow::bail!(
+            "--grant-ttl is the life of the grant a redeemed --ticket or --provisioning-key \
+             makes, and this run is making neither. --grant-expires-in is what dates a --grant"
+        );
+    }
+    Ok(())
+}
+
+/// The Endpoint a `--grant` names, refused here if it cannot be one.
+///
+/// **Checked on the arguments, before anything authenticates** — the same
+/// reason `provisioning_binding` is: a mistyped ID is a typo, and finding out
+/// after a sign-in and an Identity round trip tells the operator nothing the
+/// shape of the string did not already say.
+///
+/// Only the shape. Whether that Endpoint exists, is revoked, or is one this
+/// deployment knows is the control plane's answer to give, and it gives the
+/// same one for all three (§8.13.6) — so guessing here would be inventing a
+/// distinction the server refuses to make.
+fn grant_target(args: &Args) -> anyhow::Result<Option<&str>> {
+    let Some(id) = args.grant.as_deref() else {
+        return Ok(None);
+    };
+    let rest = id
+        .strip_prefix(isekai_p2p::agent::ENDPOINT_ID_PREFIX)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--grant takes an Endpoint ID, which begins `{}` -- got {id:?}. \
+                 `--grants` prints the ones already let in, and a peer's own \
+                 `--whoami` prints theirs",
+                isekai_p2p::agent::ENDPOINT_ID_PREFIX,
+            )
+        })?;
+    // **Exactly 64 lowercase hex.** An Endpoint ID is `"ep:" + hex(SHA-256(…))`
+    // (spec §4.2, pinned by `endpoint_id_is_prefixed_hex_and_stable`), so a
+    // half-copied id -- the likeliest paste error there is -- has to be caught
+    // here. Accepting any length let `ep:63e2433a` through to the control
+    // plane, whose answer is the deliberately uniform refusal (§8.13.6) that
+    // says nothing about what went wrong.
+    const HEX: usize = 64;
+    if rest.len() != HEX || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "--grant takes an Endpoint ID: `{}` followed by {HEX} hex digits (spec §4.2) \
+             -- got {id:?}, which has {}",
+            isekai_p2p::agent::ENDPOINT_ID_PREFIX,
+            rest.len(),
+        );
+    }
+    if rest.bytes().any(|b| b.is_ascii_uppercase()) {
+        anyhow::bail!(
+            "--grant takes an Endpoint ID in lowercase hex -- got {id:?}. The ID is \
+             compared as text, so an uppercase copy names nothing"
+        );
+    }
+    Ok(Some(id))
+}
+
 /// Answer `--grants` and `--revoke`, which need no listener.
 ///
 /// **Its own path, and it exits.** These are questions about who may reach this
@@ -366,6 +531,9 @@ async fn administer_grants(args: &Args, tokens: &std::path::Path) -> anyhow::Res
     // round trip tells the operator nothing extra. `portal-client` checks a
     // ticket's authority the same way and for the same reason.
     let binding = provisioning_binding(args)?;
+    // Same pass, same reason: a `--grant` that cannot name an Endpoint is
+    // refused before the sign-in rather than after it.
+    grant_target(args)?;
     let cfg = config(args, tokens).await?;
     // **These enrol, and still must not give the slot back.** `grant_admin`
     // issues an Endpoint Token, which on the unattended path is what registers,
@@ -468,10 +636,22 @@ async fn follow_policies(
 ) {
     let mut table = portal_core::gateway::Table::new();
     let mut ledger = portal_core::gateway::Ledger::new();
+    // **Outlives a pass, for the reason [`Reported`] gives.**
+    let mut reported = Reported::default();
     let mut backoff = POLICY_RETRY_MIN;
     loop {
         let began = tokio::time::Instant::now();
-        match follow_once(&cfg, &policy, &mut table, &mut ledger, &limits, &shutdown).await {
+        match follow_once(
+            &cfg,
+            &policy,
+            &mut table,
+            &mut ledger,
+            &mut reported,
+            &limits,
+            &shutdown,
+        )
+        .await
+        {
             Ok(()) => {
                 backoff = POLICY_RETRY_MIN;
                 // **A floor even on success.** The reader turns a mid-stream
@@ -535,6 +715,7 @@ async fn follow_once(
     policy: &portal_core::gateway::GatewayPolicy,
     table: &mut portal_core::gateway::Table,
     ledger: &mut portal_core::gateway::Ledger,
+    reported: &mut Reported,
     limits: &tokio::sync::watch::Sender<PolicyLimits>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
@@ -550,8 +731,7 @@ async fn follow_once(
     // already has one is an update that answers with the operator's grant id.
     note_existing_grants(&proxy, ledger).await;
 
-    let mut said = BTreeSet::new();
-    settle_grants(&proxy, table, ledger, &mut said).await;
+    settle_grants(&proxy, table, ledger, reported).await;
     publish_limits(limits, table);
     let mut stream = isekai_p2p::policy_stream(cfg, &token, Some(cursor)).await?;
 
@@ -575,7 +755,7 @@ async fn follow_once(
                     // lapsed lease is ever noticed, so leaving the grant to the
                     // next stream event would let it stand for up to a token
                     // lifetime with nothing behind it.
-                    settle_grants(&proxy, table, ledger, &mut said).await;
+                    settle_grants(&proxy, table, ledger, reported).await;
                     publish_limits(limits, table);
                 }
             }
@@ -586,7 +766,7 @@ async fn follow_once(
                     // order -- validate, write the table, then the grant --
                     // because the other way round leaves a grant live with no
                     // scope describing it.
-                    settle_grants(&proxy, table, ledger, &mut said).await;
+                    settle_grants(&proxy, table, ledger, reported).await;
                     // **The path that carries almost everything.** Without
                     // this, a lease granted over the stream did not reach the
                     // connection side until something else happened to expire
@@ -825,6 +1005,50 @@ fn publish_limits(
     let _ = limits.send(Some(std::sync::Arc::new(table.limits())));
 }
 
+/// What this process has already said about the policy.
+///
+/// **Both halves stand for as long as the policy does, and each is worth one
+/// line when it appears.** A row that can never be served and a pair served by
+/// a grant this process did not make are both invisible in the pass's other
+/// output; saying either on every policy event teaches whoever reads the log to
+/// skip the line.
+///
+/// **Held by [`follow_policies`], not by a pass.** `follow_once` returns every
+/// time the stream ends, which Identity does at each token expiry — and a
+/// stream that dies on connect is only throttled to `POLICY_MIN_STREAM`, not
+/// prevented. Built per pass, this would re-emit every standing line once a
+/// token lifetime at best and every five seconds at worst, which is the exact
+/// failure it exists to prevent. `table` and `ledger` are threaded in for the
+/// same reason.
+///
+/// **Keyed on what would be said, not on what it is about.** A lease whose
+/// refusal changes reason — gaining an `expires_at` too short to use turns
+/// `NoDeadline` into `LeaseTooShort` — and a pair whose lease count grows are
+/// both news, and keying on the id alone would leave the log stating something
+/// that has stopped being true.
+#[derive(Default)]
+struct Reported {
+    /// Access-lease id and the refusal as it reads.
+    refused: BTreeSet<(String, String)>,
+    /// Endpoint, protocol, and how many leases ride on the operator's grant.
+    served: BTreeSet<(String, String, usize)>,
+}
+
+/// Which of `now` has not been said yet, remembering the whole set.
+///
+/// **The once-only rule, in one place**, because it has two callers that must
+/// not drift apart. Note what happens when something leaves `now` and comes
+/// back: `said` shrinks with it, so it is said again — which is right, since a
+/// refusal that cleared and returned is news.
+fn newly<T: Ord + Clone>(said: &mut BTreeSet<T>, now: BTreeSet<T>) -> BTreeSet<T> {
+    if now == *said {
+        return BTreeSet::new();
+    }
+    let fresh = now.difference(said).cloned().collect();
+    *said = now;
+    fresh
+}
+
 /// Bring the proxy's grants into line with the table.
 ///
 /// **Never fatal, and never optimistic.** A grant that could not be made is
@@ -835,25 +1059,66 @@ async fn settle_grants(
     proxy: &ProxyClient<MasqueH3Transport>,
     table: &portal_core::gateway::Table,
     ledger: &mut portal_core::gateway::Ledger,
-    said: &mut BTreeSet<String>,
+    reported: &mut Reported,
 ) {
-    let changes = ledger.plan_now(table);
+    let changes = portal_core::gateway::grants::plan_now(ledger, table);
 
     // **Before anything else, and before any chance of returning early.** A row
     // that can never be served is the one thing that must not go unsaid, and
     // making no grant looks exactly like making one from the outside.
     //
-    // Only when the set changes, though: re-stating it on every pass turns one
-    // unservable row into a warning per policy event, which teaches whoever
-    // reads the log to skip the line.
-    let refused: BTreeSet<String> = changes.refused.iter().map(|(id, _)| id.clone()).collect();
-    if refused != *said {
-        for (lease, why) in &changes.refused {
-            if !said.contains(lease) {
-                tracing::warn!(lease, "policy: no grant made: {why}");
-            }
+    // Only when the set changes, though -- see [`newly`].
+    let fresh = newly(
+        &mut reported.refused,
+        changes
+            .refused
+            .iter()
+            .map(|(id, why)| (id.clone(), why.to_string()))
+            .collect(),
+    );
+    for (lease, why) in &changes.refused {
+        if fresh.contains(&(lease.clone(), why.to_string())) {
+            tracing::warn!(lease, "policy: no grant made: {why}");
         }
-        *said = refused;
+    }
+
+    // **A pair somebody else's grant already serves is invisible otherwise.**
+    // It is in neither `create` nor `remove`, so the pass says nothing about
+    // it -- and what an operator cannot discover any other way is that their
+    // own grant is what the policy is leaning on: revoke it and the access
+    // goes, with the table still listing the lease that wanted it.
+    //
+    // `info`, not `warn`: this is the ledger working as intended (see
+    // `isekai_p2p::grants`), not a problem to fix.
+    let fresh = newly(
+        &mut reported.served,
+        changes
+            .served
+            .iter()
+            .map(|w| {
+                (
+                    w.allowed_endpoint.clone(),
+                    w.protocol.clone(),
+                    w.leases.len(),
+                )
+            })
+            .collect(),
+    );
+    for wanted in &changes.served {
+        let said = (
+            wanted.allowed_endpoint.clone(),
+            wanted.protocol.clone(),
+            wanted.leases.len(),
+        );
+        if fresh.contains(&said) {
+            tracing::info!(
+                allowed = %wanted.allowed_endpoint,
+                protocol = %wanted.protocol,
+                leases = wanted.leases.len(),
+                "policy: served by a grant this process did not make; \
+                 it is neither refreshed nor removed here",
+            );
+        }
     }
 
     // **Removals first.** At the per-Endpoint quota a pass that drops one pair
@@ -892,17 +1157,22 @@ async fn settle_grants(
             )
             .await
         {
-            Ok(grant) => {
+            Ok((grant, made)) => {
                 // **The ledger decides whether this is ours to remove later.**
                 // Creating over a pair the operator already had succeeds and
                 // answers with *their* id, so recording the result blindly is
                 // how their grant ends up in a later removal.
                 // **Decided from what came back, not from a listing that may
                 // be a quarter of an hour old.** A grant the operator created
-                // since that read is invisible to `note_existing`, and the
-                // proxy leaves `created_at` untouched on an update -- so an
-                // answer reporting an age is one that was already there.
-                let ours = ledger.record(key, grant.grant_id.clone(), grant.created_at.as_deref());
+                // since that read is invisible to `note_existing`. The status
+                // says which happened; `created_at`'s age is the fallback for a
+                // success status that does not.
+                let ours = ledger.record(
+                    key,
+                    grant.grant_id.clone(),
+                    made,
+                    grant.created_at.as_deref(),
+                );
                 tracing::info!(
                     grant = %grant.grant_id,
                     allowed = %wanted.allowed_endpoint,
@@ -932,8 +1202,29 @@ async fn settle_grants(
 /// A grant that lapsed on its own TTL is not there to delete, and retrying that
 /// forever would log the same warning for the life of the process.
 fn is_already_gone(e: &isekai_p2p::agent::ProxyError) -> bool {
-    matches!(e.kind(), Some("grant-not-found") | Some("not-found"))
+    matches!(Outcome::of_proxy(e, &DELETING), Outcome::AlreadyGone { .. })
 }
+
+/// How the delete reads an answer: these two slugs mean the grant is not there.
+///
+/// **By slug rather than by status, and that is the whole point.** A `404`
+/// whose body is not problem+json — an intermediary's page, a wrong base path,
+/// a proxy without this route — arrives with `problem: None`, and reading *that*
+/// as "already gone" would call [`Ledger::removed`] on a grant still standing
+/// at the proxy: it would keep its TTL with nothing tracking it, and the
+/// `warn!` that would have surfaced the misconfiguration would stop. Removing
+/// too much is the direction `isekai_p2p::grants` exists to avoid.
+///
+/// So a bodiless `404` stays a failure, which is what it is, and both statuses
+/// are left `Unremarkable`.
+const DELETING: Reading = Reading {
+    not_found: Missing::Unremarkable,
+    conflict: Missing::Unremarkable,
+    token_self_replacing: false,
+    retryable_kinds: &[],
+    fixable_kinds: &[],
+    gone_kinds: &["grant-not-found", "not-found"],
+};
 
 /// Note which pairs already carry a grant this process did not make.
 ///
@@ -1131,8 +1422,15 @@ fn print_binding(binding: Option<&BindingView>) {
         println!("bound to    : not reported -- check with --provisioning-keys");
         return;
     };
-    match binding.kind.as_str() {
-        "oidc" => {
+    // **The reading is [`bound_to`]'s**, and before it was not: this matched
+    // `"none"` alone, so a `binding` object that arrived without a `type` --
+    // the case `BindingView::kind`'s `#[serde(default)]` exists for, on exactly
+    // this issue response -- fell through to the last arm and printed
+    // `bound to    : ` with nothing after it. An empty name where the answer is
+    // "nothing is holding this key" is the wrong direction to be wrong in, and
+    // `portal-client`'s twin of this function already read it correctly.
+    match bound_to(Some(binding)) {
+        Bound::Oidc { .. } => {
             println!(
                 "bound to    : {} / {}",
                 binding.issuer.as_deref().unwrap_or("?"),
@@ -1147,11 +1445,11 @@ fn print_binding(binding: Option<&BindingView>) {
                 None => println!("audience    : not reported -- ask the proxy's operator"),
             }
         }
-        "none" => {
+        Bound::Nothing => {
             println!("bound to    : nothing -- the key alone is enough to get in.");
             println!("              Use --binding-oidc for a public repository's CI.");
         }
-        other => println!("bound to    : {other}"),
+        Bound::Other(kind) => println!("bound to    : {kind}"),
     }
 }
 
@@ -1170,6 +1468,51 @@ async fn grant_admin(
             .with_context(|| format!("revoke {grant_id}"))?;
         println!("revoked     : {grant_id}");
     }
+    if let Some(allowed) = grant_target(args)? {
+        // **Omitted means until revoked**, which `create_grant`'s own doc calls
+        // the usual case for standing access. `--grant-expires-in` is the way
+        // to date one; the `--grant-ttl` flag next to it is *not* it -- that is
+        // the life of the grant a redeemed `--ticket` or `--provisioning-key`
+        // makes, which clamps differently and is set in a different flow.
+        let (grant, made) = proxy
+            .create_grant(
+                allowed,
+                &args.protocol,
+                args.grant_expires_in,
+                args.grant_label.as_deref(),
+            )
+            .await
+            .with_context(|| format!("grant {allowed} access over {}", args.protocol))?;
+        // **The protocol and the label are both in the line**, because a grant
+        // is the pair *and* the protocol: a run that printed only the id and
+        // the Endpoint would leave the half an operator is most likely to have
+        // got wrong -- the protocol comes from `--protocol`, whose default is
+        // easy not to notice -- needing a second call to see.
+        println!(
+            "granted     : {}  {}  ({}{})",
+            grant.grant_id,
+            allowed,
+            args.protocol,
+            args.grant_label
+                .as_deref()
+                .map(|l| format!(", {l}"))
+                .unwrap_or_default(),
+        );
+        // **The server's answer, not the request.** The proxy clamps a grant's
+        // lifetime, so echoing `--grant-expires-in` could print a number that
+        // is not when this grant ends. `expires_at` is what it decided; absent
+        // means nothing dates it.
+        //
+        // And either way the second half is worth saying, because the policy
+        // loop revokes grants: a Gateway run settles the proxy's grants against
+        // its table and takes away what is not in it -- but only what *it*
+        // made. `note_existing` marks anything it finds as "served but never
+        // removed", so this survives a `--gateway-config` run and `--revoke` is
+        // how it goes.
+        for line in grant_lifetime_lines(&grant, made, args.grant_expires_in) {
+            println!("{line}");
+        }
+    }
     if args.grants {
         let grants = proxy.list_grants().await.context("list grants")?;
         if grants.is_empty() {
@@ -1177,7 +1520,7 @@ async fn grant_admin(
         }
         for grant in &grants {
             println!(
-                "grant       : {}  {}  ({}{})",
+                "grant       : {}  {}  ({}{}{})",
                 grant.grant_id,
                 grant.allowed_endpoint.as_deref().unwrap_or("?"),
                 grant.origin.as_deref().unwrap_or("origin unknown"),
@@ -1185,6 +1528,17 @@ async fn grant_admin(
                     .label
                     .as_deref()
                     .map(|l| format!(", {l}"))
+                    .unwrap_or_default(),
+                // **The expiry belongs here, now that one can be set.** This is
+                // the only command for reading back who is in, and without it a
+                // grant dated by `--grant-expires-in` is indistinguishable from
+                // standing access -- the same "the operator believes access is
+                // standing when it is not" failure the new guard and the
+                // lifetime line were added to prevent.
+                grant
+                    .expires_at
+                    .as_deref()
+                    .map(|at| format!(", until {at}"))
                     .unwrap_or_default(),
             );
         }
@@ -1237,8 +1591,10 @@ async fn grant_admin(
         let ticket = proxy
             .create_ticket(
                 &cfg.protocol,
-                args.ticket_ttl,
-                args.grant_ttl,
+                TicketBounds {
+                    ticket_ttl: args.ticket_ttl,
+                    grant_ttl: args.grant_ttl,
+                },
                 args.ticket_label.as_deref(),
             )
             .await
@@ -1294,9 +1650,11 @@ async fn grant_admin(
         let key = proxy
             .create_provisioning_key(
                 &cfg.protocol,
-                args.provisioning_ttl,
-                args.grant_ttl,
-                args.max_live_grants,
+                ProvisioningBounds {
+                    key_ttl: args.provisioning_ttl,
+                    grant_ttl: args.grant_ttl,
+                    max_live_grants: args.max_live_grants,
+                },
                 binding,
                 args.provisioning_label.as_deref(),
             )
@@ -1359,15 +1717,16 @@ async fn grant_admin(
             // an unbound one is fine on a machine you own and wrong for a
             // public repository, and an operator cannot act on that without
             // being told which is which.
-            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
-                Some("none") | Some("") | None => "UNBOUND".to_owned(),
-                Some("oidc") => key
-                    .binding
-                    .as_ref()
-                    .and_then(|b| b.subject.as_deref())
-                    .map(|subject| format!("oidc {subject}"))
-                    .unwrap_or_else(|| "oidc".to_owned()),
-                Some(other) => other.to_owned(),
+            //
+            // Which inputs mean "unbound" is [`bound_to`]'s to know: it is the
+            // same answer `portal-client` needs over the same `BindingView`,
+            // and the two had it written out separately. What stays here is
+            // how to say it, which differs -- this listing names the subject.
+            let bound = match bound_to(key.binding.as_ref()) {
+                Bound::Nothing => "UNBOUND".to_owned(),
+                Bound::Oidc { subject: Some(s) } => format!("oidc {s}"),
+                Bound::Oidc { subject: None } => "oidc".to_owned(),
+                Bound::Other(kind) => kind.to_owned(),
             };
             println!(
                 "key         : {}  {bound}, {slots}, {} redemptions, expires {}{label}",
@@ -1528,6 +1887,44 @@ async fn terminate_signal() {
     std::future::pending::<()>().await;
 }
 
+/// The path `--config` reads when nothing names one.
+///
+/// Named so the check in [`excluded_local`] can tell "the operator did not ask
+/// for a file" from "the operator named one that is not there".
+const DEFAULT_CONFIG: &str = "portal-server.toml";
+
+/// Everything excluded, from the command line and from the `[network]` section
+/// of `--config`, which is **both** rather than one winning.
+///
+/// See [`isekai_p2p_core::local_address::ExcludedPrefixes::union`] for why both:
+/// a flag that replaced the file would mean re-stating the file to add one line
+/// for a single run, and a file that won would mean the flag silently did
+/// nothing.
+fn excluded_local(args: &Args) -> anyhow::Result<ExcludedPrefixes> {
+    // **Only the section, and none of the catalogue's own rules.** This runs
+    // before `--login` and the grant administration return, and those have
+    // never needed a catalogue: reading it with `config::load` made a bad
+    // `target` -- or a file holding nothing but `[network]`, which is what the
+    // guide invites a client to write -- fail every one of those runs. The
+    // catalogue is still read strictly further down, where the services are
+    // what it is for.
+    let named = args.config != std::path::Path::new(DEFAULT_CONFIG);
+    let from_file = match (args.config.exists(), named) {
+        (true, _) => portal_core::network::load_section(&args.config)?.exclude_local,
+        // **A path the operator named has to be there.** Absent, the default is
+        // simply "no file", which is how `--grants` has always run; absent
+        // after being asked for by name is a typo, and letting it through would
+        // drop the exclusions silently -- the failure this flag is arranged
+        // against everywhere else.
+        (false, true) => anyhow::bail!(
+            "no configuration file at {} (--config named it)",
+            args.config.display(),
+        ),
+        (false, false) => Vec::new(),
+    };
+    ExcludedPrefixes::union(&args.exclude_local, &from_file)
+}
+
 async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()> {
     if args.example_config {
         // Before the key, the token and the catalogue: this is what somebody
@@ -1554,6 +1951,14 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // operation runs -- which, with the PEP deferred, is not in this release at
     // all. What the policy *is* consulted for from the moment it loads is
     // whether each row the control plane sends may be applied.
+    // **Before every way out, for the reason the gateway policy above is.** The
+    // same argument applies twice over: `--exclude-local` describes the host
+    // rather than this run, so a `--pair` that accepted it and then dialled the
+    // control plane from the very interface it names would be the
+    // silent-ignore shape again.
+    let excluded = excluded_local(&args)?;
+    set_excluded_local_prefixes(excluded)?;
+
     let gateway_policy = match &args.gateway_config {
         Some(path) => {
             let policy = portal_core::gateway::load(path)?;
@@ -1621,6 +2026,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // Everything here is an Endpoint-token call that names no listener
     // (§8.8, §8.12), so none of it needs a server standing up first.
     let administering = args.grants
+        || args.grant.is_some()
         || args.revoke.is_some()
         || args.pair
         || args.ticket
@@ -1641,6 +2047,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
              is not issuing one"
         );
     }
+    check_grant_options(&args)?;
     // **`--allow` is the one that does need a listener**, and these paths exit
     // before there is one. Dropping it quietly is the worst of the three
     // options: the code or the listing would print, the run would look like it
@@ -1660,7 +2067,7 @@ async fn run(args: Args, enrolled: &mut Option<P2pConfig>) -> anyhow::Result<()>
     // Read before anything else touches the network: a typo in the catalogue
     // should cost a message, not a registered Endpoint and a listener nobody
     // can use.
-    let catalogue = portal_core::config::load(&args.config)?;
+    let catalogue = portal_core::config::load(&args.config)?.catalogue;
 
     let cert_key = args.cert_key.clone().unwrap_or_else(|| {
         let mut path = args.key.clone();
@@ -2005,6 +2412,331 @@ mod tests {
                 issuer: "https://issuer.test".to_owned(),
                 subject: "repo:o/r".to_owned(),
             },
+        );
+    }
+
+    /// `--grant` is settled on the argument, before any sign-in: a mistyped ID
+    /// is a typo, and an Identity round trip adds nothing to what the string
+    /// already says.
+    #[test]
+    fn a_grant_target_must_look_like_an_endpoint_id() {
+        let args = |grant: Option<&str>| Args {
+            grant: grant.map(str::to_owned),
+            ..Args::from_args(&["portal-server"], &[]).expect("defaults")
+        };
+        assert_eq!(grant_target(&args(None)).expect("no --grant"), None);
+        let ok = "ep:63e2433ae3cd01ea4bdf8a6dab51d6f2caf3f03f7e74ad8c834eb6b6b10318ef";
+        assert_eq!(grant_target(&args(Some(ok))).expect("an id"), Some(ok));
+
+        let upper = format!("ep:{}", &ok[3..].to_ascii_uppercase());
+        let short = &ok[..20]; // a paste that stopped early
+        let long = format!("{ok}ff");
+        for bad in [
+            "63e2433a",     // no prefix
+            "ep:",          // prefix and nothing else
+            "ep:not-hex",   // not hex
+            "ep:63e2433a!", // trailing junk
+            "EP:63e2433a",  // the prefix is lowercase
+            "ep:63e2433a ", // a shell leaving a space in
+            // **The likeliest paste error, and it used to pass.** Valid hex,
+            // lowercase, just not all of it -- so the pre-flight let it reach
+            // the control plane, whose refusal is uniform and says nothing.
+            short,
+            &upper, // hex is compared as text; an uppercase copy names nothing
+            &long,  // one digit too many
+        ] {
+            let err = grant_target(&args(Some(bad)))
+                .expect_err(&format!("{bad:?} cannot name an Endpoint"));
+            // The message has to carry the offending string: an operator who
+            // pasted the wrong field needs to see what arrived.
+            assert!(
+                format!("{err}").contains(bad),
+                "the error should quote {bad:?}, got {err}"
+            );
+        }
+    }
+
+    /// The two options that only describe a `--grant` are refused without one,
+    /// rather than dropped — a dated access that silently stands until revoked
+    /// is discovered by nothing happening.
+    #[test]
+    fn grant_options_need_a_grant() {
+        let args = |grant: Option<&str>, secs: Option<u64>, label: Option<&str>| Args {
+            grant: grant.map(str::to_owned),
+            grant_expires_in: secs,
+            grant_label: label.map(str::to_owned),
+            ..Args::from_args(&["portal-server"], &[]).expect("defaults")
+        };
+        let with_grant_ttl = |grant: Option<&str>, ticket: bool, key: bool| Args {
+            grant: grant.map(str::to_owned),
+            grant_ttl: Some(3600),
+            ticket,
+            provisioning_key: key,
+            ..Args::from_args(&["portal-server"], &[]).expect("defaults")
+        };
+        let ep = "ep:63e2433a";
+        check_grant_options(&args(None, None, None)).expect("neither option, no grant");
+        check_grant_options(&args(Some(ep), Some(60), Some("phone"))).expect("both, with a grant");
+        check_grant_options(&args(Some(ep), None, None)).expect("a grant on its own");
+
+        check_grant_options(&args(None, Some(60), None))
+            .expect_err("an expiry with nothing to date");
+        check_grant_options(&args(None, None, Some("phone")))
+            .expect_err("a label with nothing to label");
+        check_grant_options(&args(None, Some(60), Some("phone")))
+            .expect_err("both, with nothing to describe");
+
+        // **`--grant-ttl` is the trap `--grant`'s own help names.** It is read
+        // only on the `--ticket` and `--provisioning-key` paths, so with
+        // `--grant` it made an undated grant and said nothing -- the same
+        // class as the two above, and the one an operator reaches for first
+        // because the names are a letter apart in meaning.
+        check_grant_options(&with_grant_ttl(Some(ep), false, false))
+            .expect_err("--grant-ttl with --grant and neither path that reads it");
+        check_grant_options(&with_grant_ttl(Some(ep), true, false)).expect("--ticket does read it");
+        check_grant_options(&with_grant_ttl(Some(ep), false, true))
+            .expect("--provisioning-key does read it");
+        check_grant_options(&with_grant_ttl(None, true, false))
+            .expect("no --grant at all is the ticket flow, untouched");
+    }
+
+    /// The lifetime line believes the proxy, not the request — it clamps, so
+    /// the two need not agree, and printing the request would name a time that
+    /// is not when the grant ends.
+    #[test]
+    fn the_lifetime_line_reports_what_the_proxy_decided() {
+        let grant = |expires: Option<&str>| isekai_p2p::agent::Grant {
+            grant_id: "gr_1".to_owned(),
+            owner_endpoint: "ep:B".to_owned(),
+            allowed_endpoint: Some("ep:A".to_owned()),
+            protocol: Some("isekai-portal-v1".to_owned()),
+            origin: Some("manual".to_owned()),
+            provisioning_key_id: None,
+            label: None,
+            created_at: None,
+            expires_at: expires.map(str::to_owned),
+        };
+
+        // Asked two hours, clamped to one: the line says the hour.
+        let lines = grant_lifetime_lines(
+            &grant(Some("2026-11-05T10:00:00Z")),
+            Made::Unknown,
+            Some(7200),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("2026-11-05T10:00:00Z") && !lines[0].contains("7200"),
+            "the proxy's expiry, not the request: {}",
+            lines[0]
+        );
+
+        // No request and no expiry: standing access.
+        let lines = grant_lifetime_lines(&grant(None), Made::Unknown, None);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("stands until revoked"), "{}", lines[0]);
+
+        // Asked and ignored: said out loud, because nothing else would show it.
+        let lines = grant_lifetime_lines(&grant(None), Made::Unknown, Some(60));
+        assert_eq!(lines.len(), 2, "the note is the second line");
+        assert!(lines[1].contains("asked for an expiry"), "{}", lines[1]);
+    }
+
+    /// Creating over an existing grant is an **update**, and the line must not
+    /// promise standing access over something another owner may revoke.
+    #[test]
+    fn a_create_that_only_updated_says_so() {
+        let dated = |created: Option<&str>| isekai_p2p::agent::Grant {
+            grant_id: "gr_1".to_owned(),
+            owner_endpoint: "ep:B".to_owned(),
+            allowed_endpoint: Some("ep:A".to_owned()),
+            protocol: Some("isekai-portal-v1".to_owned()),
+            origin: Some("manual".to_owned()),
+            provisioning_key_id: None,
+            label: None,
+            created_at: created.map(str::to_owned),
+            expires_at: None,
+        };
+
+        // Made just now: no note. The proxy returns `created_at` on a fresh
+        // create too, so "has one" is not the test -- its age is.
+        let fresh = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format");
+        let lines = grant_lifetime_lines(&dated(Some(&fresh)), Made::Unknown, None);
+        assert_eq!(
+            lines.len(),
+            1,
+            "a fresh create says nothing extra: {lines:?}"
+        );
+
+        // Older than the window: this run updated what was already there.
+        let lines = grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Unknown, None);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].contains("UPDATED it") && lines[1].contains("revoke it"),
+            "it has to say both what happened and who else may undo it: {}",
+            lines[1]
+        );
+
+        // No `created_at` at all: nothing to judge by, so no claim either way.
+        assert_eq!(
+            grant_lifetime_lines(&dated(None), Made::Unknown, None).len(),
+            1
+        );
+    }
+
+    /// **A `201` silences the note; a `200` leaves the age to decide.**
+    ///
+    /// The operator's line and the ledger's bookkeeping read the same create
+    /// through the same `existed_before`, so this pins the operator-visible
+    /// half of that asymmetry: a slow round trip no longer tells an operator
+    /// their fresh grant "UPDATED" somebody else's.
+    #[test]
+    fn the_note_follows_a_fresh_status_and_otherwise_the_age() {
+        let dated = |created: Option<&str>| isekai_p2p::agent::Grant {
+            grant_id: "gr_1".to_owned(),
+            owner_endpoint: "ep:b".to_owned(),
+            allowed_endpoint: Some("ep:a".to_owned()),
+            protocol: Some("pg".to_owned()),
+            origin: None,
+            provisioning_key_id: None,
+            label: None,
+            created_at: created.map(str::to_owned),
+            expires_at: None,
+        };
+        let fresh = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format");
+
+        // Looks old, but the proxy said we made it.
+        let lines = grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Fresh, None);
+        assert_eq!(lines.len(), 1, "a 201 silences the note: {lines:?}");
+
+        // A `200` with a fresh timestamp: the age decides, and says ours.
+        let lines = grant_lifetime_lines(&dated(Some(&fresh)), Made::Existing, None);
+        assert_eq!(lines.len(), 1, "a 200 defers to the age: {lines:?}");
+
+        // A `200` with an old one: the two agree, and the note is raised.
+        let lines =
+            grant_lifetime_lines(&dated(Some("2020-01-01T00:00:00Z")), Made::Existing, None);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("UPDATED it"), "{}", lines[1]);
+    }
+
+    fn problem(status: u16, kind: Option<&str>) -> isekai_p2p::agent::ProxyError {
+        isekai_p2p::agent::ProxyError::Problem {
+            status,
+            problem: kind.map(|kind| isekai_p2p::agent::Problem {
+                type_uri: format!("https://proxy.test/problems/{kind}"),
+                title: String::new(),
+                status,
+                detail: None,
+            }),
+            retry_after: None,
+        }
+    }
+
+    /// The two slugs the proxy sends for a grant that is not there.
+    #[test]
+    fn the_named_slugs_mean_the_grant_is_gone() {
+        for kind in ["grant-not-found", "not-found"] {
+            assert!(is_already_gone(&problem(404, Some(kind))), "{kind}");
+        }
+    }
+
+    /// **A `404` nobody put a problem body on is not an answer about the
+    /// grant.** An intermediary's page, a wrong base path or a proxy without
+    /// the route all arrive this way, and reading it as "already gone" would
+    /// drop from the ledger a grant still standing at the proxy — which would
+    /// then keep its TTL with nothing tracking it, and the warning that would
+    /// have surfaced the misconfiguration would stop.
+    #[test]
+    fn a_bodiless_not_found_is_still_a_failure() {
+        assert!(!is_already_gone(&problem(404, None)));
+        assert!(!is_already_gone(&problem(404, Some("something-else"))));
+    }
+
+    /// And nothing else is read that way either.
+    #[test]
+    fn only_those_slugs_mean_gone() {
+        assert!(!is_already_gone(&problem(403, Some("grant-invalid"))));
+        assert!(!is_already_gone(&problem(409, None)));
+        assert!(!is_already_gone(&isekai_p2p::agent::ProxyError::Transport(
+            anyhow::anyhow!("no route to host")
+        )));
+    }
+
+    /// The once-only rule: said once when it appears, silent while it stands.
+    #[test]
+    fn a_standing_fact_is_said_once() {
+        let mut said = BTreeSet::new();
+        let now: BTreeSet<&str> = ["al_1"].into_iter().collect();
+
+        assert_eq!(
+            newly(&mut said, now.clone()),
+            ["al_1"].into_iter().collect::<BTreeSet<_>>(),
+            "the first pass says it",
+        );
+        assert!(
+            newly(&mut said, now).is_empty(),
+            "and the next pass does not say it again",
+        );
+    }
+
+    /// Only the new one, when the set grows.
+    #[test]
+    fn only_what_is_new_is_said() {
+        let mut said: BTreeSet<&str> = ["al_1"].into_iter().collect();
+        assert_eq!(
+            newly(&mut said, ["al_1", "al_2"].into_iter().collect()),
+            ["al_2"].into_iter().collect::<BTreeSet<_>>(),
+            "al_1 was already said",
+        );
+    }
+
+    /// **And a fact that cleared and came back is said again.**
+    ///
+    /// The thing to get wrong here is to keep the set only growing, which would
+    /// silence the second occurrence for the life of the process -- a refusal
+    /// that an operator fixed and then reintroduced would go unreported.
+    #[test]
+    fn a_fact_that_returns_is_said_again() {
+        let mut said = BTreeSet::new();
+        let one: BTreeSet<&str> = ["al_1"].into_iter().collect();
+
+        assert!(!newly(&mut said, one.clone()).is_empty());
+        assert!(
+            newly(&mut said, BTreeSet::new()).is_empty(),
+            "it clearing is not itself news",
+        );
+        assert_eq!(
+            newly(&mut said, one),
+            ["al_1"].into_iter().collect::<BTreeSet<_>>(),
+            "but its return is",
+        );
+    }
+
+    /// **What the line would say is part of the key, so a change to it is news.**
+    ///
+    /// This is why `Reported` holds `(lease, reason)` and
+    /// `(endpoint, protocol, leases)` rather than the id or the pair alone: a
+    /// refusal that changes reason, and a pair whose lease count grows, would
+    /// otherwise leave the log stating something that has stopped being true —
+    /// and the served line's whole point is the blast radius of revoking that
+    /// grant.
+    #[test]
+    fn the_same_subject_saying_something_new_is_said_again() {
+        let mut said = BTreeSet::new();
+        assert!(!newly(&mut said, [("al_1", "no deadline")].into_iter().collect()).is_empty());
+        assert_eq!(
+            newly(
+                &mut said,
+                [("al_1", "lease too short")].into_iter().collect()
+            ),
+            [("al_1", "lease too short")]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "the same lease with a different reason is a new line",
         );
     }
 }

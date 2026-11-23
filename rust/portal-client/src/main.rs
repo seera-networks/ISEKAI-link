@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use argh::FromArgs;
+use isekai_p2p::agent::{set_excluded_local_prefixes, ExcludedPrefixes};
 use isekai_p2p::{load_or_generate_key, P2pConfig};
 use portal_core::server::Protocol;
 use tokio_util::sync::CancellationToken;
@@ -316,6 +317,21 @@ struct Args {
     /// so it is also the answer to "why did my connection go that way"
     #[argh(switch)]
     relays: bool,
+    /// path to this client's configuration: which of the host's own addresses
+    /// its connections may use. Only the `[network]` section, and an absent
+    /// file means nothing is excluded -- see --example-config
+    #[argh(option, default = "PathBuf::from(DEFAULT_CONFIG)")]
+    config: PathBuf,
+    /// print a starter configuration on stdout and exit
+    #[argh(switch)]
+    example_config: bool,
+    /// an address and prefix this host must not open its own connections from,
+    /// as `172.17.0.0/16`, or a bare address for a single one. Repeatable, and
+    /// **added to** the `[network]` section of --config rather than replacing
+    /// it. For interfaces the proxy and the relay cannot answer on -- a
+    /// container bridge, a VPN that does not route to them
+    #[argh(option)]
+    exclude_local: Vec<String>,
     /// which Endpoints to list: `active` (default), `revoked` or `all`
     #[argh(option)]
     endpoint_status: Option<String>,
@@ -471,6 +487,41 @@ async fn run(
     enrolled: &mut Option<P2pConfig>,
     task: &mut Option<P2pConfig>,
 ) -> anyhow::Result<()> {
+    if args.example_config {
+        // Before the key and the token: this is what somebody runs when they
+        // have neither and want to know what the file can say.
+        print!("{}", portal_core::network::EXAMPLE);
+        return Ok(());
+    }
+
+    // **Before every way out of this function.** `--whoami`, `--relays`,
+    // `--endpoints` and a dozen others return early and all of them dial the
+    // control plane, so a list read further down would be accepted and
+    // silently ignored on exactly the runs that are easiest to debug with it.
+    //
+    // `--config` defaults to a file that need not exist, and an absent one
+    // excludes nothing: this binary has never needed a configuration file and
+    // still does not. One that exists and cannot be read is an error, because
+    // half-applying it is worse than refusing it.
+    let excluded = {
+        // **A path the operator named has to be there.** Absent, the default is
+        // simply "no file", which is how this binary has always run; absent
+        // after being asked for by name is a typo, and letting it through would
+        // drop the exclusions silently -- the failure this flag is arranged
+        // against everywhere else.
+        let named = args.config != std::path::Path::new(DEFAULT_CONFIG);
+        let from_file = match (args.config.exists(), named) {
+            (true, _) => portal_core::network::load(&args.config)?.exclude_local,
+            (false, true) => anyhow::bail!(
+                "no configuration file at {} (--config named it)",
+                args.config.display(),
+            ),
+            (false, false) => Vec::new(),
+        };
+        ExcludedPrefixes::union(&args.exclude_local, &from_file)?
+    };
+    set_excluded_local_prefixes(excluded)?;
+
     // **First, because the rest of this function reads the key's path.** Agent
     // mode has none, and what the token store defaults to is the first thing
     // that would quietly paper over that.
@@ -962,11 +1013,32 @@ async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
     }
 }
 
+/// The path `--config` reads when nothing names one.
+///
+/// Named so the check in [`run`] can tell "the operator did not ask for a file"
+/// from "the operator named one that is not there".
+const DEFAULT_CONFIG: &str = "portal-client.toml";
+
+/// Whether this run does nothing but write a starter file.
+///
+/// **Not a use of the service, so not something to ask about**, and
+/// `portal-server`'s copy of this says what goes wrong without it: the gate
+/// prints the policy on stderr and exits non-zero, so
+/// `portal-client --example-config > portal-client.toml` truncates that file to
+/// zero bytes and the *next* step fails on an empty one. Measured on a machine
+/// that had not agreed, which is the only machine where the line is ever run.
+fn prints_a_template_only(args: &Args) -> bool {
+    args.example_config
+}
+
 /// Answer the privacy-policy flags, and refuse a run that has not agreed.
 ///
 /// `Ok(None)` carries on; `Ok(Some(code))` is a run that did what it was asked
 /// and should now stop.
 fn privacy_gate(args: &Args) -> anyhow::Result<Option<i32>> {
+    if prints_a_template_only(args) {
+        return Ok(None);
+    }
     if args.withdraw_privacy_consent {
         portal_core::consent::withdraw(APP)?;
         eprintln!("forgot this machine's agreement to the privacy policy for {APP}");
@@ -1034,12 +1106,26 @@ async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
 /// How long `--whoami` waits for Identity before answering without it.
 const WHOAMI_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// One row of [`show_relays`], header included, so the two cannot drift apart.
+fn relay_row(rtt: &str, families: &str, probe: &str, dp_id: &str, base_url: &str) -> String {
+    format!("{rtt:<14} {families:<8} {probe:<18} {dp_id:<28} {base_url}")
+}
+
 /// `--relays` — measure this Endpoint's relay candidates and print them.
 ///
-/// **The same probe a real session runs**, so what this prints is what the
-/// control plane would be given, not an approximation of it. It reports
-/// nothing: a diagnostic that quietly replaced the stored measurements would
-/// make looking at the system change it.
+/// **The same probe a real session runs**, so the round trips it prints are
+/// what the control plane would be given, not an approximation of them. The
+/// `families` column is a second, different probe — a relay leg's unconnected
+/// socket rather than the control plane's connected one — because that is the
+/// mode whose answer decides whether a direct path can form. The `probe`
+/// column is what that cost, per family, in milliseconds — the number
+/// `docs/relay_address_family_plan.md` §8-6 defers the initiator's budget
+/// decision to, and the reason this command is the fastest way to collect it:
+/// it runs the same observation a listener runs, on demand, instead of once a
+/// half hour into a journal.
+///
+/// It reports nothing: a diagnostic that quietly replaced the stored
+/// measurements would make looking at the system change it.
 async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
     let token = isekai_p2p::issue_endpoint_token(cfg).await?.endpoint_token;
     let proxy = isekai_p2p::proxy_client(cfg, &token)?;
@@ -1063,7 +1149,22 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         .iter()
         .map(|s| (s.dp_id.as_str(), s.rtt_ms))
         .collect();
+    // **Which families answer, alongside the round trips.** An operator
+    // explaining why a direct path never formed between a v6 listener and a v4
+    // initiator is asking this question, and it costs two more dials per relay
+    // in a command that was already dialling every one of them.
+    let families: std::collections::HashMap<_, _> =
+        isekai_p2p::relay_rtt::observe_families(&candidates, opts.per_relay, opts.budget)
+            .await
+            .into_iter()
+            .map(|one| (one.dp_id.clone(), one))
+            .collect();
 
+    // Named, because `families` is not guessable from its values.
+    println!(
+        "{}",
+        relay_row("rtt", "families", "probe", "dp_id", "base_url")
+    );
     for candidate in &candidates {
         // Three states, kept apart because they mean different things to the
         // choice: a number ranks, `unreachable` is dropped from a session's
@@ -1071,12 +1172,72 @@ async fn show_relays(cfg: &P2pConfig) -> anyhow::Result<()> {
         let verdict = match measured.get(candidate.dp_id.as_str()) {
             Some(Some(ms)) => format!("{ms} ms"),
             Some(None) => "unreachable".to_owned(),
-            None => "not measured (the round ran out of time)".to_owned(),
+            // Short enough to stay inside its column. With a header above
+            // the rows, a value that overflows shifts `families`, `dp_id` and
+            // `base_url` right on that row alone -- and this is the ordinary
+            // outcome for a far relay that misses the budget, so an operator
+            // reading down the `families` column would land on `dp_id` text.
+            // The reason is spelled out once, below the rows.
+            None => "not measured".to_owned(),
+        };
+        // Four states, and the empty one is not "neither family works": a
+        // relay that did not answer, or that answered only through a CLAT
+        // translator's connected socket, reports nothing rather than ruling a
+        // family out — see `relay_rtt::families_answered`.
+        let observed = families.get(&candidate.dp_id);
+        let answers = match observed.map(|one| one.families()) {
+            Some(families) if families.is_empty() => "none".to_owned(),
+            Some(families) => families
+                .iter()
+                .map(|family| match family {
+                    isekai_p2p::relay_rtt::AddressFamily::V4 => "v4",
+                    isekai_p2p::relay_rtt::AddressFamily::V6 => "v6",
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            None => "?".to_owned(),
+        };
+        // **What asking cost, per family.** The initiator has roughly 750 ms
+        // for a whole measurement round, so whether it can afford to ask this
+        // is a question about these milliseconds. Both are shown because the
+        // *dead* family is the expensive one, and it is the one that would eat
+        // the budget.
+        // **Labelled, because the set is not fixed.** Only the families worth
+        // asking about are probed, so a single-stack relay has one value --
+        // an unlabelled number there reads as v4 even for a v6-only relay.
+        let probe = match observed {
+            Some(one) if one.probes.is_empty() => "none".to_owned(),
+            Some(one) => one
+                .probes
+                .iter()
+                .map(|p| {
+                    let family = match p.family {
+                        isekai_p2p::relay_rtt::AddressFamily::V4 => "v4",
+                        isekai_p2p::relay_rtt::AddressFamily::V6 => "v6",
+                    };
+                    format!("{family}={}", p.took.as_millis())
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => "-".to_owned(),
         };
         println!(
-            "{:<14} {:<28} {}",
-            verdict, candidate.dp_id, candidate.base_url
+            "{}",
+            relay_row(
+                &verdict,
+                &answers,
+                &probe,
+                &candidate.dp_id,
+                &candidate.base_url
+            )
         );
+    }
+
+    if candidates
+        .iter()
+        .any(|c| !measured.contains_key(c.dp_id.as_str()))
+    {
+        println!("\n`not measured` means the round ran out of time, not that the relay is down.");
     }
 
     let fastest = samples
@@ -1647,11 +1808,15 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
                 _ => "slots unknown".to_owned(),
             };
             // Which of these is a bare bearer credential is the question worth
-            // answering here, the same as on the server's side.
-            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
-                Some("oidc") => "oidc".to_owned(),
-                Some("none") | Some("") | None => "UNBOUND".to_owned(),
-                Some(other) => other.to_owned(),
+            // answering here, the same as on the server's side -- which is why
+            // the reading is [`isekai_p2p::agent::bound_to`] rather than a
+            // second copy of it. The subject is not shown: this listing is
+            // about which keys are bare, and an enrollment key's subject is a
+            // detail `--enrollment-key-enrollments` reports per registration.
+            let bound = match isekai_p2p::agent::bound_to(key.binding.as_ref()) {
+                isekai_p2p::agent::Bound::Nothing => "UNBOUND".to_owned(),
+                isekai_p2p::agent::Bound::Oidc { .. } => "oidc".to_owned(),
+                isekai_p2p::agent::Bound::Other(kind) => kind.to_owned(),
             };
             println!(
                 "key         : {}  {bound}, {slots}, {}{label}",
@@ -1861,8 +2026,11 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
         println!("bound to    : not reported -- check with --enrollment-keys");
         return;
     };
-    match binding.kind.as_str() {
-        "oidc" => {
+    // The reading is `bound_to`'s, the same as the server's twin of this
+    // function: `"none" | ""` was right here and was *not* there, so the two
+    // binaries disagreed about a binding object that arrived without a `type`.
+    match isekai_p2p::agent::bound_to(Some(binding)) {
+        isekai_p2p::agent::Bound::Oidc { .. } => {
             println!(
                 "bound to    : {} / {}",
                 binding.issuer.as_deref().unwrap_or("?"),
@@ -1876,11 +2044,11 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
                 None => println!("audience    : not reported -- ask the Identity operator"),
             }
         }
-        "none" | "" => {
+        isekai_p2p::agent::Bound::Nothing => {
             println!("bound to    : nothing -- the key alone can register Endpoints.");
             println!("              Never do this for a public repository's CI.");
         }
-        other => println!("bound to    : {other}"),
+        isekai_p2p::agent::Bound::Other(kind) => println!("bound to    : {kind}"),
     }
 }
 
