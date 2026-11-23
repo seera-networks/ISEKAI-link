@@ -559,6 +559,46 @@ pub struct IssuedCertificate {
     pub not_after: Option<String>,
 }
 
+/// Whether a create answered with something it just made, or with what was
+/// already there.
+///
+/// **The status is the only place this is stated.** `request_json_with` drops
+/// it on every success, which is why the grant ledger had to infer it from how
+/// old `created_at` looked — a guess that is wrong in both directions: a slow
+/// round trip makes a fresh grant look like an update, and an operator's grant
+/// created seconds ago looks like ours
+/// (`isekai_p2p::grants::already_existed`).
+///
+/// **This reports the status; it does not decide what the status means.** The
+/// upsert answer is the documented `200`; that a fresh row is a `201` is this
+/// workspace's assumption and is written down nowhere outside its own notes.
+/// So a caller that acts on the difference has to weigh the two readings
+/// separately — `isekai_p2p::grants::existed_before` is where that
+/// weighing lives, and why.
+///
+/// [`Unknown`](Self::Unknown) is not a failure: which success status a route
+/// uses is the proxy's to choose, and anything else simply says nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    /// `201` — this call created it.
+    Fresh,
+    /// `200` — it was already there, and came back unchanged.
+    Existing,
+    /// Some other success. Nothing to read; fall back to whatever the caller
+    /// did before this existed.
+    Unknown,
+}
+
+impl Made {
+    fn from_status(status: u16) -> Self {
+        match status {
+            201 => Made::Fresh,
+            200 => Made::Existing,
+            _ => Made::Unknown,
+        }
+    }
+}
+
 /// A standing authorization for one Endpoint to reach one listener (spec §8.8).
 ///
 /// Where a [`Capability`] is a one-shot token the owner has to carry to the
@@ -622,6 +662,54 @@ pub struct PairingCode {
     pub expires_at: String,
 }
 crate::redacted_debug!(PairingCode { owner_endpoint, protocol, expires_at } redacting { code });
+
+/// How long a Ticket lasts, and how long what it makes lasts.
+///
+/// **A struct rather than two more positional `Option<u64>`.** These sat side
+/// by side in `create_ticket`, which is how the wrong one gets passed: the
+/// proxy clamps rather than complains, so a transposition shows up as an
+/// access that lasts the wrong length rather than as an error. `create_ticket`
+/// warns in prose that "they are different quantities and the second is not
+/// capped by the first"; this is that warning where the compiler can read it.
+/// Same reasoning as `portal-client`'s `Mapped`, for the same kind of mistake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TicketBounds {
+    /// How long the paper is good for. `None` takes the proxy's default.
+    ///
+    /// Clamps to 60..=86,400.
+    pub ticket_ttl: Option<u64>,
+
+    /// How long whoever presents it may stay — the lifetime of the Grant a
+    /// redemption makes.
+    ///
+    /// **Not capped by `ticket_ttl`**: a 15-minute Ticket making a 1-hour Grant
+    /// is the intended case. Clamps to the same range, and cannot be unlimited
+    /// — a Ticket is for one-off work, and work that ends should not leave
+    /// authorization behind.
+    pub grant_ttl: Option<u64>,
+}
+
+/// What bounds a Provisioning Key: how long, how long for what it makes, and
+/// how many at once.
+///
+/// **A struct for the reason [`TicketBounds`] is one**, and more so: these were
+/// three adjacent `Option<u64>`, and the tests show what that reads like —
+/// `create_provisioning_key("isekai-portal-v1", None, None, None, None, None)`
+/// says nothing about which five things were left to the proxy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProvisioningBounds {
+    /// How long the key may be redeemed. `None` takes the proxy's default.
+    pub key_ttl: Option<u64>,
+
+    /// How long each Grant a redemption makes may stand.
+    pub grant_ttl: Option<u64>,
+
+    /// How many Grants the key may have live at once.
+    ///
+    /// The slot count a `429 provisioning-slots-exhausted` is about: it is what
+    /// makes a standing arrangement bounded rather than open-ended.
+    pub max_live_grants: Option<u64>,
+}
 
 /// A Ticket, as returned by issuing one (spec §8.12.2).
 ///
@@ -781,6 +869,60 @@ pub struct BindingView {
     /// the far side learns what to mint for.
     #[serde(default)]
     pub audience: Option<String>,
+}
+
+/// What a key is tied to, if anything.
+///
+/// **The question a key listing exists to answer.** An unbound key is a bare
+/// bearer secret -- fine on a machine you own, wrong in a public repository --
+/// and an operator cannot act on that without being told which is which. Both
+/// `portal-server`'s `--provisioning-keys` and `portal-client`'s
+/// `--enrollment-keys` had the same classification written out by hand, the
+/// second commented "the same as on the server's side", over the same
+/// [`BindingView`] reached from two different records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound<'a> {
+    /// Nothing. **Whoever holds the secret can use it.**
+    Nothing,
+    /// A workload identity token, and the subject it must carry when the answer
+    /// named one.
+    Oidc { subject: Option<&'a str> },
+    /// A kind this reading does not break out. **Not "unknown to this
+    /// build"**: `sub` and `tenant` are kinds it asks for
+    /// ([`ProvisioningBinding`]) and they land here, because nothing branches
+    /// on them -- every caller prints them as they arrived.
+    ///
+    /// Shown rather than guessed at: a binding nobody here recognises is still
+    /// a binding, and calling it unbound would be the one wrong answer.
+    Other(&'a str),
+}
+
+/// Read what a key is tied to.
+///
+/// **Absent and empty both read as [`Bound::Nothing`], and that is the point.**
+/// `binding` is `Option` because a key may have none, and `BindingView::kind`
+/// is `#[serde(default)]` so that an object arriving without a `type` cannot
+/// fail the whole response -- which means an empty string reaches here. Reading
+/// either as "bound to something" would tell an operator a bare bearer secret
+/// is safe to commit.
+///
+/// **One route reads absence differently, on purpose.** In a *listing* an
+/// absent `binding` means the key has none. In an *issue* response it means the
+/// answer did not say, which `portal-server` reports as "not reported" rather
+/// than as "nothing" -- an operator who passed `--binding-oidc` must not read
+/// silence as "it took". Those sites answer `None` themselves and call this
+/// with `Some`.
+pub fn bound_to(binding: Option<&BindingView>) -> Bound<'_> {
+    match binding {
+        None => Bound::Nothing,
+        Some(binding) => match binding.kind.as_str() {
+            "" | "none" => Bound::Nothing,
+            "oidc" => Bound::Oidc {
+                subject: binding.subject.as_deref(),
+            },
+            other => Bound::Other(other),
+        },
+    }
 }
 
 /// A Provisioning Key as issued (spec §8.13.3).
@@ -1808,23 +1950,35 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// it happens to be running. That is what lets an app be restarted without
     /// everyone it let in having to pair again.
     ///
-    /// `ttl` omitted means the grant stands until revoked, which is the usual
-    /// case — a dated grant is closer to a capability.
+    /// `expires_in` omitted means the grant stands until revoked, which is the
+    /// usual case — a dated grant is closer to a capability. Named for what it
+    /// dates rather than `ttl`, because `ttl` means the *Ticket's* lifetime one
+    /// method over and the two were confusable enough to need a guard in
+    /// `portal-server` (`check_grant_options`).
+    ///
+    /// **This is an upsert, and the [`Made`] says which happened.** A pair that
+    /// already has a grant for this protocol gets the existing id back with its
+    /// `created_at` untouched, and the `ttl` and `label` asked for here written
+    /// onto it. Whether that was a creation or an edit matters to a caller
+    /// keeping a ledger of what it made — adopting somebody else's grant means
+    /// revoking it later — and the status is the only place the answer appears.
     pub async fn create_grant(
         &self,
         allowed_endpoint: &str,
         protocol: &str,
-        ttl: Option<u64>,
+        expires_in: Option<u64>,
         label: Option<&str>,
-    ) -> Result<Grant, ProxyError> {
+    ) -> Result<(Grant, Made), ProxyError> {
         let body = serde_json::json!({
             "allowed_endpoint": allowed_endpoint,
             "protocol": protocol,
-            "ttl": ttl,
+            "ttl": expires_in,
             "label": label,
         });
-        self.request_json("POST", "/v1/peer/grants", to_vec(&body))
-            .await
+        let (grant, status) = self
+            .request_json_status_with("POST", "/v1/peer/grants", to_vec(&body), &[])
+            .await?;
+        Ok((grant, Made::from_status(status)))
     }
 
     /// `GET /v1/peer/grants` (spec §8.8.2) — everyone this Endpoint has let in.
@@ -1871,23 +2025,22 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// has no listener in it (§8.8). So this works on a node that is about to
     /// be switched off, and the Ticket still does when it comes back.
     ///
-    /// `ttl` is how long the paper is good for and `grant_ttl` is how long
-    /// whoever presents it may stay. **They are different quantities and the
-    /// second is not capped by the first** — a 15-minute Ticket making a
-    /// 1-hour Grant is the intended case. Both clamp to 60..=86,400, and
-    /// `grant_ttl` cannot be unlimited: a Ticket is for one-off work, and work
-    /// that ends should not leave authorization behind.
+    /// The two lifetimes are [`TicketBounds`], which is where what each one
+    /// means is written down — they are different quantities, the second is not
+    /// capped by the first, and they used to be adjacent `Option<u64>`.
     pub async fn create_ticket(
         &self,
         protocol: &str,
-        ttl: Option<u64>,
-        grant_ttl: Option<u64>,
+        bounds: TicketBounds,
         label: Option<&str>,
     ) -> Result<Ticket, ProxyError> {
+        // **The wire is unchanged**: the struct is how a caller says it, not a
+        // change to what is said. `ttl` and `grant_ttl` are the field names
+        // §8.12.2 names, and a test pins them.
         let body = serde_json::json!({
             "protocol": protocol,
-            "ttl": ttl,
-            "grant_ttl": grant_ttl,
+            "ttl": bounds.ticket_ttl,
+            "grant_ttl": bounds.grant_ttl,
             "label": label,
         });
         self.request_json("POST", "/v1/peer/tickets", to_vec(&body))
@@ -1965,20 +2118,20 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     pub async fn create_provisioning_key(
         &self,
         protocol: &str,
-        ttl: Option<u64>,
-        grant_ttl: Option<u64>,
-        max_live_grants: Option<u64>,
+        bounds: ProvisioningBounds,
         binding: Option<&ProvisioningBinding>,
         label: Option<&str>,
     ) -> Result<ProvisioningKey, ProxyError> {
+        // Omitted rather than null, unlike the Ticket route above, and the
+        // field names are §8.13.3's. The struct changes neither.
         let mut body = serde_json::json!({ "protocol": protocol });
-        if let Some(v) = ttl {
+        if let Some(v) = bounds.key_ttl {
             body["ttl"] = serde_json::json!(v);
         }
-        if let Some(v) = grant_ttl {
+        if let Some(v) = bounds.grant_ttl {
             body["grant_ttl"] = serde_json::json!(v);
         }
-        if let Some(v) = max_live_grants {
+        if let Some(v) = bounds.max_live_grants {
             body["max_live_grants"] = serde_json::json!(v);
         }
         if let Some(binding) = binding {
@@ -2484,9 +2637,29 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         body: Vec<u8>,
         extra: &[(String, String)],
     ) -> Result<R, ProxyError> {
+        self.request_json_status_with(method, path, body, extra)
+            .await
+            .map(|(value, _status)| value)
+    }
+
+    /// As [`request_json_with`](Self::request_json_with), keeping the status.
+    ///
+    /// **Only the routes that upsert have any use for it.** Everywhere else a
+    /// success status says nothing a caller can act on, which is why
+    /// [`request_json_with`] drops it — but on `POST /v1/peer/grants` it is the
+    /// difference between having created a grant and having edited somebody
+    /// else's, and nothing else in the answer states that (see [`Made`]).
+    async fn request_json_status_with<R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+        extra: &[(String, String)],
+    ) -> Result<(R, u16), ProxyError> {
         let resp = self.send_with(method, path, body, extra).await?;
         if (200..300).contains(&resp.status) {
-            serde_json::from_slice(&resp.body).map_err(ProxyError::Decode)
+            let value = serde_json::from_slice(&resp.body).map_err(ProxyError::Decode)?;
+            Ok((value, resp.status))
         } else {
             Err(problem_error(&resp))
         }
@@ -3007,6 +3180,122 @@ mod tests {
         assert_eq!(connection.relay_family, None);
     }
 
+    /// A dated grant sends the seconds asked for, and the caller reads the
+    /// expiry back from the response rather than assuming its own number —
+    /// the proxy clamps, so the two need not agree.
+    #[tokio::test]
+    async fn a_dated_grant_sends_its_ttl_and_reads_back_the_expiry() {
+        let body = r#"{"grant_id":"gr_2","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
+            "created_at":"2026-11-05T09:00:00Z","expires_at":"2026-11-05T10:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(201, body));
+        let (grant, made) = client
+            .create_grant("ep:A", "mjpeg", Some(7200), None)
+            .await
+            .unwrap();
+        assert_eq!(made, Made::Fresh, "a 201 says this call made it");
+        assert_eq!(
+            grant.expires_at.as_deref(),
+            Some("2026-11-05T10:00:00Z"),
+            "the server's expiry, which is an hour where two were asked for"
+        );
+        let sent = last_body(&client);
+        assert_eq!(sent["ttl"], 7200, "the seconds asked for go on the wire");
+        assert!(sent["label"].is_null(), "no label means none is sent");
+    }
+    fn binding(kind: &str, subject: Option<&str>) -> BindingView {
+        BindingView {
+            kind: kind.to_owned(),
+            issuer: None,
+            subject: subject.map(str::to_owned),
+            audience: None,
+        }
+    }
+
+    /// **Absent, empty and `"none"` all mean a bare bearer secret.**
+    ///
+    /// The three are not interchangeable on the wire -- a key may have no
+    /// `binding` at all, and `kind` is `#[serde(default)]` so an object without
+    /// a `type` yields an empty string -- but they are the same answer to the
+    /// question a listing asks. Reading any of them as "bound to something"
+    /// would tell an operator a secret is safe to commit.
+    #[test]
+    fn nothing_absent_and_empty_all_read_as_unbound() {
+        assert_eq!(bound_to(None), Bound::Nothing);
+        assert_eq!(bound_to(Some(&binding("", None))), Bound::Nothing);
+        assert_eq!(bound_to(Some(&binding("none", None))), Bound::Nothing);
+    }
+
+    #[test]
+    fn an_oidc_binding_carries_its_subject_when_there_is_one() {
+        assert_eq!(
+            bound_to(Some(&binding(
+                "oidc",
+                Some("repo:acme/app:ref:refs/heads/main")
+            ))),
+            Bound::Oidc {
+                subject: Some("repo:acme/app:ref:refs/heads/main")
+            },
+        );
+        assert_eq!(
+            bound_to(Some(&binding("oidc", None))),
+            Bound::Oidc { subject: None },
+            "a binding whose subject the answer did not name is still bound",
+        );
+    }
+
+    /// **An unrecognised kind is not unbound.** A binding nobody here knows
+    /// about is still a binding, and calling it unbound is the one wrong answer
+    /// -- it would tell an operator to treat a tied key as a bare secret.
+    #[test]
+    fn an_unknown_kind_is_reported_rather_than_guessed_at() {
+        assert_eq!(
+            bound_to(Some(&binding("spiffe", Some("spiffe://acme/sa/app")))),
+            Bound::Other("spiffe"),
+        );
+    }
+
+    /// A create that upserts says so in its status, which is the whole reason
+    /// the status is kept here and nowhere else.
+    ///
+    /// **`created_at` cannot answer this.** The grant below reports being made
+    /// a minute ago, which the ledger's 30-second window would read as "already
+    /// there" — correct here by luck, and wrong for a fresh grant whose round
+    /// trip was slow. The `200` says it outright.
+    #[tokio::test]
+    async fn a_create_that_upserts_says_so_in_its_status() {
+        let body = r#"{"grant_id":"gr_3","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
+            "created_at":"2026-11-05T09:00:00Z"}"#;
+        let (client, _key) = client(MockTransport::with_response(200, body));
+        let (grant, made) = client
+            .create_grant("ep:A", "mjpeg", None, None)
+            .await
+            .unwrap();
+        assert_eq!(made, Made::Existing, "a 200 is the upsert answer");
+        assert_eq!(
+            grant.grant_id, "gr_3",
+            "and the existing id comes back, not a new one"
+        );
+    }
+
+    /// Any other success leaves the caller where it was.
+    ///
+    /// **Not a failure.** Which success status a route uses is the proxy's to
+    /// choose, and a reading the wire did not support is worse than no reading:
+    /// the ledger falls back to the age heuristic it used before this existed.
+    #[tokio::test]
+    async fn an_unexpected_success_status_reads_as_unknown() {
+        let body = r#"{"grant_id":"gr_4","owner_endpoint":"ep:B",
+            "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual"}"#;
+        let (client, _key) = client(MockTransport::with_response(202, body));
+        let (_grant, made) = client
+            .create_grant("ep:A", "mjpeg", None, None)
+            .await
+            .unwrap();
+        assert_eq!(made, Made::Unknown);
+    }
+
     /// The shape of what goes out matters more than the plumbing: the server
     /// decides what a request means from these fields, and a rename on either
     /// side is otherwise only found on a device.
@@ -3049,7 +3338,14 @@ mod tests {
             "created_at":"2026-08-28T08:30:00Z","expires_at":"2026-08-28T08:45:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
         let ticket = client
-            .create_ticket("mjpeg", Some(900), Some(3600), Some("ci"))
+            .create_ticket(
+                "mjpeg",
+                TicketBounds {
+                    ticket_ttl: Some(900),
+                    grant_ttl: Some(3600),
+                },
+                Some("ci"),
+            )
             .await
             .unwrap();
         assert_eq!(ticket.ticket, "tkt1_secret");
@@ -3215,7 +3511,7 @@ mod tests {
             "allowed_endpoint":"ep:A","protocol":"mjpeg","origin":"manual",
             "created_at":"2026-08-02T09:00:00Z"}"#;
         let (client, _key) = client(MockTransport::with_response(201, body));
-        let grant = client
+        let (grant, _made) = client
             .create_grant("ep:A", "mjpeg", None, Some("phone"))
             .await
             .unwrap();
@@ -3231,6 +3527,15 @@ mod tests {
         assert_eq!(sent["allowed_endpoint"], "ep:A");
         assert_eq!(sent["protocol"], "mjpeg");
         assert!(sent["ttl"].is_null(), "no ttl means until revoked");
+        // **The label was passed and never checked.** A grant is the pair and
+        // the protocol; the label is the only part that is purely for whoever
+        // reads `--grants` later, which is exactly the part a silent drop
+        // would never be noticed in.
+        assert_eq!(sent["label"], "phone");
+        assert!(
+            sent.get("listener_id").is_none(),
+            "a grant authorizes reaching this Endpoint, not one of its listeners"
+        );
     }
 
     /// A line is not a chunk. The network splits the body wherever it likes, so

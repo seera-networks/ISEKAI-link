@@ -5,7 +5,7 @@ name = "portal-client-ffi"
 # `rust/Cargo.toml`'s "one version for the whole workspace" rule stops at its
 # members. It was shipping as 0.1.0 while everything around it was 0.6.x --
 # and it *is* shipped: the Android portal app links it as a cdylib.
-version = "0.8.3"
+version = "0.10.1"
 edition = "2021"
 
 # Standalone workspace root, same reasoning as portal-server/portal-client:
@@ -30,4 +30,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 msquic-async = { path = "../../submodules/msquic-async-rs/msquic-async", default-features = false, features = ["tokio", "msquic-seera"] }
 isekai-p2p = { path = "../isekai-p2p" }
 portal-core = { path = "../portal-core" }
+# The privacy policy the app asks agreement to before anything else, shared
+# with the camera apps and the CLIs so they all show the same text.
+isekai-privacy = { path = "../privacy" }
 uniffi = { version = "0.28", features = ["cli"] }

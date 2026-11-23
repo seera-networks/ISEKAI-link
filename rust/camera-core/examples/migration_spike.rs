@@ -302,7 +302,9 @@ async fn role_server_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
     // Stand in for the bind leg's observed-address watch. Held for the whole
     // run: dropping the sender would close the watch and stop the advertisement
     // for the wrong reason.
-    let (_observed_tx, observed_rx) = tokio::sync::watch::channel(Some(observed_for(server_leg.addr)?));
+    let (_observed_tx, observed_rx) = tokio::sync::watch::channel(
+        [observed_for(server_leg.addr)?].into_iter().collect(),
+    );
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
     let shutdown = CancellationToken::new();
@@ -356,7 +358,7 @@ async fn role_client_prod(reg: &Arc<Registration>) -> anyhow::Result<String> {
     let client_leg = RelayLeg::start_dialing(reg, proxy_addr).await?;
     let bridge = Bridge::start(loopback(video_port)).await?;
     let (_observed_tx, observed_rx) =
-        tokio::sync::watch::channel(Some(observed_for(client_leg.addr)?));
+        tokio::sync::watch::channel([observed_for(client_leg.addr)?].into_iter().collect());
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(16);
     let (path_tx, mut path_rx) = tokio::sync::mpsc::channel::<camera_core::PathEvent>(16);

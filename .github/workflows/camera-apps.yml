@@ -93,8 +93,19 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      # **Ubuntu is pinned, and to 24.04 rather than to whatever is latest.**
+      # `ubuntu-latest` became 26.04 on 2026-11-14, whose FFmpeg 8 dropped
+      # `avcodec_close` and `av_stream_get_side_data` — both of which OpenCV
+      # 4.11.0 calls from `cap_ffmpeg_impl.hpp`, so `opencv_videoio` does not
+      # compile there at all. 4.11.0 is not an arbitrary choice either: it is
+      # what the `opencv` crate this workspace pins is used with, so moving off
+      # it is a dependency bump and not a CI repair.
+      #
+      # Pinning also makes the Linux bundle a better artifact than the rolling
+      # label did: it is built against the older glibc, so it runs on both.
+      # `android.yml` pins the same way, for its own reasons.
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-15]
+        os: [ubuntu-24.04, windows-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/submodules
@@ -116,9 +127,50 @@ jobs:
       - name: Install the build and runtime dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
+          # `prepare-machine.ps1` above adds the lttng stable-2.13 PPA, whose
+          # own description says it supports 18.04 and 20.04 — and the
+          # `ubuntu-latest` image moved to 26.04 "resolute" on 2026-11-14. So
+          # the PPA answers 404, `apt-get update` exits 100, and this step
+          # fails on a repository nothing here installs from.
+          #
+          # Dropped rather than tolerated with `|| true`: a genuine failure of
+          # this step has to stay a failure. Nothing is lost by dropping it —
+          # `prepare-machine.ps1` has already run, and it takes
+          # `liblttng-ust-dev` from the Ubuntu archive, which is why the other
+          # Linux jobs build msquic successfully with the same 404 in their
+          # logs.
+          sudo rm -f /etc/apt/sources.list.d/*lttng*
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev build-essential cmake pkg-config \
             libavcodec-dev libavformat-dev libswscale-dev libv4l-dev
+
+      # **The OpenCV caches hold binaries linked against the image's own
+      # libraries, so their keys have to name the image.** `runner.os` does
+      # not: it is `Linux` for both Ubuntu 24.04 and 26.04, and
+      # `ubuntu-latest` moved from one to the other on 2026-11-14. The cache
+      # built on 24.04 was then restored on 26.04, where `libopencv_videoio`
+      # still wanted `libavcodec.so.60`, `libavformat.so.60`,
+      # `libavutil.so.58` and `libswscale.so.7` — sonames that image does not
+      # carry — and the bundle check failed with four libraries "not installed
+      # here". Exactly the class of failure the comment on the dependency step
+      # above describes, arriving by the other route.
+      #
+      # Read here rather than from `${{ env.ImageOS }}`, which is a variable
+      # the runner image sets in its environment and not one the `env` context
+      # carries. macOS is keyed on the major version alone, so a patch bump
+      # does not throw away a cache that is still correct.
+      - name: Name the image the OpenCV caches are keyed on
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux) tag="$(. /etc/os-release && echo "$ID-$VERSION_ID")" ;;
+            macOS) tag="macos-$(sw_vers -productVersion | cut -d. -f1)" ;;
+            *)     tag="$RUNNER_OS" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "the caches are keyed on $tag"
 
       # Ubuntu packages OpenCV 4.6 and the crate wants 4.11+, so it is built
       # here. `opencv-extra-modules: false` matters: the camera apps use
@@ -133,7 +185,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/opencv-install
-          key: opencv-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+          key: opencv-${{ steps.image.outputs.tag }}-${{ env.OPENCV_VERSION }}
       # Built here rather than through `Dovyski/setup-opencv-action`, which was
       # the obvious choice and does not work: its dependency install adds an
       # Ubuntu Xenial repository — the action still targets 18.04 — and on a
@@ -182,7 +234,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/opencv-install
-          key: opencv-${{ runner.os }}-${{ env.OPENCV_VERSION }}
+          key: opencv-${{ steps.image.outputs.tag }}-${{ env.OPENCV_VERSION }}
       - name: Install the build tools (macOS)
         if: runner.os == 'macOS'
         run: |

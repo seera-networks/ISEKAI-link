@@ -40,7 +40,7 @@ use time::OffsetDateTime;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::ObservedAddress;
+use crate::agent::ObservedAddresses;
 
 /// How long a video connection may carry nothing before it is closed.
 ///
@@ -429,6 +429,47 @@ impl AttestedPeer {
     }
 }
 
+/// Refuse a peer connection that would check nothing about who answers.
+///
+/// With no host from the proxy there is no name to hold the certificate
+/// against, so `verify` is off; with no attestation there is no key to pin
+/// (and [`AttestedPeer::from_connection`] pins nothing without a host either).
+/// Both missing means any listener that reaches the relay bridge would be
+/// taken for the peer. Production has relay certificates on, so this only
+/// stops a proxy that has them disabled, or a connect response that lost the
+/// host.
+///
+/// `ISEKAI_INSECURE_SKIP_VERIFY` still lets it through, with a warning: it is
+/// the one dev opt-in for "don't check the certificate", and a dev proxy with
+/// relay certificates off is exactly where it is set.
+///
+/// For the clients' own dials. The loopback tests dial with `verify` off on
+/// purpose, against the self-signed fallback, and don't come through here.
+pub fn require_something_to_check(verify: bool, pinned: bool) -> anyhow::Result<()> {
+    something_to_check(
+        verify,
+        pinned,
+        std::env::var_os("ISEKAI_INSECURE_SKIP_VERIFY").is_some(),
+    )
+}
+
+fn something_to_check(verify: bool, pinned: bool, insecure_opt_in: bool) -> anyhow::Result<()> {
+    if verify || pinned {
+        return Ok(());
+    }
+    if insecure_opt_in {
+        tracing::warn!(
+            "ISEKAI_INSECURE_SKIP_VERIFY set: the proxy named no host and the peer signed for \
+             no key, so nothing about the peer is checked",
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing the peer connection: the proxy named no host to check its certificate \
+         against, and the peer signed for no key to pin"
+    )
+}
+
 /// Refuse the handshake unless the certificate names `host` and, where the peer
 /// published one, is the key `pin` vouches for.
 ///
@@ -705,9 +746,14 @@ pub struct DialOptions<'a> {
     /// anything. `None` leaves the connection on name validation alone, which
     /// is the ordinary case while this is being adopted.
     pub pin: Option<AttestedPeer>,
-    /// How the proxy sees this session's relay leg. `Some` offers it as a
+    /// How the proxy sees this session's relay leg — **every address it has a
+    /// path in**, which is one per family where the relay advertises
+    /// alternative addresses. A non-empty set offers each of them as a
     /// direct-path candidate and turns migration on.
-    pub candidate: Option<ObservedAddress>,
+    ///
+    /// All of them rather than one: offering the newest is how a dual-stack end
+    /// came to offer an IPv4-only peer an IPv6 address and nothing else (#371).
+    pub candidates: ObservedAddresses,
     /// Receive QUIC datagrams — see [`ClientOptions::datagrams`].
     pub datagrams: bool,
 }
@@ -769,7 +815,7 @@ pub async fn dial(
         port,
         verify,
         pin,
-        candidate,
+        candidates,
         datagrams,
     } = opts;
     // Both flags are read off the same options the loop below reads, rather
@@ -781,7 +827,7 @@ pub async fn dial(
         ClientOptions {
             alpn,
             verify,
-            enable_migration: candidate.is_some(),
+            enable_migration: !candidates.is_empty(),
             pinning: pin.is_some(),
             datagrams,
         },
@@ -795,8 +841,8 @@ pub async fn dial(
         // redone on each one.
         conn.set_remote_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
             .map_err(|e| anyhow::anyhow!("could not pin the relay bridge address: {e}"))?;
-        if let Some(candidate) = candidate {
-            crate::direct_path::prepare(&conn, candidate)?;
+        if !candidates.is_empty() {
+            crate::direct_path::prepare(&conn, &candidates)?;
         }
         // One slot per attempt: a verdict from a connection that has been
         // dropped says nothing about this one.
@@ -1064,6 +1110,18 @@ mod tests {
 
     fn lost(status: msquic::Status) -> ConnectionStartError {
         ConnectionStartError::ConnectionLost(ConnectionError::ShutdownByTransport(status, 0))
+    }
+
+    /// **Neither a name nor a pin is refused**, unless the dev opt-in is set.
+    /// Either one alone is enough: the name is what production checks, and a
+    /// pin holds even when the name can't be.
+    #[test]
+    fn a_peer_with_nothing_to_check_is_refused() {
+        assert!(something_to_check(false, false, false).is_err());
+        assert!(something_to_check(false, false, true).is_ok(), "dev opt-in");
+        assert!(something_to_check(true, false, false).is_ok(), "name only");
+        assert!(something_to_check(false, true, false).is_ok(), "pin only");
+        assert!(something_to_check(true, true, false).is_ok());
     }
 
     /// The arithmetic that reads an alert back out of a close status, pinned

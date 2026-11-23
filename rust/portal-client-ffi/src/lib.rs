@@ -91,6 +91,41 @@ pub fn endpoint_id_of(pem: String) -> Result<String, PortalError> {
         .map_err(|e| PortalError::InvalidKey(e.to_string()))
 }
 
+/// The privacy policy this build carries, for the screen shown before anything
+/// else.
+///
+/// Comes from the core rather than a copy in the app bundle so this app, the
+/// camera apps and the CLIs cannot end up asking agreement to slightly
+/// different documents. Same shape as `isekai-client-ffi`'s, read straight
+/// from `isekai-privacy` rather than through `camera-core`, which this crate
+/// does not depend on.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PrivacyPolicy {
+    /// What was agreed to. Store it with the answer: agreement to one text is
+    /// not agreement to the next, and comparing this is how a revised policy
+    /// gets asked again.
+    pub version: String,
+    /// The canonical, always-current copy of each rendering. The text below is
+    /// what is shown and what works with no network; these stay current, and
+    /// are per language so the link matches what is on screen.
+    pub url_ja: String,
+    pub url_en: String,
+    pub text_ja: String,
+    pub text_en: String,
+}
+
+/// The policy to show, and the version to record alongside the answer.
+#[uniffi::export]
+pub fn privacy_policy() -> PrivacyPolicy {
+    PrivacyPolicy {
+        version: isekai_privacy::VERSION.to_owned(),
+        url_ja: isekai_privacy::URL_JA.to_owned(),
+        url_en: isekai_privacy::URL_EN.to_owned(),
+        text_ja: isekai_privacy::TEXT_JA.to_owned(),
+        text_en: isekai_privacy::TEXT_EN.to_owned(),
+    }
+}
+
 fn build_p2p_config(
     config: &PortalConfig,
     key: EndpointKey,
@@ -484,4 +519,23 @@ pub fn connect(
         closed: closed_rx,
         local_port,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The app records `version` with the answer and asks again when it
+    /// changes, so it has to be the one the CLIs and camera apps compare
+    /// against, and the text has to be the real documents.
+    #[test]
+    fn privacy_policy_is_the_shared_one() {
+        let policy = privacy_policy();
+        assert_eq!(policy.version, isekai_privacy::VERSION);
+        assert_eq!(policy.text_ja, isekai_privacy::TEXT_JA);
+        assert_eq!(policy.text_en, isekai_privacy::TEXT_EN);
+        assert!(policy.url_ja.ends_with("privacy-policy.ja.md"));
+        assert!(policy.url_en.ends_with("privacy-policy.en.md"));
+        assert!(!policy.text_en.is_empty() && !policy.text_ja.is_empty());
+    }
 }

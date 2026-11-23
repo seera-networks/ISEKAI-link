@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use isekai_p2p::agent::ObservedAddress;
+use isekai_p2p::agent::ObservedAddresses;
 use isekai_p2p::endpoint_cert::{dev_cert, EndpointCert};
 use isekai_p2p::peer::{dial, AttestedPeer, DialOptions, PeerSession};
 use msquic_async::{Listener, Registration};
@@ -98,9 +98,10 @@ pub struct ConnectOptions {
     /// `None` is ordinary while this is being adopted and leaves the connection
     /// on name validation alone.
     pub pin: Option<AttestedPeer>,
-    /// How the proxy sees this session's relay leg. `Some` offers it as a
-    /// direct-path candidate and turns migration on.
-    pub candidate: Option<ObservedAddress>,
+    /// How the proxy sees this session's relay leg — every address it has a
+    /// path in. A non-empty set offers each as a direct-path candidate and
+    /// turns migration on; see [`DialOptions::candidates`] for why all of them.
+    pub candidates: ObservedAddresses,
 }
 
 /// Dial a portal listener.
@@ -119,7 +120,7 @@ pub async fn connect(
     let ConnectOptions {
         verify,
         pin,
-        candidate,
+        candidates,
     } = opts;
     dial(
         reg,
@@ -129,7 +130,7 @@ pub async fn connect(
             port,
             verify,
             pin,
-            candidate,
+            candidates,
             // **Both directions or neither.** This advertises that we will
             // receive datagrams, which is what lets the *server* answer a UDP
             // forward at all -- without it every reply is denied at zero bytes.

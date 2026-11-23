@@ -41,6 +41,8 @@ pub mod gateway;
 /// Keeping a Provisioning Key's Grant alive while the work runs.
 pub mod grant;
 pub mod login;
+/// The `[network]` section both binaries' configuration files carry.
+pub mod network;
 pub mod path;
 pub mod server;
 pub mod session;

@@ -187,7 +187,10 @@ fn relay_connector(
         opts.unconnected,
         registration,
     )
-    .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host));
+    .with_peer_certificate_callback(crate::hostname::refuse_other_hosts(host))
+    // The same list the control-plane connection gets: an address the proxy
+    // cannot answer on is no more usable for a leg than for the control plane.
+    .with_local_address_policies(crate::local_address::current().as_policies());
     let (conn_tx, conn_rx) = mpsc::channel(4);
     let observed = spawn_observed_address_watch(conn_rx, shutdown);
     // **The family the control plane chose for *both* ends** (plan Q6). It is
@@ -213,9 +216,24 @@ fn relay_connector(
     // was agreed" and "the family was applied" are different facts and only
     // one of them is visible from the response.
     let connector = match family {
-        Some(family) if opts.unconnected => connector.with_preferred_address_family(family),
+        Some(family) if opts.unconnected => {
+            // The other half of the question `relay_family::chosen` logs: it
+            // says what was named, this says it reached the connector. A
+            // chosen family that is never applied looks exactly like one that
+            // was never named.
+            // `info!`, matching `relay_family::chosen`: its comment promises
+            // an operator need not raise the level on one end, and "a family
+            // was chosen" without "and applied" leaves exactly the gap this
+            // pair exists to close.
+            tracing::info!(?family, "dialling the relay in the agreed address family");
+            connector.with_preferred_address_family(family)
+        }
         Some(family) => {
-            tracing::debug!(
+            // `info!` too, and for the stronger reason: this is the arm
+            // where an agreed family is silently dropped while the peer
+            // honours it. At `debug!` an operator could see a family chosen
+            // and never learn it was not applied.
+            tracing::info!(
                 ?family,
                 "the control plane chose an address family, but this leg is on a connected \
                  socket, which cannot honour it; it has no direct path either way"

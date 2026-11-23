@@ -906,6 +906,13 @@ pub fn connect(
         Some(host) => (host.to_string(), true),
         None => ("127.0.0.1".to_string(), false),
     };
+    if let Err(e) = camera_core::require_something_to_check(verify, pin.is_some()) {
+        // Closed before returning, for the same reason as a wrong peer above.
+        // `Connect` rather than `WrongPeer`: it is the proxy's answer that is
+        // missing something, not the camera that is someone else.
+        runtime.block_on(session.close());
+        return Err(ClientError::Connect(format!("{e:#}")));
+    }
 
     sink.on_state(ConnectionState::Connected, connection_id.clone());
 

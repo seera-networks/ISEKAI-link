@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use argh::FromArgs;
+use isekai_p2p::agent::{set_excluded_local_prefixes, ExcludedPrefixes};
 use isekai_p2p::{load_or_generate_key, P2pConfig};
 use portal_core::server::Protocol;
 use tokio_util::sync::CancellationToken;
@@ -316,6 +317,21 @@ struct Args {
     /// so it is also the answer to "why did my connection go that way"
     #[argh(switch)]
     relays: bool,
+    /// path to this client's configuration: which of the host's own addresses
+    /// its connections may use. Only the `[network]` section, and an absent
+    /// file means nothing is excluded -- see --example-config
+    #[argh(option, default = "PathBuf::from(DEFAULT_CONFIG)")]
+    config: PathBuf,
+    /// print a starter configuration on stdout and exit
+    #[argh(switch)]
+    example_config: bool,
+    /// an address and prefix this host must not open its own connections from,
+    /// as `172.17.0.0/16`, or a bare address for a single one. Repeatable, and
+    /// **added to** the `[network]` section of --config rather than replacing
+    /// it. For interfaces the proxy and the relay cannot answer on -- a
+    /// container bridge, a VPN that does not route to them
+    #[argh(option)]
+    exclude_local: Vec<String>,
     /// which Endpoints to list: `active` (default), `revoked` or `all`
     #[argh(option)]
     endpoint_status: Option<String>,
@@ -471,6 +487,41 @@ async fn run(
     enrolled: &mut Option<P2pConfig>,
     task: &mut Option<P2pConfig>,
 ) -> anyhow::Result<()> {
+    if args.example_config {
+        // Before the key and the token: this is what somebody runs when they
+        // have neither and want to know what the file can say.
+        print!("{}", portal_core::network::EXAMPLE);
+        return Ok(());
+    }
+
+    // **Before every way out of this function.** `--whoami`, `--relays`,
+    // `--endpoints` and a dozen others return early and all of them dial the
+    // control plane, so a list read further down would be accepted and
+    // silently ignored on exactly the runs that are easiest to debug with it.
+    //
+    // `--config` defaults to a file that need not exist, and an absent one
+    // excludes nothing: this binary has never needed a configuration file and
+    // still does not. One that exists and cannot be read is an error, because
+    // half-applying it is worse than refusing it.
+    let excluded = {
+        // **A path the operator named has to be there.** Absent, the default is
+        // simply "no file", which is how this binary has always run; absent
+        // after being asked for by name is a typo, and letting it through would
+        // drop the exclusions silently -- the failure this flag is arranged
+        // against everywhere else.
+        let named = args.config != std::path::Path::new(DEFAULT_CONFIG);
+        let from_file = match (args.config.exists(), named) {
+            (true, _) => portal_core::network::load(&args.config)?.exclude_local,
+            (false, true) => anyhow::bail!(
+                "no configuration file at {} (--config named it)",
+                args.config.display(),
+            ),
+            (false, false) => Vec::new(),
+        };
+        ExcludedPrefixes::union(&args.exclude_local, &from_file)?
+    };
+    set_excluded_local_prefixes(excluded)?;
+
     // **First, because the rest of this function reads the key's path.** Agent
     // mode has none, and what the token store defaults to is the first thing
     // that would quietly paper over that.
@@ -962,11 +1013,32 @@ async fn revoke_if_pending(task: &mut Option<P2pConfig>) {
     }
 }
 
+/// The path `--config` reads when nothing names one.
+///
+/// Named so the check in [`run`] can tell "the operator did not ask for a file"
+/// from "the operator named one that is not there".
+const DEFAULT_CONFIG: &str = "portal-client.toml";
+
+/// Whether this run does nothing but write a starter file.
+///
+/// **Not a use of the service, so not something to ask about**, and
+/// `portal-server`'s copy of this says what goes wrong without it: the gate
+/// prints the policy on stderr and exits non-zero, so
+/// `portal-client --example-config > portal-client.toml` truncates that file to
+/// zero bytes and the *next* step fails on an empty one. Measured on a machine
+/// that had not agreed, which is the only machine where the line is ever run.
+fn prints_a_template_only(args: &Args) -> bool {
+    args.example_config
+}
+
 /// Answer the privacy-policy flags, and refuse a run that has not agreed.
 ///
 /// `Ok(None)` carries on; `Ok(Some(code))` is a run that did what it was asked
 /// and should now stop.
 fn privacy_gate(args: &Args) -> anyhow::Result<Option<i32>> {
+    if prints_a_template_only(args) {
+        return Ok(None);
+    }
     if args.withdraw_privacy_consent {
         portal_core::consent::withdraw(APP)?;
         eprintln!("forgot this machine's agreement to the privacy policy for {APP}");
@@ -1736,11 +1808,15 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
                 _ => "slots unknown".to_owned(),
             };
             // Which of these is a bare bearer credential is the question worth
-            // answering here, the same as on the server's side.
-            let bound = match key.binding.as_ref().map(|b| b.kind.as_str()) {
-                Some("oidc") => "oidc".to_owned(),
-                Some("none") | Some("") | None => "UNBOUND".to_owned(),
-                Some(other) => other.to_owned(),
+            // answering here, the same as on the server's side -- which is why
+            // the reading is [`isekai_p2p::agent::bound_to`] rather than a
+            // second copy of it. The subject is not shown: this listing is
+            // about which keys are bare, and an enrollment key's subject is a
+            // detail `--enrollment-key-enrollments` reports per registration.
+            let bound = match isekai_p2p::agent::bound_to(key.binding.as_ref()) {
+                isekai_p2p::agent::Bound::Nothing => "UNBOUND".to_owned(),
+                isekai_p2p::agent::Bound::Oidc { .. } => "oidc".to_owned(),
+                isekai_p2p::agent::Bound::Other(kind) => kind.to_owned(),
             };
             println!(
                 "key         : {}  {bound}, {slots}, {}{label}",
@@ -1950,8 +2026,11 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
         println!("bound to    : not reported -- check with --enrollment-keys");
         return;
     };
-    match binding.kind.as_str() {
-        "oidc" => {
+    // The reading is `bound_to`'s, the same as the server's twin of this
+    // function: `"none" | ""` was right here and was *not* there, so the two
+    // binaries disagreed about a binding object that arrived without a `type`.
+    match isekai_p2p::agent::bound_to(Some(binding)) {
+        isekai_p2p::agent::Bound::Oidc { .. } => {
             println!(
                 "bound to    : {} / {}",
                 binding.issuer.as_deref().unwrap_or("?"),
@@ -1965,11 +2044,11 @@ fn print_enrollment_binding(binding: Option<&isekai_p2p::agent::BindingView>) {
                 None => println!("audience    : not reported -- ask the Identity operator"),
             }
         }
-        "none" | "" => {
+        isekai_p2p::agent::Bound::Nothing => {
             println!("bound to    : nothing -- the key alone can register Endpoints.");
             println!("              Never do this for a public repository's CI.");
         }
-        other => println!("bound to    : {other}"),
+        isekai_p2p::agent::Bound::Other(kind) => println!("bound to    : {kind}"),
     }
 }
 

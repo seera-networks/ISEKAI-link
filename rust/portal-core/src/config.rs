@@ -51,6 +51,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::Context as _;
+
+use crate::network::Network;
 use serde::Deserialize;
 
 use crate::server::{Catalogue, Protocol};
@@ -96,17 +98,51 @@ target   = "192.0.2.10:5432"
 [service.dns]
 protocol = "udp"
 target   = "192.0.2.1:53"
+
+# Which of this host's own addresses may carry this server's connections.
+#
+# Nothing here is required, and left empty every address the host has is
+# available -- the right answer on a machine with one network. It is worth
+# filling in where the host has addresses the proxy and the relay cannot answer
+# on: a container bridge, a VPN that does not route to them, a management
+# interface. Those are tried anyway, cost a socket and a connection ID each,
+# and fail.
+#
+# Each entry is an address and a prefix length; a bare address means the whole
+# of it, so `10.1.2.3` is `10.1.2.3/32`. At most 16 entries. `--exclude-local`
+# adds to this list rather than replacing it.
+#
+# The same section, with the same meaning, is the whole of what
+# `portal-client --example-config` writes.
+
+[network]
+exclude_local = [
+  # "172.17.0.0/16",   # the docker bridge
+  # "10.8.0.0/24",     # a VPN the proxy cannot answer on
+]
 "#;
 
+/// What the file holds: the services, and the `[network]` section.
+///
+/// Returned together rather than read twice, and named rather than a tuple so
+/// a caller that wants one of them says which.
+#[derive(Debug)]
+pub struct Loaded {
+    /// What this server offers.
+    pub catalogue: Catalogue,
+    /// Which of the host's own addresses may carry its connections.
+    pub network: Network,
+}
+
 /// Read the catalogue from `path`.
-pub fn load(path: &Path) -> anyhow::Result<Catalogue> {
+pub fn load(path: &Path) -> anyhow::Result<Loaded> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read the service catalogue at {}", path.display()))?;
     parse(&text).with_context(|| format!("in {}", path.display()))
 }
 
 /// [`load`] from a string, which is what the tests use.
-pub fn parse(text: &str) -> anyhow::Result<Catalogue> {
+pub fn parse(text: &str) -> anyhow::Result<Loaded> {
     let file: File = toml::from_str(text).context("the service catalogue is not valid TOML")?;
     anyhow::ensure!(
         !file.service.is_empty(),
@@ -133,7 +169,10 @@ pub fn parse(text: &str) -> anyhow::Result<Catalogue> {
             .try_with(&name, protocol, target)
             .with_context(|| format!("service `{name}`"))?;
     }
-    Ok(catalogue)
+    Ok(Loaded {
+        catalogue,
+        network: file.network,
+    })
 }
 
 #[derive(Deserialize)]
@@ -150,6 +189,13 @@ struct File {
     /// and neither should be silent.
     #[serde(default)]
     service: BTreeMap<String, ServiceEntry>,
+    /// The same section `portal-client`'s own configuration file holds, and the
+    /// same type reads it — see [`crate::network`]. It lives in this file
+    /// rather than one of its own because a server operator already has a file
+    /// here, and a third one for three lines is a worse trade than a catalogue
+    /// that also says which of the host's addresses are usable.
+    #[serde(default)]
+    network: Network,
 }
 
 #[derive(Deserialize)]
@@ -179,7 +225,7 @@ mod tests {
 
     #[test]
     fn the_example_from_the_plan_loads() {
-        let catalogue = parse(BOTH).expect("the plan's own example");
+        let catalogue = parse(BOTH).expect("the plan's own example").catalogue;
         assert_eq!(catalogue.len(), 2);
         assert_eq!(
             catalogue.look_up("db", Protocol::Tcp),
@@ -193,7 +239,7 @@ mod tests {
     /// into one `Refused`, and it can only do that because both arrive here.
     #[test]
     fn a_udp_service_is_not_reachable_over_tcp() {
-        let catalogue = parse(BOTH).expect("parse");
+        let catalogue = parse(BOTH).expect("parse").catalogue;
         assert_eq!(
             catalogue.look_up("dns", Protocol::Tcp),
             Lookup::WrongProtocol(Protocol::Udp),
@@ -208,8 +254,41 @@ mod tests {
     /// Here rather than in the binary because this is where `parse` lives, and
     /// an example that drifts from its parser is the same failure a step later.
     #[test]
+    fn the_example_catalogue_excludes_no_addresses() {
+        // The same guarantee `network::EXAMPLE` carries, for the same reason:
+        // this is a file people copy and edit, and an exclusion they did not
+        // mean is an interface that silently stops being used.
+        let loaded = parse(EXAMPLE).expect("--example-config must load");
+        assert!(
+            loaded.network.exclude_local.is_empty(),
+            "the example must not exclude anything by itself",
+        );
+    }
+
+    #[test]
+    fn a_catalogue_can_carry_the_network_section() {
+        let loaded = parse(
+            r#"[service.db]
+               protocol = "tcp"
+               target = "10.0.0.5:5432"
+
+               [network]
+               exclude_local = ["172.17.0.0/16"]"#,
+        )
+        .expect("a catalogue with both sections");
+        assert_eq!(loaded.network.exclude_local, ["172.17.0.0/16"]);
+        assert_eq!(
+            loaded.catalogue.look_up("db", Protocol::Tcp),
+            Lookup::Found("10.0.0.5:5432".parse().unwrap()),
+            "and the services are still read",
+        );
+    }
+
+    #[test]
     fn the_example_catalogue_is_one_this_would_accept() {
-        let catalogue = parse(EXAMPLE).expect("--example-config must produce a file that loads");
+        let catalogue = parse(EXAMPLE)
+            .expect("--example-config must produce a file that loads")
+            .catalogue;
         assert_eq!(
             catalogue.look_up("db", Protocol::Tcp),
             Lookup::Found("192.0.2.10:5432".parse().unwrap()),
@@ -232,7 +311,8 @@ mod tests {
                protocol = "udp"
                target = "10.0.0.1:53""#,
         )
-        .expect("a UDP-only catalogue is served as of phase 3b");
+        .expect("a UDP-only catalogue is served as of phase 3b")
+        .catalogue;
         assert_eq!(
             catalogue.look_up("dns", Protocol::Udp),
             Lookup::Found("10.0.0.1:53".parse().unwrap()),

@@ -16,6 +16,7 @@ use isekai_p2p_core::identity::Narrowing;
 use isekai_p2p_core::identity::{
     EndpointToken, IdentityAuth, IdentityClient, IdentityError, RevokeAuth,
 };
+use isekai_p2p_core::outcome::{Missing, Outcome, Reading};
 use isekai_p2p_core::proxy::{ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
@@ -533,14 +534,31 @@ async fn unattended<T: ControlPlaneTransport>(
 /// Whether this failure is the Identity API saying the Endpoint is already
 /// registered (§8.8.5).
 ///
-/// Looked at by status rather than by the problem's slug: `409` is the only one
-/// that route answers, and the body is not worth parsing twice.
+/// Read by status rather than by the problem's slug: `409` is the only one that
+/// route answers, which is also why [`REGISTERING`] reads the `404` as nothing
+/// in particular — giving it a meaning here would invent one the route never
+/// sends.
 fn already_registered(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<isekai_p2p_core::identity::IdentityError>()
-        .and_then(|e| e.status())
-        == Some(409)
+        .downcast_ref::<IdentityError>()
+        .map(|e| {
+            matches!(
+                Outcome::of_identity(e, &REGISTERING),
+                Outcome::AlreadyGone { .. }
+            )
+        })
+        .unwrap_or(false)
 }
+
+/// How the register call reads an answer: its `409` is "already there".
+const REGISTERING: Reading = Reading {
+    not_found: Missing::Unremarkable,
+    conflict: Missing::Done,
+    token_self_replacing: false,
+    retryable_kinds: &[],
+    fixable_kinds: &[],
+    gone_kinds: &[],
+};
 
 /// §8.8.4 → §8.8.5: a challenge, then registration and the first token.
 async fn enrol<T: ControlPlaneTransport>(
@@ -857,20 +875,41 @@ fn is_permanent(error: &anyhow::Error) -> bool {
     error
         .chain()
         .filter_map(|e| e.downcast_ref::<IdentityError>())
-        .any(|e| {
-            e.status() == Some(403)
-                // **And the `401` that means "not in this tenant".** Identity
-                // answers it for an Endpoint it cannot find as well as for a
-                // bad signature, and neither becomes true by asking again: one
-                // needs a key registered where the token points, the other a
-                // different key. Left in the transient bucket, the explanation
-                // this file attaches would be re-read out at `warn` every few
-                // minutes for the life of the process — an in-memory token
-                // source never notices a re-login elsewhere, so nothing would
-                // ever change.
-                || e.kind().as_deref() == Some("pop-signature-invalid")
-        })
+        .any(|e| matches!(Outcome::of_identity(e, &ISSUING), Outcome::Refused { .. }))
 }
+
+/// How this path reads an answer (`docs/p2p_sdk_error_type.md` §3.4).
+///
+/// **`token_self_replacing` is false because this *is* the path that replaces
+/// it.** A `403` here is settled: there is no other loop about to hand this
+/// call a different token. On a path renewing a lease the same answer is a
+/// wait, which is the distinction `initiator::renewal_verdict` warns about.
+///
+/// **A `409` does reach here** — `explain_issue_failure` says "a `409` lands
+/// here too", and that one is the cross-tenant collision. `Unremarkable` keeps
+/// it out of the permanent bucket, which is where it was before; reading it as
+/// `Done` would call a cross-tenant collision "already gone". The `404` is the
+/// same, and neither is what this predicate is about.
+///
+/// `retryable_kinds` and `fixable_kinds` are empty: `429` and `503` are already
+/// waits by status, and no kind on this route asks to be read against its own.
+///
+/// **The `401 pop-signature-invalid` this used to name here moved into
+/// [`Outcome`]**, which reads it status-independently with the reason recorded
+/// alongside: Identity answers it for an Endpoint it cannot find as well as for
+/// a bad signature, and neither becomes true by asking again — one needs a key
+/// registered where the token points, the other a different key. Left in the
+/// transient bucket, the explanation this file attaches would be re-read out at
+/// `warn` every few minutes for the life of the process, since an in-memory
+/// token source never notices a re-login elsewhere.
+const ISSUING: Reading = Reading {
+    not_found: Missing::Unremarkable,
+    conflict: Missing::Unremarkable,
+    token_self_replacing: false,
+    retryable_kinds: &[],
+    fixable_kinds: &[],
+    gone_kinds: &[],
+};
 
 /// Keep `proxy`'s Endpoint Token current for as long as the returned guard
 /// lives.

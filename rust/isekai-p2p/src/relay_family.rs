@@ -55,7 +55,61 @@ pub fn chosen(
             }
         }
     };
-    match (named(relay_family), named(connection_family)) {
+    let decided = decide(named(relay_family), named(connection_family), context);
+    // **Said out loud every time, including when nothing was named.**
+    // Without this line the three reasons a leg dials whatever it likes are
+    // indistinguishable from outside: the control plane named nothing, it
+    // named something on a route this side does not read, or it named
+    // something and this side dropped it. The symptom is identical -- on a
+    // dual-stack host `getaddrinfo` orders AAAA first, so an unconstrained leg
+    // goes v6 while an IPv4-only peer goes v4 and no direct path can form --
+    // and an operator cannot tell which from "no direct path".
+    //
+    // `INFO` because it is once per connection and it is the first question
+    // asked when a direct path is missing.
+    match decided {
+        Some(family) => tracing::info!(
+            ?family,
+            // `?` on purpose: a bare `Option` field is **dropped entirely**
+            // when it is `None`, so the absent case printed neither name and
+            // the line could not say which of the two fields was missing --
+            // which is the whole question when one route carries the family
+            // and another does not.
+            ?relay_family,
+            ?connection_family,
+            context,
+            "the control plane chose an address family for both ends of this relay leg",
+        ),
+        // **Three reasons reach this arm and only one of them is "named
+        // nothing".** The other two -- two fields that contradict, and a
+        // spelling this build does not know -- did name something; it just
+        // cannot be used. Saying "named no address family" for those asserts
+        // the opposite of what happened, and the whole point of this line is
+        // to tell the reasons apart. The two fields disambiguate, and the
+        // sentence should not fight them.
+        None if relay_family.is_none() && connection_family.is_none() => tracing::info!(
+            context,
+            "the control plane named no address family for this relay leg; each end \
+             chooses for itself, so the two may not line up",
+        ),
+        None => tracing::info!(
+            ?relay_family,
+            ?connection_family,
+            context,
+            "the control plane named an address family this leg cannot use; each end \
+             chooses for itself, so the two may not line up",
+        ),
+    }
+    decided
+}
+
+/// The rule itself, separated from the line that reports it.
+fn decide(
+    from_relay: Option<AddressFamily>,
+    from_connection: Option<AddressFamily>,
+    context: &str,
+) -> Option<AddressFamily> {
+    match (from_relay, from_connection) {
         (Some(a), Some(b)) if a != b => {
             tracing::warn!(
                 ?a,
