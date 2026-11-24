@@ -295,9 +295,21 @@ impl MasqueH3Transport {
         // that have no business knowing about it (see
         // [`crate::local_address`]).
         .with_local_address_policies(crate::local_address::current().as_policies());
-        // Watched only where it is asked for, and read by the caller rather
-        // than by a task of our own -- see [`landing`](Self::landing) for why
-        // that is what makes it race-free.
+        // **Both kinds of transport ask for the connections now, for opposite
+        // reasons.**
+        //
+        // A measuring connection is read by the caller rather than by a task of
+        // our own -- see [`landing`](Self::landing) for why that is what makes
+        // it race-free -- and it exists for one request, so which of its paths
+        // carries that request is not a question worth asking.
+        //
+        // An ordinary control-plane connection is long-lived and multipath
+        // (`make_client_config`), and nothing else polls its events:
+        // `h3-msquic-async` never calls `poll_event`, so every path msquic adds
+        // would stay active and `QuicConnChoosePath` would spread the control
+        // plane at random across every address the host has. That is what
+        // [`crate::path_preference`] is for, and this is the only place the
+        // connection can be reached from.
         let conns = match measuring {
             Some(family) => {
                 connector = connector.with_preferred_address_family(family);
@@ -305,7 +317,10 @@ impl MasqueH3Transport {
                 connector = connector.with_channel(conn_tx);
                 Some(Arc::new(Mutex::new(conn_rx)))
             }
-            None => None,
+            None => {
+                connector = crate::path_preference::attach(connector, "control plane");
+                None
+            }
         };
         let channel = H3Channel::<_, Full<Bytes>>::new(connector, uri.clone(), None);
         Ok(Self {
