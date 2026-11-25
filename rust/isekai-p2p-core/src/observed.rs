@@ -211,7 +211,9 @@ async fn watch_connection(
     // hearing back, at the same moment the video connection goes quiet.
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     // One per connection: a leg that reconnects has new paths and new path ids.
-    let mut paths = OneActivePath::default();
+    // Read before the first event is polled, which is what lets it recognise the
+    // path the leg started on.
+    let mut paths = OneActivePath::for_connection(&conn, "relay leg");
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
