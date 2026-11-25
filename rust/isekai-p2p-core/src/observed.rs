@@ -26,6 +26,8 @@ use h3_util::msquic_async::{Binding, Established};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::path_preference::OneActivePath;
+
 /// How a relay leg is addressed, as the proxy sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservedAddress {
@@ -208,6 +210,10 @@ async fn watch_connection(
     // here are where it shows: the leg would keep sending to the proxy and stop
     // hearing back, at the same moment the video connection goes quiet.
     let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    // One per connection: a leg that reconnects has new paths and new path ids.
+    // Read before the first event is polled, which is what lets it recognise the
+    // path the leg started on.
+    let mut paths = OneActivePath::for_connection(&conn, "relay leg");
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -225,30 +231,41 @@ async fn watch_connection(
                     );
                 }
             }
-            event = poll_fn(|cx| conn.poll_event(cx)) => match event {
-                Ok(ConnectionEvent::NotifyObservedAddress { local_address, observed_address }) => {
-                    tracing::info!(
-                        local = %local_address,
-                        observed = %observed_address,
-                        "relay leg observed-address report",
-                    );
-                    let mut addresses = tx.borrow().clone();
-                    addresses.record(ObservedAddress {
-                        local: local_address,
-                        observed: observed_address,
-                        binding,
-                    });
-                    if tx.send(addresses).is_err() {
-                        // Every receiver is gone; nothing left to tell.
+            event = poll_fn(|cx| conn.poll_event(cx)) => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(e) => {
+                        tracing::debug!("relay leg connection event stream ended: {e}");
                         break;
                     }
+                };
+                // **Every path event goes here first, because this loop is the
+                // only thing polling them.** `poll_event` is a single-consumer
+                // queue, so a leg's paths cannot be managed by a task of their
+                // own alongside this one -- see [`crate::path_preference`] for
+                // what it does with them and why a leg needs it.
+                paths.observe(&conn, &event, "relay leg");
+                match event {
+                    ConnectionEvent::NotifyObservedAddress { local_address, observed_address } => {
+                        tracing::info!(
+                            local = %local_address,
+                            observed = %observed_address,
+                            "relay leg observed-address report",
+                        );
+                        let mut addresses = tx.borrow().clone();
+                        addresses.record(ObservedAddress {
+                            local: local_address,
+                            observed: observed_address,
+                            binding,
+                        });
+                        if tx.send(addresses).is_err() {
+                            // Every receiver is gone; nothing left to tell.
+                            break;
+                        }
+                    }
+                    other => tracing::debug!("relay leg connection event: {other:?}"),
                 }
-                Ok(other) => tracing::debug!("relay leg connection event: {other:?}"),
-                Err(e) => {
-                    tracing::debug!("relay leg connection event stream ended: {e}");
-                    break;
-                }
-            },
+            }
         }
     }
 }

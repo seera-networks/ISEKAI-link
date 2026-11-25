@@ -51,3 +51,8 @@ pub mod datapath;
 /// Which of the host's own addresses the stack may use (feature `msquic`).
 #[cfg(feature = "msquic")]
 pub mod local_address;
+
+/// Keeping one path of a multipath connection carrying traffic (feature
+/// `msquic`).
+#[cfg(feature = "msquic")]
+pub mod path_preference;
