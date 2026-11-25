@@ -45,14 +45,25 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: tools.isekai.viewer
         TARGETED_DEVICE_FAMILY: "1,2"
         # The Rust staticlib brings its own std dependencies, and msquic's
-        # darwin platform layer needs these two frameworks. rustc passes them
-        # automatically when *it* drives the link; here Xcode does.
+        # darwin platform layer needs these frameworks. rustc passes them
+        # automatically when *it* drives the link -- seera-msquic's build script
+        # emits a `rustc-link-lib=framework=` for each -- but here Xcode drives
+        # it, and Xcode does not read cargo's metadata.
+        #
+        # So this list has to be kept level with that one. A framework added
+        # there and not here links everywhere except the iOS app, and the first
+        # sign of it is `Undefined symbols for architecture arm64` at this
+        # target's Ld step. Network arrived that way: it backs the
+        # nw_path_monitor subscription, which is how iOS -- with no routing
+        # socket -- sees address changes at all.
         OTHER_LDFLAGS:
           - -liconv
           - -framework
           - CoreFoundation
           - -framework
           - Security
+          - -framework
+          - Network
     info:
       path: IsekaiCameraClient/Info.plist
       properties:
