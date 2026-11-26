@@ -17,7 +17,7 @@
 //! session APIs above do not have to hand out raw QUIC handles.
 
 use std::future::poll_fn;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 // Reached through `h3-util` rather than depended on directly, like the rest of
 // this crate's msquic usage (see `crate::transport`).
@@ -53,12 +53,28 @@ pub struct ObservedAddress {
 /// Every address the leg currently has a path in, in the order they were
 /// reported.
 ///
-/// **One entry per local IP, because that is the unit msquic acts on.** A
-/// direct-path candidate is found by the local address of the pair being
-/// considered, compared by IP alone and taking the first match
-/// (`QuicConnPunchableClientAddress`), so two entries on one IP would mean the
-/// second is never read. A second report for an IP therefore replaces the
-/// first, in place, keeping the order the leg reported them in.
+/// **One entry per local address, which is one per path.** This held one entry
+/// per local *IP*, and a second report on an IP replaced the first, because a
+/// direct-path candidate is found by IP alone and taking the first match
+/// (`QuicConnPunchableClientAddress`) -- so a second entry on an IP is one a
+/// consumer could not use. That is still true of the consumers, and
+/// [`one_per_ip`](Self::one_per_ip) is how they say so; it was never true of
+/// the leg.
+///
+/// **A leg with the relay's alternative address on has two paths in one
+/// family**, each from its own port on the same IP, and collapsing them cost
+/// both of the only things this set is read for (#378). The server advertised
+/// the second port as a bound address of its own, which the peer opened a
+/// second direct path to -- one path slot out of four, held for the life of
+/// the connection. The client read the same change as the leg having *moved*,
+/// withdrew the candidate of the path carrying its traffic and offered the
+/// backup path's instead. Neither end was wrong about its own rule; the set
+/// had thrown away the fact that distinguishes a second path from a move.
+///
+/// So a path's report replaces only that path's entry, and
+/// [`forget`](Self::forget) takes an entry away when its path does. What a
+/// consumer that can use one address per IP should read is then a question with
+/// an answer rather than a guess: the oldest live entry on each IP.
 ///
 /// **A set rather than the latest one, as of #371.** This held a single value,
 /// and a leg with paths in two families reports one per path: whichever landed
@@ -71,16 +87,33 @@ pub struct ObservedAddress {
 pub struct ObservedAddresses(Vec<ObservedAddress>);
 
 impl ObservedAddresses {
-    /// Record a report, replacing whatever this IP had.
+    /// Record a report, replacing whatever this local address had.
+    ///
+    /// The leg reports per path and a path keeps its local address, so a repeat
+    /// is a new observed address for a path already known -- a NAT mapping that
+    /// moved -- and belongs in that entry rather than in one of its own.
     fn record(&mut self, address: ObservedAddress) {
-        match self
-            .0
-            .iter_mut()
-            .find(|held| held.local.ip() == address.local.ip())
-        {
+        match self.0.iter_mut().find(|held| held.local == address.local) {
             Some(held) => *held = address,
             None => self.0.push(address),
         }
+    }
+
+    /// Take away the entry a path that has gone reported, by its local address.
+    ///
+    /// **This is what makes [`one_per_ip`](Self::one_per_ip) answerable.**
+    /// Preferring the oldest entry on an IP is only right while that entry is a
+    /// path the leg still has; without this it would go on naming a dead one
+    /// and the live path's mapping would never be offered, which is #358's
+    /// silent failure. `PathRemoved` carries the path's local address, the same
+    /// value its reports carried, so the entry can be found rather than aged
+    /// out.
+    ///
+    /// `true` if an entry went, so the caller can publish only a real change.
+    fn forget(&mut self, local: SocketAddr) -> bool {
+        let before = self.0.len();
+        self.0.retain(|held| held.local != local);
+        self.0.len() != before
     }
 
     /// Nothing has been reported yet.
@@ -98,6 +131,35 @@ impl ObservedAddresses {
         self.0.iter()
     }
 
+    /// The oldest live entry on each IP, in the order the IPs were first
+    /// reported — what a consumer that can act on one address per IP wants.
+    ///
+    /// **Both of this set's consumers are that consumer, for different
+    /// reasons.** A direct-path candidate is read by IP alone and by the first
+    /// match, so a second candidate on an IP is never consulted. A bound
+    /// address advertised to the peer is read whole, so a second one on an IP
+    /// *is* consulted -- and becomes another path, on a connection with four
+    /// slots and a relay fallback to leave room for (#378).
+    ///
+    /// The oldest rather than the newest, because the oldest entry on an IP is
+    /// the path the leg has been carrying its traffic on since it came up: the
+    /// others are the backup paths `isekai_p2p_core::path_preference` holds in
+    /// reserve, and a NAT mapping observed on a path nothing sends over is the
+    /// one least worth punching to. When that path goes,
+    /// [`forget`](Self::forget) takes its entry with it and the next one here
+    /// is the next oldest.
+    pub fn one_per_ip(&self) -> impl Iterator<Item = &ObservedAddress> {
+        let mut seen: Vec<IpAddr> = Vec::new();
+        self.0.iter().filter(move |address| {
+            let ip = address.local.ip();
+            if seen.contains(&ip) {
+                return false;
+            }
+            seen.push(ip);
+            true
+        })
+    }
+
     /// The one reported most recently, for a caller that can show or use only
     /// one.
     ///
@@ -112,8 +174,8 @@ impl ObservedAddresses {
 }
 
 impl FromIterator<ObservedAddress> for ObservedAddresses {
-    /// In the order given, one entry per local IP — the last of a repeated IP
-    /// wins, as a later report does.
+    /// In the order given, one entry per local address — the last report of a
+    /// repeated address wins, as a later report does.
     fn from_iter<I: IntoIterator<Item = ObservedAddress>>(iter: I) -> Self {
         let mut addresses = Self::default();
         for address in iter {
@@ -263,6 +325,27 @@ async fn watch_connection(
                             break;
                         }
                     }
+                    ConnectionEvent::PathRemoved { local_address, path_id, .. } => {
+                        // **An address this leg no longer has a path in is not
+                        // an address to punch to.** The set keeps one entry per
+                        // path so that a second path on an IP is not read as the
+                        // first one moving (#378); the other half of that is
+                        // taking an entry away when its path goes, or the oldest
+                        // entry on an IP -- the one `one_per_ip` hands out --
+                        // could name a path that died minutes ago while the live
+                        // one is never offered.
+                        let mut addresses = tx.borrow().clone();
+                        if addresses.forget(local_address) {
+                            tracing::info!(
+                                local = %local_address,
+                                path_id,
+                                "a relay leg path went away; its address is no longer offered",
+                            );
+                            if tx.send(addresses).is_err() {
+                                break;
+                            }
+                        }
+                    }
                     other => tracing::debug!("relay leg connection event: {other:?}"),
                 }
             }
@@ -284,8 +367,12 @@ mod tests {
         assert!(watch.borrow().is_empty());
     }
 
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("an address")
+    }
+
     fn report(local: &str) -> ObservedAddress {
-        let local: SocketAddr = local.parse().expect("an address");
+        let local: SocketAddr = addr(local);
         ObservedAddress {
             local,
             observed: local,
@@ -293,17 +380,22 @@ mod tests {
         }
     }
 
+    fn locals(addresses: impl Iterator<Item = ObservedAddress>) -> Vec<String> {
+        addresses.map(|a| a.local.to_string()).collect()
+    }
+
     /// **#371's own sequence.** A dual-stack leg against a relay that
     /// advertises alternative addresses reported three times, 3 ms apart: two
     /// IPv4 paths and one IPv6. Holding the last of them is what offered an
     /// IPv4-only peer an IPv6 address and nothing else.
     ///
-    /// What the set has to keep is one entry per IP — the second IPv4 report
-    /// replaces the first, because msquic reads a candidate by IP and takes the
-    /// first match, so two entries on one IP would mean the second is never
-    /// read — and both families, in the order they arrived.
+    /// What a consumer has to be given is one address per IP — msquic reads a
+    /// candidate by IP and takes the first match, so a second entry on an IP is
+    /// never read — and both families, in the order they arrived. The set keeps
+    /// all three, because the two IPv4 reports are two paths (#378); it is
+    /// `one_per_ip` that answers #371's question.
     #[test]
-    fn a_dual_stack_leg_keeps_an_address_in_each_family() {
+    fn a_dual_stack_leg_offers_an_address_in_each_family() {
         let addresses: ObservedAddresses = [
             report("10.0.2.10:33705"),
             report("10.0.2.10:37560"),
@@ -312,18 +404,68 @@ mod tests {
         .into_iter()
         .collect();
 
-        assert_eq!(addresses.len(), 2, "one per IP, both families");
-        let locals: Vec<String> = addresses.iter().map(|a| a.local.to_string()).collect();
+        assert_eq!(addresses.len(), 3, "three paths, three entries");
         assert_eq!(
-            locals,
-            ["10.0.2.10:37560", "[2001:db8:2::10]:57529"],
-            "the newer IPv4 report replaced the older one, in its place",
+            locals(addresses.one_per_ip().copied()),
+            ["10.0.2.10:33705", "[2001:db8:2::10]:57529"],
+            "one per IP, both families, the IPv4 one being the path reported first",
         );
         assert_eq!(
-            addresses.newest().expect("two").local.to_string(),
+            addresses.newest().expect("three").local.to_string(),
             "[2001:db8:2::10]:57529",
             "and `newest` is still the last reported, which is what a display shows",
         );
+    }
+
+    /// **#378's own sequence**, which is #371's with the relay's alternative
+    /// address on: the leg comes up in IPv6, gains an IPv4 path to the
+    /// alternative address, and a second later a *second IPv6* path to it from
+    /// another local port.
+    ///
+    /// Read as "the leg moved", that third report withdrew the candidate of the
+    /// path carrying the leg's traffic and had the server advertise a second
+    /// bound address, which cost the peer connection a path slot it needed for
+    /// its replacement relay path. What a consumer sees now is the IPv6 path
+    /// the leg started on and the IPv4 one — the backup path's port is in the
+    /// set, and offered to nobody.
+    #[test]
+    fn a_second_port_on_one_ip_is_a_second_path_not_a_move() {
+        let mut addresses: ObservedAddresses = [
+            report("[2001:db8:2::10]:41024"),
+            report("10.0.2.10:35303"),
+            report("[2001:db8:2::10]:56938"),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            locals(addresses.one_per_ip().copied()),
+            ["[2001:db8:2::10]:41024", "10.0.2.10:35303"],
+            "the path the leg started on, not the backup path's port",
+        );
+
+        // The path it started on goes away: now the backup's port is the only
+        // IPv6 path the leg has, and it is what should be offered.
+        assert!(addresses.forget(addr("[2001:db8:2::10]:41024")));
+        assert_eq!(
+            locals(addresses.one_per_ip().copied()),
+            ["10.0.2.10:35303", "[2001:db8:2::10]:56938"],
+            "the next oldest path on the IP takes over",
+        );
+    }
+
+    /// A path that was never reported takes nothing away, and says so — the
+    /// caller publishes only a real change.
+    #[test]
+    fn forgetting_an_address_the_leg_never_reported_changes_nothing() {
+        let mut addresses: ObservedAddresses = [report("10.0.2.10:35303")].into_iter().collect();
+
+        assert!(
+            !addresses.forget(addr("10.0.2.10:40000")),
+            "same IP, other port"
+        );
+        assert!(!addresses.forget(addr("10.0.2.11:35303")), "other IP");
+        assert_eq!(addresses.len(), 1);
     }
 
     /// A report for an address already held replaces it **in place**, so the
@@ -335,11 +477,23 @@ mod tests {
         let mut addresses: ObservedAddresses = [report("10.0.0.1:1"), report("10.0.0.2:2")]
             .into_iter()
             .collect();
-        addresses.record(report("10.0.0.1:3"));
+        // The same path reporting again: its NAT mapping moved, which belongs
+        // in its own entry and nowhere else.
+        addresses.record(ObservedAddress {
+            observed: addr("203.0.113.9:9"),
+            ..report("10.0.0.1:1")
+        });
 
-        let locals: Vec<String> = addresses.iter().map(|a| a.local.to_string()).collect();
-        assert_eq!(locals, ["10.0.0.1:3", "10.0.0.2:2"]);
+        assert_eq!(
+            locals(addresses.iter().copied()),
+            ["10.0.0.1:1", "10.0.0.2:2"]
+        );
         assert_eq!(addresses.len(), 2);
+        assert_eq!(
+            addresses.iter().next().expect("two").observed.to_string(),
+            "203.0.113.9:9",
+            "in place, with the new mapping",
+        );
     }
 
     /// Nothing reported is an empty set, not an entry that means nothing: every

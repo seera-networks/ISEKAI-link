@@ -159,9 +159,15 @@ pub fn prepare(conn: &Connection, candidates: &ObservedAddresses) -> anyhow::Res
 /// [`Binding`](isekai_p2p_core::observed::ObservedAddress::binding) carries the
 /// answer — so the check belongs to the address rather than to the set. One
 /// unusable address does not cost the others.
+///
+/// **One address per IP**, which is all msquic will read: a candidate is found
+/// by IP alone and by the first match, so a second one on an IP is never
+/// consulted. `one_per_ip` hands out the oldest live entry on each, which is
+/// the path the leg carries its traffic on — the others are the backup paths a
+/// relay's alternative address adds (#378).
 fn usable(candidates: &ObservedAddresses, side: &str) -> Vec<UnconnectedLeg> {
     candidates
-        .iter()
+        .one_per_ip()
         .filter_map(|candidate| UnconnectedLeg::check(*candidate, side))
         .collect()
 }
@@ -441,7 +447,7 @@ pub fn reoffer(
             // would stall the task publishing the reports for the length of a
             // set-param call, for no reason.
             let reported: Vec<ObservedAddress> =
-                observed.borrow_and_update().iter().copied().collect();
+                observed.borrow_and_update().one_per_ip().copied().collect();
             for address in reported {
                 // Only the pair matters, and only against what this IP already
                 // holds. A report carrying the same pair with a different
@@ -546,16 +552,37 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
         // needs to be: a bound address is advertised to the peer, which looks
         // an advertised address up by matching it whole rather than by taking
         // the first entry on an IP, so a stale one shadows nothing — see
-        // [`withdraw`] for the asymmetry. It costs the peer a pair it will
-        // probe once and fail. What a withdrawal would cost is worse: a bound
-        // address is a UDP binding this connection holds and may have a
-        // validated path running over. The list is capped at
+        // [`withdraw`] for the asymmetry. What a withdrawal would cost is
+        // worse: `QuicConnRemoveBoundAddress` removes every path whose local
+        // address matches, so withdrawing the address a validated direct
+        // path runs over takes that path down. The list is capped at
         // `QUIC_MAX_LOCAL_ADDRESS_COUNT` (128), so the growth is bounded
         // rather than merely slow.
+        //
+        // **What a stale advertisement costs is no longer "a pair the peer
+        // probes once and fails"** (#378), which is what stood here. These
+        // connections carry multipath now, so an advertised address the peer
+        // can reach becomes a path that validates and stays -- one of four
+        // slots, for the life of the connection, with a replacement relay
+        // path still to come. A leg with the relay's alternative address on
+        // has two paths in one family, each from its own port on the same
+        // IP, and advertising both put the peer at the limit: the
+        // replacement relay path was then refused with PATH_LIMIT_REACHED.
+        // So one address per IP is advertised -- `one_per_ip` below, the
+        // oldest live entry, which is the path the leg carries its traffic
+        // on -- and nothing here has to decide whether a second port is a
+        // second path or a move, because the set no longer collapses the two.
         // Keyed by host address, for [`withdraw`]'s reason on the other side:
         // what the peer does with an advertised address is decided per address,
         // and a second entry for one of them replaces what the first said.
-        let mut applied: BTreeMap<IpAddr, SocketAddr> = BTreeMap::new();
+        //
+        // The value is the whole pair rather than the observed address alone,
+        // because with one entry per IP the local address is a thing that can
+        // change: the path this IP was advertised for goes away, its entry
+        // goes with it, and the next oldest path on the IP is what should be
+        // advertised. That is the leg rebinding, which is #358's listener half
+        // and the reason this loop re-applies at all.
+        let mut applied: BTreeMap<IpAddr, (SocketAddr, SocketAddr)> = BTreeMap::new();
         loop {
             // **Every address, not the newest** (#371). A leg with a path per
             // family has an address in each, and advertising one of them is
@@ -563,9 +590,9 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
             // Copied out rather than iterated through the guard, for the
             // reason [`reoffer`] gives: `apply` below calls into msquic twice.
             let reported: Vec<ObservedAddress> =
-                observed.borrow_and_update().iter().copied().collect();
+                observed.borrow_and_update().one_per_ip().copied().collect();
             for address in reported {
-                if applied.get(&address.local.ip()) == Some(&address.observed) {
+                if applied.get(&address.local.ip()) == Some(&(address.local, address.observed)) {
                     continue;
                 }
                 // Kept watching where this used to `return`, for
@@ -574,7 +601,7 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
                 // one.
                 if let Some(leg) = UnconnectedLeg::check(address, "advertise") {
                     if apply(&conn, leg) {
-                        applied.insert(address.local.ip(), address.observed);
+                        applied.insert(address.local.ip(), (address.local, address.observed));
                     }
                 }
             }
