@@ -555,9 +555,19 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
         // [`withdraw`] for the asymmetry. What a withdrawal would cost is
         // worse: `QuicConnRemoveBoundAddress` removes every path whose local
         // address matches, so withdrawing the address a validated direct
-        // path runs over takes that path down. The list is capped at
-        // `QUIC_MAX_LOCAL_ADDRESS_COUNT` (128), so the growth is bounded
-        // rather than merely slow.
+        // path runs over takes that path down.
+        //
+        // **What bounds the growth is not the list's own cap.** It is
+        // `QUIC_MAX_LOCAL_ADDRESS_COUNT` (128) entries here and four path
+        // slots at the peer, and four is the one that binds: a dual-stack
+        // session wants the relay path, a direct path per family, and room
+        // for the replacement relay path, which is all of them. So this
+        // advertises one address per IP (below) and leaves behind at most the
+        // addresses of paths that have since gone -- a rotation, each of
+        // which the peer may still hold a validated path over, since a path
+        // holds its own binding reference and does not end with the leg
+        // path that shared the address. That is the limit this fix does not
+        // raise, and #378 says so out loud.
         //
         // **What a stale advertisement costs is no longer "a pair the peer
         // probes once and fails"** (#378), which is what stood here. These

@@ -16,6 +16,7 @@
 //! surface. Callers get [`ObservedAddress`] values and nothing else, so the
 //! session APIs above do not have to hand out raw QUIC handles.
 
+use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 
@@ -109,11 +110,62 @@ impl ObservedAddresses {
     /// value its reports carried, so the entry can be found rather than aged
     /// out.
     ///
+    /// This takes the address out of the *set*, which is what consumers read
+    /// next; it does not reach the connections that were already told about it.
+    /// `isekai_p2p::direct_path` withdraws a candidate only when a replacement
+    /// on the same IP goes in front of it, and never withdraws a bound address,
+    /// so an address alone on its IP goes on being offered until another on
+    /// that IP takes over.
+    ///
     /// `true` if an entry went, so the caller can publish only a real change.
     fn forget(&mut self, local: SocketAddr) -> bool {
         let before = self.0.len();
         self.0.retain(|held| held.local != local);
         self.0.len() != before
+    }
+
+    /// Retire an entry whose path is gone **and which is hiding another on its
+    /// IP**, given the local addresses the connection still has a path on.
+    ///
+    /// **[`forget`](Self::forget) is not enough on its own, because
+    /// `PathRemoved` is not raised for every path that goes away.** Of the
+    /// eleven places seera-msquic removes a path, two indicate it: an abandon
+    /// (local, the peer's, or a validation timeout) and loss detection giving
+    /// up. A path taken off because its route stopped resolving, or because the
+    /// reconciler found its local address gone, says nothing — and the entry it
+    /// reported would then stay the oldest on its IP for the life of the leg,
+    /// with `one_per_ip` handing it out while the live path's mapping on that
+    /// IP is never offered. That is #358's silent failure, and the rule this
+    /// replaced — a report replacing whatever its IP held — was immune to it
+    /// by accident.
+    ///
+    /// **Only where it hides something**, which is the whole of the harm. An
+    /// entry alone on its IP is the only answer there is for that IP, and
+    /// whether the address is still there is not this type's to decide: a path
+    /// nothing was told about is missing from `live` too, and retiring on that
+    /// basis would throw away a candidate for no reason. Where two entries
+    /// share an IP, one of them is being hidden, and preferring a live one is
+    /// strictly better than preferring a dead one.
+    ///
+    /// `true` if anything went, so the caller can publish only a real change.
+    fn retire_shadowed(&mut self, live: &[SocketAddr]) -> bool {
+        let retiring: Vec<bool> = (0..self.0.len())
+            .map(|i| {
+                let held = self.0[i];
+                !live.contains(&held.local)
+                    && self.0[i + 1..]
+                        .iter()
+                        .any(|other| other.local.ip() == held.local.ip())
+            })
+            .collect();
+        if !retiring.iter().any(|&retire| retire) {
+            return false;
+        }
+        // `retain` visits each element once, in order, so the flags line up.
+        let mut retiring = retiring.into_iter();
+        self.0
+            .retain(|_| !retiring.next().expect("one flag per entry"));
+        true
     }
 
     /// Nothing has been reported yet.
@@ -207,29 +259,29 @@ pub type ObservedAddressWatch = watch::Receiver<ObservedAddresses>;
 /// while a display of "this is the mapping the proxy sees" is true and useful
 /// either way. Filtering here would answer one of them by lying to the other.
 ///
-/// # One slot, and a leg can now have several paths
+/// # One entry per path, and the leg has several
 ///
 /// `crate::transport` *offers* multipath on these connections — whether it is
 /// negotiated is up to the proxy, which has to send `initial_max_path_id` back
-/// — and where it is, a leg on a host with two usable addresses runs a path on
-/// each. The proxy then reports an observed address per path, each naming its
-/// own `local`, and this channel still holds one: what a reader sees is
-/// whichever arrived last.
+/// — and where it is, a leg runs a path on each usable address of the host,
+/// plus one to each alternative address the relay advertises. The proxy reports
+/// an observed address per path, each naming its own `local`, and the value
+/// here holds all of them.
 ///
-/// **Kept this way on purpose, because the consumer that matters is additive.**
-/// `isekai_p2p::direct_path::reoffer` watches this and offers each new pair as
-/// a direct-path candidate, withdrawing only the entry a new one would be
-/// shadowed by — the one on the same address. Reports for genuinely different
-/// addresses therefore accumulate as candidates rather than replacing each
-/// other, which is what punching wants: more places the peer may reach this
-/// Endpoint at.
+/// **It used to hold one entry per local IP, and before that a single value.**
+/// Each collapse cost the consumer below the fact it needed. A single value
+/// offered an IPv4-only peer an IPv6 address about half the time (#371); one
+/// entry per IP made a leg's *second path in a family* — same IP, its own port
+/// — indistinguishable from the first one moving, which had the client
+/// withdraw the candidate of the path carrying its traffic and the server
+/// advertise a bound address the peer spent a path slot on (#378).
 ///
-/// What it does cost is the two readers that take a single value. The candidate
-/// `prepare` offers before the handshake is whichever path reported first, and
-/// a display of "the mapping the proxy sees" shows one of several without
-/// saying so. Holding a report per local address would answer both, and would
-/// change every consumer's shape; it is worth doing when something needs the
-/// set rather than when it first becomes possible.
+/// So the collapsing is the consumer's to do, with
+/// [`ObservedAddresses::one_per_ip`] where it is a consumer that can act on one
+/// address per IP — both of `isekai_p2p::direct_path`'s are, for opposite
+/// reasons — while a display that shows "the mapping the proxy sees" can say
+/// "one of several" and
+/// [`newest`](ObservedAddresses::newest) still answers it.
 pub fn spawn_observed_address_watch(
     mut conn_rx: mpsc::Receiver<Established>,
     shutdown: CancellationToken,
@@ -260,6 +312,25 @@ pub fn spawn_observed_address_watch(
     rx
 }
 
+/// The local addresses `conn` still has a path on, as far as it will say.
+///
+/// Slot 0's, which is what `get_local_addr` reads and which always holds a
+/// live path, plus every path this leg's loop was told about by `PathAdded`
+/// that is still in the path statistics. A path nothing announced and that is
+/// not in slot 0 is missing from this, which is why
+/// `ObservedAddresses::retire_shadowed` only acts where an entry hides another.
+fn live_addresses(conn: &Connection, announced: &BTreeMap<u32, SocketAddr>) -> Vec<SocketAddr> {
+    let mut live: Vec<SocketAddr> = conn.get_local_addr().into_iter().collect();
+    if let Ok(stats) = conn.get_path_statistics() {
+        for path in stats {
+            if let Some(local) = announced.get(&path.PathId) {
+                live.push(*local);
+            }
+        }
+    }
+    live
+}
+
 async fn watch_connection(
     conn: Connection,
     binding: Binding,
@@ -276,6 +347,9 @@ async fn watch_connection(
     // Read before the first event is polled, which is what lets it recognise the
     // path the leg started on.
     let mut paths = OneActivePath::for_connection(&conn, "relay leg");
+    // Which path each announced address belongs to, so a path that goes away
+    // without saying so can still be noticed: its id leaves the statistics.
+    let mut announced: BTreeMap<u32, SocketAddr> = BTreeMap::new();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -291,6 +365,23 @@ async fn watch_connection(
                         recv_dropped = stats.Recv.DroppedPackets,
                         "relay leg stats",
                     );
+                }
+                // **The backstop for a path that went away without saying so.**
+                // Most of seera-msquic's path removals raise no event (see
+                // `ObservedAddresses::retire_shadowed`), and an entry left
+                // behind on an IP that has another path hides the live one.
+                // Checked here rather than on a timer of its own: the
+                // statistics are already being read, and a stale entry costs
+                // nothing until something reads the set.
+                let mut addresses = tx.borrow().clone();
+                if addresses.retire_shadowed(&live_addresses(&conn, &announced)) {
+                    tracing::info!(
+                        "a relay leg path went away without an event; \
+                         its address no longer hides the live one on its IP",
+                    );
+                    if tx.send(addresses).is_err() {
+                        break;
+                    }
                 }
             }
             event = poll_fn(|cx| conn.poll_event(cx)) => {
@@ -325,7 +416,19 @@ async fn watch_connection(
                             break;
                         }
                     }
+                    ConnectionEvent::PathAdded { local_address, path_id, .. } => {
+                        // The address this path reports is the address this
+                        // path has, so the pair is what lets a removal that
+                        // raises no event be noticed from the statistics.
+                        announced.insert(path_id, local_address);
+                        tracing::debug!(
+                            local = %local_address,
+                            path_id,
+                            "a relay leg path was added",
+                        );
+                    }
                     ConnectionEvent::PathRemoved { local_address, path_id, .. } => {
+                        announced.remove(&path_id);
                         // **An address this leg no longer has a path in is not
                         // an address to punch to.** The set keeps one entry per
                         // path so that a second path on an IP is not read as the
@@ -336,10 +439,21 @@ async fn watch_connection(
                         // one is never offered.
                         let mut addresses = tx.borrow().clone();
                         if addresses.forget(local_address) {
+                            // **What this does and does not do.** The entry
+                            // goes, so the address stops being what `one_per_ip`
+                            // hands out for its IP -- but nothing is taken off
+                            // the peer connection here. `reoffer` withdraws a
+                            // candidate only when it has a replacement on the
+                            // same IP to put in front, and `advertise` never
+                            // withdraws at all (removing a bound address would
+                            // take the path over it down). So an address that
+                            // was alone on its IP stays offered and advertised
+                            // until something on that IP replaces it.
                             tracing::info!(
                                 local = %local_address,
                                 path_id,
-                                "a relay leg path went away; its address is no longer offered",
+                                "a relay leg path went away; its address is no longer \
+                                 this IP's, though what was already offered stays",
                             );
                             if tx.send(addresses).is_err() {
                                 break;
@@ -452,6 +566,61 @@ mod tests {
             ["10.0.2.10:35303", "[2001:db8:2::10]:56938"],
             "the next oldest path on the IP takes over",
         );
+    }
+
+    /// **The removal that raises no event.** Of the eleven places seera-msquic
+    /// removes a path, two indicate it; a path whose route stopped resolving,
+    /// or whose local address the reconciler found gone, says nothing. The
+    /// entry stays — and if its IP has since gained another path, it is the
+    /// oldest on that IP and hides the live one for the life of the leg. The
+    /// address going away and coming back on a fresh port is the sequence that
+    /// does it, and the rule this set used to follow was immune by accident.
+    #[test]
+    fn an_entry_whose_path_went_quietly_stops_hiding_the_live_one() {
+        let mut addresses: ObservedAddresses = [
+            report("[2001:db8:2::10]:41024"),
+            report("10.0.2.10:35303"),
+            report("[2001:db8:2::10]:56938"),
+        ]
+        .into_iter()
+        .collect();
+
+        // The leg has all three: nothing is hiding anything that is gone.
+        let all = [
+            addr("[2001:db8:2::10]:41024"),
+            addr("10.0.2.10:35303"),
+            addr("[2001:db8:2::10]:56938"),
+        ];
+        assert!(!addresses.retire_shadowed(&all));
+        assert_eq!(addresses.len(), 3);
+
+        // The IPv6 path it started on is gone, and said nothing.
+        let live = [addr("10.0.2.10:35303"), addr("[2001:db8:2::10]:56938")];
+        assert!(addresses.retire_shadowed(&live));
+        assert_eq!(
+            locals(addresses.one_per_ip().copied()),
+            ["10.0.2.10:35303", "[2001:db8:2::10]:56938"],
+            "the live IPv6 path is what the IP answers with now",
+        );
+        assert!(
+            !addresses.retire_shadowed(&live),
+            "and there is nothing left to retire",
+        );
+    }
+
+    /// **An entry alone on its IP is left alone, however unreachable it looks.**
+    /// A path nothing announced is missing from the live list too, so retiring
+    /// on that basis would throw away the only candidate an IP has for no
+    /// reason. `forget` is what retires it, when the connection says so.
+    #[test]
+    fn an_entry_hiding_nothing_is_not_retired() {
+        let mut addresses: ObservedAddresses =
+            [report("10.0.2.10:35303"), report("[2001:db8:2::10]:41024")]
+                .into_iter()
+                .collect();
+
+        assert!(!addresses.retire_shadowed(&[]), "neither hides the other");
+        assert_eq!(addresses.len(), 2);
     }
 
     /// A path that was never reported takes nothing away, and says so — the
