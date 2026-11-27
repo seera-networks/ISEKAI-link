@@ -1899,3 +1899,43 @@ mod tests {
         assert!(opaque.principal().is_none());
     }
 }
+
+#[cfg(test)]
+mod display {
+    use super::IdentityError;
+
+    /// **`{:#}` does nothing to this type, and a caller that assumes otherwise
+    /// loses the reason.** The alternate flag is `anyhow::Error`'s: it is what
+    /// makes anyhow walk its chain. `thiserror` generates a `Display` that
+    /// formats `{0}` plainly, so `{err:#}` on an `IdentityError::Transport`
+    /// prints the head of the inner error and stops — the `Connection refused`
+    /// at the end of it is gone.
+    ///
+    /// This is pinned because it bit the moment the inventory routes started
+    /// answering this type instead of `anyhow::Error`
+    /// (`docs/p2p_sdk_design.md` D12): two `portal-client` messages that had
+    /// been printing the whole chain quietly started printing four words. A
+    /// caller that wants the chain goes through anyhow, as the second
+    /// assertion shows.
+    #[test]
+    fn the_alternate_flag_belongs_to_anyhow_not_to_this_type() {
+        let inner = anyhow::anyhow!("Connection refused")
+            .context("error sending request")
+            .context("HTTPS request failed");
+        let typed = IdentityError::Transport(inner);
+
+        assert_eq!(
+            format!("{typed:#}"),
+            format!("{typed}"),
+            "the alternate flag reaches nothing, so it cannot add the cause",
+        );
+        assert!(
+            !format!("{typed:#}").contains("Connection refused"),
+            "{typed:#}",
+        );
+
+        let chained = format!("{:#}", anyhow::Error::from(typed));
+        assert!(chained.contains("Connection refused"), "{chained}");
+        assert!(chained.contains("error sending request"), "{chained}");
+    }
+}

@@ -10,7 +10,7 @@
 
 use isekai_p2p_core::https::HttpsTransport;
 use isekai_p2p_core::identity::{
-    EndpointDetail, EndpointList, IdentityClient, RevokeAuth, RevokeReason, Revoked,
+    EndpointDetail, EndpointList, IdentityClient, IdentityError, RevokeAuth, RevokeReason, Revoked,
 };
 use isekai_p2p_core::transport::MasqueH3Transport;
 
@@ -40,7 +40,7 @@ pub async fn list(
     auth0_token: &str,
     status: Option<&str>,
     cursor: Option<&str>,
-) -> anyhow::Result<EndpointList> {
+) -> Result<EndpointList, IdentityError> {
     Ok(on_transport!(identity, |client| {
         client.list_endpoints(auth0_token, status, cursor).await?
     }))
@@ -51,7 +51,7 @@ pub async fn get(
     identity: &Identity,
     auth0_token: &str,
     endpoint_id: &str,
-) -> anyhow::Result<EndpointDetail> {
+) -> Result<EndpointDetail, IdentityError> {
     Ok(on_transport!(identity, |client| {
         client.get_endpoint(auth0_token, endpoint_id).await?
     }))
@@ -71,7 +71,7 @@ pub async fn revoke(
     endpoint_id: &str,
     reason: RevokeReason,
     note: Option<&str>,
-) -> anyhow::Result<Revoked> {
+) -> Result<Revoked, IdentityError> {
     let auth = RevokeAuth::Auth0 {
         token: auth0_token,
         endpoint_id,

@@ -11,7 +11,7 @@
 //! Route A, no PoP: this is about the person, not about an Endpoint.
 
 use isekai_p2p_core::https::HttpsTransport;
-use isekai_p2p_core::identity::{IdentityClient, Membership};
+use isekai_p2p_core::identity::{IdentityClient, IdentityError, Membership};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::enrollment::Identity;
@@ -29,7 +29,7 @@ macro_rules! on_transport {
 }
 
 /// Ask Identity what this sign-in is, here.
-pub async fn me(identity: &Identity, auth0_token: &str) -> anyhow::Result<Membership> {
+pub async fn me(identity: &Identity, auth0_token: &str) -> Result<Membership, IdentityError> {
     Ok(on_transport!(identity, |client| {
         client.me(auth0_token).await?
     }))
