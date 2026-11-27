@@ -1,0 +1,24 @@
+[package]
+name = "isekai-sdk"
+# **The one member that does not inherit the workspace version.** The facade
+# promises semver and the crates behind it do not, which is the whole reason it
+# exists (`docs/p2p_sdk_design.md` §4.3, D2 = B). `rust/Cargo.toml` records the
+# "one version for the whole workspace" rule this is the exception to.
+#
+# `0.1.0` rather than `0.10.x`: a line of its own makes the exception visible,
+# and the surface is not settled — no `1.0` is promised until it is.
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "isekai_sdk"
+path = "src/lib.rs"
+
+# **One dependency, on purpose.** Everything this crate offers comes from
+# `isekai-p2p` (which re-exports what it needs of `isekai-p2p-core`), so the
+# facade cannot grow a surface the layers below do not have.
+[dependencies]
+isekai-p2p = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
