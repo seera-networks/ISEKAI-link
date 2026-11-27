@@ -364,7 +364,11 @@ async fn a_membership_that_ended_is_explained_on_both_issue_paths() {
         let error = issue_endpoint_token(&config(format!("http://{addr}"), register))
             .await
             .expect_err("an ended membership issues nothing");
-        let text = format!("{error:#}");
+        // **Through `anyhow`, because the cause is a cause.** `TokenError`
+        // carries the server's answer as a `source` rather than inside its own
+        // `Display`, so the date below arrives only for a reader that walks the
+        // chain -- which is what the renewal loop and every app `?` do.
+        let text = format!("{:#}", anyhow::Error::from(error));
         assert!(text.contains("has ended"), "register={register}: {text}");
         // The server's own moment, which is the whole of what the holder can
         // act on -- and the person asking is the one it is about.

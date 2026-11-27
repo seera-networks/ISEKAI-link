@@ -38,12 +38,17 @@ pub mod public;
 /// Holding a relay leg's lease open (proxy spec §8.14).
 pub mod relay_lease;
 pub mod secret;
+/// Why no Endpoint Token came back (`docs/p2p_sdk_design.md` D14).
+pub mod token;
 
 pub use auth::{AssertionSource, Auth0TokenSource, Credential, Enrollment, StaticAuth0Token};
 pub use config::{
     issue_endpoint_token, list_policies, load_or_generate_key, policy_stream, proxy_client,
     P2pConfig, PolicyStream,
 };
+// **The failure of the first call every session makes**, so it is nameable
+// beside the call itself rather than two modules down.
+pub use token::TokenError;
 // **A field of `P2pConfig` has to be nameable.** `portal-client` depends on
 // this crate alone, so without the re-export agent mode could only ever write
 // `Default::default()` -- the ceiling, which is the thing it exists to avoid.

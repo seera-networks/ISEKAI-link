@@ -1639,6 +1639,12 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
     if let Some(request) = &request {
         let issued = isekai_p2p::enrollment::issue(&identity, token, request)
             .await
+            // **The advice belongs here, where it is printed.** A guest is
+            // refused this route by name and the server's answer is an ordinary
+            // `insufficient-permission`; attaching the sentence inside
+            // `enrollment::issue` instead would wrap the typed refusal in an
+            // `anyhow::Error` and take it back as a transport failure.
+            .map_err(isekai_p2p::config::explain_membership_refusal)
             .context("issue an enrollment key")?;
         // The secret first: everything else in the response is optional, and a
         // missing `created_at` must not cost the operator the one string they

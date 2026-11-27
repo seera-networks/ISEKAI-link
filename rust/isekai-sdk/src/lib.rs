@@ -58,6 +58,11 @@ pub use isekai_p2p::load_or_generate_key;
 pub use isekai_p2p::agent::{
     EndpointKey, Missing, Outcome, Problem, ProxyError, Reading, Unreachable,
 };
+// **The failure of the call every accessor is built on** (D14). Each group in
+// §3.3 needs an Endpoint Token before it can ask anything, so this is the error
+// a caller of the facade meets first — and reading it takes
+// [`TokenError::outcome`], which is the same `Outcome` vocabulary as the rest.
+pub use isekai_p2p::TokenError;
 
 /// How long a call waits before giving up, when the caller does not say.
 ///

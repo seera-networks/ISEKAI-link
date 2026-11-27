@@ -62,10 +62,15 @@ pub async fn issue(
         // is nothing on it to narrow -- Identity refuses a guest here by name
         // instead (`guest_membership.md` §3 D7), and that refusal arrives as an
         // ordinary `insufficient-permission` unless somebody says what it was.
-        client
-            .create_enrollment_key(auth0_token, request)
-            .await
-            .map_err(crate::config::explain_membership_refusal)?
+        //
+        // **Which is said where it is reported, not here.** This used to attach
+        // the sentence with `map_err(explain_membership_refusal)`, and once this
+        // route returned `IdentityError` (D12) that silently became
+        // `IdentityError::Transport` holding an `anyhow::Error` -- a `403` read
+        // as a network failure. `portal-client` calls
+        // [`crate::config::explain_membership_refusal`] on the way to the
+        // screen, where an `anyhow::Error` is what is wanted.
+        client.create_enrollment_key(auth0_token, request).await?
     }))
 }
 

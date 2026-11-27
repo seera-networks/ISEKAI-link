@@ -18,6 +18,7 @@ path = "src/bin/isekai-agent.rs"
 [dependencies]
 isekai-p2p-core = { workspace = true, features = ["msquic"] }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 # The Auth0 device-authorization flow and refresh (`auth`).
