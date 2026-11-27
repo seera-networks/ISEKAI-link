@@ -38,7 +38,7 @@
 //! belongs to which connection, and the ordering `set_unconnected_socket`
 //! demands. Phase 4 of `docs/portal_plan.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -348,17 +348,62 @@ fn withdraw(conn: &Connection, superseded: ObservedAddress, keeping: ObservedAdd
     }
 }
 
-/// Whether this report is already on the connection, asked of the entry for
-/// **its own host address** and of no other.
+/// What a report means for the address this connection has already acted on
+/// for that report's **host address**, and for no other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reported {
+    /// The peer has this pair already. Saying it again sends it a frame that
+    /// tells it nothing.
+    Known,
+    /// Another port on an IP already acted on, and one the leg had reported
+    /// before the address in use was lost — so it is a second path of the leg
+    /// rather than that address moving.
+    SiblingPath,
+    /// Something to act on: an IP not acted on yet, the same binding observed
+    /// at a new mapping, or an address the leg has not reported before.
+    Act,
+}
+
+/// Read a report against what this connection has acted on and what the leg has
+/// reported.
 ///
-/// Separated out because it is the one piece of [`reoffer`]'s bookkeeping that
-/// can be tested, and because getting it wrong is silent: an offer skipped as
-/// "known" leaves the peer punching at a mapping that has moved, and the only
-/// symptom is a session that stays on the relay.
-fn already_offered(offered: &BTreeMap<IpAddr, ObservedAddress>, address: &ObservedAddress) -> bool {
-    offered
-        .get(&address.local.ip())
-        .is_some_and(|held| (held.local, held.observed) == (address.local, address.observed))
+/// Separated out because it is the one piece of [`reoffer`]'s and
+/// [`advertise`]'s bookkeeping that can be tested, and because getting it wrong
+/// is silent in both directions. Skipped as [`Known`](Reported::Known) when it
+/// was not, the peer goes on punching at a mapping that has moved and the
+/// session stays on the relay (#358). Acted on when it is a
+/// [`SiblingPath`](Reported::SiblingPath), the peer opens a direct path to a
+/// second address of the same leg, and on a connection with four slots that is
+/// the one the replacement relay path needed (#381).
+///
+/// **The two are told apart by whether the leg had reported the address
+/// already**, which is the whole of it. `#379` made the leg's reports one per
+/// path and gave each IP its oldest live entry, so when the path in use goes the
+/// next port on that IP is handed out -- and that port has been in the set since
+/// the leg came up. An address the leg is reporting for the *first* time is the
+/// other thing entirely: a leg that left a network and came back to it, which is
+/// #358's own sequence and has to be acted on.
+fn reported(
+    acted: Option<(SocketAddr, SocketAddr)>,
+    seen: &BTreeSet<SocketAddr>,
+    address: &ObservedAddress,
+) -> Reported {
+    let Some((local, observed)) = acted else {
+        return Reported::Act;
+    };
+    if local == address.local {
+        // The same binding. Only its mapping can have changed.
+        return if observed == address.observed {
+            Reported::Known
+        } else {
+            Reported::Act
+        };
+    }
+    if seen.contains(&address.local) {
+        Reported::SiblingPath
+    } else {
+        Reported::Act
+    }
 }
 
 /// Keep the offer current as the leg's address changes, for the life of
@@ -429,8 +474,14 @@ pub fn reoffer(
         // and left the stale entry in front of the new one — #358's silent
         // failure again, in the one sequence that looks most like ordinary use.
         let mut offered: BTreeMap<IpAddr, ObservedAddress> = BTreeMap::new();
+        // Every address the leg has reported, which is a different question
+        // from what has been offered: an address can be reported and refused,
+        // and having been reported is exactly what has to be remembered about
+        // it (see [`reported`]).
+        let mut seen: BTreeSet<SocketAddr> = BTreeSet::new();
         for UnconnectedLeg(candidate) in seed {
             offered.insert(candidate.local.ip(), candidate);
+            seen.insert(candidate.local);
         }
         loop {
             // Read before waiting, because the watch may already have moved
@@ -446,14 +497,60 @@ pub fn reoffer(
             // logs. Nothing here awaits, so it could not deadlock -- but it
             // would stall the task publishing the reports for the length of a
             // set-param call, for no reason.
-            let reported: Vec<ObservedAddress> =
-                observed.borrow_and_update().one_per_ip().copied().collect();
-            for address in reported {
+            // Two views of the same guard: the addresses to act on, one per IP,
+            // and every address the leg is reporting -- which is what tells a
+            // second path of the leg from an address it has come back to (see
+            // [`reported`]).
+            let (chosen, reported_now): (Vec<ObservedAddress>, Vec<SocketAddr>) = {
+                let addresses = observed.borrow_and_update();
+                (
+                    addresses.one_per_ip().copied().collect(),
+                    addresses.iter().map(|address| address.local).collect(),
+                )
+            };
+            // **A new leg connection starts this again.**
+            // `spawn_observed_address_watch` publishes an empty set when it is
+            // handed a connection, which is the one moment this end knows the
+            // addresses it offered belong to a leg that has gone. Without it the
+            // rule below would outlive the leg it was about: a relay that
+            // restarts is replaced by a leg on the same host IP with a fresh
+            // port, and refusing *that* would leave this session with nowhere to
+            // punch for the rest of its life.
+            if chosen.is_empty() && !offered.is_empty() {
+                tracing::debug!("the relay leg's reports have started again; so has this");
+                offered.clear();
+                seen.clear();
+            }
+            for address in chosen {
                 // Only the pair matters, and only against what this IP already
                 // holds. A report carrying the same pair with a different
                 // binding kind has nothing for msquic, and acting on it would
                 // re-send what it already knows.
-                let moved = !already_offered(&offered, &address);
+                let moved = match reported(
+                    offered
+                        .get(&address.local.ip())
+                        .map(|held| (held.local, held.observed)),
+                    &seen,
+                    &address,
+                ) {
+                    Reported::Act => true,
+                    Reported::Known => false,
+                    // Refused for `advertise`'s reason, and here so that the two
+                    // ends of a session name the same pair (#381). This side
+                    // spends no path slot -- msquic reads candidates by IP and
+                    // takes the first match, so the port named here decides where
+                    // this end's own punch leaves from and nothing else -- but
+                    // naming a second path of a leg that is losing its paths is
+                    // naming a binding that is going the same way.
+                    Reported::SiblingPath => {
+                        tracing::debug!(
+                            local = %address.local,
+                            "another port on an IP this connection already offers, and one \
+                             the leg had already reported; left alone",
+                        );
+                        false
+                    }
+                };
                 // Kept watching where [`prepare`] gives up: the leg's binding
                 // can change into one no direct path can run over, and back
                 // again.
@@ -496,6 +593,9 @@ pub fn reoffer(
                     }
                 }
             }
+            // Recorded after the pass, not before it: an address reported for
+            // the first time has to read as new while it is being decided.
+            seen.extend(reported_now);
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 changed = observed.changed() => {
@@ -593,17 +693,57 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
         // advertised. That is the leg rebinding, which is #358's listener half
         // and the reason this loop re-applies at all.
         let mut applied: BTreeMap<IpAddr, (SocketAddr, SocketAddr)> = BTreeMap::new();
+        // Every address the leg has reported, which is a different question
+        // from what has been advertised: an address can be reported and
+        // refused, and having been reported is exactly what has to be
+        // remembered about it (see [`reported`]).
+        let mut seen: BTreeSet<SocketAddr> = BTreeSet::new();
         loop {
             // **Every address, not the newest** (#371). A leg with a path per
             // family has an address in each, and advertising one of them is
             // how an IPv4-only peer came to be told only an IPv6 address.
             // Copied out rather than iterated through the guard, for the
             // reason [`reoffer`] gives: `apply` below calls into msquic twice.
-            let reported: Vec<ObservedAddress> =
-                observed.borrow_and_update().one_per_ip().copied().collect();
-            for address in reported {
-                if applied.get(&address.local.ip()) == Some(&(address.local, address.observed)) {
-                    continue;
+            let (chosen, reported_now): (Vec<ObservedAddress>, Vec<SocketAddr>) = {
+                let addresses = observed.borrow_and_update();
+                (
+                    addresses.one_per_ip().copied().collect(),
+                    addresses.iter().map(|address| address.local).collect(),
+                )
+            };
+            // A new leg connection starts this again -- see [`reoffer`], which
+            // says why the refusal below must not outlive the leg it was about.
+            if chosen.is_empty() && !applied.is_empty() {
+                tracing::debug!("the relay leg's reports have started again; so has this");
+                applied.clear();
+                seen.clear();
+            }
+            for address in chosen {
+                match reported(applied.get(&address.local.ip()).copied(), &seen, &address) {
+                    Reported::Known => continue,
+                    // **A second port on an IP this connection already advertises
+                    // is refused** (#381). Nothing withdraws an advertisement --
+                    // `QuicConnRemoveBoundAddress` would take down the path over
+                    // it -- so the peer keeps both and opens a path to each, and a
+                    // path slot out of four is what that costs, for the life of
+                    // the connection.
+                    //
+                    // The sequence that produces one is the relay dying: the leg
+                    // loses its paths one at a time, so for about a second the
+                    // oldest live address on an IP is a backup path to the relay
+                    // that has just gone. The peer opened a direct path to it in
+                    // 70 ms, the leg was declared gone a second later, and the
+                    // replacement leg found no slot left.
+                    Reported::SiblingPath => {
+                        tracing::debug!(
+                            local = %address.local,
+                            "another port on an IP this connection already advertises, and \
+                             one the leg had already reported; left alone, so the peer \
+                             spends no path slot on it",
+                        );
+                        continue;
+                    }
+                    Reported::Act => {}
                 }
                 // Kept watching where this used to `return`, for
                 // [`reoffer`]'s reason: a leg that comes back on a
@@ -615,6 +755,9 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
                     }
                 }
             }
+            // Recorded after the pass, not before it: an address reported for
+            // the first time has to read as new while it is being decided.
+            seen.extend(reported_now);
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 changed = observed.changed() => {
@@ -1097,12 +1240,61 @@ mod tests {
         }
     }
 
+    fn acted(
+        offered: &BTreeMap<IpAddr, ObservedAddress>,
+        of: &ObservedAddress,
+    ) -> Option<(SocketAddr, SocketAddr)> {
+        offered
+            .get(&of.local.ip())
+            .map(|held| (held.local, held.observed))
+    }
+
+    /// **#381's own sequence.** The leg comes up in IPv6 with a backup path to
+    /// the relay's alternative address, on the same IP and its own port, and
+    /// that port is reported while the path in use is still live. When the relay
+    /// dies the leg loses its paths one at a time, so for about a second the
+    /// oldest live address on that IP is the backup's — and acting on it had the
+    /// peer open a third direct path, to a relay that was already gone, which is
+    /// the slot the replacement leg then had no room for.
+    #[test]
+    fn a_port_the_leg_reported_beside_the_one_in_use_is_a_sibling_path() {
+        let in_use = report("[2001:db8:2::10]:34663", "[2001:db8:2::10]:34663");
+        let backup = report("[2001:db8:2::10]:58930", "[2001:db8:2::10]:58930");
+
+        let mut offered = BTreeMap::new();
+        offered.insert(in_use.local.ip(), in_use);
+        // Both were reported at setup; only the first was acted on.
+        let seen: BTreeSet<SocketAddr> = [in_use.local, backup.local].into_iter().collect();
+
+        assert_eq!(
+            reported(acted(&offered, &backup), &seen, &backup),
+            Reported::SiblingPath,
+            "a second path of the leg, whether or not the first one has gone",
+        );
+
+        // The mapping of the path in use moving is still something to say: the
+        // binding is the same one, and the peer is punching at the old pair.
+        let moved = ObservedAddress {
+            observed: "203.0.113.9:34663".parse().expect("an address"),
+            ..in_use
+        };
+        assert_eq!(
+            reported(acted(&offered, &moved), &seen, &moved),
+            Reported::Act,
+        );
+    }
+
     /// **The sequence a single `last` got wrong**, which is a leg leaving a
     /// network and coming back to it: Wi-Fi, then cellular, then Wi-Fi again on
     /// the same address with a fresh port. The last of those has to read as new,
     /// and has to supersede the *first* one rather than the cellular pair —
     /// msquic takes the first candidate matching by IP, so a stale entry left on
     /// that IP is what the peer keeps being told to punch at.
+    ///
+    /// **And it is the sequence #381's rule must not swallow.** A port the leg
+    /// has never reported is an address it has come back to; a port it reported
+    /// while the one in use was still live is a second path of the same leg. The
+    /// `seen` set is the whole difference, which is why this test carries one.
     #[test]
     fn an_address_returned_to_supersedes_its_own_old_entry() {
         let wifi = report("192.168.1.10:41000", "203.0.113.2:41000");
@@ -1112,16 +1304,24 @@ mod tests {
 
         let mut offered = BTreeMap::new();
         offered.insert(wifi.local.ip(), wifi);
+        let mut seen: BTreeSet<SocketAddr> = [wifi.local].into_iter().collect();
 
-        assert!(
-            already_offered(&offered, &wifi),
+        assert_eq!(
+            reported(acted(&offered, &wifi), &seen, &wifi),
+            Reported::Known,
             "the pair `prepare` offered must not be offered twice",
         );
-        assert!(!already_offered(&offered, &cell), "another address is new");
+        assert_eq!(
+            reported(acted(&offered, &cell), &seen, &cell),
+            Reported::Act,
+            "another address is new",
+        );
         offered.insert(cell.local.ip(), cell);
-        assert!(
-            !already_offered(&offered, &wifi_again),
-            "a new port on a known address is a new candidate",
+        seen.insert(cell.local);
+        assert_eq!(
+            reported(acted(&offered, &wifi_again), &seen, &wifi_again),
+            Reported::Act,
+            "a port the leg has never reported is an address it has come back to",
         );
 
         // And what it replaces is the entry for its own IP, with the other
