@@ -11,8 +11,8 @@
 
 use isekai_p2p_core::https::HttpsTransport;
 use isekai_p2p_core::identity::{
-    EnrollmentKeyRecord, EnrollmentRecord, IdentityClient, IssuedEnrollmentKey, NewEnrollmentKey,
-    RevokedEnrollmentKey,
+    EnrollmentKeyRecord, EnrollmentRecord, IdentityClient, IdentityError, IssuedEnrollmentKey,
+    NewEnrollmentKey, RevokedEnrollmentKey,
 };
 use isekai_p2p_core::proxy::ControlPlaneTransport;
 use isekai_p2p_core::transport::MasqueH3Transport;
@@ -55,7 +55,7 @@ pub async fn issue(
     identity: &Identity,
     auth0_token: &str,
     request: &NewEnrollmentKey,
-) -> anyhow::Result<IssuedEnrollmentKey> {
+) -> Result<IssuedEnrollmentKey, IdentityError> {
     Ok(on_transport!(identity, |client| {
         // **The one door a permission cannot close.** Issuing a key is
         // authenticated as the person and carries no Endpoint Token, so there
@@ -73,7 +73,7 @@ pub async fn issue(
 pub async fn list(
     identity: &Identity,
     auth0_token: &str,
-) -> anyhow::Result<Vec<EnrollmentKeyRecord>> {
+) -> Result<Vec<EnrollmentKeyRecord>, IdentityError> {
     Ok(on_transport!(identity, |client| {
         client.list_enrollment_keys(auth0_token).await?
     }))
@@ -90,7 +90,7 @@ pub async fn enrollments(
     identity: &Identity,
     auth0_token: &str,
     key_id: &str,
-) -> anyhow::Result<Vec<EnrollmentRecord>> {
+) -> Result<Vec<EnrollmentRecord>, IdentityError> {
     Ok(on_transport!(identity, |client| {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
@@ -116,7 +116,7 @@ pub async fn revoke(
     identity: &Identity,
     auth0_token: &str,
     key_id: &str,
-) -> anyhow::Result<RevokedEnrollmentKey> {
+) -> Result<RevokedEnrollmentKey, IdentityError> {
     Ok(on_transport!(identity, |client| {
         client
             .revoke_enrollment_key(auth0_token, key_id, None, None)

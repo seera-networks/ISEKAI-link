@@ -276,16 +276,18 @@ async fn revoke_now(cfg: &isekai_p2p::P2pConfig) -> anyhow::Result<()> {
 }
 
 /// Whether Identity answered that there is no such Endpoint.
-fn not_found(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .filter_map(|e| e.downcast_ref::<isekai_p2p::agent::IdentityError>())
-        .any(|e| {
-            matches!(
-                Outcome::of_identity(e, &REVOKING),
-                Outcome::AlreadyGone { .. }
-            )
-        })
+fn not_found(error: &isekai_p2p::agent::IdentityError) -> bool {
+    // **Read straight, not fished out of a chain.** `endpoints::revoke` used to
+    // answer `anyhow::Error`, so this had to walk `chain()` and downcast to find
+    // the typed failure it needed — and a `with_context` anywhere between would
+    // have kept the error but hidden nothing, while a conversion that dropped the
+    // concrete type would have made this silently always-false. The route answers
+    // `IdentityError` now (`docs/p2p_sdk_design.md` D12 = C), so the reading is
+    // the whole of it.
+    matches!(
+        Outcome::of_identity(error, &REVOKING),
+        Outcome::AlreadyGone { .. }
+    )
 }
 
 /// How the revocation reads an answer: its `404` is "there was no such
