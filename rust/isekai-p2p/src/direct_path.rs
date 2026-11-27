@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use msquic_async::{msquic, Connection, ConnectionError};
 use tokio_util::sync::CancellationToken;
@@ -348,6 +348,33 @@ fn withdraw(conn: &Connection, superseded: ObservedAddress, keeping: ObservedAdd
     }
 }
 
+/// How long a report that reads as a second path of the leg is left alone
+/// before it is acted on anyway.
+///
+/// **The refusal is for a leg that is shedding paths, and a leg that sheds
+/// paths does not last.** When the relay dies the leg loses its paths, is
+/// declared gone about a second later, and a replacement is up about two
+/// seconds after that — 2.85 s from the first removal to the new leg, in
+/// #381's own run — at which point the report set starts again and there is
+/// nothing left to act on. So a sibling that is *still* the only answer for its
+/// IP long after that is not a doomed path on a dying leg: it is the leg's
+/// address, and refusing it for ever would leave the session on the relay with
+/// a usable binding in hand.
+///
+/// Generous on purpose. Being ten times the cycle it has to outlast costs a
+/// direct path that re-forms half a minute late in the cases this is wrong
+/// about, where being tight costs the path slot #381 is about.
+const SIBLING_HOLD_DOWN: Duration = Duration::from_secs(30);
+
+/// Whether a report refused as a second path of the leg has waited out
+/// [`SIBLING_HOLD_DOWN`] as the only answer for its IP.
+///
+/// `None` is a sibling seen for the first time, which is always refused: the
+/// clock starts here.
+fn sibling_waited(refused_since: Option<Instant>, now: Instant) -> bool {
+    refused_since.is_some_and(|since| now.duration_since(since) >= SIBLING_HOLD_DOWN)
+}
+
 /// What a report means for the address this connection has already acted on
 /// for that report's **host address**, and for no other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +506,9 @@ pub fn reoffer(
         // and having been reported is exactly what has to be remembered about
         // it (see [`reported`]).
         let mut seen: BTreeSet<SocketAddr> = BTreeSet::new();
+        // A sibling left alone, and when: what [`SIBLING_HOLD_DOWN`] is
+        // measured from.
+        let mut refused: BTreeMap<IpAddr, (SocketAddr, Instant)> = BTreeMap::new();
         for UnconnectedLeg(candidate) in seed {
             offered.insert(candidate.local.ip(), candidate);
             seen.insert(candidate.local);
@@ -516,10 +546,25 @@ pub fn reoffer(
             // restarts is replaced by a leg on the same host IP with a fresh
             // port, and refusing *that* would leave this session with nowhere to
             // punch for the rest of its life.
-            if chosen.is_empty() && !offered.is_empty() {
+            // **Only what the leg has reported is forgotten here, not what is on
+            // the connection.** `offered` is what [`withdraw`] is driven from --
+            // clearing it would leave the dead leg's candidate in front of the
+            // new one, answering for that IP for ever, which is the silent #358
+            // failure withdrawing exists to prevent.
+            //
+            // **Seeing the empty set is not guaranteed**, because the watch
+            // keeps only its newest value: if this task is not scheduled
+            // between the reset and the new leg's first report, the reset is
+            // never read. What that costs is bounded by the hold-down -- a
+            // new leg whose port happens to be one the old leg used would be
+            // left alone for [`SIBLING_HOLD_DOWN`] rather than for ever -- so
+            // the set carries no generation counter to make the moment
+            // certain. It would need one if anything here became permanent
+            // again.
+            if chosen.is_empty() && !seen.is_empty() {
                 tracing::debug!("the relay leg's reports have started again; so has this");
-                offered.clear();
                 seen.clear();
+                refused.clear();
             }
             for address in chosen {
                 // Only the pair matters, and only against what this IP already
@@ -542,13 +587,35 @@ pub fn reoffer(
                     // this end's own punch leaves from and nothing else -- but
                     // naming a second path of a leg that is losing its paths is
                     // naming a binding that is going the same way.
+                    //
+                    // Refused for [`SIBLING_HOLD_DOWN`] and not for ever: a leg
+                    // that is shedding paths does not last, so a sibling still
+                    // answering for its IP long afterwards is the leg's address
+                    // rather than a doomed path.
                     Reported::SiblingPath => {
-                        tracing::debug!(
-                            local = %address.local,
-                            "another port on an IP this connection already offers, and one \
-                             the leg had already reported; left alone",
-                        );
-                        false
+                        let since = refused
+                            .get(&address.local.ip())
+                            .filter(|(local, _)| *local == address.local)
+                            .map(|(_, since)| *since);
+                        if sibling_waited(since, Instant::now()) {
+                            tracing::info!(
+                                local = %address.local,
+                                "this port is still the only one the leg reports on its IP \
+                                 after {SIBLING_HOLD_DOWN:?}; offering it after all",
+                            );
+                            refused.remove(&address.local.ip());
+                            true
+                        } else {
+                            if since.is_none() {
+                                refused.insert(address.local.ip(), (address.local, Instant::now()));
+                            }
+                            tracing::debug!(
+                                local = %address.local,
+                                "another port on an IP this connection already offers, and one \
+                                 the leg had already reported; left alone for now",
+                            );
+                            false
+                        }
                     }
                 };
                 // Kept watching where [`prepare`] gives up: the leg's binding
@@ -596,8 +663,22 @@ pub fn reoffer(
             // Recorded after the pass, not before it: an address reported for
             // the first time has to read as new while it is being decided.
             seen.extend(reported_now);
+            // Wake when the oldest refusal has waited out the hold-down. A leg
+            // that has settled does not report again, so without this a sibling
+            // that is the leg's address would wait for a change that never
+            // comes.
+            let wake = refused
+                .values()
+                .map(|(_, since)| *since + SIBLING_HOLD_DOWN)
+                .min();
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                _ = async {
+                    match wake {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
                 changed = observed.changed() => {
                     if changed.is_err() {
                         break;
@@ -698,6 +779,9 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
         // refused, and having been reported is exactly what has to be
         // remembered about it (see [`reported`]).
         let mut seen: BTreeSet<SocketAddr> = BTreeSet::new();
+        // A sibling left alone, and when: what [`SIBLING_HOLD_DOWN`] is
+        // measured from.
+        let mut refused: BTreeMap<IpAddr, (SocketAddr, Instant)> = BTreeMap::new();
         loop {
             // **Every address, not the newest** (#371). A leg with a path per
             // family has an address in each, and advertising one of them is
@@ -712,11 +796,15 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
                 )
             };
             // A new leg connection starts this again -- see [`reoffer`], which
+            // A new leg connection starts this again -- see [`reoffer`], which
             // says why the refusal below must not outlive the leg it was about.
-            if chosen.is_empty() && !applied.is_empty() {
+            // Only what the leg reported is forgotten: `applied` is what the
+            // peer has been told, and an address this end has advertised is
+            // still advertised whatever the leg does next.
+            if chosen.is_empty() && !seen.is_empty() {
                 tracing::debug!("the relay leg's reports have started again; so has this");
-                applied.clear();
                 seen.clear();
+                refused.clear();
             }
             for address in chosen {
                 match reported(applied.get(&address.local.ip()).copied(), &seen, &address) {
@@ -734,14 +822,33 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
                     // that has just gone. The peer opened a direct path to it in
                     // 70 ms, the leg was declared gone a second later, and the
                     // replacement leg found no slot left.
+                    //
+                    // For [`SIBLING_HOLD_DOWN`] and not for ever, for the reason
+                    // given there: a leg that is shedding paths does not last.
                     Reported::SiblingPath => {
-                        tracing::debug!(
-                            local = %address.local,
-                            "another port on an IP this connection already advertises, and \
-                             one the leg had already reported; left alone, so the peer \
-                             spends no path slot on it",
-                        );
-                        continue;
+                        let since = refused
+                            .get(&address.local.ip())
+                            .filter(|(local, _)| *local == address.local)
+                            .map(|(_, since)| *since);
+                        if sibling_waited(since, Instant::now()) {
+                            tracing::info!(
+                                local = %address.local,
+                                "this port is still the only one the leg reports on its IP \
+                                 after {SIBLING_HOLD_DOWN:?}; advertising it after all",
+                            );
+                            refused.remove(&address.local.ip());
+                        } else {
+                            if since.is_none() {
+                                refused.insert(address.local.ip(), (address.local, Instant::now()));
+                            }
+                            tracing::debug!(
+                                local = %address.local,
+                                "another port on an IP this connection already advertises, and \
+                                 one the leg had already reported; left alone for now, so the \
+                                 peer spends no path slot on it",
+                            );
+                            continue;
+                        }
                     }
                     Reported::Act => {}
                 }
@@ -758,8 +865,20 @@ pub fn advertise(conn: Connection, legs: RelayLegs, shutdown: CancellationToken)
             // Recorded after the pass, not before it: an address reported for
             // the first time has to read as new while it is being decided.
             seen.extend(reported_now);
+            // Wake when the oldest refusal has waited out the hold-down -- see
+            // [`reoffer`], which says why a change cannot be waited for.
+            let wake = refused
+                .values()
+                .map(|(_, since)| *since + SIBLING_HOLD_DOWN)
+                .min();
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                _ = async {
+                    match wake {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
                 changed = observed.changed() => {
                     if changed.is_err() {
                         break;
@@ -1247,6 +1366,44 @@ mod tests {
         offered
             .get(&of.local.ip())
             .map(|held| (held.local, held.observed))
+    }
+
+    /// **A refusal that never expired would strand the session on the relay.**
+    /// One path of a multi-path IP dying while the leg lives leaves a sibling
+    /// that *is* the leg's address on that IP, and nothing else would ever
+    /// re-evaluate it. The hold-down is what makes the refusal provisional: a
+    /// leg that is shedding paths is gone long before it elapses, and a leg
+    /// that is not gets its address offered.
+    #[test]
+    fn a_refused_sibling_is_offered_once_it_has_outlasted_a_relay_replacement() {
+        let now = Instant::now();
+
+        assert!(
+            !sibling_waited(None, now),
+            "the first sight of a sibling is always refused; the clock starts there",
+        );
+        assert!(
+            !sibling_waited(Some(now - SIBLING_HOLD_DOWN / 2), now),
+            "half way through is still inside the window",
+        );
+        assert!(
+            sibling_waited(Some(now - SIBLING_HOLD_DOWN), now),
+            "the boundary itself counts as waited",
+        );
+        assert!(sibling_waited(Some(now - SIBLING_HOLD_DOWN * 2), now));
+    }
+
+    /// The hold-down has to outlast a relay replacement, which is what it is
+    /// for: #381's run took 2.85 s from the leg's first lost path to a new leg
+    /// being up, and the report set starts again there.
+    #[test]
+    fn the_hold_down_outlasts_a_relay_replacement() {
+        let replacement = Duration::from_millis(2_850);
+        assert!(
+            SIBLING_HOLD_DOWN >= replacement * 5,
+            "{SIBLING_HOLD_DOWN:?} has to be clear of {replacement:?} by a margin, \
+             or #381's doomed path comes back",
+        );
     }
 
     /// **#381's own sequence.** The leg comes up in IPv6 with a backup path to
