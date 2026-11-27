@@ -1095,7 +1095,16 @@ async fn this_role(args: &Args, tokens: &std::path::Path) -> String {
     .await
     {
         Ok(Ok(me)) => isekai_p2p::membership::describe(&me),
-        Ok(Err(e)) => format!("unknown -- could not ask Identity ({e:#})"),
+        // **Through anyhow, because `{:#}` means nothing to the typed error.**
+        // The alternate flag is what makes anyhow walk its chain;
+        // `IdentityError`'s `Display` formats its inner error plainly, so
+        // `{e:#}` would print "transport error: HTTPS request failed" and drop
+        // the `Connection refused` that says *why* the host did not answer —
+        // which is the whole point of naming the host in this message.
+        Ok(Err(e)) => format!(
+            "unknown -- could not ask Identity ({:#})",
+            anyhow::Error::from(e)
+        ),
         Err(_) => format!(
             "unknown -- {} had not answered in {WHOAMI_WAIT:?}",
             args.identity_url
@@ -1715,7 +1724,10 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
         if let Some(detail) = &revoked.proxy_notification_detail {
             println!("              ({detail})");
         }
-        match &before {
+        // Matched by value, not by reference: the error arm hands its failure
+        // to anyhow for the chain, and `anyhow::Error::from` needs to own it.
+        // `before` is not read after this.
+        match before {
             // **`duplicate_key` decides, and the list only names names.** A row
             // can be flagged with an empty list — the siblings are same-tenant
             // only — and gating on the list alone would print nothing in
@@ -1733,9 +1745,15 @@ async fn enrollment_admin(args: &Args, tokens: &Path) -> anyhow::Result<()> {
                 }
             }
             Ok(_) => {}
+            // Through anyhow for the reason `--whoami` gives above: this
+            // message is read after a revocation has already gone through, when
+            // the operator is deciding whether the credential is really
+            // stopped, and "connection refused" against a TLS failure is the
+            // part that answers it.
             Err(e) => println!(
-                "\ncould not check whether another Endpoint shares this key: {e:#}\n\
+                "\ncould not check whether another Endpoint shares this key: {:#}\n\
                  Look it up with --endpoints before trusting that the key is stopped.",
+                anyhow::Error::from(e)
             ),
         }
     }

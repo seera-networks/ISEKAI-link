@@ -685,8 +685,8 @@ A。2 本は**別のアプリの都合**（frame sink があるかどうか、�
 | D13 | Endpoint トークンの取得 | — | **決定 B**（`REFRESH_MARGIN = 60s` の先例に倣う） | — |
 | D14 | トークン発行の読み | `anyhow` のまま / 下を型付きに / facade が畳む | **B**（`Outcome::Reauthenticate` が既にある） | §3.3 のアクセサ＝段 2 |
 
-これで §9 の 7 問には答えが付いている。本文書が出した判断は 13 で、
-うち 11 が決定済み。
+これで §9 の 7 問には答えが付いている。本文書が出した判断は **14** で、
+うち **13 が決定済み**（残りは D14）。
 
 Q5（通知）と Q7（FFI 統合）は §4.2 / §4.4 に答えがあり、`FrameSink` という先例が
 あるので**判断ではなく作業**である。Q2 と Q6 は既決（§0、§4.3）。
@@ -703,9 +703,11 @@ Q5（通知）と Q7（FFI 統合）は §4.2 / §4.4 に答えがあり、`Fram
 2. **群アクセサ（発行側）** — §3.3。読みは `ProxyError` で既に正しく、
    `grants()` の list と revoke は `ProxyClient` を直接呼ぶ（D10 = A）。
    **D13** がここで要る（トークンの取得）。
-2b. **棚卸し 3 モジュールを型付きの失敗に**（D12 = C）。`isekai-p2p` の
-   `endpoints` / `enrollment` / `membership` と、その呼び出し側（`portal-server`,
-   `portal-client`）が動く。**facade より先に下を直す**段で、ここだけは
+2b. **棚卸し 3 モジュールを型付きの失敗に**（D12 = C、実装済み）。`isekai-p2p` の
+   `endpoints` / `enrollment` / `membership` の 8 シグネチャ。**動いた呼び出し側は
+   `portal-core/src/agent.rs` の 1 箇所だけ**で、`portal-client` の 10 箇所は
+   `.context(..)?` で anyhow に入れているので無変更だった（`portal-server` は
+   この 8 つを呼んでいない）。**facade より先に下を直す**段で、ここだけは
    「素通し」ではない。
 2c. **群アクセサ（棚卸し側）** — §3.2。2b が済めば素通しで足りる。
 3. **`redeem` 1 本**（§3.4、D11 = A。Enrollment Key を名指しで断る）と
