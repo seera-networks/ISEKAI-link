@@ -1,7 +1,8 @@
 # SDK の設計 — 7 群から面を決める
 
-- status: 設計（§9 Q1 の答え）。**D1–D9 すべて決定済み**（0.3）。実装はまだ無い
-- version: 0.3
+- status: 設計（§9 Q1 の答え）。**D1–D9 決定済み**。0.4 でレビューが 9 点を正し、
+  判断が 2 つ増えた（D10, D11）。実装はまだ無い
+- version: 0.4
 - 対象: `1d63993`（`main`, v0.10.2）
 - 前提:
   - `docs/p2p_sdk_surface_from_portal.md` §7 — **必要な面の 7 群**。本文書の入力
@@ -14,15 +15,15 @@
 **決めること**: 7 群それぞれを SDK の面に出すか、出すならどの形で出すか。
 Q1（面の広さ）への答えを、群ごとの素案シグネチャとして置く。
 
-**決めないこと**: もう無い。0.1 で挙げた 8 つと、0.2 で派生した 1 つ（D9）は
-**すべて決定済み**（§6）。残っているのは判断ではなく作業で、§7 がその順である。
+**決めないこと**: **D10 と D11**。どちらも 0.4 のレビューで前提が動いて立ち上がった
+もので、選択肢と推奨を置く。D1–D9 は決定済み（§6）。
 
 **0.2 で決まったこと**: D1 = C、D2 = B、D3 = A（0.1 の推奨どおり）。
 この 3 つは他の全部のシグネチャを決めるので先に確定させた（§2）。
 確定の結果 **D9 が生まれ、D8 の選択肢が割れた**。
 
 **0.3 で決まったこと**: D4 = A、D5 = A（確認が先）、D6 = A、D7 = C、
-D8 = C1、D9 = A。いずれも推奨どおり。これで判断は尽きた。
+D8 = C1、D9 = A。いずれも推奨どおり。
 確定の過程で**書き出すべきことが 3 つ**出た:
 
 | | 何が出たか | どこ |
@@ -30,6 +31,25 @@ D8 = C1、D9 = A。いずれも推奨どおり。これで判断は尽きた。
 | 1 | **D8 = C1 と D9 = A が噛み合っていなかった。** 「msquic を閉じるのはプロセスの持ち主」と「低位は facade に出さない」を素直に読むと、facade だけを使うアプリは終了処理ができない。D9 の「低位」の範囲をデータパスと bind の内部に限定し、`shutdown` / `drain` は約束する面に置くことにした | §3.7, §5 |
 | 2 | **D6 は `portal-client-ffi` のシグネチャを変える。** 固定値 2 つが引数になるので、FFI の載せ替えと同時に出す（先に出すと FFI だけ 2 度変わる） | §3.5, §7 |
 | 3 | **D7 は分類を 1 つ増やす。** 締め切り超過は下層に材料が無い唯一の失敗なので、下層を触らず SDK 側の読みとして足す | §3.7 |
+
+**0.4 でレビューが正したこと**: 0.3 までの主張のうち、ツリーと食い違っていたもの。
+決定（A/B/C の選択）は 1 つも覆らなかったが、**中身が 9 点動いた**。
+
+| | 正したこと | どこ |
+| --- | --- | --- |
+| 1 | **締め切りの読みは既にある。** `Unreachable::Deadline { waited }`（`outcome.rs:110`）が「Nothing produces this yet」付きで存在し、締め切り超過は 8 種の **#8**。要るのは分類ではなく**作る側** | §3.7 |
+| 2 | **8 メソッドに `list_grants` / `revoke_grant` は入らない。** 既に `ListenerSession` に包まれている（`listener.rs:678`, `:684`）。この 2 つにアクセサを足すのは素通しではない → **D10** | §3.3 |
+| 3 | **`Made` は upsert の答えではない。** `(Grant, Made)` の 3 アーム enum で、`existed_before` は `Made::Existing` を意図的に非権威として扱う（#350 が避けた枯れの罠） | §3.3 |
+| 4 | **D4 の継ぎ目は 2 つある。** `Auth0TokenSource` と `AssertionSource` の**両方が trait**。片方だけ出すと、もう片方の資格情報で自前のトークン源が入らない | §3.1 |
+| 5 | **D6 の 2 つは `connect` の引数ではない。** どちらも `P2pConfig` のフィールドで、登録・enroll・トークン発行で消費される＝接続より前。出す場所は `Sdk::open` | §3.5 |
+| 6 | **§3.4 の理由が事実ではなかった。** FFI 2 本は ticket も Provisioning Key も引き換えない。3 分岐は `portal-client` の 1 箇所だけ。残る理由は弱く、判断を立て直した → **D11** | §3.4 |
+| 7 | **点検の三状態を潰していた。** `list_relays` の `Ok(None)`（近さで選ばない）と空一覧（登録無し）は別物で、`portal-client` は別の文を出す | §3.6 |
+| 8 | **D9 の例が間違っていた。** `DatapathHook` に本番の利用者はいない（example とテストだけ）。`camera-core` が低位に留まる理由は QUIC 面 | §5 |
+| 9 | **semver の道筋が書かれていなかった。** facade だけ `version.workspace` を使わない例外が要り、git-rev と submodule path 依存のため **crates.io には出せない** | §4.3 |
+
+小さい訂正も同時に入れた: 4 概念の 4 つ目は「切る」（「ローカルポートを得て切る」ではない）、
+点検の引用順、`paths()` / `observed()` は同期でよい理由（D3 は網に触るものの話）、
+§7-5 は `portal-client-ffi` が自分のワークスペースと lock を持つこと。
 
 **既決として扱うもの**（再提案しない）:
 
@@ -150,9 +170,12 @@ let sdk = Sdk::open(Credential::auth0(token_source), P2pConfig { .. }).await?;
 **決定: A。** `portal-client` の `--login` は人がブラウザを開く前提で、
 そこは app の領分である。ただし §4.2 の通知を使って **B を後から足せる**ようにしておく。
 
-**この決定が確定させたもの**: facade は **`AssertionSource` を trait として出す**。
-具体の `Auth0TokenSource` / `StaticAuth0Token` だけを出すと、自分のトークン源を
-持つ利用者（OIDC を自前で回すサービス）が入れない —— A を選んだ意味が消える。
+**この決定が確定させたもの**: facade は **2 つの trait を両方出す**。
+`Auth0TokenSource`（`isekai-p2p/src/auth.rs:25`）が §3.1 の素案
+`Credential::auth0(..)` の継ぎ目で、`AssertionSource`（同 `:52`）が無人
+ワークロード（`Credential::Enrollment`）側の継ぎ目である。**どちらも trait** で、
+具体の実装は `StaticAuth0Token`（同 `:355`）。片方だけ出すと、出さなかった側の
+資格情報で自分のトークン源を持ち込めない —— A を選んだ意味が半分消える。
 
 ### 3.2 自分の棚卸し — 群ごとのアクセサ
 
@@ -167,15 +190,42 @@ sdk.me().await?;                        // membership::me
 （surface §4.3 の「素通しは足さない」をここでも守る）。
 462 の公開アイテムを 1 つの名前空間に並べないための措置である。
 
+**D10 — `list_grants` / `revoke_grant` はどちらの名前で出すか**
+
+| | 選択肢 | 得るもの | 失うもの |
+| --- | --- | --- | --- |
+| A | facade のアクセサを唯一の名前にし、`ListenerSession` の 2 つは repo 内の利用者が載せ替わるまで残す | 読みが 1 つ（`Outcome`）に揃う | 載せ替えまで 2 つの名前が同居する |
+| B | `ListenerSession` の 2 つをそのまま面にし、アクセサには出さない | 名前は増えない | `grants()` が create と list で非対称になる。`anyhow` の読みが面に出る |
+
+**推奨 A。** `ListenerSession` 版は `anyhow::Result` を返していて、
+`Outcome` を前提にした SDK の読みとは合わない（`error_type.md` が
+「読みと原因は両方要る」と書いた形になっていない）。
+ただし `ListenerSession` を使っている repo 内の利用者を同時に動かす必要はない。
+
+**upsert の答えを `Made` で出してはいけない。** `create_grant` が返すのは
+`(Grant, Made)` で、`Made` は `Fresh` / `Existing` / `Unknown` の
+3 アーム（`proxy.rs:582`）。upsert の判定は `grants::existed_before`
+（`isekai-p2p/src/grants.rs:67`）であり、その doc が **`Made::Existing` は
+権威ではない**と明記している —— プロキシが新規作成にも `200` を返すなら、
+自分が作った Grant まで `theirs` に入って誰も更新せず、短い TTL で枯れる。
+facade が `Made` を upsert の答えとして見せると、#350 が避けたその罠が戻る。
+出すのは `existed_before` / `already_existed` の読みである。
+
 ### 3.3 アクセスを与える — 同じ 8 メソッドを群に分ける
 
-`create_grant` / `list_grants` / `revoke_grant`、`create_ticket` /
-`list_tickets` / `revoke_ticket`、`create_provisioning_key` /
-`list_provisioning_keys` / `provisioning_redemptions` /
-`revoke_provisioning_key`（`proxy.rs:1965`–`:2189`）。
+surface §4 が数えた 8 つは、**`isekai-p2p` に面が無い**ものである:
+`create_grant` / `create_ticket` / `create_provisioning_key`、
+`list_tickets` / `list_provisioning_keys` / `provisioning_redemptions`、
+`revoke_ticket` / `revoke_provisioning_key`（`proxy.rs:1965`–`:2189`）。
+
+**`list_grants` と `revoke_grant` はこの 8 つに入らない。** 既に
+`ListenerSession` に包まれていて（`isekai-p2p/src/listener.rs:678`, `:684`）、
+戻りは `anyhow::Result` である。したがってこの 2 つにアクセサを足すのは
+**素通しのグルーピングではなく、読みの違う 2 つ目の名前を増やす**ことになる
+（surface §4.3 がまさに警戒した形）。→ **D10**。
 
 ```rust
-sdk.grants().create(spec).await?;       // Made<Grant> — already_existed を持つ
+sdk.grants().create(spec).await?;       // (Grant, Made) — Made は 3 アームの enum
 sdk.grants().list().await?;
 sdk.tickets().revoke(id).await?;
 sdk.provisioning_keys().redemptions(id).await?;
@@ -207,22 +257,41 @@ sdk.provisioning_keys().redemptions(id).await?;
 ### 3.4 アクセスを受け取る — 入口を 1 つ足す
 
 今は `pair_with_code` / `redeem_ticket` / `redeem_provisioning_key` の 3 つで、
-利用者は文字列を見て**どれを呼ぶか自分で決めている**。判別の材料は既に面にある
-（`TICKET_PREFIX`, `PROVISIONING_KEY_PREFIX`, `pairing_code_from_input`,
-`ticket_from_transfer`）。
+利用者は文字列を見て**どれを呼ぶか自分で決めている**。判別の材料は既に面にある:
+`secret_prefix`（`proxy.rs:1292`）と 4 つの接頭辞（`TICKET_PREFIX`,
+`TICKET_TRANSFER_PREFIX`, `PROVISIONING_KEY_PREFIX`, `ENROLLMENT_KEY_PREFIX`）。
+
+**0.3 が書いていた理由は事実ではなかった**（0.4 で訂正）。「判別規則が app 側に
+2 つ複製されている」と書いたが、**FFI 2 本はどちらも ticket も Provisioning Key も
+引き換えない** —— `pair_with_code` だけで、やっているのはペアリングコードの
+正規化である（`portal-client-ffi/src/lib.rs:205`,
+`isekai-client-ffi/src/lib.rs:727`）。3 分岐が実在するのは 1 箇所、
+`portal-client/src/main.rs:743`, `:1258`（`what_it_is`）だけである。
+
+残る理由は弱い: **面に dispatch が無い**こと —— 材料は公開されているのに、
+「この文字列を引き換える」1 本が無いので、SDK の利用者は `what_it_is` 相当を
+自分で書く。足すなら **Enrollment Key を弾く**必要もある（引き換えられない
+ものが 4 つ目の接頭辞として存在する）。→ **D11**。
 
 ```rust
 sdk.redeem(input).await?;   // 既存 3 つは残す
 ```
 
-**この文書の決定（§0 の「決めること」）: 足す。** 3 つを畳むのではなく 4 つ目を足す。
-QR から来た 1 本の文字列を扱うのは FFI 2 本が両方やっていることで、
-判別規則が app 側に 2 つ複製されている。
+**D11 — `redeem` 1 本を足すか**
+
+| | 選択肢 | 得るもの | 失うもの |
+| --- | --- | --- | --- |
+| A | 足す（3 つは残す）。Enrollment Key は弾く | QR の 1 本を扱う経路が面にある。`what_it_is` 相当を各自が書かなくて済む | 5 つ目の名前。重複の除去にはならない（複製は無かった） |
+| B | 足さない。`secret_prefix` で各自が分ける | 面が増えない | 分岐が利用者ごとに増える。弾くべき 4 つ目を各自が思い出す必要がある |
+
+**推奨 A。** 理由は 0.3 が書いたものより弱いが、`portal-client` が実際に
+`secret_prefix` + `what_it_is` を書いている以上、**2 人目の利用者も同じものを書く**。
+ただし「重複を消す」ではなく「dispatch を面に置く」と理由を言い直す。
 
 ### 3.5 繋ぐ — 2 段で出す
 
-FFI 2 本が収斂した 4 概念の 4 つ目は「**ローカルポートを得て切る**」だった
-（api_review §3.3）。一方 `camera-core` は QUIC のストリームとデータグラムを
+FFI 2 本が収斂した 4 概念は「**鍵を作る / 相手と繋がる / ローカルポートを得る /
+切る**」で（api_review §3.3）、3 つ目と 4 つ目がこの群にあたる。一方 `camera-core` は QUIC のストリームとデータグラムを
 直接使う。どちらも実在する利用で、同じ面では収まらない。
 
 ```rust
@@ -242,25 +311,43 @@ let session = sdk.connect(peer).session().await?;            // InitiatorSession
 
 | | 選択肢 | |
 | --- | --- | --- |
-| A | SDK の `connect` の引数に出す | **決定**。固定値はアプリの決定であって SDK の既定ではない |
+| A | 利用者が与えられるようにする | **決定**。固定値はアプリの決定であって SDK の既定ではない |
 | B | 既定のまま隠す | |
 
-**この決定が作った段取り**: `portal-client-ffi` の `connect` の**シグネチャが変わる**
-（固定値 2 つが引数になる）。Kotlin / Swift の呼び出し側に届く変更なので、
-§7 の「FFI を facade に載せ替える」段と**同時に**出す。先に出すと FFI だけが
-2 度変わる。
+**どこに出すか（0.4 で訂正）**: `connect` の引数ではない。両方とも `P2pConfig` の
+フィールドで、**接続より前**に消費される —— `device_name` は登録と enroll
+（`isekai-p2p/src/config.rs:367`, `:588`）、`narrowing` はトークン発行
+（同 `:318`, `:419`）。§3.1 が `P2pConfig` を `Sdk::open` に渡しているので、
+**出す場所はそこ**で足りる。`connect` ごとの引数にすると、呼び出しごとに
+トークンを再発行する話になってしまう。
+
+**段取り**: `portal-client-ffi` の固定値 2 つは `build_p2p_config`
+（`portal-client-ffi/src/lib.rs:141`, `:144`）にあり、これは `pair_with_code`
+（`:191`）と `connect`（`:448`）の**両方**に効く。したがって動くのは
+`connect` のシグネチャ 1 本ではなく FFI の設定の形で、§7 の載せ替えと
+**同時に**出す。先に出すと FFI だけが 2 度変わる。
 
 ### 3.6 点検 — 要約を足し、低位は `low` に残す（§10-3 への答え）
 
 portal が実際に使っているのは `relay_rtt::measure` /
-`observe_families` / `list_relays`（`portal-client/src/main.rs:1133`, `:1147`, `:1157`）。
+`list_relays` / `measure` / `observe_families`
+（`portal-client/src/main.rs:1133`, `:1147`, `:1157` — この順）。
 返るのは `RelayRttSample` と `FamilyObservation` で、どちらも測定器の語彙である。
 
 ```rust
-sdk.inspect().relays().await?;   // RelayView { url, rtt, families, reachable }
-sdk.inspect().paths()?;          // PathView { carrying, reserve: Vec<PathView> }
+sdk.inspect().relays().await?;   // Option<Vec<RelayView>> — None は「近さで選ばない」
+sdk.inspect().paths()?;          // Paths { carrying: PathView, reserve: Vec<PathView> }
 sdk.inspect().observed()?;       // ObservedAddresses（既存の型）
 ```
+
+**三状態を潰さないこと**（0.4 で訂正）: `list_relays` は
+`Ok(None)`（このプロキシは近さでリレーを選ばない）と**空の一覧**（登録リレーが無い）を
+区別し、`portal-client` はそれぞれ別の文を出す（`main.rs:1133`–`:1144`）。
+要約が `Vec` 1 本だとこの区別が消えるので、`Option<Vec<_>>` のまま出す。
+
+**同期で読めるものは同期**（D3 との整合）: D3 = A が言う `async fn` は
+**網に触るもの**である。`paths()` と `observed()` は手元の状態を読むだけなので
+同期でよく、`relays()` は測るので `async`。
 
 **この文書の決定: 要約を足し、低位の型は消さない。** `ProbeOptions` の調整は面に残す
 （surface §5 が「要るのは読む面と `ProbeOptions`」と書いている）。
@@ -293,8 +380,11 @@ sdk.inspect().observed()?;       // ObservedAddresses（既存の型）
   待受けや通知の購読に締め切りは無く、終わらせ方は `close()`（D8）と
   キャンセルである。ここを混ぜると「接続が 60 秒で切れる SDK」になる。
 - 締め切り超過は `Outcome` に材料が無い唯一の失敗（surface §9）なので、
-  **分類を 1 つ足す**必要がある。`error_type.md` の 8 種に 9 つ目を足すのではなく、
-  締め切りは SDK 側の読みとして出す（下層は何も知らないままでよい）。
+  **読みは既にある**: `Unreachable::Deadline { waited }`
+  （`isekai-p2p-core/src/outcome.rs:110`）。その doc が「**Nothing produces this
+  yet**」と書いているとおり、足りないのは分類ではなく**それを作る側**である。
+  締め切りは `error_classification.md` の 8 種の **#8** で（同 §5 の表、材料「なし」）、
+  9 つ目を足す話ではない。facade が自分の締め切りで `Deadline` を作る。
 
 **D8 — 終了順序（api_review §5.2）**
 
@@ -358,8 +448,21 @@ A の形は `SessionObserver { on_state, on_path, on_rtt }` で、
 **facade だけが semver を約束し、内部 2 クレートはワークスペース版のまま**。
 外に出す面と内部の面に別の寿命を与える、というのが D2 = B を選んだ理由そのものである。
 
-残るのは facade の最初の版をどう置くかだけで、これは実装時の判断になる
-（`0.1.0` から始めるか、ワークスペースに合わせて `0.10.x` から始めるか）。
+**そのために要る例外（0.4 で明記）**: `rust/Cargo.toml` は
+「**一つの版をワークスペース全体で**。すべては単一のタグで切られる」と書いていて、
+各メンバは `version.workspace = true` でそれに従っている。facade が自分の線を
+引くなら、**facade だけが `version.workspace` を使わない**という例外になる。
+例外を作る判断そのものは D2 = B に含まれるが、ワークスペースの規則に
+一行書き足す必要がある。
+
+**crates.io には今出せない**: 依存に git-rev 固定の `h3` 系 3 本
+（`rust/Cargo.toml:39`–`:41`）と、submodule を指す path 依存
+（`axum-h3`, `h3-util`, `msquic-async`、同 `:25`, `:42`, `:52`）がある。
+したがって「外に出す」は当面 **git / vendored での利用**を意味し、
+semver はその上での約束である。publish を望むなら依存の形を先に変える話になる。
+
+残るのは facade の最初の版だけで、これは実装時の判断になる
+（`0.1.0` か、ワークスペースに合わせた `0.10.x` か）。
 **面が固まる前に `1.0` を約束しない**、という点だけ先に書いておく。
 
 ### 4.4 FFI 2 本（Q7）
@@ -387,17 +490,23 @@ A。2 本は**別のアプリの都合**（frame sink があるかどうか、�
   | B | facade が `low` として再輸出する | 入口が 1 つ | 約束していない面が facade の名前空間に入る。semver の線が曖昧になる |
 
   **決定: A。** facade を足した理由は「約束する面を切り出す」ことなので、
-  約束しないものを同じクレートに入れると理由が消える。`camera-core` の
-  `DatapathHook` 利用はまさにこの「降りる」側で、repo 内の依存なら 2 クレートでも
-  不便はない。外部利用者から要求が出たら B へ上げる。
+  約束しないものを同じクレートに入れると理由が消える。repo 内の依存なら
+  2 クレートでも不便はない。外部利用者から要求が出たら B へ上げる。
+
+  **「降りる」側の例を 0.4 で差し替えた**: `DatapathHook` を挙げていたが、
+  **本番の利用者はいない** —— `camera-core/examples/validation_loss.rs` と
+  `portal-core/tests/loopback.rs` だけで、`channel-masque` 自身の doc も
+  「a test instrument」と書いている（api_review §3.4 も「テストと example のみ」）。
+  `camera-core` が低位に留まる本当の理由は §3.5 段 2 の **QUIC 面**（ストリームと
+  データグラム）である。
 
   **範囲の限定**（D8 = C1 との整合、§3.7）: ここで言う「低位」は
   **データパスと bind の内部**である。`shutdown_msquic` / `drain_msquic` は
-  利用者が守る契約なので facade 側に出す。`camera-core` は `DatapathHook` のために
-  `isekai-p2p` に直接依存したままになり、repo 内では facade と 2 本が同居する。
+  利用者が守る契約なので facade 側に出す。`camera-core` は §3.5 段 2 の QUIC 面の
+  ために `isekai-p2p` に直接依存したままになり、repo 内では facade と 2 本が同居する。
 - **計測の駆動**: `measure_for_connect` は接続経路が内部で呼ぶ（surface §5）。
 
-## 6. 判断の一覧 — すべて決定済み
+## 6. 判断の一覧
 
 選んだ理由は各節にある。ここは**何が確定したか**だけを書く。
 
@@ -406,12 +515,19 @@ A。2 本は**別のアプリの都合**（frame sink があるかどうか、�
 | D1 | ハンドルの所有（Q4） | **C** 入口だけ | 7 群すべての第一引数は `Sdk`。`close()` は msquic を閉じない |
 | D2 | クレートの見せ方 | **B** facade クレート | semver は facade だけが約束。`agent` は載せ替えまで残す |
 | D3 | 非同期の形 | **A** async | facade は `async fn`。ランタイムは利用側のもの |
-| D4 | サインインの駆動 | **A** 受け取るだけ | `AssertionSource` を trait として出す（自前のトークン源が入る） |
+| D4 | サインインの駆動 | **A** 受け取るだけ | `Auth0TokenSource` と `AssertionSource` を**両方** trait として出す |
 | D5 | revoke の `Reading` | **A** 揃える（確認が先） | 到達可能性の確認 → 厳しい側へ揃える → 確認できない分だけ文書化 |
-| D6 | `Narrowing` / `device_name` | **A** 出す | `portal-client-ffi` のシグネチャが変わる。FFI 載せ替えと同時 |
-| D7 | 締め切り（Q3） | **C** ハンドル既定＋上書き | 既定は 30 s / 60 s。締め切りは要求と応答にかかる。分類が 1 つ増える |
+| D6 | `Narrowing` / `device_name` | **A** 出す | `P2pConfig` のフィールドとして `Sdk::open` に出す（`connect` の引数ではない）。FFI は設定の形が動くので載せ替えと同時 |
+| D7 | 締め切り（Q3） | **C** ハンドル既定＋上書き | 既定は 30 s / 60 s。読みは既にある（`Unreachable::Deadline`）ので、要るのは作る側 |
 | D8 | 終了順序 | **C1** 自分のセッションだけ | msquic を閉じるのはプロセスの持ち主。`shutdown`/`drain` は facade に出す |
-| D9 | 低位の面の再輸出 | **A** 出さない | 「低位」はデータパスと bind の内部。`camera-core` は 2 本に依存したまま |
+| D9 | 低位の面の再輸出 | **A** 出さない | 「低位」はデータパスと bind の内部。`camera-core` は QUIC 面のため 2 本に依存したまま |
+
+0.4 のレビューで前提が動き、**判断が 2 つ増えた**。
+
+| | 判断 | 選択肢 | 推奨 | 決まらないと止まるもの |
+| --- | --- | --- | --- | --- |
+| D10 | `list_grants` / `revoke_grant` の名前 | facade を唯一に / `ListenerSession` を面に | **A** | §3.3 の読みの一貫性（`anyhow` が面に出るか） |
+| D11 | `redeem` 1 本を足すか | 足す（Enrollment Key は弾く）/ 足さない | **A** | §3.4 と §7-3 |
 
 Q5（通知）と Q7（FFI 統合）は §4.2 / §4.4 に答えがあり、`FrameSink` という先例が
 あるので**判断ではなく作業**である。Q2 と Q6 は既決（§0、§4.3）。
@@ -419,18 +535,25 @@ Q5（通知）と Q7（FFI 統合）は §4.2 / §4.4 に答えがあり、`Fram
 
 ## 7. 作る順
 
-判断は尽きているので、以下は作業の順である。**各段がそれ自体で出せる**ように切った。
+D1–D9 は決まっているので、以下は作業の順である。**各段がそれ自体で出せる**ように
+切った。D10 は段 2 の中で、D11 は段 3 の中で決めれば足りる（それ以前を止めない）。
 
 1. **facade クレートの骨格** — `Sdk::open` / `async fn` / `Deadlines` の既定と、
-   `AssertionSource` の再輸出、`shutdown` / `drain`（D1, D2, D3, D4, D7, D8, D9）。
-   入口の形がここで固まる。中身は空でよい。
+   `Auth0TokenSource` / `AssertionSource` の再輸出、`shutdown` / `drain`
+   （D1, D2, D3, D4, D7, D8, D9）。入口の形がここで固まる。中身は空でよい。
+   `version.workspace` の例外（§4.3）もここで入れる。
 2. **群アクセサ** — §3.2 / §3.3。**素通しのみで意味論は足さない**ので機械的に進む。
-3. **`redeem` 1 本**（§3.4）と**点検の要約**（§3.6）。どちらも足すだけで、
-   既存の面を変えない。
+   **D10**（`list_grants` / `revoke_grant` の名前）はここで決める。
+3. **`redeem` 1 本**（§3.4、**D11** をここで決める）と**点検の要約**（§3.6）。
+   どちらも足すだけで、既存の面を変えない。
 4. **ポート面**（§3.5 段 1）。FFI 2 本が持っている形を facade に移す段で、
    ここから下は FFI に届く。
-5. **FFI 2 本を facade に載せ替える** + **D6 の 2 引数**を同時に出す（§3.5）。
+5. **FFI 2 本を facade に載せ替える** + **D6 の 2 項目**を同時に出す（§3.5）。
    Kotlin / Swift に届く変更はこの 1 回にまとめる。
+   **`portal-client-ffi` は自分のワークスペース**で、自分の tracked な
+   `Cargo.lock` を持つ（`rust/Cargo.toml` がその理由を書いている: 古いままだと
+   タグを切った後に `cargo build --locked` が落ちる —— 0.7.0 がそれで FFI を
+   壊して出た）。facade を向け直す**同じ段でロックを作り直す**。
 6. **通知を `portal-client-ffi` に広げる**（§4.2）。`FrameSink` の一般化。
 7. **`Reading` 揃え**（D5）。先に 3 ルートの `409` の到達可能性を確かめる。
    揃った分だけ面に出し、残りは差を文書化する。
