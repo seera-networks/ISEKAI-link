@@ -44,6 +44,12 @@ pub use isekai_p2p::{
     AssertionSource, Auth0TokenSource, Credential, Enrollment, Narrowing, P2pConfig,
     StaticAuth0Token,
 };
+// **The key has to be loadable, not just generatable.** Without this a caller
+// that depends on the facade alone reaches only `EndpointKey::generate()` — a
+// fresh Endpoint identity, and therefore a fresh registration, on every start —
+// or `from_pkcs8_pem`, whose error type is re-exported nowhere. A facade that
+// forces a second dependency for one function is not the facade D2 = B chose.
+pub use isekai_p2p::load_or_generate_key;
 // **Both credential seams go out, and both are traits** (D4 = A). `Auth0` is
 // the path a person signs in on and `AssertionSource` the one an unattended
 // workload proves itself on; exporting only one of them would leave a caller
@@ -65,7 +71,14 @@ pub use isekai_p2p::agent::{
 /// **A deadline covers a request and its answer, not the life of a session.**
 /// A session ends through [`Sdk::close`] or cancellation; a deadline on one
 /// would read as "this SDK drops a connection after sixty seconds".
+/// **Not exhaustively constructible, deliberately.** §7's later stages add
+/// surface — listening, inspection — and a third deadline with it. With a
+/// struct literal reachable from outside, that addition would break every
+/// caller that wrote `Deadlines { redeem, connect }` and force a major bump on
+/// the crate that exists to avoid exactly that. Build from
+/// [`Deadlines::default`] and the setters below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Deadlines {
     /// Redeeming a pairing code, a ticket or a provisioning key.
     pub redeem: Duration,
@@ -79,6 +92,20 @@ impl Default for Deadlines {
             redeem: Duration::from_secs(30),
             connect: Duration::from_secs(60),
         }
+    }
+}
+
+impl Deadlines {
+    /// How long to wait for a redemption.
+    pub fn with_redeem(mut self, redeem: Duration) -> Self {
+        self.redeem = redeem;
+        self
+    }
+
+    /// How long to wait for a peer.
+    pub fn with_connect(mut self, connect: Duration) -> Self {
+        self.connect = connect;
+        self
     }
 }
 
@@ -106,9 +133,15 @@ impl std::fmt::Debug for Sdk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sdk")
             .field("identity_url", &self.config.identity_url)
+            // Printed because it is the misconfiguration a `{:?}` is for:
+            // `true` against an Identity API serving only h1/h2 fails in a way
+            // the URL alone cannot explain.
+            .field("identity_http3", &self.config.identity_http3)
             .field("proxy_url", &self.config.proxy_url)
             .field("protocol", &self.config.protocol)
             .field("device_name", &self.config.device_name)
+            .field("token_ttl", &self.config.token_ttl)
+            .field("narrowing", &self.config.narrowing)
             .field("credential", &format_args!("<redacted>"))
             .field("key", &format_args!("<redacted>"))
             .field("deadlines", &self.deadlines)
@@ -156,18 +189,36 @@ impl Sdk {
     /// Ending the process's use of the stack is [`shutdown`] or [`drain`], and
     /// that judgement belongs to whoever owns the process.
     ///
+    /// `true` if everything this handle owned finished within `timeout`.
+    /// **The answer is the point**: its siblings [`shutdown`] and [`drain`]
+    /// return one because "did it finish?" is the caller's decision, and a
+    /// relay lease left reserved because a drain did not complete is a failure
+    /// nobody would otherwise hear about. Returning `()` here and adding the
+    /// answer later would break the callers who wrote `sdk.close(t).await;`.
+    ///
+    /// **Idempotent, and shared between clones.** [`Sdk`] is `Clone`, and what
+    /// a handle owns is owned by all of its clones — so closing one closes it
+    /// for every clone, and closing twice is not an error.
+    ///
     /// **Today it owns nothing**, because the sessions arrive with §7's later
-    /// stages; it returns immediately. It is here now because the contract is
-    /// the handle's, and because a crate that promises semver cannot grow a
-    /// `close` later without breaking the callers that did not have one.
-    pub async fn close(&self, _timeout: Duration) {}
+    /// stages, so it returns `true` at once: everything it owned — nothing —
+    /// finished.
+    pub async fn close(&self, _timeout: Duration) -> bool {
+        true
+    }
 }
 
 /// Drain the process's msquic registration and close it.
 ///
-/// `true` if it drained within `timeout`; it is closed either way. The caller
-/// that owns the process calls this on the way out, after the last [`Sdk`] is
-/// done with (`p2p_sdk_api_review.md` §5.2).
+/// `true` if it drained within `timeout`, **and closing only happens then**:
+/// on timeout it logs that live handles remain, skips `RegistrationClose` and
+/// leaks the registration on purpose, so nothing below can block an exit
+/// (`isekai-p2p-core/src/transport.rs:500`). So `false` does not mean "closed
+/// anyway" — it means the stack is still live, and a caller that has to be
+/// certain nothing is running should not return from `main` normally on it.
+///
+/// The caller that owns the process calls this on the way out, after the last
+/// [`Sdk`] is done with (`p2p_sdk_api_review.md` §5.2).
 pub async fn shutdown(timeout: Duration) -> bool {
     isekai_p2p::agent::shutdown_msquic(timeout).await
 }
@@ -176,8 +227,10 @@ pub async fn shutdown(timeout: Duration) -> bool {
 ///
 /// For the path that leaves the process without running destructors: the
 /// registration is deliberately leaked whether the drain succeeded or not, so
-/// nothing below can block an exit. Prefer [`shutdown`] where the process
-/// carries on.
+/// nothing below can block an exit. `true` if it drained within `timeout`.
+/// Prefer [`shutdown`] where the process carries on — the difference between
+/// the two is only whether a *successful* drain is followed by
+/// `RegistrationClose`.
 pub async fn drain(timeout: Duration) -> bool {
     isekai_p2p::agent::drain_msquic(timeout).await
 }
@@ -205,13 +258,37 @@ mod tests {
         let sdk = Sdk::open(config.clone());
         assert_eq!(sdk.deadlines(), Deadlines::default());
 
-        let patient = Deadlines {
-            redeem: Duration::from_secs(5),
-            connect: Duration::from_secs(600),
-        };
+        // Built the way a caller outside this crate has to: `Deadlines` is
+        // `#[non_exhaustive]`, so there is no struct literal to write.
+        let patient = Deadlines::default()
+            .with_redeem(Duration::from_secs(5))
+            .with_connect(Duration::from_secs(600));
         let sdk = sdk.with_deadlines(patient);
         assert_eq!(sdk.deadlines(), patient);
         assert_eq!(sdk.config().proxy_url, config.proxy_url);
+    }
+
+    /// **The setters are the only way in from outside**, so they have to leave
+    /// the other field alone — a `with_redeem` that reset `connect` to the
+    /// default would be silently wrong for every caller that set both.
+    #[test]
+    fn a_setter_changes_one_deadline_and_leaves_the_other() {
+        let short = Deadlines::default().with_redeem(Duration::from_secs(1));
+        assert_eq!(short.redeem, Duration::from_secs(1));
+        assert_eq!(short.connect, Deadlines::default().connect);
+
+        let both = short.with_connect(Duration::from_secs(2));
+        assert_eq!(both.redeem, Duration::from_secs(1));
+        assert_eq!(both.connect, Duration::from_secs(2));
+    }
+
+    /// Closing a handle that owns nothing answers `true`, and twice is not an
+    /// error — the contract the doc comment states.
+    #[tokio::test]
+    async fn closing_an_idle_handle_answers_true_and_is_idempotent() {
+        let sdk = Sdk::open(config());
+        assert!(sdk.close(Duration::from_secs(1)).await);
+        assert!(sdk.close(Duration::from_secs(1)).await);
     }
 
     /// **The handle prints without printing the token.** `P2pConfig` has no
@@ -224,6 +301,8 @@ mod tests {
 
         assert!(printed.contains("link.example:6443"), "{printed}");
         assert!(printed.contains("identity.example:9443"), "{printed}");
+        assert!(printed.contains("identity_http3"), "{printed}");
+        assert!(printed.contains("narrowing"), "{printed}");
         assert!(printed.contains("deadlines"), "{printed}");
         assert!(
             !printed.contains(THE_TOKEN),

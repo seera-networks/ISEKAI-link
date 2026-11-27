@@ -14,11 +14,18 @@ edition = "2021"
 name = "isekai_sdk"
 path = "src/lib.rs"
 
-# **One dependency, on purpose.** Everything this crate offers comes from
-# `isekai-p2p` (which re-exports what it needs of `isekai-p2p-core`), so the
-# facade cannot grow a surface the layers below do not have.
+# **One dependency, and it is literally one.** Everything this crate offers
+# comes from `isekai-p2p` (which re-exports what it needs of
+# `isekai-p2p-core`), so the facade cannot grow a surface the layers below do
+# not have. It had `tokio` beside it for one revision, which nothing used: the
+# two `async fn`s here only forward a future, and `Duration` comes from `std`.
+# A dependency a vendored consumer pulls for nothing is worth deleting.
 [dependencies]
 isekai-p2p = { workspace = true }
-tokio = { workspace = true }
 
+# **Only to await an `async fn` in a test.** Building the facade needs no
+# runtime — the two `async fn`s forward a future and `Duration` is `std` — so a
+# consumer pulls no runtime through this crate, which is the point of the line
+# above.
 [dev-dependencies]
+tokio = { workspace = true }

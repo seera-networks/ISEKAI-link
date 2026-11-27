@@ -1,8 +1,9 @@
 # SDK の設計 — 7 群から面を決める
 
 - status: 設計（§9 Q1 の答え）。**D1–D11 すべて決定済み**。§7 段 1 は実装済み
-  （`rust/isekai-sdk`）。実装して素案を 1 点正した — §0
-- version: 0.6
+  （`rust/isekai-sdk`）。実装とそのレビューで素案を 1 点正し、前方互換のために
+  形を 3 点固めた — §0
+- version: 0.7
 - 対象: `1d63993`（`main`, v0.10.2）
 - 前提:
   - `docs/p2p_sdk_surface_from_portal.md` §7 — **必要な面の 7 群**。本文書の入力
@@ -60,6 +61,24 @@ D8 = C1、D9 = A。いずれも推奨どおり。
 
 **0.6 で実装が正したこと**: 素案 1 点 —— `Sdk::open` は `P2pConfig` 1 つを取り、
 `async` でも `Result` でもない（§3.1）。
+
+**0.7 — semver が形を決めた 3 点**（段 1 のレビューで出た）。D2 = B が「facade が
+約束する」と決めた以上、**後から足せないものを先に置く**必要がある:
+
+- `Deadlines` は `#[non_exhaustive]`。段 2 以降が 3 つ目の締め切りを足したとき、
+  構造体リテラルを書いた利用者が壊れる＝major を強いられるのを避ける。
+  外からは `Deadlines::default().with_redeem(..)` で組む。
+- `close` は `bool` を返す。「時間内に終わったか」は呼び出し側の判断で、
+  `shutdown` / `drain` が `bool` を返すのと同じ理由である（終わらなかった drain は
+  リレーのリースを予約したまま残す）。戻り値を後から足すのも破壊的変更になる。
+- `tokio` は dev-dependency だけ。facade のビルドにランタイムは要らないので、
+  利用者が facade 経由でランタイムを引き込むことはない。
+
+**CI の穴も段 1 で塞いだ**: 新クレートを建てるジョブが無く、`isekai-p2p` の
+再輸出が変わっても気付けない状態だった（CI の cargo 呼び出しは全部 `-p` 指定）。
+`migration-spike.yml` のテストに `-p isekai-sdk` を足し、両トリガーの
+`paths:` に `rust/isekai-sdk/**` を入れた（closure チェックは通る —— facade の
+依存は `isekai-p2p` の部分集合）。
 
 **既決として扱うもの**（再提案しない）:
 
