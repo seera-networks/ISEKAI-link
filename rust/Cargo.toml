@@ -1,5 +1,5 @@
 [workspace]
-members = ["agent", "camera-client", "camera-core", "camera-server", "camera-ui", "channel-masque", "isekai-client-ffi", "isekai-p2p", "isekai-p2p-core", "privacy", "utils", "webrtc-app",
+members = ["agent", "camera-client", "camera-core", "camera-server", "camera-ui", "channel-masque", "isekai-client-ffi", "isekai-p2p", "isekai-p2p-core", "isekai-sdk", "privacy", "utils", "webrtc-app",
     "portal-core", "portal-server", "portal-client",
 ]
 resolver = "3"
@@ -16,6 +16,11 @@ package.edition = "2021"
 # `cargo build --locked` in that directory fails on the tag. Both were missed
 # at 0.7.0 and caught in review; it is written down here so the next bump does
 # not rediscover it.
+# **`isekai-sdk` is the other exception, and the only one inside this
+# workspace.** It promises semver for the surface it offers while the crates
+# behind it do not, so it carries its own version rather than inheriting
+# (`docs/p2p_sdk_design.md` §4.3). A release tag moves everything below it; the
+# facade's number moves when its surface does.
 package.version = "0.10.2"
 
 [workspace.dependencies]

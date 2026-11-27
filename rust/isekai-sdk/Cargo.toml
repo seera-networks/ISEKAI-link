@@ -1,0 +1,31 @@
+[package]
+name = "isekai-sdk"
+# **The one member that does not inherit the workspace version.** The facade
+# promises semver and the crates behind it do not, which is the whole reason it
+# exists (`docs/p2p_sdk_design.md` §4.3, D2 = B). `rust/Cargo.toml` records the
+# "one version for the whole workspace" rule this is the exception to.
+#
+# `0.1.0` rather than `0.10.x`: a line of its own makes the exception visible,
+# and the surface is not settled — no `1.0` is promised until it is.
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "isekai_sdk"
+path = "src/lib.rs"
+
+# **One dependency, and it is literally one.** Everything this crate offers
+# comes from `isekai-p2p` (which re-exports what it needs of
+# `isekai-p2p-core`), so the facade cannot grow a surface the layers below do
+# not have. It had `tokio` beside it for one revision, which nothing used: the
+# two `async fn`s here only forward a future, and `Duration` comes from `std`.
+# A dependency a vendored consumer pulls for nothing is worth deleting.
+[dependencies]
+isekai-p2p = { workspace = true }
+
+# **Only to await an `async fn` in a test.** Building the facade needs no
+# runtime — the two `async fn`s forward a future and `Duration` is `std` — so a
+# consumer pulls no runtime through this crate, which is the point of the line
+# above.
+[dev-dependencies]
+tokio = { workspace = true }

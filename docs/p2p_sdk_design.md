@@ -1,7 +1,9 @@
 # SDK の設計 — 7 群から面を決める
 
-- status: 設計（§9 Q1 の答え）。**D1–D11 すべて決定済み**。実装はまだ無い
-- version: 0.5
+- status: 設計（§9 Q1 の答え）。**D1–D11 すべて決定済み**。§7 段 1 は実装済み
+  （`rust/isekai-sdk`）。実装とそのレビューで素案を 1 点正し、前方互換のために
+  形を 3 点固めた — §0
+- version: 0.7
 - 対象: `1d63993`（`main`, v0.10.2）
 - 前提:
   - `docs/p2p_sdk_surface_from_portal.md` §7 — **必要な面の 7 群**。本文書の入力
@@ -56,6 +58,27 @@ D8 = C1、D9 = A。いずれも推奨どおり。
 小さい訂正も同時に入れた: 4 概念の 4 つ目は「切る」（「ローカルポートを得て切る」ではない）、
 点検の引用順、`paths()` / `observed()` は同期でよい理由（D3 は網に触るものの話）、
 §7-5 は `portal-client-ffi` が自分のワークスペースと lock を持つこと。
+
+**0.6 で実装が正したこと**: 素案 1 点 —— `Sdk::open` は `P2pConfig` 1 つを取り、
+`async` でも `Result` でもない（§3.1）。
+
+**0.7 — semver が形を決めた 3 点**（段 1 のレビューで出た）。D2 = B が「facade が
+約束する」と決めた以上、**後から足せないものを先に置く**必要がある:
+
+- `Deadlines` は `#[non_exhaustive]`。段 2 以降が 3 つ目の締め切りを足したとき、
+  構造体リテラルを書いた利用者が壊れる＝major を強いられるのを避ける。
+  外からは `Deadlines::default().with_redeem(..)` で組む。
+- `close` は `bool` を返す。「時間内に終わったか」は呼び出し側の判断で、
+  `shutdown` / `drain` が `bool` を返すのと同じ理由である（終わらなかった drain は
+  リレーのリースを予約したまま残す）。戻り値を後から足すのも破壊的変更になる。
+- `tokio` は dev-dependency だけ。facade のビルドにランタイムは要らないので、
+  利用者が facade 経由でランタイムを引き込むことはない。
+
+**CI の穴も段 1 で塞いだ**: 新クレートを建てるジョブが無く、`isekai-p2p` の
+再輸出が変わっても気付けない状態だった（CI の cargo 呼び出しは全部 `-p` 指定）。
+`migration-spike.yml` のテストに `-p isekai-sdk` を足し、両トリガーの
+`paths:` に `rust/isekai-sdk/**` を入れた（closure チェックは通る —— facade の
+依存は `isekai-p2p` の部分集合）。
 
 **既決として扱うもの**（再提案しない）:
 
@@ -161,10 +184,21 @@ blocking にすると両方が損をする。FFI の blocking は既に 2 本で
 ### 3.1 身元 — 入口
 
 ```rust
-let sdk = Sdk::open(Credential::auth0(token_source), P2pConfig { .. }).await?;
+let sdk = Sdk::open(P2pConfig { credential, key, device_name, narrowing, .. });
 ```
 
 `Credential` と `P2pConfig` は既にある。サインインの扱いだけ判断が要る。
+
+**0.6 で素案を正した**（実装で分かった 1 点）: 0.5 までは
+`Sdk::open(Credential::auth0(..), P2pConfig { .. }).await?` と書いていたが、
+**`P2pConfig` は `credential` をフィールドに持つ**（`isekai-p2p/src/config.rs:31`）。
+資格情報を二重に渡す形だった。そして `open` は**網に触らない**ので
+`async` でも `Result` でもない —— 最初の呼び出しがスタックを開き、
+到達できない設定もそこで報告される。呼び出し側がまだ再試行するものを
+持っていない時点で失敗を返しても何もできない。
+
+これは D6 = A の置き場所の裏付けにもなっている: `device_name` と `narrowing` は
+`open` が受け取る同じ `P2pConfig` のフィールドである。
 
 **D4 — サインインを SDK が駆動するか**
 
