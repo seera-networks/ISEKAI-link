@@ -123,6 +123,14 @@ impl TokenError {
 /// it as `Done` would call a cross-tenant collision "already gone". The `404`
 /// is the same, and neither is what this reading is about.
 ///
+/// **One reading for every answer this call can return**, the enrolment and
+/// renewal routes' included, and the one answer whose meaning changes with the
+/// route never arrives here: a `409` that means "already registered" is
+/// absorbed inside `config`'s cells — `already_registered` reads it under its
+/// own `REGISTERING`, where `conflict` is `Missing::Done` — and comes out a
+/// success. The `409` that does escape is the cross-tenant collision, which
+/// this reads as `Rejected`, as it was read before.
+///
 /// `retryable_kinds` and `fixable_kinds` are empty: `429` and `503` are already
 /// waits by status, and no kind on this route asks to be read against its own.
 ///
