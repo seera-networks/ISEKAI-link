@@ -16,6 +16,46 @@ use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::enrollment::Identity;
 
+pub mod reading {
+    //! How this module's routes are read.
+    //!
+    //! **Beside the routes** (`p2p_sdk_design.md` D15): a [`Reading`] is the call
+    //! site saying what a status means *on this route*, and when every caller
+    //! writes its own, the same answer ends up read several ways. The long form of
+    //! that argument is in [`isekai_p2p_core::proxy::reading`], which these are the
+    //! Identity-side counterpart of; they sit beside the typed wrappers rather than
+    //! `IdentityClient`'s raw methods, because the wrappers are what a caller
+    //! reaches and what D12 gave a type to.
+    //!
+    //! **All three say nothing about absence.** [`Reading::gone_kinds`] spells out
+    //! why a `404` cannot be read by status — one with no problem+json body is also
+    //! what a wrong base path answers — and Identity has not been observed naming a
+    //! slug for absence on these routes. That includes [`REVOKE`]: `portal-core`
+    //! answers `Missing::Done` for its own revoke and keeps that on purpose,
+    //! because it is asking "did my registration land?" about an id it has just
+    //! registered itself, which is local knowledge this surface does not have.
+    use isekai_p2p_core::outcome::{Missing, Reading};
+
+    /// The reading every route in this module shares today.
+    const PLAIN: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::list`] — `GET /v1/endpoints`.
+    pub const LIST: Reading = PLAIN;
+
+    /// [`super::get`] — `GET /v1/endpoints/{id}`.
+    pub const GET: Reading = PLAIN;
+
+    /// [`super::revoke`] — `DELETE /v1/endpoints/{id}`.
+    pub const REVOKE: Reading = PLAIN;
+}
+
 macro_rules! on_transport {
     ($identity:expr, |$client:ident| $body:expr) => {{
         if $identity.http3 {

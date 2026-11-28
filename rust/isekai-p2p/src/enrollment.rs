@@ -17,6 +17,44 @@ use isekai_p2p_core::identity::{
 use isekai_p2p_core::proxy::ControlPlaneTransport;
 use isekai_p2p_core::transport::MasqueH3Transport;
 
+pub mod reading {
+    //! How this module's routes are read.
+    //!
+    //! **Beside the routes** (`p2p_sdk_design.md` D15), for the reason
+    //! [`isekai_p2p_core::proxy::reading`] gives at length, and beside the typed
+    //! wrappers rather than `IdentityClient`'s raw methods — the wrappers are what
+    //! a caller reaches and what D12 gave a type to.
+    //!
+    //! **None of the four says anything about absence**, including [`REVOKE`]:
+    //! [`Reading::gone_kinds`] spells out why a `404` cannot be read by status, and
+    //! Identity has not been observed naming a slug for absence here. A guest
+    //! refused [`ISSUE`] by name arrives as an ordinary `insufficient-permission`
+    //! instead, which `crate::config::membership_advice` is what says so.
+    use isekai_p2p_core::outcome::{Missing, Reading};
+
+    /// The reading every route in this module shares today.
+    const PLAIN: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::issue`] — `POST /v1/enrollment-keys`.
+    pub const ISSUE: Reading = PLAIN;
+
+    /// [`super::list`] — `GET /v1/enrollment-keys`.
+    pub const LIST: Reading = PLAIN;
+
+    /// [`super::enrollments`] — `GET /v1/enrollment-keys/{id}/enrollments`.
+    pub const ENROLLMENTS: Reading = PLAIN;
+
+    /// [`super::revoke`] — `DELETE /v1/enrollment-keys/{id}`.
+    pub const REVOKE: Reading = PLAIN;
+}
+
 /// How to reach the Identity API for these calls.
 #[derive(Debug, Clone)]
 pub struct Identity {

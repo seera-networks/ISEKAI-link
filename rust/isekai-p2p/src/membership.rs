@@ -16,6 +16,32 @@ use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::enrollment::Identity;
 
+pub mod reading {
+    //! How this module's route is read.
+    //!
+    //! **Beside the route** (`p2p_sdk_design.md` D15), for the reason
+    //! [`isekai_p2p_core::proxy::reading`] gives at length.
+    //!
+    //! One route, and nothing to say about it that its status does not already
+    //! say: a membership either answers or is refused, and a refusal about the
+    //! membership itself is told apart by its slug in
+    //! `crate::config::membership_advice` rather than here.
+    use isekai_p2p_core::outcome::{Missing, Reading};
+
+    /// The reading every route in this module shares today.
+    const PLAIN: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::me`] — `GET /v1/me`.
+    pub const ME: Reading = PLAIN;
+}
+
 macro_rules! on_transport {
     ($identity:expr, |$client:ident| $body:expr) => {{
         if $identity.http3 {
