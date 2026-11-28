@@ -613,9 +613,16 @@ impl Made {
 /// different token; on these routes nothing is — whoever asks mints its own
 /// Endpoint Token and a refusal here is settled.
 ///
-/// The revoke routes are deliberately absent: whether their `409` is reachable
-/// is being established first (`p2p_sdk_design.md` D5), and a `Reading` written
-/// before that answer would be a guess with a constant's authority.
+/// **The seven agree, today.** Six of them are collections or plain creates,
+/// where a `404` or a `409` does not arise, and the seventh — the one that
+/// names a key — cannot read its `404` by status either (see
+/// [`reading::KEY_REDEMPTIONS`]). They are still seven constants and not one:
+/// each is named for a route, so the first route whose answers stop agreeing
+/// moves on its own, and a caller holding one can compare it with another.
+/// The revoke routes are the first that will not agree, which is why they are
+/// deliberately absent: whether their `409` is reachable is being established
+/// first (`p2p_sdk_design.md` D5), and a `Reading` written before that answer
+/// would be a guess with a constant's authority.
 pub mod reading {
     use crate::outcome::{Missing, Reading};
 
@@ -695,14 +702,19 @@ pub mod reading {
     /// [`super::ProxyClient::provisioning_redemptions`] —
     /// `GET /v1/peer/provisioning-keys/{key_id}/redemptions`.
     ///
-    /// **The one of the seven that names a thing**, so its `404` means that
-    /// thing is not here — [`Missing::Vanished`], which is "gone, and the
-    /// caller decides what that means". Not `Done`: nothing was being asked to
-    /// happen. And the record outlives the key it belongs to (§8.13.7), so a
-    /// revoked key still answers — a `404` is an id this Endpoint never had,
-    /// or no longer has at all.
+    /// **The one of the seven that names a thing**, and still not a `404` that
+    /// can be read by status. [`Reading::gone_kinds`] spells out why: *any*
+    /// `404` whose body is not problem+json — an intermediary's page, a wrong
+    /// base path, a proxy built without the route — arrives as `Problem {
+    /// status: 404, problem: None }`, and §8.13.7 is new enough that the last
+    /// of those is a live possibility. Reading it as
+    /// [`Missing::Vanished`](crate::outcome::Missing::Vanished) would tell a
+    /// caller "that key is not here" for a deployment that cannot answer at
+    /// all. The slug that *would* carry it is not named here because this route
+    /// has not been observed answering one, and a guess in a constant reads
+    /// like a fact.
     pub const KEY_REDEMPTIONS: Reading = Reading {
-        not_found: Missing::Vanished,
+        not_found: Missing::Unremarkable,
         conflict: Missing::Unremarkable,
         token_self_replacing: false,
         retryable_kinds: &[],
@@ -2284,9 +2296,7 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// a key is stopped because of a leak, a compromise or somebody leaving,
     /// and that is the moment "who came in on it" matters most.
     ///
-    /// Read with [`reading::KEY_REDEMPTIONS`], whose `404` is the one
-    /// [`Missing::Vanished`](crate::outcome::Missing::Vanished) among the
-    /// seven: this route names a key, and the others name collections.
+    /// Read with [`reading::KEY_REDEMPTIONS`].
     pub async fn provisioning_redemptions(
         &self,
         key_id: &str,

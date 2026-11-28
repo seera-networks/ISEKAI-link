@@ -10,7 +10,8 @@
 //!
 //! # What is settled, and where it is written down
 //!
-//! The design document records eleven decisions. The four that shape this file:
+//! The design document records fifteen decisions. The six that shape this
+//! file:
 //!
 //! - **The handle is the entry point, and the stack under it is shared**
 //!   (D1 = C). msquic's registration is one per process, so two [`Sdk`] values
@@ -25,17 +26,25 @@
 //!   `BindSession` and the rest stay in `isekai_p2p::agent`; a caller that
 //!   needs them depends on that crate directly, which keeps the promise this
 //!   crate makes the same size as the surface it offers.
+//! - **The token is this handle's to keep** (D13 = B). One Endpoint Token and
+//!   one control-plane client are cached and shared by every clone, because an
+//!   accessor that minted a token and built a MASQUE tunnel per call would pay
+//!   two round trips for a list.
+//! - **A failure says which layer it came from** (D15 = B). [`SdkError`] has an
+//!   arm for the token and an arm for the proxy, and both are read through
+//!   [`SdkError::outcome`]; the `Reading` each route is read under lives beside
+//!   the route, in [`reading`], so grouping the routes here adds no semantics.
 //!
 //! # What is not here yet
 //!
-//! The group accessors (§7's stage 2 onwards): `endpoints()`, `grants()`,
-//! `tickets()`, `provisioning_keys()`, `redeem()`, `connect()`, `listen()`,
-//! `inspect()`. This stage fixes the shape of the entry — the handle, the
-//! deadlines, the credential seams, the lifetime — because every one of those
-//! hangs off it and because adding any of this later would break a crate that
-//! promises semver.
+//! `grants().revoke()`, `tickets().revoke()` and
+//! `provisioning_keys().revoke()` — the three wait on D5, which settles how a
+//! `409` is read on those routes before a `Reading` is written for them. Then
+//! §7's later stages: `endpoints()`, `redeem()`, `connect()`, `listen()`,
+//! `inspect()`.
 
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -158,7 +167,8 @@ pub struct Sdk {
 struct Control {
     client: ProxyClient<MasqueH3Transport>,
     /// When the token stops being good for a whole call, not when it expires:
-    /// [`renew_delay`] keeps the margin that `isekai-p2p` renews on.
+    /// [`good_for`] keeps the margin `isekai-p2p` renews on, under a ceiling of
+    /// the token's own lifetime.
     stale_at: Instant,
 }
 
@@ -212,6 +222,16 @@ impl Sdk {
     }
 
     /// What this handle applies when a call does not name a deadline.
+    ///
+    /// **The issuer accessors apply neither of them**, and neither does
+    /// anything below this crate (`p2p_sdk_api_review.md` §5.3 found no request
+    /// timeout at all). The two numbers here are a redemption and a connect,
+    /// measured for those two waits by the FFIs; a control-plane request is a
+    /// third quantity nobody has measured, and inventing a default for it here
+    /// would be the one thing D7 = C set out to avoid. So a caller that needs
+    /// one wraps the call — `tokio::time::timeout(d, sdk.tickets().list())` —
+    /// and a `Deadlines` with a third field stays an addition this crate can
+    /// make without breaking anyone, which is what `#[non_exhaustive]` is for.
     pub fn deadlines(&self) -> Deadlines {
         self.deadlines
     }
@@ -240,10 +260,20 @@ impl Sdk {
     /// a handle owns is owned by all of its clones — so closing one closes it
     /// for every clone, and closing twice is not an error.
     ///
-    /// **Today it owns nothing**, because the sessions arrive with §7's later
-    /// stages, so it returns `true` at once: everything it owned — nothing —
-    /// finished.
+    /// **What it owns today is the control-plane client** — a MASQUE tunnel on
+    /// msquic, kept by the handle so that every accessor does not build one.
+    /// Dropping it is the whole of the work and does not wait, so the timeout
+    /// is not consulted and the answer is always `true`.
+    ///
+    /// **It has to be dropped for [`shutdown`] to close anything.**
+    /// `shutdown_msquic` waits for the registration to go idle and, when
+    /// something still holds a handle, logs "still has live handles", skips
+    /// `RegistrationClose` and answers `false`. A handle left in scope with a
+    /// cached tunnel under it is such a holder — so the documented order,
+    /// close the handles and then shut the stack down, is what lets
+    /// [`shutdown`] answer `true` at all.
     pub async fn close(&self, _timeout: Duration) -> bool {
+        self.forget();
         true
     }
 
@@ -286,24 +316,28 @@ impl Sdk {
     /// every reading reports the same way (`Outcome::of_proxy` answers
     /// `Unreachable` before it consults one), and carrying the caller's route
     /// keeps the error saying which call never happened.
+    ///
+    /// The flag says whether *this* call minted the token, which is what tells
+    /// a refusal of a cached token from a refusal of a fresh one — see
+    /// [`Sdk::call`].
     async fn control(
         &self,
         reading: &'static Reading,
-    ) -> Result<ProxyClient<MasqueH3Transport>, SdkError> {
+    ) -> Result<(ProxyClient<MasqueH3Transport>, Minted), SdkError> {
         if let Some(client) = self.unexpired() {
-            return Ok(client);
+            return Ok((client, Minted::No));
         }
         let token = isekai_p2p::issue_endpoint_token(&self.config).await?;
-        let stale_at = Instant::now() + isekai_p2p::config::renew_delay(Some(token.expires_in));
+        let stale_at = Instant::now() + good_for(token.expires_in);
         let mut held = self
             .control
             .lock()
             .expect("the control-plane lock is poisoned");
-        match held.as_mut() {
+        let client = match held.as_mut() {
             Some(control) => {
                 control.client.set_endpoint_token(&token.endpoint_token);
                 control.stale_at = stale_at;
-                Ok(control.client.clone())
+                control.client.clone()
             }
             None => {
                 let client = isekai_p2p::proxy_client(&self.config, &token.endpoint_token)
@@ -312,9 +346,57 @@ impl Sdk {
                     client: client.clone(),
                     stale_at,
                 });
-                Ok(client)
+                client
             }
+        };
+        Ok((client, Minted::Yes))
+    }
+
+    /// Make one control-plane call with the client this handle keeps.
+    ///
+    /// **The cache is dropped when the answer says it is spent**, which two
+    /// answers do.
+    ///
+    /// A `ProxyError::Transport` means the request did not get out, and the
+    /// client may be unusable for good: the MASQUE channel is a tower
+    /// `Buffer`, whose worker stores the first `poll_ready` error "so that
+    /// subsequent requests will also fail with the same error" and then closes
+    /// the queue (tower 0.5.3, `buffer/worker.rs`). Building the client reaches
+    /// nothing, so a handle that made its first call while the proxy was away
+    /// would otherwise keep that dead client — and every clone with it, since
+    /// the cache is shared — answering `Unreachable` with the same stale
+    /// message for the life of the process, long after the proxy came back.
+    ///
+    /// A `401` means the token is no longer accepted, which the margin did not
+    /// predict: a clock out by more than a minute, a host suspended between two
+    /// calls, a lifetime shorter than anything [`good_for`] can stay ahead of.
+    ///
+    /// **A `401` on a cached token is retried once.** The caller cannot mint
+    /// this handle's token for it, so answering `Reauthenticate` — "get another
+    /// credential" — for a credential that is fine would be this cache's
+    /// bookkeeping leaking out as advice. One fresh token, one retry; if that
+    /// is refused too, the refusal is the Endpoint's own and is reported as it
+    /// came.
+    async fn call<T, F, Fut>(&self, reading: &'static Reading, call: F) -> Result<T, SdkError>
+    where
+        F: Fn(ProxyClient<MasqueH3Transport>) -> Fut,
+        Fut: Future<Output = Result<T, ProxyError>>,
+    {
+        let (client, minted) = self.control(reading).await?;
+        let error = match call(client).await {
+            Ok(answer) => return Ok(answer),
+            Err(error) => error,
+        };
+        let worth_retrying = minted == Minted::No && token_refused(&error);
+        self.forget_if_spent(&error);
+        if !worth_retrying {
+            return Err(SdkError::proxy(error, reading));
         }
+        let (client, _) = self.control(reading).await?;
+        call(client).await.map_err(|again| {
+            self.forget_if_spent(&again);
+            SdkError::proxy(again, reading)
+        })
     }
 
     /// The cached client, while its token is still good for a whole call.
@@ -326,6 +408,61 @@ impl Sdk {
         let control = held.as_ref()?;
         (Instant::now() < control.stale_at).then(|| control.client.clone())
     }
+
+    /// Drop the cached client if this answer says it is spent.
+    fn forget_if_spent(&self, error: &ProxyError) {
+        if spent(error) {
+            self.forget();
+        }
+    }
+
+    /// Drop the cached client, so that the next call builds one.
+    fn forget(&self) {
+        *self
+            .control
+            .lock()
+            .expect("the control-plane lock is poisoned") = None;
+    }
+}
+
+/// Whether this handle minted the token the call is about to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Minted {
+    Yes,
+    No,
+}
+
+/// Whether this answer says the cached client is of no further use.
+///
+/// The two that do, for the reasons [`Sdk::call`] gives: a request that did not
+/// get out may have poisoned the channel under it, and a refused token is one
+/// this handle can replace. Everything else — a `403`, a `404`, a malformed
+/// body — is an answer about the *request*, and throwing the client away over
+/// it would turn one refusal into a new tunnel per call.
+fn spent(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::Transport(_)) || token_refused(error)
+}
+
+/// Whether the proxy refused the Endpoint Token itself.
+///
+/// By status: the control plane answers `401` when the token is missing,
+/// expired or not accepted, and a cached one being past its use is the only
+/// case of the three this handle can do something about on its own.
+fn token_refused(error: &ProxyError) -> bool {
+    matches!(error, ProxyError::Problem { status: 401, .. })
+}
+
+/// How long a token this handle just issued can be relied on.
+///
+/// [`renew_delay`](isekai_p2p::config::renew_delay) answers the renewal loop's
+/// question and keeps a floor under its answer — `RENEW_MIN`, so that a loop
+/// cannot busy-spin — and that floor is not an answer to *this* question. A
+/// `token_ttl` the caller set low, or one a server clamped, can expire inside
+/// it; so the token's own lifetime is the ceiling here, and the margin only
+/// ever makes the window shorter.
+fn good_for(expires_in: i64) -> Duration {
+    let lifetime = Duration::from_secs(expires_in.max(0) as u64);
+    isekai_p2p::config::renew_delay(Some(expires_in)).min(lifetime)
 }
 
 /// Why a control-plane call did not answer (D15 = B).
@@ -414,10 +551,17 @@ impl std::error::Error for SdkError {
 
 /// Everyone this Endpoint has let in (spec §8.8).
 ///
-/// **The facade is the only name for `list` and `revoke`** (D10 = A): the two
-/// on `ListenerSession` are plumbing for a running listener and answer with
+/// **The facade is the only name for these** (D10 = A): the two on
+/// `ListenerSession` are plumbing for a running listener and answer with
 /// `anyhow::Result`, and a second public name with a different reading is what
-/// `p2p_sdk_surface_from_portal.md` §4.3 warned about.
+/// `p2p_sdk_surface_from_portal.md` §4.3 warned about. `revoke` joins them once
+/// D5 has established how the three revoke routes read a `409`.
+///
+/// **By value, and `Copy`.** The group is one reference, and a method taking
+/// `&self` would make every future borrow the temporary the group is — so
+/// `let pending = sdk.grants().list();` would not compile, and neither would a
+/// fan-out like `ids.iter().map(|id| sdk.provisioning_keys().redemptions(id))`.
+#[derive(Debug, Clone, Copy)]
 pub struct Grants<'a>(&'a Sdk);
 
 impl Grants<'_> {
@@ -431,30 +575,35 @@ impl Grants<'_> {
     /// `expires_in` omitted means it stands until revoked, which is the usual
     /// case.
     pub async fn create(
-        &self,
+        self,
         allowed_endpoint: &str,
         protocol: &str,
         expires_in: Option<u64>,
         label: Option<&str>,
     ) -> Result<(Grant, Made), SdkError> {
-        let proxy = self.0.control(&reading::GRANT_CREATE).await?;
-        proxy
-            .create_grant(allowed_endpoint, protocol, expires_in, label)
+        self.0
+            .call(&reading::GRANT_CREATE, |proxy| async move {
+                proxy
+                    .create_grant(allowed_endpoint, protocol, expires_in, label)
+                    .await
+            })
             .await
-            .map_err(|e| SdkError::proxy(e, &reading::GRANT_CREATE))
     }
 
     /// Everyone this Endpoint has let in, including grants it did not make.
-    pub async fn list(&self) -> Result<Vec<Grant>, SdkError> {
-        let proxy = self.0.control(&reading::GRANT_LIST).await?;
-        proxy
-            .list_grants()
+    pub async fn list(self) -> Result<Vec<Grant>, SdkError> {
+        self.0
+            .call(&reading::GRANT_LIST, |proxy| async move {
+                proxy.list_grants().await
+            })
             .await
-            .map_err(|e| SdkError::proxy(e, &reading::GRANT_LIST))
     }
 }
 
 /// The Tickets this Endpoint has handed out (spec §8.12).
+///
+/// `Copy` and taken by value, for the reason [`Grants`] gives.
+#[derive(Debug, Clone, Copy)]
 pub struct Tickets<'a>(&'a Sdk);
 
 impl Tickets<'_> {
@@ -465,29 +614,32 @@ impl Tickets<'_> {
     /// two lifetimes are written down: they are different quantities, and the
     /// Grant's is not capped by the Ticket's.
     pub async fn create(
-        &self,
+        self,
         protocol: &str,
         bounds: TicketBounds,
         label: Option<&str>,
     ) -> Result<Ticket, SdkError> {
-        let proxy = self.0.control(&reading::TICKET_CREATE).await?;
-        proxy
-            .create_ticket(protocol, bounds, label)
+        self.0
+            .call(&reading::TICKET_CREATE, |proxy| async move {
+                proxy.create_ticket(protocol, bounds, label).await
+            })
             .await
-            .map_err(|e| SdkError::proxy(e, &reading::TICKET_CREATE))
     }
 
     /// The Tickets this Endpoint has issued, spent ones included.
-    pub async fn list(&self) -> Result<Vec<TicketRecord>, SdkError> {
-        let proxy = self.0.control(&reading::TICKET_LIST).await?;
-        proxy
-            .list_tickets()
+    pub async fn list(self) -> Result<Vec<TicketRecord>, SdkError> {
+        self.0
+            .call(&reading::TICKET_LIST, |proxy| async move {
+                proxy.list_tickets().await
+            })
             .await
-            .map_err(|e| SdkError::proxy(e, &reading::TICKET_LIST))
     }
 }
 
 /// The Provisioning Keys this Endpoint has issued (spec §8.13).
+///
+/// `Copy` and taken by value, for the reason [`Grants`] gives.
+#[derive(Debug, Clone, Copy)]
 pub struct ProvisioningKeys<'a>(&'a Sdk);
 
 impl ProvisioningKeys<'_> {
@@ -498,42 +650,42 @@ impl ProvisioningKeys<'_> {
     /// tied to one — which is what makes a key usable in a public repository's
     /// CI.
     pub async fn create(
-        &self,
+        self,
         protocol: &str,
         bounds: ProvisioningBounds,
         binding: Option<&ProvisioningBinding>,
         label: Option<&str>,
     ) -> Result<ProvisioningKey, SdkError> {
-        let proxy = self.0.control(&reading::KEY_CREATE).await?;
-        proxy
-            .create_provisioning_key(protocol, bounds, binding, label)
+        self.0
+            .call(&reading::KEY_CREATE, |proxy| async move {
+                proxy
+                    .create_provisioning_key(protocol, bounds, binding, label)
+                    .await
+            })
             .await
-            .map_err(|e| SdkError::proxy(e, &reading::KEY_CREATE))
     }
 
     /// The keys this Endpoint has issued, with how many Grants each is holding
     /// against its ceiling.
-    pub async fn list(&self) -> Result<Vec<ProvisioningKeyRecord>, SdkError> {
-        let proxy = self.0.control(&reading::KEY_LIST).await?;
-        proxy
-            .list_provisioning_keys()
+    pub async fn list(self) -> Result<Vec<ProvisioningKeyRecord>, SdkError> {
+        self.0
+            .call(&reading::KEY_LIST, |proxy| async move {
+                proxy.list_provisioning_keys().await
+            })
             .await
-            .map_err(|e| SdkError::proxy(e, &reading::KEY_LIST))
     }
 
     /// Who came in on one key.
     ///
     /// **Outlives the key**: revoking or expiring one does not erase this, and
     /// a key is stopped because of a leak or somebody leaving — the moment the
-    /// answer matters most. A `404` here is therefore an id this Endpoint never
-    /// had, which [`reading::KEY_REDEMPTIONS`] reads as
-    /// [`Outcome::Vanished`].
-    pub async fn redemptions(&self, key_id: &str) -> Result<Vec<ProvisioningRedemption>, SdkError> {
-        let proxy = self.0.control(&reading::KEY_REDEMPTIONS).await?;
-        proxy
-            .provisioning_redemptions(key_id)
+    /// answer matters most.
+    pub async fn redemptions(self, key_id: &str) -> Result<Vec<ProvisioningRedemption>, SdkError> {
+        self.0
+            .call(&reading::KEY_REDEMPTIONS, |proxy| async move {
+                proxy.provisioning_redemptions(key_id).await
+            })
             .await
-            .map_err(|e| SdkError::proxy(e, &reading::KEY_REDEMPTIONS))
     }
 }
 
@@ -579,26 +731,74 @@ mod tests {
         }
     }
 
-    /// **The route's own reading is the one that is applied**, which is the
-    /// whole reason the error carries it. The same `404` means "that key is not
-    /// here" where a key was named, and nothing in particular on a collection —
-    /// so a caller branching on the outcome gets a different answer for the two
-    /// without having to know which route it called.
+    /// **The failure carries the route it came from**, which is what lets the
+    /// reading be the route's rather than the facade's. The seven readings
+    /// agree today — none of these routes assigns a meaning to a `404` or a
+    /// `409` — so this checks the wiring rather than a difference in outcome:
+    /// the first route whose answers stop agreeing is a revoke, and D5 settles
+    /// those before they are written.
     #[test]
-    fn a_404_reads_by_the_route_it_came_from() {
-        let named = SdkError::proxy(problem(404), &reading::KEY_REDEMPTIONS);
-        assert!(
-            matches!(named.outcome(), Outcome::Vanished { .. }),
-            "{:?}",
-            named.outcome()
-        );
+    fn the_failure_carries_the_route_it_came_from() {
+        let error = SdkError::proxy(problem(404), &reading::KEY_REDEMPTIONS);
+        let SdkError::Proxy { reading, .. } = &error else {
+            panic!("the proxy arm");
+        };
+        assert!(std::ptr::eq(*reading, &reading::KEY_REDEMPTIONS));
 
-        let collection = SdkError::proxy(problem(404), &reading::TICKET_LIST);
+        // **And a bodiless `404` stays a failure.** `Reading::gone_kinds`
+        // argues why: an intermediary's page, a wrong base path or a proxy
+        // built without the route all arrive as a `404` with no problem
+        // document, and reading that by status would answer "that key is not
+        // here" for a deployment that cannot answer at all.
         assert!(
-            !matches!(collection.outcome(), Outcome::Vanished { .. }),
+            !matches!(error.outcome(), Outcome::Vanished { .. }),
             "{:?}",
-            collection.outcome()
+            error.outcome()
         );
+    }
+
+    /// **Two answers end the cached client's usefulness, and only two.** A
+    /// request that never got out may have left the channel under it poisoned
+    /// for good — tower's `Buffer` hands every later request a clone of the
+    /// first `poll_ready` error — and a refused token is one this handle can
+    /// replace. A `403` is an answer about the request, and dropping the
+    /// tunnel over it would build a new one for every refusal.
+    #[test]
+    fn only_a_dead_channel_or_a_refused_token_spends_the_client() {
+        assert!(spent(&ProxyError::Transport(anyhow::anyhow!(
+            "connection refused"
+        ))));
+        assert!(spent(&problem(401)));
+        assert!(!spent(&problem(403)));
+        assert!(!spent(&problem(404)));
+        assert!(!spent(&problem(429)));
+    }
+
+    /// **The renewal margin's floor is not an answer to "is this token still
+    /// good".** `renew_delay` keeps `RENEW_MIN` under its answer so a renewal
+    /// loop cannot busy-spin; a `token_ttl` the caller set low — or one a
+    /// server clamped — would otherwise be treated as fresh for thirty seconds
+    /// after it had expired, and every call in that window would take a `401`.
+    #[test]
+    fn a_short_lived_token_is_never_called_fresh_past_its_end() {
+        assert_eq!(good_for(300), Duration::from_secs(240));
+        assert_eq!(good_for(10), Duration::from_secs(10));
+        assert_eq!(good_for(0), Duration::ZERO);
+        assert_eq!(good_for(-5), Duration::ZERO);
+    }
+
+    /// **A call can be held before it is awaited**, which is what taking the
+    /// group by value buys: with `&self` the future borrowed the temporary the
+    /// group is, so this line was `E0716` and so was every `map` over ids.
+    #[test]
+    fn a_group_call_can_be_held_before_it_is_awaited() {
+        let sdk = Sdk::open(config());
+        let pending = sdk.grants().list();
+        let fanned: Vec<_> = ["k1", "k2"]
+            .iter()
+            .map(|id| sdk.provisioning_keys().redemptions(id))
+            .collect();
+        drop((pending, fanned));
     }
 
     /// **The two layers keep their own remedies** (D15 = B). A credential that
@@ -734,12 +934,16 @@ mod tests {
     }
 
     /// Closing a handle that owns nothing answers `true`, and twice is not an
-    /// error — the contract the doc comment states.
+    /// error — the contract the doc comment states. **And it leaves the cache
+    /// empty**, which is what `shutdown` needs: a tunnel still held is a live
+    /// msquic handle, and `shutdown_msquic` answers `false` and skips
+    /// `RegistrationClose` while one exists.
     #[tokio::test]
     async fn closing_an_idle_handle_answers_true_and_is_idempotent() {
         let sdk = Sdk::open(config());
         assert!(sdk.close(Duration::from_secs(1)).await);
         assert!(sdk.close(Duration::from_secs(1)).await);
+        assert!(sdk.unexpired().is_none());
     }
 
     /// **The handle prints without printing the token.** `P2pConfig` has no
