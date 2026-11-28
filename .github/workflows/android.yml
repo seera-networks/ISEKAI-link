@@ -204,6 +204,41 @@ jobs:
         with:
           path: ~/.gradle/wrapper/dists
           key: gradle-dist-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android-portal/gradle/wrapper/gradle-wrapper.properties') }}
+      # **And the dependencies, which is the other half of the same problem.**
+      # The step above keeps Gradle itself; without this one, every run of both
+      # jobs resolves the whole AGP graph from Maven Central again, and under
+      # load Central answers `429 Too Many Requests` — so the job fails in
+      # `Cross-compile the core`, before a line of Rust is compiled. That is
+      # #389, seen three times in two days, each time passing on a re-run and
+      # each time blocking a merge until somebody re-ran it by hand.
+      #
+      # **Only `modules-2`**, which is the part that goes to the network. The
+      # rest of `~/.gradle/caches` is derived locally — transforms, generated
+      # jars — and rebuilding those costs CPU rather than a request to a host
+      # that is rate-limiting us.
+      #
+      # **With `restore-keys`, unlike the distribution above.** The reasoning
+      # there — an old entry contributes nothing towards fetching a new one — is
+      # the opposite of true here: a build file that gains one dependency leaves
+      # every other artifact in the old cache still wanted, so seeding from it
+      # turns a cold download into a delta.
+      #
+      # Keyed on every file that decides what gets resolved, for both apps:
+      # there is no version catalog, so the dependency sets live in the
+      # `.gradle.kts` files and the `gradle.properties` beside them. Both apps
+      # share one `~/.gradle` and the two jobs run on the same OS, so they share
+      # the entry deliberately — whichever job finishes first saves the one the
+      # other hits next time.
+      #
+      # **A failed job still saves nothing** (`post-if: success()`), so this
+      # does not help the run that populates it: the first green run after this
+      # change fills the entry, and the flake stops from the one after that.
+      - name: Cache the Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches/modules-2
+          key: gradle-deps-${{ runner.os }}-${{ hashFiles('android/*.gradle.kts', 'android/**/*.gradle.kts', 'android-portal/*.gradle.kts', 'android-portal/**/*.gradle.kts', 'android/gradle.properties', 'android-portal/gradle.properties') }}
+          restore-keys: gradle-deps-${{ runner.os }}-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -262,6 +297,41 @@ jobs:
         with:
           path: ~/.gradle/wrapper/dists
           key: gradle-dist-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android-portal/gradle/wrapper/gradle-wrapper.properties') }}
+      # **And the dependencies, which is the other half of the same problem.**
+      # The step above keeps Gradle itself; without this one, every run of both
+      # jobs resolves the whole AGP graph from Maven Central again, and under
+      # load Central answers `429 Too Many Requests` — so the job fails in
+      # `Cross-compile the core`, before a line of Rust is compiled. That is
+      # #389, seen three times in two days, each time passing on a re-run and
+      # each time blocking a merge until somebody re-ran it by hand.
+      #
+      # **Only `modules-2`**, which is the part that goes to the network. The
+      # rest of `~/.gradle/caches` is derived locally — transforms, generated
+      # jars — and rebuilding those costs CPU rather than a request to a host
+      # that is rate-limiting us.
+      #
+      # **With `restore-keys`, unlike the distribution above.** The reasoning
+      # there — an old entry contributes nothing towards fetching a new one — is
+      # the opposite of true here: a build file that gains one dependency leaves
+      # every other artifact in the old cache still wanted, so seeding from it
+      # turns a cold download into a delta.
+      #
+      # Keyed on every file that decides what gets resolved, for both apps:
+      # there is no version catalog, so the dependency sets live in the
+      # `.gradle.kts` files and the `gradle.properties` beside them. Both apps
+      # share one `~/.gradle` and the two jobs run on the same OS, so they share
+      # the entry deliberately — whichever job finishes first saves the one the
+      # other hits next time.
+      #
+      # **A failed job still saves nothing** (`post-if: success()`), so this
+      # does not help the run that populates it: the first green run after this
+      # change fills the entry, and the flake stops from the one after that.
+      - name: Cache the Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches/modules-2
+          key: gradle-deps-${{ runner.os }}-${{ hashFiles('android/*.gradle.kts', 'android/**/*.gradle.kts', 'android-portal/*.gradle.kts', 'android-portal/**/*.gradle.kts', 'android/gradle.properties', 'android-portal/gradle.properties') }}
+          restore-keys: gradle-deps-${{ runner.os }}-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
