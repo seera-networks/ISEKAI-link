@@ -3116,6 +3116,7 @@ dependencies = [
 name = "isekai-sdk"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "isekai-p2p",
  "tokio",
 ]

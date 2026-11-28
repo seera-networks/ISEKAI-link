@@ -599,6 +599,130 @@ impl Made {
     }
 }
 
+/// How each issuer route's answers are read.
+///
+/// **Beside the routes, not beside the callers.** A [`Reading`] is the call
+/// site saying what a status means *on this route*, and when every caller
+/// writes its own, the same `409` ends up read three ways — which is exactly
+/// what `docs/p2p_sdk_surface_from_portal.md` §4.3 counted on the three revoke
+/// routes. These are stated once, where the route is, so a facade grouping them
+/// adds no semantics of its own (`p2p_sdk_design.md` D15).
+///
+/// **Every one of them has `token_self_replacing: false`.** That flag says a
+/// `401`/`403` is a wait because some other loop is about to hand this caller a
+/// different token; on these routes nothing is — whoever asks mints its own
+/// Endpoint Token and a refusal here is settled.
+///
+/// **The seven agree, today.** Six of them are collections or plain creates,
+/// where a `404` or a `409` does not arise, and the seventh — the one that
+/// names a key — cannot read its `404` by status either (see
+/// [`reading::KEY_REDEMPTIONS`]). They are still seven constants and not one:
+/// each is named for a route, so the first route whose answers stop agreeing
+/// moves on its own, and a caller holding one can compare it with another.
+/// The revoke routes are the first that will not agree, which is why they are
+/// deliberately absent: whether their `409` is reachable is being established
+/// first (`p2p_sdk_design.md` D5), and a `Reading` written before that answer
+/// would be a guess with a constant's authority.
+pub mod reading {
+    use crate::outcome::{Missing, Reading};
+
+    /// [`super::ProxyClient::create_grant`] — `POST /v1/peer/grants`.
+    ///
+    /// **The upsert answers in the status, not with a conflict**: a pair that
+    /// already has a grant for this protocol comes back `200` and becomes
+    /// [`super::Made::Existing`], so a `409` carries no meaning this route
+    /// assigns.
+    pub const GRANT_CREATE: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::ProxyClient::list_grants`] — `GET /v1/peer/grants`.
+    ///
+    /// A collection: it answers with however many there are, including none, so
+    /// neither `404` nor `409` arises.
+    pub const GRANT_LIST: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::ProxyClient::create_ticket`] — `POST /v1/peer/tickets`.
+    ///
+    /// **Several Tickets may be live for one protocol** (§8.12.2), unlike a
+    /// pairing code, so there is nothing for a `409` to collide with.
+    pub const TICKET_CREATE: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::ProxyClient::list_tickets`] — `GET /v1/peer/tickets`.
+    pub const TICKET_LIST: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::ProxyClient::create_provisioning_key`] —
+    /// `POST /v1/peer/provisioning-keys`.
+    pub const KEY_CREATE: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::ProxyClient::list_provisioning_keys`] —
+    /// `GET /v1/peer/provisioning-keys`.
+    pub const KEY_LIST: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::ProxyClient::provisioning_redemptions`] —
+    /// `GET /v1/peer/provisioning-keys/{key_id}/redemptions`.
+    ///
+    /// **The one of the seven that names a thing**, and still not a `404` that
+    /// can be read by status. [`Reading::gone_kinds`] spells out why: *any*
+    /// `404` whose body is not problem+json — an intermediary's page, a wrong
+    /// base path, a proxy built without the route — arrives as `Problem {
+    /// status: 404, problem: None }`, and §8.13.7 is new enough that the last
+    /// of those is a live possibility. Reading it as
+    /// [`Missing::Vanished`](crate::outcome::Missing::Vanished) would tell a
+    /// caller "that key is not here" for a deployment that cannot answer at
+    /// all. The slug that *would* carry it is not named here because this route
+    /// has not been observed answering one, and a guess in a constant reads
+    /// like a fact.
+    pub const KEY_REDEMPTIONS: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+}
+
 /// A standing authorization for one Endpoint to reach one listener (spec §8.8).
 ///
 /// Where a [`Capability`] is a one-shot token the owner has to carry to the
@@ -1943,7 +2067,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
         .await
     }
 
-    /// `POST /v1/peer/grants` (spec §8.8.1).
+    /// `POST /v1/peer/grants` (spec §8.8.1). Read with
+    /// [`reading::GRANT_CREATE`].
     ///
     /// The caller is the owner, and no listener is named: a grant authorizes
     /// reaching **this Endpoint** over one protocol, through whichever listener
@@ -1982,6 +2107,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     }
 
     /// `GET /v1/peer/grants` (spec §8.8.2) — everyone this Endpoint has let in.
+    ///
+    /// Read with [`reading::GRANT_LIST`].
     pub async fn list_grants(&self) -> Result<Vec<Grant>, ProxyError> {
         let list: GrantList = self
             .request_json("GET", "/v1/peer/grants", Vec::new())
@@ -2014,7 +2141,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
             .await
     }
 
-    /// `POST /v1/peer/tickets` (spec §8.12.2).
+    /// `POST /v1/peer/tickets` (spec §8.12.2). Read with
+    /// [`reading::TICKET_CREATE`].
     ///
     /// **Several of these can be live for the same protocol**, which is what a
     /// pairing code cannot do — there is one of those per (Endpoint, protocol)
@@ -2052,6 +2180,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     ///
     /// Redeemed Tickets stay here until the sweep removes them, which is the
     /// point: a record that vanished the moment it was used would not be one.
+    ///
+    /// Read with [`reading::TICKET_LIST`].
     pub async fn list_tickets(&self) -> Result<Vec<TicketRecord>, ProxyError> {
         let list: TicketList = self
             .request_json("GET", "/v1/peer/tickets", Vec::new())
@@ -2115,6 +2245,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// down to its derived Grants, whereas an Enrollment Key creates *subjects*
     /// that stand on their own keys afterwards. **`none` is still the wrong
     /// choice for a public repository's CI.**
+    ///
+    /// Read with [`reading::KEY_CREATE`].
     pub async fn create_provisioning_key(
         &self,
         protocol: &str,
@@ -2149,6 +2281,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     ///
     /// `live_grants` against `max_live_grants` is the number that says whether
     /// a key is turning jobs away; the ceiling alone does not.
+    ///
+    /// Read with [`reading::KEY_LIST`].
     pub async fn list_provisioning_keys(&self) -> Result<Vec<ProvisioningKeyRecord>, ProxyError> {
         let list: ProvisioningKeyList = self
             .request_json("GET", "/v1/peer/provisioning-keys", Vec::new())
@@ -2161,6 +2295,8 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// **Outlives the key.** Revoking or expiring one does not erase this:
     /// a key is stopped because of a leak, a compromise or somebody leaving,
     /// and that is the moment "who came in on it" matters most.
+    ///
+    /// Read with [`reading::KEY_REDEMPTIONS`].
     pub async fn provisioning_redemptions(
         &self,
         key_id: &str,

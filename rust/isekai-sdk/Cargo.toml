@@ -28,4 +28,10 @@ isekai-p2p = { workspace = true }
 # consumer pulls no runtime through this crate, which is the point of the line
 # above.
 [dev-dependencies]
+# **Tests only, like `tokio` below.** The facade's own dependency list stays at
+# one crate (`isekai-p2p`); `anyhow` is here because `ProxyError::Transport`
+# holds one, so building a failure to read takes it -- and because the rule
+# that a cause chain is printed through `anyhow::Error` is what the report test
+# checks.
+anyhow = { workspace = true }
 tokio = { workspace = true }
