@@ -40,8 +40,18 @@
 //! `grants().revoke()`, `tickets().revoke()` and
 //! `provisioning_keys().revoke()` — the three wait on D5, which settles how a
 //! `409` is read on those routes before a `Reading` is written for them. Then
-//! §7's later stages: `endpoints()`, `redeem()`, `connect()`, `listen()`,
-//! `inspect()`.
+//! §7's later stages: `redeem()`, `connect()`, `listen()`, `inspect()`.
+//!
+//! # Two kinds of call, and they authenticate differently
+//!
+//! The issuer groups ([`Sdk::grants`], [`Sdk::tickets`],
+//! [`Sdk::provisioning_keys`]) speak to the proxy as **this Endpoint**, with an
+//! Endpoint Token this handle mints and keeps. The inventory groups
+//! ([`Sdk::endpoints`], [`Sdk::enrollment_keys`], [`Sdk::me`]) speak to
+//! Identity as **the person who owns the account**, with an Auth0 access token
+//! taken from the credential for each call. That is why a handle configured
+//! with an Enrollment Key can do the first and not the second, and why
+//! [`SdkError`] has an arm for each side's error.
 
 use std::fmt;
 use std::future::Future;
@@ -85,6 +95,14 @@ pub use isekai_p2p::TokenError;
 pub use isekai_p2p::agent::{
     reading, Grant, Made, ProvisioningBinding, ProvisioningBounds, ProvisioningKey,
     ProvisioningKeyRecord, ProvisioningRedemption, Ticket, TicketBounds, TicketRecord,
+};
+// The inventory side's own vocabulary (§3.2), for the same reason: a caller
+// that depends on the facade alone has to be able to name what `list` answered
+// with, and to build the request `issue` takes.
+pub use isekai_p2p::agent::{
+    EndpointDetail, EndpointList, EndpointSummary, EnrollmentKeyRecord, EnrollmentRecord,
+    IdentityError, IssuedEnrollmentKey, Membership, NewEnrollmentKey, RevokeEffects, RevokeReason,
+    Revoked, RevokedEnrollmentKey,
 };
 
 /// How long a call waits before giving up, when the caller does not say.
@@ -280,6 +298,59 @@ impl Sdk {
     pub async fn close(&self, _timeout: Duration) -> bool {
         self.forget();
         true
+    }
+
+    /// The Endpoints this account owns (§3.2).
+    pub fn endpoints(&self) -> Endpoints<'_> {
+        Endpoints(self)
+    }
+
+    /// The Enrollment Keys this account has issued (§3.2).
+    pub fn enrollment_keys(&self) -> EnrollmentKeys<'_> {
+        EnrollmentKeys(self)
+    }
+
+    /// What this account's membership is.
+    ///
+    /// **A guest's is dated and can be revoked**, and this is where the holder
+    /// reads their own — which is why Identity states the moment rather than
+    /// hiding it: concealing whether something exists is a rule about third
+    /// parties, and this is the person it is about.
+    pub async fn me(&self) -> Result<Membership, SdkError> {
+        let token = self.person().await?;
+        isekai_p2p::membership::me(&self.identity(), &token)
+            .await
+            .map_err(|e| SdkError::identity(e, &isekai_p2p::membership::reading::ME))
+    }
+
+    /// The Identity deployment this handle was opened over.
+    fn identity(&self) -> isekai_p2p::enrollment::Identity {
+        isekai_p2p::enrollment::Identity::new(&self.config.identity_url, self.config.identity_http3)
+    }
+
+    /// A current Auth0 access token, for the routes authenticated as a person.
+    ///
+    /// **Asked for every call rather than captured.** A token taken when the
+    /// handle was opened has expired by the time a long-running job revokes
+    /// what it made, which is the moment the answer matters most
+    /// (`Credential::current_auth0_token`).
+    async fn person(&self) -> Result<String, SdkError> {
+        match self.config.credential.current_auth0_token().await {
+            Ok(Some(token)) => Ok(token),
+            // **An Endpoint can hold a credential that cannot speak for a
+            // person.** An Enrollment Key authenticates a workload, and §8's
+            // inventory routes are the account's own — so this is a
+            // configuration that cannot make the call, not a call that failed.
+            Ok(None) => Err(SdkError::Credential {
+                explain: "these routes are authenticated as a person, and this configuration \
+                          carries an Enrollment Key",
+                said: None,
+            }),
+            Err(error) => Err(SdkError::Credential {
+                explain: "could not obtain a current Auth0 token",
+                said: Some(format!("{error:#}")),
+            }),
+        }
     }
 
     /// Everyone this Endpoint has let in (§3.3).
@@ -499,6 +570,39 @@ pub enum SdkError {
         /// route itself, in [`reading`].
         reading: &'static Reading,
     },
+    /// The Identity API refused the call, or could not be reached.
+    ///
+    /// The inventory routes (§3.2) are authenticated as the person rather than
+    /// as the Endpoint, so they answer with [`IdentityError`] and not with the
+    /// proxy's error.
+    #[non_exhaustive]
+    Identity {
+        /// What Identity said.
+        source: IdentityError,
+        /// How the route this came from reads its answers — stated beside the
+        /// route, in `isekai_p2p::endpoints::reading` and its siblings.
+        reading: &'static Reading,
+    },
+    /// The configuration holds no credential this call could present.
+    ///
+    /// **Not every credential can speak for a person.** The inventory routes
+    /// are authenticated with an Auth0 access token; an Endpoint enrolled with
+    /// an Enrollment Key has none, and a token source that cannot refresh has
+    /// stopped having one. Nothing was sent either way.
+    #[non_exhaustive]
+    Credential {
+        /// What could not be produced.
+        explain: &'static str,
+        /// Why, when there was a source to ask and it answered with a reason.
+        ///
+        /// **Words and not a type.** The two credential seams are traits that
+        /// answer with `anyhow::Error` (D4 = A), and this crate does not name
+        /// `anyhow` in its surface — that is the dependency D10 and D12 spent
+        /// their time removing. So the chain is formatted in when the failure
+        /// is built, the way `Outcome::of_proxy` formats a transport cause into
+        /// its `explain` and for the same reason.
+        said: Option<String>,
+    },
 }
 
 impl SdkError {
@@ -507,11 +611,38 @@ impl SdkError {
         match self {
             SdkError::Token(error) => error.outcome(),
             SdkError::Proxy { source, reading } => Outcome::of_proxy(source, reading),
+            // **With the membership sentence, when there is one.** Identity
+            // tells an expired guest membership from a revoked one and from a
+            // permission a guest will never have, and the words for all three
+            // are `isekai-p2p`'s; `of_identity` builds `explain` from the
+            // server's answer alone. This is the same gap the review of D14
+            // found one layer down, closed the same way.
+            SdkError::Identity { source, reading } => {
+                let outcome = Outcome::of_identity(source, reading);
+                match isekai_p2p::config::membership_advice(source) {
+                    Some(advice) => outcome.with_context(advice),
+                    None => outcome,
+                }
+            }
+            // **A new credential is what this needs**, which is what the arm
+            // means whether the source refused, failed, or was never the kind
+            // that could answer: all three are answered by signing in, or by
+            // handing this handle a configuration that can.
+            SdkError::Credential { explain, said } => Outcome::Reauthenticate {
+                explain: match said {
+                    Some(said) => format!("{explain}: {said}"),
+                    None => (*explain).to_owned(),
+                },
+            },
         }
     }
 
     fn proxy(source: ProxyError, reading: &'static Reading) -> Self {
         SdkError::Proxy { source, reading }
+    }
+
+    fn identity(source: IdentityError, reading: &'static Reading) -> Self {
+        SdkError::Identity { source, reading }
     }
 }
 
@@ -526,6 +657,8 @@ impl fmt::Display for SdkError {
         match self {
             SdkError::Token(error) => write!(f, "{error}"),
             SdkError::Proxy { source, .. } => write!(f, "{source}"),
+            SdkError::Identity { source, .. } => write!(f, "{source}"),
+            SdkError::Credential { explain, .. } => write!(f, "{explain}"),
         }
     }
 }
@@ -550,6 +683,11 @@ impl std::error::Error for SdkError {
         match self {
             SdkError::Token(error) => error.source(),
             SdkError::Proxy { source, .. } => source.source(),
+            SdkError::Identity { source, .. } => source.source(),
+            // **Nothing typed underneath.** The credential arm's reason is
+            // already words (see its `said`), because the source traits answer
+            // with `anyhow::Error` and this surface does not name it.
+            SdkError::Credential { .. } => None,
         }
     }
 }
@@ -721,6 +859,112 @@ pub async fn drain(timeout: Duration) -> bool {
     isekai_p2p::agent::drain_msquic(timeout).await
 }
 
+/// The Endpoints this account owns (spec §8.6, §8.7).
+///
+/// **Authenticated as the person, not as the Endpoint** — these are the
+/// account's own records, so they take an Auth0 access token and answer with
+/// [`IdentityError`]. A handle whose credential is an Enrollment Key cannot
+/// reach them; [`SdkError::Credential`] says so without sending anything.
+///
+/// `Copy` and taken by value, for the reason [`Grants`] gives.
+#[derive(Debug, Clone, Copy)]
+pub struct Endpoints<'a>(&'a Sdk);
+
+impl Endpoints<'_> {
+    /// The Endpoints this account owns, a page at a time.
+    ///
+    /// `status` filters (§8.6) and `cursor` continues a previous answer; both
+    /// omitted is the first page of everything.
+    pub async fn list(
+        self,
+        status: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<EndpointList, SdkError> {
+        let token = self.0.person().await?;
+        isekai_p2p::endpoints::list(&self.0.identity(), &token, status, cursor)
+            .await
+            .map_err(|e| SdkError::identity(e, &isekai_p2p::endpoints::reading::LIST))
+    }
+
+    /// One Endpoint's record.
+    pub async fn get(self, endpoint_id: &str) -> Result<EndpointDetail, SdkError> {
+        let token = self.0.person().await?;
+        isekai_p2p::endpoints::get(&self.0.identity(), &token, endpoint_id)
+            .await
+            .map_err(|e| SdkError::identity(e, &isekai_p2p::endpoints::reading::GET))
+    }
+
+    /// Retire an Endpoint.
+    ///
+    /// **This cannot be undone**, and the keypair cannot register again: one
+    /// key is one Endpoint, so a device that comes back needs a new key. The
+    /// reason is typed because it lands in an audit log somebody reads during
+    /// an incident.
+    pub async fn revoke(
+        self,
+        endpoint_id: &str,
+        reason: RevokeReason,
+        note: Option<&str>,
+    ) -> Result<Revoked, SdkError> {
+        let token = self.0.person().await?;
+        isekai_p2p::endpoints::revoke(&self.0.identity(), &token, endpoint_id, reason, note)
+            .await
+            .map_err(|e| SdkError::identity(e, &isekai_p2p::endpoints::reading::REVOKE))
+    }
+}
+
+/// The Enrollment Keys this account has issued (spec §8.8).
+///
+/// Authenticated as the person, like [`Endpoints`]. `Copy` and taken by value,
+/// for the reason [`Grants`] gives.
+#[derive(Debug, Clone, Copy)]
+pub struct EnrollmentKeys<'a>(&'a Sdk);
+
+impl EnrollmentKeys<'_> {
+    /// Issue a key.
+    ///
+    /// **The secret comes back once and never again** (§8.8.2), so whatever is
+    /// going to hold it has to take it from this answer.
+    ///
+    /// A guest is refused this route by name rather than by permission
+    /// (`guest_membership.md` §3 D7); the refusal arrives as an ordinary
+    /// `insufficient-permission`, and [`SdkError::outcome`] attaches the
+    /// sentence that says what it was about.
+    pub async fn issue(self, request: &NewEnrollmentKey) -> Result<IssuedEnrollmentKey, SdkError> {
+        let token = self.0.person().await?;
+        isekai_p2p::enrollment::issue(&self.0.identity(), &token, request)
+            .await
+            .map_err(|e| SdkError::identity(e, &isekai_p2p::enrollment::reading::ISSUE))
+    }
+
+    /// This caller's keys, newest first.
+    pub async fn list(self) -> Result<Vec<EnrollmentKeyRecord>, SdkError> {
+        let token = self.0.person().await?;
+        isekai_p2p::enrollment::list(&self.0.identity(), &token)
+            .await
+            .map_err(|e| SdkError::identity(e, &isekai_p2p::enrollment::reading::LIST))
+    }
+
+    /// What one key has enrolled.
+    pub async fn enrollments(self, key_id: &str) -> Result<Vec<EnrollmentRecord>, SdkError> {
+        let token = self.0.person().await?;
+        isekai_p2p::enrollment::enrollments(&self.0.identity(), &token, key_id)
+            .await
+            .map_err(|e| SdkError::identity(e, &isekai_p2p::enrollment::reading::ENROLLMENTS))
+    }
+
+    /// Stop a key, and say what became of what it grew.
+    ///
+    /// The answer carries [`RevokeEffects`]: which Endpoints it had enrolled,
+    /// and which of those are still up for the owner to deal with.
+    pub async fn revoke(self, key_id: &str) -> Result<RevokedEnrollmentKey, SdkError> {
+        let token = self.0.person().await?;
+        isekai_p2p::enrollment::revoke(&self.0.identity(), &token, key_id)
+            .await
+            .map_err(|e| SdkError::identity(e, &isekai_p2p::enrollment::reading::REVOKE))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +1036,69 @@ mod tests {
         assert_eq!(good_for(-5), Duration::ZERO);
     }
 
+    /// **A credential that cannot speak for a person stops before the wire.**
+    /// The inventory routes are the account's own, and an Endpoint enrolled
+    /// with an Enrollment Key has no Auth0 token to present — so this is a
+    /// configuration that cannot make the call, reported without sending
+    /// anything. The test would reach the network if the check were missing,
+    /// which is the other half of what it pins.
+    #[tokio::test]
+    async fn an_enrolled_credential_cannot_ask_the_account_routes() {
+        let sdk = Sdk::open(P2pConfig {
+            credential: isekai_p2p::Credential::enrollment("enr1_SECRET"),
+            ..config()
+        });
+        for error in [
+            sdk.me().await.expect_err("no person to speak for"),
+            sdk.endpoints()
+                .list(None, None)
+                .await
+                .expect_err("no person to speak for"),
+            sdk.enrollment_keys()
+                .list()
+                .await
+                .expect_err("no person to speak for"),
+        ] {
+            let SdkError::Credential { said, .. } = &error else {
+                panic!("the credential arm, not {error:?}");
+            };
+            // Nothing was asked, so there is nothing a source said.
+            assert!(said.is_none(), "{said:?}");
+            match error.outcome() {
+                Outcome::Reauthenticate { explain } => {
+                    assert!(explain.contains("Enrollment Key"), "{explain}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// **The membership sentence reaches the verdict**, which `of_identity`
+    /// alone would not carry: it builds `explain` from the server's answer, and
+    /// "this guest membership has ended -- ask whoever invited you" is
+    /// `isekai-p2p`'s. The server's own date has to survive with it, because
+    /// that is the whole of what the holder can act on.
+    #[test]
+    fn a_membership_refusal_arrives_with_its_advice_and_its_date() {
+        let error = SdkError::identity(
+            IdentityError::Api {
+                status: 403,
+                body: r#"{"type":"https://identity.example/problems/membership-expired",
+                          "detail":"membership expired at 2026-09-01T00:00:00Z"}"#
+                    .to_owned(),
+                retry_after: None,
+            },
+            &isekai_p2p::enrollment::reading::ISSUE,
+        );
+        match error.outcome() {
+            Outcome::Refused { explain } => {
+                assert!(explain.contains("has ended"), "{explain}");
+                assert!(explain.contains("2026-09-01T00:00:00Z"), "{explain}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// **A call can be held before it is awaited**, which is what taking the
     /// group by value buys: with `&self` the future borrowed the temporary the
     /// group is, so this line was `E0716` and so was every `map` over ids.
@@ -803,7 +1110,10 @@ mod tests {
             .iter()
             .map(|id| sdk.provisioning_keys().redemptions(id))
             .collect();
-        drop((pending, fanned));
+        // The inventory groups are the same shape, so they are held the same
+        // way.
+        let inventory = sdk.endpoints().get("ep:none");
+        drop((pending, fanned, inventory));
     }
 
     /// **The two layers keep their own remedies** (D15 = B). A credential that

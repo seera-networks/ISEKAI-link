@@ -16,6 +16,42 @@ use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::enrollment::Identity;
 
+/// How the inventory routes' answers are read.
+///
+/// **Beside the routes**, for the reason
+/// [`isekai_p2p_core::proxy::reading`] gives at length: a [`Reading`] is the
+/// call site saying what a status means *on this route*, and when every caller
+/// writes its own, the same answer ends up read several ways
+/// (`p2p_sdk_design.md` D15). These sit beside the typed wrappers rather than
+/// beside `IdentityClient`'s raw methods, because the wrappers are what a
+/// caller reaches and what D12 gave a type to.
+///
+/// **They agree today, and are still one per route.** A `404` is read as
+/// nothing in particular everywhere here, including on the two revokes —
+/// [`Reading::gone_kinds`] spells out why a `404` with no problem+json body
+/// cannot be told from a wrong base path or a proxy that never had the route,
+/// and Identity has not been observed naming a slug for absence on any of
+/// them. `portal-core`'s own revoke reading answers `Missing::Done` instead,
+/// and keeps that on purpose: it is asking "did my registration land?" about
+/// an id it has just registered itself, which is local knowledge this surface
+/// does not have.
+pub mod reading {
+    use isekai_p2p_core::outcome::{Missing, Reading};
+
+    /// The reading every route in this module shares today.
+    const PLAIN: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
+
+    /// [`super::me`] — `GET /v1/me`.
+    pub const ME: Reading = PLAIN;
+}
+
 macro_rules! on_transport {
     ($identity:expr, |$client:ident| $body:expr) => {{
         if $identity.http3 {
