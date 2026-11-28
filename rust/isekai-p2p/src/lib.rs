@@ -132,6 +132,11 @@ pub mod agent {
         Problem, ProxyClient, ProxyError,
     };
     pub use isekai_p2p_core::proxy::{RelayCandidate, RelayRttSample};
+    // **The readings live beside their routes** (`p2p_sdk_design.md` D15), so
+    // the facade that groups those routes adds no semantics of its own -- and
+    // every other caller reads a `409` the same way, which is what
+    // `p2p_sdk_surface_from_portal.md` §4.3 found was not happening.
+    pub use isekai_p2p_core::proxy::reading;
     // **A public address is reached from outside this crate.** The example
     // `docs/public_listener_client_plan.md` P4 asks for lives in
     // `isekai-p2p/examples/`, which sees only what is re-exported here.

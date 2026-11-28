@@ -1,8 +1,8 @@
 # SDK の設計 — 7 群から面を決める
 
-- status: 設計（§9 Q1 の答え）。**判断は 14 すべて決定済み**。
-  §7 段 1 / 2b / D14 実装済み
-- version: 0.10
+- status: 設計（§9 Q1 の答え）。**判断は 15 すべて決定済み**。
+  §7 段 1 / 2b / D14 / 段 2a 実装済み。残りは revoke 3 本（D5 待ち）と段 2c 以降
+- version: 0.11
 - 対象: `1d63993`（`main`, v0.10.2）
 - 前提:
   - `docs/p2p_sdk_surface_from_portal.md` §7 — **必要な面の 7 群**。本文書の入力
@@ -625,6 +625,53 @@ context と同じく外側が先）。`Unreachable::Deadline` は言葉を持た
 コメントにも書いた（同じファイルの他の `{e:#}` は `anyhow::Result` が相手なので
 正しい、という判別も併せて）。
 
+### 3.10 段 2a を書いて立った判断 — アクセサ 1 本が 2 層を跨ぐ
+
+**D15 — 発行側アクセサの失敗の型**
+
+`sdk.tickets().list()` は 2 つの理由で失敗する: Endpoint トークンが取れない
+（`TokenError`）と、プロキシが断った／届かない（`ProxyError`）。`proxy_client`
+は接続構築で `anyhow::Result` を返すので、ここも素通しにすると facade が
+`anyhow` を継ぐ。
+
+| | 選択肢 | 得るもの | 失うもの |
+| --- | --- | --- | --- |
+| A | `ProxyError` 1 本に畳む（トークン失敗を `Transport` 腕へ） | 型が 1 つ | **D14 が取り除いた誤読そのもの**。「資格情報を取り直せ」が `Unreachable` になる |
+| B | `SdkError { Token, Proxy { source, reading } }` ＋ `outcome()` | 両方の型が保たれ、読みは `Outcome` 1 種類 | facade に型が 1 つ（`#[non_exhaustive]` 必須） |
+| C | 不透明な構造体＋アクセサ | semver に最も強い | 利用者が `match` できない |
+
+**決定 B**（0.11 で実装）。D14 が C を却下した理由は「facade が**畳む**＝意味論を
+持つ」ことであり、B は畳まず「どちらの層が落ちたか」を言うだけである。
+
+**`Reading` はルートの隣に置いた**（同じ判断の派生）。`Outcome::of_proxy` は
+ルートごとの `Reading` を要するが、それを facade に書くと facade が意味を持つ。
+7 本ぶんを `isekai_p2p_core::proxy::reading` に公開定数として置き、各メソッドの
+doc から指した —— surface §4.3 が数えた「同じ `409` が呼び出し側ごとに 3 通りに
+読まれている」の根治でもある。
+
+**実装が教えた 3 点**:
+
+- **`404` はルートで意味が変わる。** 7 本のうち鍵を名指しするのは
+  `provisioning_redemptions` だけで、そこだけ `Missing::Vanished`。残りは
+  コレクションなので `404` は起きない。`create_grant` の upsert は **`200` で
+  「既にあった」を返す**（`Made::Existing`）ので、`409` に意味は無い。
+- **トランスポート失敗の原因鎖は `ProxyError` からは辿れない。**
+  `ProxyError::Transport` は `anyhow::Error` を持つが source として印していない
+  （`IdentityError::Transport` は `#[from]` で印している）。だから
+  `of_proxy` が `{inner:#}` を `explain` に焼いており、**その言葉は
+  `outcome()` 側にある**。`SdkError` の `Error::source` のドキュメントがこれを
+  明記している。
+- **キャッシュは `renew_delay` を共有する**（D13 = B）。`auth0.rs` の
+  `REFRESH_MARGIN` を写すのではなく、既にテストのある
+  `isekai_p2p::config::renew_delay` を公開して使う —— マージンが 2 つに
+  分かれて片方だけ調整される事故を避ける。`ProxyClient` は `Clone` で
+  `set_endpoint_token` が `Arc<RwLock<_>>` 越しなので、**トンネルを張り替えずに
+  トークンだけ差し替わる**（セッションが走っているリレー脚を落とさない）。
+  ロックは `std::sync::Mutex` で、**await 中は保持しない** —— facade の依存を
+  1 クレートに保つため（`tokio` は dev のみ）。冷えたハンドルに 2 つの呼び出しが
+  同時に来ると両方がトークンを取り得るが、後の 1 つが共有クライアントの上で
+  差し替えるだけなので、1 往復の損で済み不整合は起きない。
+
 ## 4. 横断的な事項
 
 ### 4.1 エラー — 既決（Q2）
@@ -744,7 +791,13 @@ A。2 本は**別のアプリの都合**（frame sink があるかどうか、�
 | D13 | Endpoint トークンの取得 | — | **決定 B**（`REFRESH_MARGIN = 60s` の先例に倣う） | — |
 | D14 | トークン発行の読み | — | **決定 B**（実装済み。`TokenError` 3 腕。`Outcome` の腕は増やさず、`with_context` を 1 つ足した） | — |
 
-これで §9 の 7 問には答えが付いている。本文書が出した判断は **14** で、
+段 2a を書いて、さらに 1 つ出た（§3.10）。
+
+| | 判断 | 選択肢 | 決定 | 確定したもの |
+| --- | --- | --- | --- | --- |
+| D15 | アクセサの失敗の型 | 畳む / 2 腕 / 不透明 | **B** 2 腕＋`outcome()` | `SdkError { Token, Proxy { source, reading } }`。`Reading` は**ルートの隣**（`proxy::reading`）に置く |
+
+これで §9 の 7 問には答えが付いている。本文書が出した判断は **15** で、
 **すべて決定済み**。
 
 Q5（通知）と Q7（FFI 統合）は §4.2 / §4.4 に答えがあり、`FrameSink` という先例が
@@ -759,10 +812,15 @@ Q5（通知）と Q7（FFI 統合）は §4.2 / §4.4 に答えがあり、`Fram
    `Auth0TokenSource` / `AssertionSource` の再輸出、`shutdown` / `drain`
    （D1, D2, D3, D4, D7, D8, D9）。入口の形がここで固まる。中身は空でよい。
    `version.workspace` の例外（§4.3）もここで入れる。
-2. **群アクセサ（発行側）** — §3.3。読みは `ProxyError` で既に正しく、
-   `grants()` の list と revoke は `ProxyClient` を直接呼ぶ（D10 = A）。
-   **D13** がここで要る（トークンの取得）。入口の失敗は **D14 = B** で
-   `TokenError` になっている（実装済み）ので、アクセサは `anyhow` を継がない。
+2a. **群アクセサ（発行側）の create / list**（実装済み）— §3.3。
+   `grants().create/list`、`tickets().create/list`、
+   `provisioning_keys().create/list/redemptions` の **7 本**。
+   **D13 = B** のトークンキャッシュ（`renew_delay` 共有）と **D15 = B** の
+   `SdkError` がここで入る。`grants()` の 2 本は `ProxyClient` を直接呼ぶ
+   （D10 = A）。
+2b′. **revoke 3 本** — **D5 が塞いでいる**。`409` が到達可能かを確かめ、
+   到達可能なら厳しい側へ揃えてから、`reading` に 3 本を足して面に出す。
+   先に `Reading` を書くと、推測が定数の権威を持ってしまう。
 2b. **棚卸し 3 モジュールを型付きの失敗に**（D12 = C、実装済み）。`isekai-p2p` の
    `endpoints` / `enrollment` / `membership` の 8 シグネチャ。**動いた呼び出し側は
    `portal-core/src/agent.rs` の 1 箇所だけ**で、`portal-client` の 10 箇所は
