@@ -33,8 +33,8 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use argh::FromArgs;
 use isekai_p2p::agent::{
-    bound_to, BindingView, Bound, Made, Missing, Outcome, ProvisioningBinding, ProvisioningBounds,
-    Reading, TicketBounds,
+    bound_to, BindingView, Bound, Made, Outcome, ProvisioningBinding, ProvisioningBounds,
+    TicketBounds,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -1202,29 +1202,24 @@ async fn settle_grants(
 /// A grant that lapsed on its own TTL is not there to delete, and retrying that
 /// forever would log the same warning for the life of the process.
 fn is_already_gone(e: &isekai_p2p::agent::ProxyError) -> bool {
-    matches!(Outcome::of_proxy(e, &DELETING), Outcome::AlreadyGone { .. })
+    // **The reading moved to the route** (`p2p_sdk_design.md` D5, D15), saying
+    // the same thing this file used to say for itself: by slug rather than by
+    // status, because a `404` whose body is not problem+json — an
+    // intermediary's page, a wrong base path, a proxy without this route —
+    // arrives with `problem: None`, and reading *that* as "already gone" would
+    // call [`Ledger::removed`] on a grant still standing at the proxy. It would
+    // keep its TTL with nothing tracking it, and the `warn!` that would have
+    // surfaced the misconfiguration would stop; removing too much is the
+    // direction `isekai_p2p::grants` exists to avoid.
+    //
+    // Shared so that this server and the facade cannot drift apart on what a
+    // missing grant is — which is what `p2p_sdk_surface_from_portal.md` §4.3
+    // counted when it found the three revokes read differently.
+    matches!(
+        Outcome::of_proxy(e, &isekai_p2p::agent::reading::GRANT_REVOKE),
+        Outcome::AlreadyGone { .. }
+    )
 }
-
-/// How the delete reads an answer: these two slugs mean the grant is not there.
-///
-/// **By slug rather than by status, and that is the whole point.** A `404`
-/// whose body is not problem+json — an intermediary's page, a wrong base path,
-/// a proxy without this route — arrives with `problem: None`, and reading *that*
-/// as "already gone" would call [`Ledger::removed`] on a grant still standing
-/// at the proxy: it would keep its TTL with nothing tracking it, and the
-/// `warn!` that would have surfaced the misconfiguration would stop. Removing
-/// too much is the direction `isekai_p2p::grants` exists to avoid.
-///
-/// So a bodiless `404` stays a failure, which is what it is, and both statuses
-/// are left `Unremarkable`.
-const DELETING: Reading = Reading {
-    not_found: Missing::Unremarkable,
-    conflict: Missing::Unremarkable,
-    token_self_replacing: false,
-    retryable_kinds: &[],
-    fixable_kinds: &[],
-    gone_kinds: &["grant-not-found", "not-found"],
-};
 
 /// Note which pairs already carry a grant this process did not make.
 ///
@@ -1462,11 +1457,32 @@ async fn grant_admin(
     let proxy = isekai_p2p::proxy_client(cfg, &token)?;
 
     if let Some(grant_id) = &args.revoke {
-        proxy
-            .revoke_grant(grant_id)
-            .await
-            .with_context(|| format!("revoke {grant_id}"))?;
-        println!("revoked     : {grant_id}");
+        match proxy.revoke_grant(grant_id).await {
+            Ok(()) => println!("revoked     : {grant_id}"),
+            // **The same reading the serve path uses** (D5). A grant that
+            // lapsed on its own TTL is not there to delete, and that is the
+            // state the operator asked for -- so saying it plainly beats
+            // exiting non-zero on the one answer that means the job is done.
+            // By slug and not by status, so a wrong base path still fails:
+            // `is_already_gone` is where that is written down.
+            //
+            // Until this, the same `404 grant-not-found` was success inside
+            // `settle_grants` and a failure here, which is the inconsistency
+            // `p2p_sdk_surface_from_portal.md` §4.3 counted.
+            // **A different word, because it is a different outcome.** The
+            // proxy answers this for a grant that lapsed on its own TTL, for
+            // an id that never existed, and for one belonging to another
+            // Endpoint -- and nothing here can tell them apart. Printing
+            // `revoked` would tell an operator who mistyped an id that the job
+            // was done, and a script grepping for it the same.
+            Err(e) if is_already_gone(&e) => {
+                println!("not there   : {grant_id}  (nothing to revoke -- it may have lapsed on");
+                println!("              its own TTL, or the id may not be this Endpoint's)");
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("revoke {grant_id}")));
+            }
+        }
     }
     if let Some(allowed) = grant_target(args)? {
         // **Omitted means until revoked**, which `create_grant`'s own doc calls
@@ -2636,12 +2652,19 @@ mod tests {
         }
     }
 
-    /// The two slugs the proxy sends for a grant that is not there.
+    /// The slug the proxy sends for a grant that is not there.
+    ///
+    /// **And not the generic `not-found` this predicate used to match too.**
+    /// That one was here from its first version (#221) and defensively —
+    /// nothing records this route sending it — and because `gone_kinds` is
+    /// read before the status, it would have taken a gateway's problem
+    /// document for a route it does not have as "the grant is already gone",
+    /// and dropped from the ledger grants that all still stand.
+    /// `reading::GRANT_REVOKE` carries the reasoning.
     #[test]
-    fn the_named_slugs_mean_the_grant_is_gone() {
-        for kind in ["grant-not-found", "not-found"] {
-            assert!(is_already_gone(&problem(404, Some(kind))), "{kind}");
-        }
+    fn the_named_slug_means_the_grant_is_gone() {
+        assert!(is_already_gone(&problem(404, Some("grant-not-found"))));
+        assert!(!is_already_gone(&problem(404, Some("not-found"))));
     }
 
     /// **A `404` nobody put a problem body on is not an answer about the

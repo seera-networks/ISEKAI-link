@@ -37,9 +37,6 @@
 //!
 //! # What is not here yet
 //!
-//! `grants().revoke()`, `tickets().revoke()` and
-//! `provisioning_keys().revoke()` — the three wait on D5, which settles how a
-//! `409` is read on those routes before a `Reading` is written for them. Then
 //! §7's later stages: `redeem()`, `connect()`, `listen()`, `inspect()`.
 //!
 //! # Two kinds of call, and they authenticate differently
@@ -727,8 +724,7 @@ impl std::error::Error for SdkError {
 /// **The facade is the only name for these** (D10 = A): the two on
 /// `ListenerSession` are plumbing for a running listener and answer with
 /// `anyhow::Result`, and a second public name with a different reading is what
-/// `p2p_sdk_surface_from_portal.md` §4.3 warned about. `revoke` joins them once
-/// D5 has established how the three revoke routes read a `409`.
+/// `p2p_sdk_surface_from_portal.md` §4.3 warned about.
 ///
 /// **By value, and `Copy`.** The group is one reference, and a method taking
 /// `&self` would make every future borrow the temporary the group is — so
@@ -771,6 +767,31 @@ impl Grants<'_> {
             })
             .await
     }
+
+    /// Stop letting one Endpoint in.
+    ///
+    /// **It takes effect on the peer's next connect**; a connection already
+    /// established stays up, so a caller that has to cut something off now has
+    /// to end the session as well.
+    ///
+    /// **A grant that was already gone arrives as an `Err` whose
+    /// [`SdkError::outcome`] is [`Outcome::AlreadyGone`]** — one that lapsed on
+    /// its own TTL is not there to delete, and that is the ending the caller
+    /// asked for. **So `?` propagates it**: this is the first method on the
+    /// facade where that arm is reachable, and a caller who wants "gone counts
+    /// as done" has to `match` rather than `?`, as `Outcome::AlreadyGone`'s own
+    /// documentation warns.
+    ///
+    /// It is read from the problem document's slug — the specific one — and not
+    /// from the status, because a `404` with no problem+json body is also what a
+    /// wrong base path answers (D5); see [`reading::GRANT_REVOKE`].
+    pub async fn revoke(self, grant_id: &str) -> Result<(), SdkError> {
+        self.0
+            .call(&reading::GRANT_REVOKE, |proxy| async move {
+                proxy.revoke_grant(grant_id).await
+            })
+            .await
+    }
 }
 
 /// The Tickets this Endpoint has handed out (spec §8.12).
@@ -804,6 +825,25 @@ impl Tickets<'_> {
         self.0
             .call(&reading::TICKET_LIST, |proxy| async move {
                 proxy.list_tickets().await
+            })
+            .await
+    }
+
+    /// Stop a Ticket being redeemed.
+    ///
+    /// **A Grant already made from it is not withdrawn** — tearing up the paper
+    /// does not remove whoever already walked in; [`Grants::revoke`] is for
+    /// that.
+    ///
+    /// **An id that was never there is a success, not an
+    /// [`Outcome::AlreadyGone`]**: this route answers `204` either way, "since
+    /// the state the caller wanted is the state there is" (§8.12.6). So there
+    /// is no absence for a caller to handle here, which is not true of the
+    /// other two revokes.
+    pub async fn revoke(self, ticket_id: &str) -> Result<(), SdkError> {
+        self.0
+            .call(&reading::TICKET_REVOKE, |proxy| async move {
+                proxy.revoke_ticket(ticket_id).await
             })
             .await
     }
@@ -857,6 +897,28 @@ impl ProvisioningKeys<'_> {
         self.0
             .call(&reading::KEY_REDEMPTIONS, |proxy| async move {
                 proxy.provisioning_redemptions(key_id).await
+            })
+            .await
+    }
+
+    /// Stop a key, **and close the door it opened**.
+    ///
+    /// This deletes the Grants the key made, which is the opposite of what
+    /// revoking a Ticket does: the owner does not know who came in without
+    /// asking, so stopping the key has to mean stopping them — otherwise there
+    /// is a door nobody can shut for up to `grant_ttl`. Established
+    /// connections are not torn down, but nothing new is authorized, and
+    /// [`ProvisioningKeys::redemptions`] still answers afterwards.
+    ///
+    /// **An id that was never there is reported as a failure.** Nothing has
+    /// been observed about what this route answers for one, and reading absence
+    /// into an answer that did not state it would report a revocation that may
+    /// not have happened — on the one revoke where believing it costs the most
+    /// (D5, [`reading::KEY_REVOKE`]).
+    pub async fn revoke(self, key_id: &str) -> Result<(), SdkError> {
+        self.0
+            .call(&reading::KEY_REVOKE, |proxy| async move {
+                proxy.revoke_provisioning_key(key_id).await
             })
             .await
     }
@@ -999,9 +1061,11 @@ impl EnrollmentKeys<'_> {
 mod tests {
     use super::*;
 
-    /// A refusal with no problem document, which is all these readings need:
-    /// none of the seven sanctions a `kind`, so every one of them answers by
-    /// status alone.
+    /// A refusal with no problem document.
+    ///
+    /// Which is all most of these readings need — but not
+    /// [`reading::GRANT_REVOKE`], which sanctions two slugs, and where a
+    /// bodiless answer is exactly the case worth checking.
     fn problem(status: u16) -> ProxyError {
         ProxyError::Problem {
             status,
@@ -1010,30 +1074,67 @@ mod tests {
         }
     }
 
-    /// **The failure carries the route it came from**, which is what lets the
-    /// reading be the route's rather than the facade's. The seven readings
-    /// agree today — none of these routes assigns a meaning to a `404` or a
-    /// `409` — so this checks the wiring rather than a difference in outcome:
-    /// the first route whose answers stop agreeing is a revoke, and D5 settles
-    /// those before they are written.
+    /// **The failure carries the route it came from**, and with the revokes
+    /// written (D5) that now changes the answer: the same "no such thing" slug
+    /// is "already gone" on the grant delete, which names its absence, and
+    /// nothing in particular on the Ticket revoke, which never reports absence
+    /// at all. A caller branching on the outcome gets the right answer for each
+    /// without having to know which route it called.
     #[test]
     fn the_failure_carries_the_route_it_came_from() {
-        let error = SdkError::proxy(problem(404), &reading::KEY_REDEMPTIONS);
-        let SdkError::Proxy { reading, .. } = &error else {
-            panic!("the proxy arm");
+        let slug = Problem {
+            type_uri: "https://link.example/problems/grant-not-found".to_owned(),
+            title: String::new(),
+            status: 404,
+            detail: None,
         };
-        assert!(std::ptr::eq(*reading, &reading::KEY_REDEMPTIONS));
+        let answer = |reading| {
+            SdkError::proxy(
+                ProxyError::Problem {
+                    status: 404,
+                    problem: Some(slug.clone()),
+                    retry_after: None,
+                },
+                reading,
+            )
+            .outcome()
+        };
+        assert!(matches!(
+            answer(&reading::GRANT_REVOKE),
+            Outcome::AlreadyGone { .. }
+        ));
+        assert!(!matches!(
+            answer(&reading::TICKET_REVOKE),
+            Outcome::AlreadyGone { .. }
+        ));
 
-        // **And a bodiless `404` stays a failure.** `Reading::gone_kinds`
-        // argues why: an intermediary's page, a wrong base path or a proxy
-        // built without the route all arrive as a `404` with no problem
-        // document, and reading that by status would answer "that key is not
-        // here" for a deployment that cannot answer at all.
+        // **And a bodiless `404` stays a failure on the route that does read a
+        // slug.** `Reading::gone_kinds` argues why: an intermediary's page, a
+        // wrong base path or a proxy built without the route all arrive as a
+        // `404` with no problem document, and reading that as absence would
+        // report a revocation that never happened.
+        let bodiless = SdkError::proxy(problem(404), &reading::GRANT_REVOKE);
         assert!(
-            !matches!(error.outcome(), Outcome::Vanished { .. }),
+            !matches!(bodiless.outcome(), Outcome::AlreadyGone { .. }),
             "{:?}",
-            error.outcome()
+            bodiless.outcome()
         );
+        // **And the route that names a key still does not read its `404` as
+        // absence.** `KEY_REDEMPTIONS`'s documentation spends a paragraph on
+        // why — it would tell a caller "that key is not here" for a deployment
+        // that cannot answer at all — so the assertion stays here: without it,
+        // flipping that one field to `Missing::Vanished` passes the suite.
+        let named = SdkError::proxy(problem(404), &reading::KEY_REDEMPTIONS);
+        assert!(
+            !matches!(named.outcome(), Outcome::Vanished { .. }),
+            "{:?}",
+            named.outcome()
+        );
+
+        // **Not compared by address.** Equal `const` values may share one
+        // static, so a pointer tells a caller nothing about which route an
+        // answer came from — what the carried reading is for is reading the
+        // answer, which is what the assertions above check.
     }
 
     /// **Two answers end the cached client's usefulness, and only two.** A

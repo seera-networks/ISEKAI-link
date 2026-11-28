@@ -599,32 +599,66 @@ impl Made {
     }
 }
 
-/// How each issuer route's answers are read.
-///
-/// **Beside the routes, not beside the callers.** A [`Reading`] is the call
-/// site saying what a status means *on this route*, and when every caller
-/// writes its own, the same `409` ends up read three ways — which is exactly
-/// what `docs/p2p_sdk_surface_from_portal.md` §4.3 counted on the three revoke
-/// routes. These are stated once, where the route is, so a facade grouping them
-/// adds no semantics of its own (`p2p_sdk_design.md` D15).
-///
-/// **Every one of them has `token_self_replacing: false`.** That flag says a
-/// `401`/`403` is a wait because some other loop is about to hand this caller a
-/// different token; on these routes nothing is — whoever asks mints its own
-/// Endpoint Token and a refusal here is settled.
-///
-/// **The seven agree, today.** Six of them are collections or plain creates,
-/// where a `404` or a `409` does not arise, and the seventh — the one that
-/// names a key — cannot read its `404` by status either (see
-/// [`reading::KEY_REDEMPTIONS`]). They are still seven constants and not one:
-/// each is named for a route, so the first route whose answers stop agreeing
-/// moves on its own, and a caller holding one can compare it with another.
-/// The revoke routes are the first that will not agree, which is why they are
-/// deliberately absent: whether their `409` is reachable is being established
-/// first (`p2p_sdk_design.md` D5), and a `Reading` written before that answer
-/// would be a guess with a constant's authority.
 pub mod reading {
+    //! How each issuer route's answers are read.
+    //!
+    //! **Beside the routes, not beside the callers.** A [`Reading`] is the call
+    //! site saying what a status means *on this route*, and when every caller
+    //! writes its own, the same `409` ends up read three ways — which is exactly
+    //! what `docs/p2p_sdk_surface_from_portal.md` §4.3 counted on the three revoke
+    //! routes. These are stated once, where the route is, so a facade grouping them
+    //! adds no semantics of its own (`p2p_sdk_design.md` D15).
+    //!
+    //! **Every one of them has `token_self_replacing: false`.** That flag says a
+    //! `401`/`403` is a wait because some other loop is about to hand this caller a
+    //! different token; on these routes nothing is — whoever asks mints its own
+    //! Endpoint Token and a refusal here is settled.
+    //!
+    //! **Nine of the ten agree**, and the tenth is [`GRANT_REVOKE`], which
+    //! names the two slugs a missing grant arrives as. The nine are collections,
+    //! plain creates, or routes whose absence cannot be read by status anyway (see
+    //! [`KEY_REDEMPTIONS`] and [`TICKET_REVOKE`]); they are
+    //! written as one value named `PLAIN` so that sharing it is visible, and still
+    //! named one per route, so that the next route whose answers stop agreeing
+    //! moves on its own.
+    //!
+    //! **Do not compare these by address.** Equal `const` values may share one
+    //! static — measured: `std::ptr::eq(&reading::GRANT_CREATE,
+    //! &reading::TICKET_REVOKE)` is `true` — so a pointer says nothing about which
+    //! route an answer came from. What a reading is for is reading an answer; the
+    //! route is what the caller asked.
+    //!
+    //! **The revokes are where D5 looked**, and what each of the three knows
+    //! turned out to be different — which is why only one of them ended up
+    //! saying anything:
+    //!
+    //! - the grant delete names its absence (`grant-not-found`), so it is read by
+    //!   slug — the reading `portal-server` arrived at independently and that this
+    //!   module now holds for both of them;
+    //! - the Ticket revoke **cannot report absence at all**: an unknown id answers
+    //!   `204` ([`super::ProxyClient::revoke_ticket`] says so), so there is nothing
+    //!   on that route for a reading to say;
+    //! - the Provisioning Key revoke has nothing recorded either way, so it says
+    //!   nothing, which leaves an id that was never there a failure.
+    //!
+    //! That last one is the direction this errs in on purpose: reading absence into
+    //! an answer that did not state it would report a revocation that may not have
+    //! happened, and `isekai_p2p::grants` exists to avoid removing too much.
     use crate::outcome::{Missing, Reading};
+
+    /// The reading a route with nothing to say takes: no status carries a
+    /// meaning this route assigns, and no kind asks to be read against its own.
+    ///
+    /// Named so that the routes which share it say so, and so that the one
+    /// which does not — [`GRANT_REVOKE`] — is visibly the exception.
+    const PLAIN: Reading = Reading {
+        not_found: Missing::Unremarkable,
+        conflict: Missing::Unremarkable,
+        token_self_replacing: false,
+        retryable_kinds: &[],
+        fixable_kinds: &[],
+        gone_kinds: &[],
+    };
 
     /// [`super::ProxyClient::create_grant`] — `POST /v1/peer/grants`.
     ///
@@ -632,77 +666,102 @@ pub mod reading {
     /// already has a grant for this protocol comes back `200` and becomes
     /// [`super::Made::Existing`], so a `409` carries no meaning this route
     /// assigns.
-    pub const GRANT_CREATE: Reading = Reading {
-        not_found: Missing::Unremarkable,
-        conflict: Missing::Unremarkable,
-        token_self_replacing: false,
-        retryable_kinds: &[],
-        fixable_kinds: &[],
-        gone_kinds: &[],
-    };
+    pub const GRANT_CREATE: Reading = PLAIN;
 
     /// [`super::ProxyClient::list_grants`] — `GET /v1/peer/grants`.
     ///
     /// A collection: it answers with however many there are, including none, so
     /// neither `404` nor `409` arises.
-    pub const GRANT_LIST: Reading = Reading {
-        not_found: Missing::Unremarkable,
-        conflict: Missing::Unremarkable,
-        token_self_replacing: false,
-        retryable_kinds: &[],
-        fixable_kinds: &[],
-        gone_kinds: &[],
-    };
+    pub const GRANT_LIST: Reading = PLAIN;
 
     /// [`super::ProxyClient::create_ticket`] — `POST /v1/peer/tickets`.
     ///
     /// **Several Tickets may be live for one protocol** (§8.12.2), unlike a
     /// pairing code, so there is nothing for a `409` to collide with.
-    pub const TICKET_CREATE: Reading = Reading {
-        not_found: Missing::Unremarkable,
-        conflict: Missing::Unremarkable,
-        token_self_replacing: false,
-        retryable_kinds: &[],
-        fixable_kinds: &[],
-        gone_kinds: &[],
-    };
+    pub const TICKET_CREATE: Reading = PLAIN;
 
     /// [`super::ProxyClient::list_tickets`] — `GET /v1/peer/tickets`.
-    pub const TICKET_LIST: Reading = Reading {
-        not_found: Missing::Unremarkable,
-        conflict: Missing::Unremarkable,
-        token_self_replacing: false,
-        retryable_kinds: &[],
-        fixable_kinds: &[],
-        gone_kinds: &[],
-    };
+    pub const TICKET_LIST: Reading = PLAIN;
 
     /// [`super::ProxyClient::create_provisioning_key`] —
     /// `POST /v1/peer/provisioning-keys`.
-    pub const KEY_CREATE: Reading = Reading {
-        not_found: Missing::Unremarkable,
-        conflict: Missing::Unremarkable,
-        token_self_replacing: false,
-        retryable_kinds: &[],
-        fixable_kinds: &[],
-        gone_kinds: &[],
-    };
+    pub const KEY_CREATE: Reading = PLAIN;
 
     /// [`super::ProxyClient::list_provisioning_keys`] —
     /// `GET /v1/peer/provisioning-keys`.
-    pub const KEY_LIST: Reading = Reading {
+    pub const KEY_LIST: Reading = PLAIN;
+
+    /// [`super::ProxyClient::revoke_grant`] —
+    /// `DELETE /v1/peer/grants/{grant_id}`.
+    ///
+    /// **By slug, and that is the whole point.** A grant that lapsed on its own
+    /// TTL is not there to delete, which is an ending the caller asked for; but
+    /// a `404` whose body is not problem+json — an intermediary's page, a wrong
+    /// base path, a proxy without this route — arrives with `problem: None`,
+    /// and reading *that* as "already gone" would drop a grant from a ledger
+    /// while it still stands at the proxy. So both statuses stay
+    /// `Unremarkable` and the two slugs carry the meaning.
+    ///
+    /// **One slug, and not the generic one.** `portal-server`'s copy of this
+    /// reading matched a bare `not-found` as well, from its first version
+    /// (#221) and defensively — nothing records this route answering it. That
+    /// is too wide for a reading the whole surface shares: `read` consults
+    /// `gone_kinds` *before* the status, so any answer whose problem `type`
+    /// ends in `not-found` — a gateway's own RFC 7807 for a route it does not
+    /// have, on any status — would read as "already gone", and
+    /// `settle_grants` would call `Ledger::removed` on grants that all still
+    /// stand. That is the silent half of the mistake the bodiless-`404`
+    /// reasoning above guards against.
+    ///
+    /// So the specific slug only. If this route is ever observed answering the
+    /// bare one, it can be added **with that observation recorded** — and the
+    /// cost of being wrong this way round is loud: a lapsed grant's delete
+    /// fails and says so, which is the direction `isekai_p2p::grants` exists
+    /// to err in.
+    ///
+    /// **`portal-server` had reached the rest of this reading on its own**,
+    /// which is what `p2p_sdk_surface_from_portal.md` §4.3 counted as the
+    /// three revokes disagreeing; both of its call sites read this constant
+    /// now instead of its own copy.
+    pub const GRANT_REVOKE: Reading = Reading {
         not_found: Missing::Unremarkable,
         conflict: Missing::Unremarkable,
         token_self_replacing: false,
         retryable_kinds: &[],
         fixable_kinds: &[],
-        gone_kinds: &[],
+        gone_kinds: &["grant-not-found"],
     };
+
+    /// [`super::ProxyClient::revoke_ticket`] —
+    /// `DELETE /v1/peer/tickets/{ticket_id}`.
+    ///
+    /// **Nothing to read: absence does not arrive here.** An unknown id answers
+    /// `204`, "since the state the caller wanted is the state there is"
+    /// (§8.12.6, and that method's own documentation). So the `404` and `409`
+    /// branches of this reading describe answers this route does not send —
+    /// which is also the answer to one of the three disagreements §4.3
+    /// counted: `--revoke-ticket` dropping a `404` through `?` could never
+    /// have cost anybody anything, because there is no `404` to drop.
+    pub const TICKET_REVOKE: Reading = PLAIN;
+
+    /// [`super::ProxyClient::revoke_provisioning_key`] —
+    /// `DELETE /v1/peer/provisioning-keys/{key_id}`.
+    ///
+    /// **Silent on absence, deliberately.** Unlike the Ticket revoke above,
+    /// nothing records whether this route answers `204` or `404` for an id that
+    /// was never there, and unlike the grant delete, no slug for it has been
+    /// observed. Reading absence into an answer that did not state it would
+    /// report a revocation that may not have happened — and this revoke is the
+    /// one that also deletes the Grants the key made, so a caller believing it
+    /// had happened is the expensive mistake. An id that was never there
+    /// arrives as an ordinary failure until the route is observed saying
+    /// otherwise.
+    pub const KEY_REVOKE: Reading = PLAIN;
 
     /// [`super::ProxyClient::provisioning_redemptions`] —
     /// `GET /v1/peer/provisioning-keys/{key_id}/redemptions`.
     ///
-    /// **The one of the seven that names a thing**, and still not a `404` that
+    /// **The one of the ten that names a thing**, and still not a `404` that
     /// can be read by status. [`Reading::gone_kinds`] spells out why: *any*
     /// `404` whose body is not problem+json — an intermediary's page, a wrong
     /// base path, a proxy built without the route — arrives as `Problem {
@@ -713,14 +772,7 @@ pub mod reading {
     /// all. The slug that *would* carry it is not named here because this route
     /// has not been observed answering one, and a guess in a constant reads
     /// like a fact.
-    pub const KEY_REDEMPTIONS: Reading = Reading {
-        not_found: Missing::Unremarkable,
-        conflict: Missing::Unremarkable,
-        token_self_replacing: false,
-        retryable_kinds: &[],
-        fixable_kinds: &[],
-        gone_kinds: &[],
-    };
+    pub const KEY_REDEMPTIONS: Reading = PLAIN;
 }
 
 /// A standing authorization for one Endpoint to reach one listener (spec §8.8).
@@ -2120,6 +2172,9 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     ///
     /// Takes effect on the peer's next connect; anything already established
     /// stays up.
+    ///
+    /// Read with [`reading::GRANT_REVOKE`], whose two slugs are what "it was
+    /// already gone" arrives as.
     pub async fn revoke_grant(&self, grant_id: &str) -> Result<(), ProxyError> {
         self.request_empty("DELETE", &format!("/v1/peer/grants/{grant_id}"), Vec::new())
             .await
@@ -2195,6 +2250,9 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     /// does not remove whoever already walked in; use
     /// [`revoke_grant`](Self::revoke_grant) for that. An unknown id also
     /// answers `204`, since the state the caller wanted is the state there is.
+    ///
+    /// Read with [`reading::TICKET_REVOKE`] — which, for that reason, has
+    /// nothing to say about absence.
     pub async fn revoke_ticket(&self, ticket_id: &str) -> Result<(), ProxyError> {
         self.request_empty(
             "DELETE",
@@ -2322,6 +2380,9 @@ impl<T: ControlPlaneTransport> ProxyClient<T> {
     ///
     /// **Running jobs are cut off.** Established connections are not torn down,
     /// but nothing new is authorized.
+    ///
+    /// Read with [`reading::KEY_REVOKE`], which says nothing about absence
+    /// because nothing has been observed about it here.
     pub async fn revoke_provisioning_key(&self, key_id: &str) -> Result<(), ProxyError> {
         self.request_empty(
             "DELETE",
@@ -2825,6 +2886,96 @@ fn problem_error(resp: &HttpResponse) -> ProxyError {
         status: resp.status,
         problem: serde_json::from_slice(&resp.body).ok(),
         retry_after: resp.retry_after(),
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::reading;
+    use super::{Problem, ProxyError};
+    use crate::outcome::Outcome;
+
+    fn refused(status: u16, kind: Option<&str>) -> ProxyError {
+        ProxyError::Problem {
+            status,
+            problem: kind.map(|kind| Problem {
+                type_uri: format!("https://link.example/problems/{kind}"),
+                title: String::new(),
+                status,
+                detail: None,
+            }),
+            retry_after: None,
+        }
+    }
+
+    fn gone(error: &ProxyError, reading: &'static crate::outcome::Reading) -> bool {
+        matches!(
+            Outcome::of_proxy(error, reading),
+            Outcome::AlreadyGone { .. }
+        )
+    }
+
+    /// **D5's answer, pinned.** Of the three revokes, the grant delete is the
+    /// one that names its absence, and it is read from the slug and not from
+    /// the status: a `404` with no problem document is also what a wrong base
+    /// path or an intermediary answers, and reading *that* as "already gone"
+    /// would let a caller drop a grant from its ledger while it still stands at
+    /// the proxy.
+    #[test]
+    fn the_grant_revoke_reads_absence_by_slug_and_not_by_status() {
+        assert!(gone(
+            &refused(404, Some("grant-not-found")),
+            &reading::GRANT_REVOKE
+        ));
+        // **And not the generic slug beside it.** A gateway's own problem
+        // document for a route it does not have can carry `not-found`, and
+        // `gone_kinds` is consulted before the status — so matching it would
+        // read a misrouted request as "this grant is already gone", whatever
+        // status it came with.
+        assert!(!gone(
+            &refused(404, Some("not-found")),
+            &reading::GRANT_REVOKE
+        ));
+        assert!(!gone(&refused(404, None), &reading::GRANT_REVOKE));
+        assert!(!gone(
+            &refused(404, Some("something-else")),
+            &reading::GRANT_REVOKE
+        ));
+        assert!(!gone(&refused(409, None), &reading::GRANT_REVOKE));
+        // **A sanctioned kind wins over the status, deliberately.** `read`
+        // consults the kind lists before the status, because a call site that
+        // names a slug is saying this particular answer does not mean what its
+        // status usually does. So the slug on a `403` still reads as gone —
+        // an answer the proxy has no reason to send, and not one this reading
+        // has to second-guess.
+        assert!(gone(
+            &refused(403, Some("grant-not-found")),
+            &reading::GRANT_REVOKE
+        ));
+    }
+
+    /// **And the other two say nothing about absence, for two different
+    /// reasons.** The Ticket revoke answers `204` for an id that was never
+    /// there, so nothing arrives for a reading to interpret; the Provisioning
+    /// Key revoke has not been observed either way, and that one also deletes
+    /// the Grants the key made — so reporting a revocation that may not have
+    /// happened is the expensive mistake. Neither invents a slug.
+    #[test]
+    fn the_other_two_revokes_do_not_guess_at_a_slug() {
+        for kind in [
+            "ticket-not-found",
+            "not-found",
+            "provisioning-key-not-found",
+        ] {
+            assert!(
+                !gone(&refused(404, Some(kind)), &reading::TICKET_REVOKE),
+                "{kind}"
+            );
+            assert!(
+                !gone(&refused(404, Some(kind)), &reading::KEY_REVOKE),
+                "{kind}"
+            );
+        }
     }
 }
 

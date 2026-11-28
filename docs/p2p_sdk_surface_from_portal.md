@@ -218,6 +218,14 @@ grant の delete を `Outcome::of_proxy(e, &DELETING)` で読むのに
 そもそも起きない。コメントの「`204` says almost nothing」はそう読める）。
 それでも 3 経路が食い違っていること自体は限界として記録に値する。
 
+> **後記（`p2p_sdk_design.md` D5 / §3.12 で決着）**: この留保が当たっていた。
+> `revoke_ticket` の doc 自身が「An unknown id also answers `204`」と書いており、
+> **Ticket の revoke では不在が届かない** —— `--revoke-ticket` が `404` を落とす
+> という上記の指摘は起き得なかった。grant の delete だけが不在に名前を持ち
+> （`grant-not-found` / `not-found`）、その読みは `portal-server` から
+> `isekai_p2p_core::proxy::reading::GRANT_REVOKE` に移って共有された。
+> Provisioning Key の revoke は何も分かっていないので、黙ったままにした。
+
 #### 足す価値があるもの 2 — 一覧の行の読み方（#352 で入れた）
 
 これは**すでに重複していた**。binding 種別の分類が
