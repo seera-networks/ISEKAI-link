@@ -223,15 +223,20 @@ impl Sdk {
 
     /// What this handle applies when a call does not name a deadline.
     ///
-    /// **The issuer accessors apply neither of them**, and neither does
-    /// anything below this crate (`p2p_sdk_api_review.md` §5.3 found no request
-    /// timeout at all). The two numbers here are a redemption and a connect,
+    /// **The issuer accessors apply neither of them** (D16 = A), and neither
+    /// does anything below this crate (`p2p_sdk_api_review.md` §5.3 found no
+    /// request timeout at all). The two numbers here are a redemption and a
+    /// connect,
     /// measured for those two waits by the FFIs; a control-plane request is a
     /// third quantity nobody has measured, and inventing a default for it here
     /// would be the one thing D7 = C set out to avoid. So a caller that needs
     /// one wraps the call — `tokio::time::timeout(d, sdk.tickets().list())` —
     /// and a `Deadlines` with a third field stays an addition this crate can
-    /// make without breaking anyone, which is what `#[non_exhaustive]` is for.
+    /// make without breaking anyone, which is what `#[non_exhaustive]` is for —
+    /// so choosing not to apply one here does not close the door on a measured
+    /// number later. What it does leave standing: a proxy that accepts a stream
+    /// and never answers holds an unwrapped call open, and that is the caller's
+    /// to bound rather than this crate's to guess.
     pub fn deadlines(&self) -> Deadlines {
         self.deadlines
     }
