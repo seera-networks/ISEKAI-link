@@ -93,9 +93,28 @@ pub use isekai_p2p::TokenError;
 // one layer along: a caller holding a [`SdkError`] can ask how the route it
 // came from reads its answers, and compare it with its own.
 pub use isekai_p2p::agent::{
-    reading, Grant, Made, ProvisioningBinding, ProvisioningBounds, ProvisioningKey,
-    ProvisioningKeyRecord, ProvisioningRedemption, Ticket, TicketBounds, TicketRecord,
+    Grant, Made, ProvisioningBinding, ProvisioningBounds, ProvisioningKey, ProvisioningKeyRecord,
+    ProvisioningRedemption, Ticket, TicketBounds, TicketRecord,
 };
+
+/// How each route's answers are read.
+///
+/// **Every reading a [`SdkError`] can carry is nameable from here.** The error
+/// hands back a `&'static Reading`, and a caller that depends on this crate
+/// alone — the point of the crate — would otherwise hold one it could not
+/// compare with anything. The readings themselves stay beside their routes
+/// (`p2p_sdk_design.md` D15); this module is the one place that gathers the
+/// names.
+pub mod reading {
+    /// The proxy routes — the issuer groups.
+    pub use isekai_p2p::agent::reading::*;
+    /// `endpoints()`.
+    pub use isekai_p2p::endpoints::reading as endpoints;
+    /// `enrollment_keys()`.
+    pub use isekai_p2p::enrollment::reading as enrollment_keys;
+    /// `me()`.
+    pub use isekai_p2p::membership::reading as membership;
+}
 // The inventory side's own vocabulary (§3.2), for the same reason: a caller
 // that depends on the facade alone has to be able to name what `list` answered
 // with, and to build the request `issue` takes.
@@ -658,7 +677,18 @@ impl fmt::Display for SdkError {
             SdkError::Token(error) => write!(f, "{error}"),
             SdkError::Proxy { source, .. } => write!(f, "{source}"),
             SdkError::Identity { source, .. } => write!(f, "{source}"),
-            SdkError::Credential { explain, .. } => write!(f, "{explain}"),
+            // **The reason is printed here or nowhere.** This arm has no
+            // typed source — `said` is words, because the credential seams
+            // answer with `anyhow::Error` and this surface does not name it —
+            // so leaving it out of `Display` would drop the cause for every
+            // caller that logs `{e}` or wraps this in `anyhow` and prints
+            // `{e:#}`. `TokenError::Credential` keeps its cause as a `source`;
+            // this is how the same failure keeps the same fidelity one layer
+            // up.
+            SdkError::Credential { explain, said } => match said {
+                Some(said) => write!(f, "{explain}: {said}"),
+                None => write!(f, "{explain}"),
+            },
         }
     }
 }

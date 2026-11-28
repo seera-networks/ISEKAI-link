@@ -707,8 +707,9 @@ const REFUSED_RETRY: Duration = Duration::from_secs(300);
 /// **Public because the facade's control-plane cache asks the same question**
 /// (`p2p_sdk_design.md` D13): how long a token it just issued can be relied on
 /// for. A second margin written next to the cache would be a second number to
-/// keep in step with [`RENEW_MARGIN`], and the two would drift the first time
-/// one of them was tuned.
+/// keep in step with the `RENEW_MARGIN` below — private, and deliberately so:
+/// the margin is this module's to choose — and the two would drift the first
+/// time one of them was tuned.
 pub fn renew_delay(expires_in: Option<i64>) -> Duration {
     let Some(expires_in) = expires_in else {
         return RENEW_UNKNOWN;

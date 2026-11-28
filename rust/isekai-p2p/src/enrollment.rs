@@ -17,25 +17,18 @@ use isekai_p2p_core::identity::{
 use isekai_p2p_core::proxy::ControlPlaneTransport;
 use isekai_p2p_core::transport::MasqueH3Transport;
 
-/// How the inventory routes' answers are read.
+/// How this module's routes are read.
 ///
-/// **Beside the routes**, for the reason
-/// [`isekai_p2p_core::proxy::reading`] gives at length: a [`Reading`] is the
-/// call site saying what a status means *on this route*, and when every caller
-/// writes its own, the same answer ends up read several ways
-/// (`p2p_sdk_design.md` D15). These sit beside the typed wrappers rather than
-/// beside `IdentityClient`'s raw methods, because the wrappers are what a
-/// caller reaches and what D12 gave a type to.
+/// **Beside the routes** (`p2p_sdk_design.md` D15), for the reason
+/// [`isekai_p2p_core::proxy::reading`] gives at length, and beside the typed
+/// wrappers rather than `IdentityClient`'s raw methods — the wrappers are what
+/// a caller reaches and what D12 gave a type to.
 ///
-/// **They agree today, and are still one per route.** A `404` is read as
-/// nothing in particular everywhere here, including on the two revokes —
-/// [`Reading::gone_kinds`] spells out why a `404` with no problem+json body
-/// cannot be told from a wrong base path or a proxy that never had the route,
-/// and Identity has not been observed naming a slug for absence on any of
-/// them. `portal-core`'s own revoke reading answers `Missing::Done` instead,
-/// and keeps that on purpose: it is asking "did my registration land?" about
-/// an id it has just registered itself, which is local knowledge this surface
-/// does not have.
+/// **None of the four says anything about absence**, including [`REVOKE`]:
+/// [`Reading::gone_kinds`] spells out why a `404` cannot be read by status, and
+/// Identity has not been observed naming a slug for absence here. A guest
+/// refused [`ISSUE`] by name arrives as an ordinary `insufficient-permission`
+/// instead, which `crate::config::membership_advice` is what says so.
 pub mod reading {
     use isekai_p2p_core::outcome::{Missing, Reading};
 

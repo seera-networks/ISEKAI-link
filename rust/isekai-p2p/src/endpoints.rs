@@ -16,25 +16,23 @@ use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::enrollment::Identity;
 
-/// How the inventory routes' answers are read.
+/// How this module's routes are read.
 ///
-/// **Beside the routes**, for the reason
-/// [`isekai_p2p_core::proxy::reading`] gives at length: a [`Reading`] is the
-/// call site saying what a status means *on this route*, and when every caller
-/// writes its own, the same answer ends up read several ways
-/// (`p2p_sdk_design.md` D15). These sit beside the typed wrappers rather than
-/// beside `IdentityClient`'s raw methods, because the wrappers are what a
-/// caller reaches and what D12 gave a type to.
+/// **Beside the routes** (`p2p_sdk_design.md` D15): a [`Reading`] is the call
+/// site saying what a status means *on this route*, and when every caller
+/// writes its own, the same answer ends up read several ways. The long form of
+/// that argument is in [`isekai_p2p_core::proxy::reading`], which these are the
+/// Identity-side counterpart of; they sit beside the typed wrappers rather than
+/// `IdentityClient`'s raw methods, because the wrappers are what a caller
+/// reaches and what D12 gave a type to.
 ///
-/// **They agree today, and are still one per route.** A `404` is read as
-/// nothing in particular everywhere here, including on the two revokes —
-/// [`Reading::gone_kinds`] spells out why a `404` with no problem+json body
-/// cannot be told from a wrong base path or a proxy that never had the route,
-/// and Identity has not been observed naming a slug for absence on any of
-/// them. `portal-core`'s own revoke reading answers `Missing::Done` instead,
-/// and keeps that on purpose: it is asking "did my registration land?" about
-/// an id it has just registered itself, which is local knowledge this surface
-/// does not have.
+/// **All three say nothing about absence.** [`Reading::gone_kinds`] spells out
+/// why a `404` cannot be read by status — one with no problem+json body is also
+/// what a wrong base path answers — and Identity has not been observed naming a
+/// slug for absence on these routes. That includes [`REVOKE`]: `portal-core`
+/// answers `Missing::Done` for its own revoke and keeps that on purpose,
+/// because it is asking "did my registration land?" about an id it has just
+/// registered itself, which is local knowledge this surface does not have.
 pub mod reading {
     use isekai_p2p_core::outcome::{Missing, Reading};
 
