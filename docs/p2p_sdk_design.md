@@ -1,8 +1,8 @@
 # SDK の設計 — 7 群から面を決める
 
-- status: 設計（§9 Q1 の答え）。D1–D13 決定済み。§7 段 1 と 2b 実装済み。
-  **2b を入れて判断が 1 つ増えた（D14）** — §3.8
-- version: 0.9
+- status: 設計（§9 Q1 の答え）。**判断は 14 すべて決定済み**。
+  §7 段 1 / 2b / D14 実装済み
+- version: 0.10
 - 対象: `1d63993`（`main`, v0.10.2）
 - 前提:
   - `docs/p2p_sdk_surface_from_portal.md` §7 — **必要な面の 7 群**。本文書の入力
@@ -15,8 +15,8 @@
 **決めること**: 7 群それぞれを SDK の面に出すか、出すならどの形で出すか。
 Q1（面の広さ）への答えを、群ごとの素案シグネチャとして置く。
 
-**決めないこと**: **D14**。2b（D12 = C）を入れたら、同じ問いがトークン発行に
-残っていた（§3.8）。D1–D13 は決定済み（§6）。
+**決めないこと**: もう無い。D14 が決まった（**B**、0.10 で実装）ので、
+本文書の判断は尽きている（§6）。残りは作業である（§7）。
 
 **0.5 で決まったこと**: D10 = A、D11 = A（どちらも推奨どおり）。
 確定の過程で、**D10 の前提が 0.4 で書いたものより良いことが分かった**（§3.3）:
@@ -78,6 +78,27 @@ D8 = C1、D9 = A。いずれも推奨どおり。
 `migration-spike.yml` のテストに `-p isekai-sdk` を足し、両トリガーの
 `paths:` に `rust/isekai-sdk/**` を入れた（closure チェックは通る —— facade の
 依存は `isekai-p2p` の部分集合）。
+
+**0.10 — D14 = B が実装で見つけたもの**。`issue_endpoint_token` は
+`Result<EndpointToken, TokenError>` になった（`isekai-p2p/src/token.rs`）。腕は 3 つ
+で、素案の 2 つに**局所的な矛盾**が加わった —— 同じ `Credential` が別の鍵の登録を
+既に使っている場合で、これは `anyhow::bail!` が 2 箇所にあった。読みは
+`TokenError::outcome()`（`Identity` は `Outcome::of_identity`、`Credential` は
+`Reauthenticate`、`Mismatched` は `Rejected`）。
+
+**そして 2b が 1 箇所取りこぼしていた**。`enrollment::issue` は
+`.map_err(explain_membership_refusal)?` を残していて、この関数が返すのは
+`anyhow::Error`、`IdentityError::Transport` は `#[from] anyhow::Error` —— つまり
+**`403` が「Transport」の腕に入り、ネットワーク障害（`Unreachable`）として
+読まれていた**。2b が型を変えた時点で静かにそうなった（本体は 1 行も動かして
+いないのに、意味が動いた）。助言は**印字する側**（`portal-client`）で付け直し、
+`explain_membership_refusal` は「報告側で呼ぶもの」と文書化した。
+`a_wrapped_refusal_loses_its_status` が罠を固定している。
+
+**`{:#}` の罠は型を足すたびに付いてくる**（#386 と同じもの）: `TokenError` の
+`Display` はこの層が足す 1 文だけなので、サーバの答え（状態・本文・原因）は
+`anyhow::Error` 経由でしか出ない。更新ループの 3 つの報告と
+`token_flow` のテストはそう直した。
 
 **既決として扱うもの**（再提案しない）:
 
@@ -560,11 +581,49 @@ Auth0 トークンに対して同じ判断をしている。`EndpointToken` は 
 | B | `issue_endpoint_token` に型付きの失敗を与える（`Identity(IdentityError)` ＋ 資格情報の腕）。読みは `Outcome` | 面の読みが 1 種類に揃う。`portal-*` も分類できる | `isekai-p2p` に小さな型が 1 つ増える |
 | C | facade が自分のエラー型を作って畳む | 下を触らない | facade が意味論を持つ＝「素通しだけ」を破る。約束する面に新しい語彙が増える |
 
-**推奨 B。** D12 = C と同じ理屈（失われている場所で直す）であり、**`Outcome` に
-足すものは無い**: `Reauthenticate { explain }` が既にあり
+**決定 B**（0.10 で実装）。D12 = C と同じ理屈（失われている場所で直す）であり、
+**`Outcome` に足した腕は無い**: `Reauthenticate { explain }` が既にあり
 （`outcome.rs` の `Outcome`）、「資格情報を取り直せ」はまさにその腕である。
-読みの関数は `isekai-p2p` 側に置く（core は `isekai-p2p` の型を知らないので、
+読みの関数は `isekai-p2p` 側に置いた（core は `isekai-p2p` の型を知らないので、
 `Outcome::of_*` には入れられない）。
+
+**実装が足した 3 つ目の腕。** 素案は 2 腕（`Identity` ＋ 資格情報）だったが、
+`config.rs` には `anyhow::bail!` が 2 箇所あった —— 同じ `Credential` が別の鍵の
+登録を既に使っている場合で、これは**サーバに何も訊いていない**局所的な矛盾である。
+`Mismatched` として分け、読みは `Rejected`（「要求が成り立たなかった。状態は
+動いていない」＝鍵ごとに `Credential` を与えれば直る）にした。`Refused` では
+ない: 「認可が断った」とは、規則が引かれたという主張だからである。
+
+**`Reauthenticate` は資格情報の失敗すべてに付く。** `Auth0TokenSource` /
+`AssertionSource` は `anyhow::Error` で答える trait なので、「更新を断られた」と
+「認可サーバが答えなかった」は同じ形で届く。2 つの誤読のうち安全なのはこちら
+である —— どちらでも動けるのは source を持っている側だけで、本当に「入り直せ」
+である場合、app の source は既に自分のサインイン状態を印している
+（`auth0::RefreshingAuth0Token`）。`Unreachable` と読めば、終わったセッションに
+待ち続けろと言うことになる。
+
+**消えたのは鎖歩きである。** `already_registered` は `downcast_ref` を捨てて腕を
+見るだけになり（D12 が `portal-core` でしたのと同じ）、`is_permanent` は
+`error.outcome()` が `Refused` かを見るだけになった。資格情報の腕は意図的に
+「恒久」ではない（source が次の周で渡せることがある）。
+
+**ただし core に 1 つメソッドが増えた（レビューが出した）。** `of_identity` は
+`explain` を**サーバの答えだけ**から作る。だから助言（どの鍵か、どの
+Enrollment Key のファイルか、ゲスト期間が終わったのか）を付けた `Identity` の腕を
+`outcome()` に通すと、**その助言が落ちていた** —— `Credential` と `Mismatched` は
+自分の言葉を `Outcome` に載せるので、面として非対称でもあった。
+`Outcome::with_context(said)` を core に足して両方を保つ（順序は `anyhow` の
+context と同じく外側が先）。`Unreachable::Deadline` は言葉を持たないので素通し
+する —— 答えを読む関数はどちらも `Transport` しか作らないので、到達しない。
+
+**`{:#}` の罠は 3 件目に出た。** `portal-client-ffi/src/lib.rs` の
+`PortalError::Pair(format!("{e:#}"))` —— **別ワークスペースなのでビルドは通り、
+言葉だけが消える**。Android で `register: true` の組み立てが `403` や `429` を
+受けたとき、Kotlin 側に届くのは `"could not issue an Endpoint Token"` だけに
+なっていた。型付きのエラーを入れるたびにこの罠が付いてくるので、
+**鎖が欲しければ `anyhow::Error::from(e)` を通す**という規則を、その呼び出し側の
+コメントにも書いた（同じファイルの他の `{e:#}` は `anyhow::Result` が相手なので
+正しい、という判別も併せて）。
 
 ## 4. 横断的な事項
 
@@ -683,10 +742,10 @@ A。2 本は**別のアプリの都合**（frame sink があるかどうか、�
 | --- | --- | --- | --- | --- |
 | D12 | 棚卸し側の読み | — | **決定 C**（2b で実装済み。8 シグネチャ、呼び出し側は 1 箇所だけ変わり簡単になった） | — |
 | D13 | Endpoint トークンの取得 | — | **決定 B**（`REFRESH_MARGIN = 60s` の先例に倣う） | — |
-| D14 | トークン発行の読み | `anyhow` のまま / 下を型付きに / facade が畳む | **B**（`Outcome::Reauthenticate` が既にある） | §3.3 のアクセサ＝段 2 |
+| D14 | トークン発行の読み | — | **決定 B**（実装済み。`TokenError` 3 腕。`Outcome` の腕は増やさず、`with_context` を 1 つ足した） | — |
 
 これで §9 の 7 問には答えが付いている。本文書が出した判断は **14** で、
-うち **13 が決定済み**（残りは D14）。
+**すべて決定済み**。
 
 Q5（通知）と Q7（FFI 統合）は §4.2 / §4.4 に答えがあり、`FrameSink` という先例が
 あるので**判断ではなく作業**である。Q2 と Q6 は既決（§0、§4.3）。
@@ -702,7 +761,8 @@ Q5（通知）と Q7（FFI 統合）は §4.2 / §4.4 に答えがあり、`Fram
    `version.workspace` の例外（§4.3）もここで入れる。
 2. **群アクセサ（発行側）** — §3.3。読みは `ProxyError` で既に正しく、
    `grants()` の list と revoke は `ProxyClient` を直接呼ぶ（D10 = A）。
-   **D13** がここで要る（トークンの取得）。
+   **D13** がここで要る（トークンの取得）。入口の失敗は **D14 = B** で
+   `TokenError` になっている（実装済み）ので、アクセサは `anyhow` を継がない。
 2b. **棚卸し 3 モジュールを型付きの失敗に**（D12 = C、実装済み）。`isekai-p2p` の
    `endpoints` / `enrollment` / `membership` の 8 シグネチャ。**動いた呼び出し側は
    `portal-core/src/agent.rs` の 1 箇所だけ**で、`portal-client` の 10 箇所は

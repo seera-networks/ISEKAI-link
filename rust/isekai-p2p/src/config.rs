@@ -21,6 +21,7 @@ use isekai_p2p_core::proxy::{ControlPlaneTransport, ProxyClient};
 use isekai_p2p_core::transport::MasqueH3Transport;
 
 use crate::auth::{Credential, Enrollment};
+use crate::token::TokenError;
 
 /// Everything a P2P session needs to reach the services and identify itself.
 ///
@@ -87,16 +88,17 @@ pub fn load_or_generate_key(path: &Path) -> anyhow::Result<EndpointKey> {
 
 /// Obtain an Endpoint Token over whichever Identity API transport the config
 /// selects, registering or enrolling first when that is what is needed.
-pub async fn issue_endpoint_token(cfg: &P2pConfig) -> anyhow::Result<EndpointToken> {
+pub async fn issue_endpoint_token(cfg: &P2pConfig) -> Result<EndpointToken, TokenError> {
     // The Identity API serves h1/h2 on TCP+TLS and h3 on QUIC at the same port;
     // pick one. The two branches build different concrete transports, so the
     // register/issue work is shared via the generic `issue`.
     let token = if cfg.identity_http3 {
-        let client = IdentityClient::new(MasqueH3Transport::connect(&cfg.identity_url)?);
-        issue(&client, cfg).await
+        let transport =
+            MasqueH3Transport::connect(&cfg.identity_url).map_err(unreachable_identity)?;
+        issue(&IdentityClient::new(transport), cfg).await
     } else {
-        let client = IdentityClient::new(HttpsTransport::connect(&cfg.identity_url)?);
-        issue(&client, cfg).await
+        let transport = HttpsTransport::connect(&cfg.identity_url).map_err(unreachable_identity)?;
+        issue(&IdentityClient::new(transport), cfg).await
     }?;
     say_if_guest(&token);
     Ok(token)
@@ -284,7 +286,7 @@ pub fn proxy_client(
 async fn issue<T: ControlPlaneTransport>(
     client: &IdentityClient<T>,
     cfg: &P2pConfig,
-) -> anyhow::Result<EndpointToken> {
+) -> Result<EndpointToken, TokenError> {
     match &cfg.credential {
         Credential::Auth0 {
             token,
@@ -300,10 +302,9 @@ async fn issue<T: ControlPlaneTransport>(
             // by the second call the captured token may already be the stale
             // one.
             let auth0 = match source {
-                Some(source) => source
-                    .auth0_token()
-                    .await
-                    .context("could not obtain a current Auth0 token")?,
+                Some(source) => source.auth0_token().await.map_err(|e| {
+                    TokenError::credential("could not obtain a current Auth0 token", e)
+                })?,
                 None => token.clone(),
             };
             // **The narrowing goes to both arms.** It used to reach neither:
@@ -378,7 +379,7 @@ async fn issue<T: ControlPlaneTransport>(
                         // its registration on, which is a local fact.
                         Ok(()) => {
                             registered_here.store(true, std::sync::atomic::Ordering::Relaxed);
-                            anyhow::Ok(cfg.key.endpoint_id())
+                            Ok(cfg.key.endpoint_id())
                         }
                         // **`409` means it is already there, which is what this
                         // cell wanted.** Registration can reach the server and
@@ -395,7 +396,7 @@ async fn issue<T: ControlPlaneTransport>(
                         // registration too, and this is a guest's very first
                         // call -- the one where "403" with nothing attached is
                         // least likely to be recognised.
-                        Err(e) => Err(explain_membership_refusal(e)),
+                        Err(e) => Err(membership_refusal(e, "could not register this Endpoint")),
                     }
                 })
                 .await?;
@@ -406,11 +407,13 @@ async fn issue<T: ControlPlaneTransport>(
             // for an Endpoint that was never registered — which fails at the
             // proxy, naming nothing that points back here.
             if registered_id != &cfg.key.endpoint_id() {
-                anyhow::bail!(
-                    "this credential already registered {registered_id}, but this config \
-                     carries {}. Give each keypair its own Credential.",
-                    cfg.key.endpoint_id(),
-                );
+                return Err(TokenError::Mismatched {
+                    explain: format!(
+                        "this credential already registered {registered_id}, but this config \
+                         carries {}. Give each keypair its own Credential.",
+                        cfg.key.endpoint_id(),
+                    ),
+                });
             }
             // **Always a separate call**, which costs nothing: §8.1's
             // registration answers with the Endpoint's record and no token, so
@@ -449,7 +452,7 @@ async fn unattended<T: ControlPlaneTransport>(
     client: &IdentityClient<T>,
     cfg: &P2pConfig,
     enrollment: &Enrollment,
-) -> anyhow::Result<EndpointToken> {
+) -> Result<EndpointToken, TokenError> {
     // Set by whichever caller actually enrols, and read back below. The
     // enrolment response carries the first Endpoint Token with it (§8.8.5), so
     // the caller that did the work already holds one and must not go on to
@@ -514,12 +517,15 @@ async fn unattended<T: ControlPlaneTransport>(
     // `Credential`, and saying so here beats a `403` from §8.2.3 that names
     // nothing.
     if enrolled_id.endpoint_id != cfg.key.endpoint_id() {
-        anyhow::bail!(
-            "this Enrollment Key credential already enrolled {}, but this config carries {}. \
-             One key registers one Endpoint per keypair — give each keypair its own Credential.",
-            enrolled_id.endpoint_id,
-            cfg.key.endpoint_id(),
-        );
+        return Err(TokenError::Mismatched {
+            explain: format!(
+                "this Enrollment Key credential already enrolled {}, but this config carries \
+                 {}. One key registers one Endpoint per keypair — give each keypair its own \
+                 Credential.",
+                enrolled_id.endpoint_id,
+                cfg.key.endpoint_id(),
+            ),
+        });
     }
 
     match minted {
@@ -538,16 +544,17 @@ async fn unattended<T: ControlPlaneTransport>(
 /// route answers, which is also why [`REGISTERING`] reads the `404` as nothing
 /// in particular — giving it a meaning here would invent one the route never
 /// sends.
-fn already_registered(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<IdentityError>()
-        .map(|e| {
-            matches!(
-                Outcome::of_identity(e, &REGISTERING),
-                Outcome::AlreadyGone { .. }
-            )
-        })
-        .unwrap_or(false)
+fn already_registered(error: &TokenError) -> bool {
+    // **The chain walk is gone with the type** (D14): the answer is in the arm,
+    // and a credential failure — a different arm now rather than one more
+    // `anyhow` string among the Identity ones — cannot be mistaken for it.
+    let TokenError::Identity { source, .. } = error else {
+        return false;
+    };
+    matches!(
+        Outcome::of_identity(source, &REGISTERING),
+        Outcome::AlreadyGone { .. }
+    )
 }
 
 /// How the register call reads an answer: its `409` is "already there".
@@ -565,7 +572,7 @@ async fn enrol<T: ControlPlaneTransport>(
     client: &IdentityClient<T>,
     cfg: &P2pConfig,
     enrollment: &Enrollment,
-) -> anyhow::Result<isekai_p2p_core::identity::Enrolled> {
+) -> Result<isekai_p2p_core::identity::Enrolled, TokenError> {
     let auth0 = enrollment_auth0(enrollment).await?;
     // **Minted before the challenge so that a failed mint costs nothing.** A
     // challenge is one-shot and lives 120 seconds, so taking one and then
@@ -578,8 +585,9 @@ async fn enrol<T: ControlPlaneTransport>(
     let challenge = client
         .enroll_challenge(auth, &cfg.key)
         .await
-        .map_err(|error| explain_key_refused(error, enrollment))
-        .context("could not obtain an enrolment challenge")?;
+        .map_err(|error| {
+            key_refusal(error, enrollment, "could not obtain an enrolment challenge")
+        })?;
     client
         .enroll(
             auth,
@@ -589,8 +597,7 @@ async fn enrol<T: ControlPlaneTransport>(
             cfg.token_ttl,
         )
         .await
-        .map_err(|error| explain_key_refused(error, enrollment))
-        .context("could not enrol this Endpoint")
+        .map_err(|error| key_refusal(error, enrollment, "could not enrol this Endpoint"))
 }
 
 /// §8.2.2 → §8.2.3 with an Enrollment Key in place of the Auth0 token (§8.8.7).
@@ -598,7 +605,7 @@ async fn refresh<T: ControlPlaneTransport>(
     client: &IdentityClient<T>,
     cfg: &P2pConfig,
     enrollment: &Enrollment,
-) -> anyhow::Result<EndpointToken> {
+) -> Result<EndpointToken, TokenError> {
     let auth0 = enrollment_auth0(enrollment).await?;
     // **Minted again, every renewal**, and before the challenge for the same
     // reason as in `enrol`. §8.8.7 verifies the binding each time, which is
@@ -612,8 +619,7 @@ async fn refresh<T: ControlPlaneTransport>(
     let challenge = client
         .refresh_challenge(auth, &cfg.key.endpoint_id())
         .await
-        .map_err(|error| explain_key_refused(error, enrollment))
-        .context("could not obtain a renewal challenge")?;
+        .map_err(|error| key_refusal(error, enrollment, "could not obtain a renewal challenge"))?;
     client
         // **The selector is re-sent, unlike the other two axes.** The server
         // remembers a narrowing of permissions and protocols and does not
@@ -628,8 +634,7 @@ async fn refresh<T: ControlPlaneTransport>(
             cfg.token_ttl,
         )
         .await
-        .map_err(|error| explain_key_refused(error, enrollment))
-        .context("could not renew the endpoint token")
+        .map_err(|error| key_refusal(error, enrollment, "could not renew the endpoint token"))
 }
 
 fn identity_auth<'a>(
@@ -644,23 +649,25 @@ fn identity_auth<'a>(
     }
 }
 
-async fn enrollment_assertion(enrollment: &Enrollment) -> anyhow::Result<Option<String>> {
+async fn enrollment_assertion(enrollment: &Enrollment) -> Result<Option<String>, TokenError> {
     match &enrollment.assertion {
-        Some(source) => Ok(Some(source.assertion(IDENTITY_AUDIENCE).await.context(
-            "could not mint a workload identity token for the Identity API",
+        Some(source) => Ok(Some(source.assertion(IDENTITY_AUDIENCE).await.map_err(
+            |e| {
+                TokenError::credential(
+                    "could not mint a workload identity token for the Identity API",
+                    e,
+                )
+            },
         )?)),
         None => Ok(None),
     }
 }
 
-async fn enrollment_auth0(enrollment: &Enrollment) -> anyhow::Result<Option<String>> {
+async fn enrollment_auth0(enrollment: &Enrollment) -> Result<Option<String>, TokenError> {
     match &enrollment.auth0 {
-        Some(source) => Ok(Some(
-            source
-                .auth0_token()
-                .await
-                .context("could not obtain a current Auth0 token")?,
-        )),
+        Some(source) => Ok(Some(source.auth0_token().await.map_err(|e| {
+            TokenError::credential("could not obtain a current Auth0 token", e)
+        })?)),
         None => Ok(None),
     }
 }
@@ -734,11 +741,11 @@ fn retry_delay(failures: u32) -> Duration {
 /// error a machine meets the first time it does. An Endpoint cannot follow:
 /// its id is derived from its keypair and the same key cannot be registered
 /// twice, so the answer is a new key registered under the organization.
-fn explain_pop_failure(error: IdentityError, cfg: &P2pConfig) -> anyhow::Error {
+fn pop_failure_advice(error: &IdentityError, cfg: &P2pConfig) -> Option<String> {
     if error.kind().as_deref() != Some("pop-signature-invalid") {
-        return error.into();
+        return None;
     }
-    anyhow::Error::from(error).context(format!(
+    Some(format!(
         "Identity could not verify {}. It answers this both for a bad signature and for an \
          Endpoint it does not find in the tenant the Auth0 token names, so the usual cause is \
          that this Endpoint was registered before signing in to an organization -- or without \
@@ -765,9 +772,9 @@ fn explain_pop_failure(error: IdentityError, cfg: &P2pConfig) -> anyhow::Error {
 /// **And which key**, from [`Enrollment::source`]. A CI run holds two, with
 /// different permissions, and reissuing the wrong one leaves the job failing
 /// on the same line.
-fn explain_key_refused(error: IdentityError, enrollment: &Enrollment) -> anyhow::Error {
+fn key_refused_advice(error: &IdentityError, enrollment: &Enrollment) -> Option<String> {
     if error.kind().as_deref() != Some("enrollment-key-invalid") {
-        return error.into();
+        return None;
     }
     let named = match &enrollment.source {
         Some(source) => format!("the Enrollment Key in {source}"),
@@ -777,7 +784,7 @@ fn explain_key_refused(error: IdentityError, enrollment: &Enrollment) -> anyhow:
         Some(source) => format!("put it back in {source}"),
         None => "replace the secret".to_owned(),
     };
-    anyhow::Error::from(error).context(format!(
+    Some(format!(
         "{named} was refused. The server answers the same way for all four reasons, so it \
          cannot say which: the key has expired (they live seven days by default, 30 at the \
          most, and nothing warns before it), or it was revoked, or its owner was, or it is \
@@ -786,6 +793,43 @@ fn explain_key_refused(error: IdentityError, enrollment: &Enrollment) -> anyhow:
          `--permissions` as the key it replaces, since leaving them out burns in the \
          server's default set rather than this role's"
     ))
+}
+
+/// The unattended paths' failure: the advice when the key is what was refused,
+/// and which of the four calls it was otherwise.
+///
+/// Both, when there is advice — `during` first, the way the `anyhow` context
+/// that used to carry it printed. "Invalid" says nothing about *when*, and a
+/// renewal that fails days into a session is a different thing to look at than
+/// an enrolment that never got off the ground.
+fn key_refusal(error: IdentityError, enrollment: &Enrollment, during: &'static str) -> TokenError {
+    let explain = match key_refused_advice(&error, enrollment) {
+        Some(advice) => format!("{during}: {advice}"),
+        None => during.to_owned(),
+    };
+    TokenError::identity(explain, error)
+}
+
+/// The same, for a refusal that is about the membership rather than the key.
+fn membership_refusal(error: IdentityError, during: &'static str) -> TokenError {
+    let explain = match membership_advice(&error) {
+        Some(advice) => format!("{during}: {advice}"),
+        None => during.to_owned(),
+    };
+    TokenError::identity(explain, error)
+}
+
+/// A transport to the Identity API that would not even build.
+///
+/// **`IdentityError::Transport` is the honest arm for it**: what failed is
+/// reaching Identity, and a wait is the right reading. It is the *credential*
+/// failures that must not land there — that is what [`TokenError::Credential`]
+/// is for.
+fn unreachable_identity(error: anyhow::Error) -> TokenError {
+    TokenError::identity(
+        "could not open a connection to the Identity API",
+        IdentityError::Transport(error),
+    )
 }
 
 /// Say what a membership refusal means for the person holding the token.
@@ -803,7 +847,15 @@ fn explain_key_refused(error: IdentityError, enrollment: &Enrollment) -> anyhow:
 /// A guest refused for lack of a permission is the third shape, and the one
 /// worth catching: it arrives as an ordinary `insufficient-permission` whose
 /// detail happens to begin "guests cannot".
-pub(crate) fn explain_membership_refusal(error: IdentityError) -> anyhow::Error {
+///
+/// **Call this where the failure is reported, not where it is returned.** It
+/// answers with an `anyhow::Error`, and `IdentityError` takes an `anyhow::Error`
+/// by `#[from]` — so inside a function that returns `IdentityError`,
+/// `.map_err(explain_membership_refusal)?` compiles, puts the `403` in the
+/// `Transport` arm, and leaves it to be read as a network failure worth
+/// retrying forever. That is what it did to `enrollment::issue` when these
+/// routes became typed; `a_wrapped_refusal_loses_its_status` pins it.
+pub fn explain_membership_refusal(error: IdentityError) -> anyhow::Error {
     match membership_advice(&error) {
         Some(advice) => anyhow::Error::from(error).context(advice),
         None => error.into(),
@@ -811,7 +863,12 @@ pub(crate) fn explain_membership_refusal(error: IdentityError) -> anyhow::Error 
 }
 
 /// What to tell the holder, when a refusal is about their membership.
-fn membership_advice(error: &IdentityError) -> Option<&'static str> {
+///
+/// Public because the advice has to outlive the `anyhow` wrapper it used to
+/// arrive in: a caller holding an `IdentityError` — which, since D12, is every
+/// caller of the inventory routes — can ask for the sentence without giving up
+/// the type that says what the answer was.
+pub fn membership_advice(error: &IdentityError) -> Option<&'static str> {
     let advice = match error.kind().as_deref() {
         Some("membership-expired") => {
             "this guest membership has ended. Everything it was issued stops with it -- ask \
@@ -848,18 +905,23 @@ fn explain_issue_failure(
     error: IdentityError,
     cfg: &P2pConfig,
     registered_here: bool,
-) -> anyhow::Error {
+) -> TokenError {
+    const DURING: &str = "could not issue an Endpoint Token";
     if membership_advice(&error).is_some() {
-        return explain_membership_refusal(error);
+        return membership_refusal(error, DURING);
     }
     if registered_here {
-        return error.into();
+        return TokenError::identity(DURING, error);
     }
     // **A `409` lands here too**, and that one *is* the cross-tenant collision:
     // the keypair is registered somewhere, this tenant cannot see it, and the
-    // issue that follows is refused for exactly the reason `explain_pop_failure`
+    // issue that follows is refused for exactly the reason `pop_failure_advice`
     // gives.
-    explain_pop_failure(error, cfg)
+    let explain = match pop_failure_advice(&error, cfg) {
+        Some(advice) => format!("{DURING}: {advice}"),
+        None => DURING.to_owned(),
+    };
+    TokenError::identity(explain, error)
 }
 
 /// Whether retrying this failure could ever produce a different answer.
@@ -871,45 +933,15 @@ fn explain_issue_failure(
 /// left retryable on purpose: `429` and `503` say when to come back, a `401`
 /// is usually an Auth0 token the source is about to replace, and a transport
 /// error is the network.
-fn is_permanent(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .filter_map(|e| e.downcast_ref::<IdentityError>())
-        .any(|e| matches!(Outcome::of_identity(e, &ISSUING), Outcome::Refused { .. }))
+/// **The credential arm is deliberately not permanent.** A source that could
+/// not hand over a token may manage on the next pass — a refresh that raced an
+/// expiry, an authorization server briefly away — and where the cause really is
+/// "sign in again", the app that owns the source has already been told. The
+/// `Mismatched` arm does not arise here at all: a renewal repeats the config
+/// whose registration the cell has already agreed with.
+fn is_permanent(error: &TokenError) -> bool {
+    matches!(error.outcome(), Outcome::Refused { .. })
 }
-
-/// How this path reads an answer (`docs/p2p_sdk_error_type.md` §3.4).
-///
-/// **`token_self_replacing` is false because this *is* the path that replaces
-/// it.** A `403` here is settled: there is no other loop about to hand this
-/// call a different token. On a path renewing a lease the same answer is a
-/// wait, which is the distinction `initiator::renewal_verdict` warns about.
-///
-/// **A `409` does reach here** — `explain_issue_failure` says "a `409` lands
-/// here too", and that one is the cross-tenant collision. `Unremarkable` keeps
-/// it out of the permanent bucket, which is where it was before; reading it as
-/// `Done` would call a cross-tenant collision "already gone". The `404` is the
-/// same, and neither is what this predicate is about.
-///
-/// `retryable_kinds` and `fixable_kinds` are empty: `429` and `503` are already
-/// waits by status, and no kind on this route asks to be read against its own.
-///
-/// **The `401 pop-signature-invalid` this used to name here moved into
-/// [`Outcome`]**, which reads it status-independently with the reason recorded
-/// alongside: Identity answers it for an Endpoint it cannot find as well as for
-/// a bad signature, and neither becomes true by asking again — one needs a key
-/// registered where the token points, the other a different key. Left in the
-/// transient bucket, the explanation this file attaches would be re-read out at
-/// `warn` every few minutes for the life of the process, since an in-memory
-/// token source never notices a re-login elsewhere.
-const ISSUING: Reading = Reading {
-    not_found: Missing::Unremarkable,
-    conflict: Missing::Unremarkable,
-    token_self_replacing: false,
-    retryable_kinds: &[],
-    fixable_kinds: &[],
-    gone_kinds: &[],
-};
 
 /// Keep `proxy`'s Endpoint Token current for as long as the returned guard
 /// lives.
@@ -947,6 +979,12 @@ pub fn spawn_token_renewal(
                     );
                 }
                 Err(e) if is_permanent(&e) => {
+                    // **`{:#}` is `anyhow`'s flag.** `TokenError`'s own
+                    // `Display` is the one sentence it adds, so the status, the
+                    // body and a transport cause all arrive only by going
+                    // through `anyhow::Error` — and this message is the only
+                    // place a refusal is ever said out loud.
+                    let e = anyhow::Error::from(e);
                     // **Said once, loudly, and then asked for rarely.** A `403`
                     // is an authorization decision: the ceiling has to gain the
                     // protocol, or the Endpoint has to stop being revoked, and
@@ -985,6 +1023,8 @@ pub fn spawn_token_renewal(
                 Err(e) => {
                     failures += 1;
                     delay = retry_delay(failures);
+                    // The cause, for the reason the arm above gives.
+                    let e = anyhow::Error::from(e);
                     // A failure here is not the end of the session — the token
                     // in force keeps working until it expires — but it is the
                     // beginning of one, so it is worth saying loudly once the
@@ -1077,8 +1117,8 @@ mod tests {
     #[test]
     fn a_tenant_mismatch_is_explained_rather_than_read_as_a_bad_key() {
         let cfg = a_config();
-        let explained = explain_pop_failure(problem(401, "pop-signature-invalid"), &cfg);
-        let text = format!("{explained:#}");
+        let text = pop_failure_advice(&problem(401, "pop-signature-invalid"), &cfg)
+            .expect("this one is explained");
         assert!(text.contains(&cfg.key.endpoint_id()), "{text}");
         assert!(text.contains("tenant"), "{text}");
         assert!(text.contains("new key"), "{text}");
@@ -1091,29 +1131,32 @@ mod tests {
     /// be read out at `warn` every few minutes for the life of the process.
     #[test]
     fn a_tenant_mismatch_is_not_retried_every_few_minutes() {
-        let explained = explain_pop_failure(problem(401, "pop-signature-invalid"), &a_config());
+        let cfg = a_config();
+        let explained = explain_issue_failure(problem(401, "pop-signature-invalid"), &cfg, false);
         assert!(is_permanent(&explained));
         // The `401`s that are not this are still worth retrying: an Auth0 token
         // the source is about to replace is one of them.
-        assert!(!is_permanent(&problem(401, "token-invalid").into()));
+        let other = explain_issue_failure(problem(401, "token-invalid"), &cfg, false);
+        assert!(!is_permanent(&other));
     }
 
     /// Every other refusal is left as it came: this explains one message, it
     /// does not narrate them all.
     #[test]
     fn other_refusals_are_not_dressed_up() {
-        let plain = explain_pop_failure(problem(403, "insufficient-permission"), &a_config());
-        let text = format!("{plain:#}");
-        assert!(!text.contains("tenant"), "{text}");
+        let plain = pop_failure_advice(&problem(403, "insufficient-permission"), &a_config());
+        assert!(plain.is_none(), "{plain:?}");
     }
 
-    fn api_error(status: u16) -> anyhow::Error {
-        anyhow::Error::from(isekai_p2p_core::identity::IdentityError::Api {
-            status,
-            body: String::new(),
-            retry_after: None,
-        })
-        .context("could not renew the endpoint token")
+    fn api_error(status: u16) -> TokenError {
+        TokenError::identity(
+            "could not renew the endpoint token",
+            IdentityError::Api {
+                status,
+                body: String::new(),
+                retry_after: None,
+            },
+        )
     }
 
     /// **"Invalid" is four answers wearing one name**, and the server will not
@@ -1122,11 +1165,11 @@ mod tests {
     /// lives seven days by default and nothing counts down to it.
     #[test]
     fn a_refused_enrollment_key_says_what_that_covers() {
-        let explained = explain_key_refused(
-            problem(403, "enrollment-key-invalid"),
+        let text = key_refused_advice(
+            &problem(403, "enrollment-key-invalid"),
             &Enrollment::new("enr1_SECRET"),
-        );
-        let text = format!("{explained:#}");
+        )
+        .expect("a refused key is explained");
         assert!(text.contains("expired"), "{text}");
         assert!(text.contains("seven days"), "{text}");
         assert!(text.contains("--issue-enrollment-key"), "{text}");
@@ -1138,11 +1181,11 @@ mod tests {
     /// the job fails again on the same line.
     #[test]
     fn a_refusal_names_where_the_key_came_from() {
-        let explained = explain_key_refused(
-            problem(403, "enrollment-key-invalid"),
+        let text = key_refused_advice(
+            &problem(403, "enrollment-key-invalid"),
             &Enrollment::new("enr1_SECRET").from_source("ISEKAI_SERVER_ENROLLMENT_KEY"),
-        );
-        let text = format!("{explained:#}");
+        )
+        .expect("a refused key is explained");
         assert!(text.contains("ISEKAI_SERVER_ENROLLMENT_KEY"), "{text}");
         // And what a replacement has to carry, since omitting `--permissions`
         // burns in the server default and not the role's (§9.5, §15.2).
@@ -1153,11 +1196,19 @@ mod tests {
     /// not every one.
     #[test]
     fn other_enrolment_failures_are_left_alone() {
-        let plain = explain_key_refused(
-            problem(403, "insufficient-permission"),
+        let plain = key_refused_advice(
+            &problem(403, "insufficient-permission"),
             &Enrollment::new("enr1_SECRET"),
         );
-        assert!(!format!("{plain:#}").contains("seven days"));
+        assert!(plain.is_none(), "{plain:?}");
+        // And the failure still says which call it was, which is the whole of
+        // what this layer knows about it.
+        let error = key_refusal(
+            problem(403, "insufficient-permission"),
+            &Enrollment::new("enr1_SECRET"),
+            "could not obtain a renewal challenge",
+        );
+        assert!(error.to_string().contains("renewal challenge"), "{error}");
     }
 
     fn problem_with(status: u16, kind: &str, detail: &str) -> IdentityError {
@@ -1236,17 +1287,22 @@ mod tests {
             &cfg,
             false,
         );
-        let text = format!("{membership:#}");
+        let text = membership.to_string();
         assert!(text.contains("has ended"), "{text}");
         assert!(!text.contains("tenant"), "{text}");
+        // **The server's own date is still underneath**, now one layer down
+        // rather than one `anyhow` context along: this is what the renewal
+        // loop prints and what the holder acts on.
+        let reported = format!("{:#}", anyhow::Error::from(membership));
+        assert!(reported.contains("2026-09-01T00:00:00Z"), "{reported}");
 
         // And the case that explanation exists for still gets it.
         let pop = explain_issue_failure(problem(401, "pop-signature-invalid"), &cfg, false);
-        assert!(format!("{pop:#}").contains("tenant"));
+        assert!(pop.to_string().contains("tenant"), "{pop}");
 
         // A run that did register here is told neither story.
         let plain = explain_issue_failure(problem(401, "pop-signature-invalid"), &cfg, true);
-        assert!(!format!("{plain:#}").contains("tenant"));
+        assert!(!plain.to_string().contains("tenant"), "{plain}");
     }
 
     /// **A rule refused, and asking again asks the same rule.** `403` is the
@@ -1263,17 +1319,57 @@ mod tests {
         }
     }
 
-    /// The loop's errors arrive wrapped in context, so a check that only looked
-    /// at the outermost error would find an `anyhow` string and retry forever.
+    /// **A credential that could not be minted is not a refusal.** It used to
+    /// be impossible to confuse the two here, because a credential failure was
+    /// an `anyhow` string with no `IdentityError` under it; with the arm it has
+    /// to be said. The renewal keeps asking, because the source may well hand
+    /// over a working token on the next pass.
     #[test]
-    fn the_status_is_found_under_the_context() {
-        let wrapped = api_error(403).context("issue the endpoint token");
-        assert!(is_permanent(&wrapped));
+    fn a_credential_failure_is_not_permanent() {
+        let error = TokenError::credential(
+            "could not obtain a current Auth0 token",
+            anyhow::anyhow!("the refresh token has expired"),
+        );
+        assert!(!is_permanent(&error));
+        assert!(matches!(
+            error.outcome(),
+            isekai_p2p_core::outcome::Outcome::Reauthenticate { .. }
+        ));
     }
 
     #[test]
     fn a_transport_failure_is_not_permanent() {
-        assert!(!is_permanent(&anyhow::anyhow!("connection reset")));
+        assert!(!is_permanent(&unreachable_identity(anyhow::anyhow!(
+            "connection reset"
+        ))));
+    }
+
+    /// **Attaching advice by wrapping costs the status**, which is how a `403`
+    /// on `enrollment::issue` came to be read as a network failure once that
+    /// route returned `IdentityError`: the arm takes an `anyhow::Error` by
+    /// `#[from]`, so the wrap compiles and the refusal arrives as `Transport`.
+    /// Hence [`explain_membership_refusal`] is for the reporting side and
+    /// [`membership_advice`] for everyone else.
+    #[test]
+    fn a_wrapped_refusal_loses_its_status() {
+        let refusal = problem_with(403, "membership-revoked", "revoked at 2026-09-01T00:00:00Z");
+        assert_eq!(refusal.status(), Some(403));
+        let wrapped = IdentityError::from(explain_membership_refusal(refusal));
+        assert_eq!(wrapped.status(), None);
+        assert_eq!(wrapped.kind(), None);
+        assert!(matches!(
+            TokenError::identity("could not issue an Endpoint Token", wrapped).outcome(),
+            isekai_p2p_core::outcome::Outcome::Unreachable(_)
+        ));
+        // Where the type survives, the refusal reads as one.
+        let kept = membership_refusal(
+            problem_with(403, "membership-revoked", "revoked at 2026-09-01T00:00:00Z"),
+            "could not issue an Endpoint Token",
+        );
+        assert!(matches!(
+            kept.outcome(),
+            isekai_p2p_core::outcome::Outcome::Refused { .. }
+        ));
     }
     /// A token is replaced a margin before it lapses, not as it lapses: the
     /// renewal is a round-trip that can fail, and there has to be room to try

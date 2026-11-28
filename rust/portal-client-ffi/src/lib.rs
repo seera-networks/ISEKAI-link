@@ -192,7 +192,14 @@ pub fn pair_with_code(
             if register {
                 isekai_p2p::issue_endpoint_token(&cfg)
                     .await
-                    .map_err(|e| PortalError::Pair(format!("{e:#}")))?;
+                    // **Through `anyhow`, because `TokenError` is typed.**
+                    // `{:#}` is `anyhow::Error`'s flag: on the typed error it
+                    // prints only the one sentence that layer adds, so the
+                    // status and the problem document -- the whole of what the
+                    // phone can show a person who was refused -- arrive only
+                    // this way. The other `{e:#}` sites here are on
+                    // `anyhow::Result` calls and are right as they stand.
+                    .map_err(|e| PortalError::Pair(format!("{:#}", anyhow::Error::from(e))))?;
             }
             let cfg = P2pConfig {
                 credential: isekai_p2p::Credential::auth0(config.auth0_token.clone(), None, false),
@@ -438,8 +445,7 @@ pub fn connect(
         // Pair/Connect calls themselves) — a second on-disk copy here would
         // be a store this crate then has to keep in sync with that one for
         // no benefit, since nothing else reads it.
-        RefreshingAuth0Token::new(Auth0Config::default(), tokens, None)
-            as Arc<dyn Auth0TokenSource>
+        RefreshingAuth0Token::new(Auth0Config::default(), tokens, None) as Arc<dyn Auth0TokenSource>
     });
 
     let shutdown = CancellationToken::new();
