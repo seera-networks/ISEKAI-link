@@ -582,7 +582,7 @@ Auth0 トークンに対して同じ判断をしている。`EndpointToken` は 
 | C | facade が自分のエラー型を作って畳む | 下を触らない | facade が意味論を持つ＝「素通しだけ」を破る。約束する面に新しい語彙が増える |
 
 **決定 B**（0.10 で実装）。D12 = C と同じ理屈（失われている場所で直す）であり、
-**`Outcome` に足すものは無かった**: `Reauthenticate { explain }` が既にあり
+**`Outcome` に足した腕は無い**: `Reauthenticate { explain }` が既にあり
 （`outcome.rs` の `Outcome`）、「資格情報を取り直せ」はまさにその腕である。
 読みの関数は `isekai-p2p` 側に置いた（core は `isekai-p2p` の型を知らないので、
 `Outcome::of_*` には入れられない）。
@@ -606,6 +606,24 @@ Auth0 トークンに対して同じ判断をしている。`EndpointToken` は 
 見るだけになり（D12 が `portal-core` でしたのと同じ）、`is_permanent` は
 `error.outcome()` が `Refused` かを見るだけになった。資格情報の腕は意図的に
 「恒久」ではない（source が次の周で渡せることがある）。
+
+**ただし core に 1 つメソッドが増えた（レビューが出した）。** `of_identity` は
+`explain` を**サーバの答えだけ**から作る。だから助言（どの鍵か、どの
+Enrollment Key のファイルか、ゲスト期間が終わったのか）を付けた `Identity` の腕を
+`outcome()` に通すと、**その助言が落ちていた** —— `Credential` と `Mismatched` は
+自分の言葉を `Outcome` に載せるので、面として非対称でもあった。
+`Outcome::with_context(said)` を core に足して両方を保つ（順序は `anyhow` の
+context と同じく外側が先）。`Unreachable::Deadline` は言葉を持たないので素通し
+する —— 答えを読む関数はどちらも `Transport` しか作らないので、到達しない。
+
+**`{:#}` の罠は 3 件目に出た。** `portal-client-ffi/src/lib.rs` の
+`PortalError::Pair(format!("{e:#}"))` —— **別ワークスペースなのでビルドは通り、
+言葉だけが消える**。Android で `register: true` の組み立てが `403` や `429` を
+受けたとき、Kotlin 側に届くのは `"could not issue an Endpoint Token"` だけに
+なっていた。型付きのエラーを入れるたびにこの罠が付いてくるので、
+**鎖が欲しければ `anyhow::Error::from(e)` を通す**という規則を、その呼び出し側の
+コメントにも書いた（同じファイルの他の `{e:#}` は `anyhow::Result` が相手なので
+正しい、という判別も併せて）。
 
 ## 4. 横断的な事項
 
@@ -724,7 +742,7 @@ A。2 本は**別のアプリの都合**（frame sink があるかどうか、�
 | --- | --- | --- | --- | --- |
 | D12 | 棚卸し側の読み | — | **決定 C**（2b で実装済み。8 シグネチャ、呼び出し側は 1 箇所だけ変わり簡単になった） | — |
 | D13 | Endpoint トークンの取得 | — | **決定 B**（`REFRESH_MARGIN = 60s` の先例に倣う） | — |
-| D14 | トークン発行の読み | — | **決定 B**（実装済み。`TokenError` 3 腕。`Outcome` に足したものは無い） | — |
+| D14 | トークン発行の読み | — | **決定 B**（実装済み。`TokenError` 3 腕。`Outcome` の腕は増やさず、`with_context` を 1 つ足した） | — |
 
 これで §9 の 7 問には答えが付いている。本文書が出した判断は **14** で、
 **すべて決定済み**。

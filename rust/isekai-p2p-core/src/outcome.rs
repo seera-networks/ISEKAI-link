@@ -222,6 +222,60 @@ pub struct Reading {
 }
 
 impl Outcome {
+    /// The same verdict, with the caller's own sentence in front of the words.
+    ///
+    /// **For a layer that knows something the wire did not say.**
+    /// [`Self::of_identity`] and [`Self::of_proxy`] build `explain` from the
+    /// error's own `Display`, which is the server's answer and nothing else; a
+    /// crate that has advice to add — which keypair was registered where, which
+    /// Enrollment Key file to replace, that a guest membership has ended rather
+    /// than simply being refused — would otherwise have to choose between its
+    /// sentence and the server's. This keeps both, in the order `anyhow`'s
+    /// contexts print them: the outermost thing first.
+    ///
+    /// **Why it is wanted at all**: a caller that reads an outcome and shows
+    /// `explain` is doing the thing these types are for, and the advice is the
+    /// half it cannot reconstruct. Leaving it only in the typed error's
+    /// `Display` means it reaches a log and not the decision.
+    ///
+    /// **[`Unreachable::Deadline`] comes back unchanged**: it carries a
+    /// duration and no words, and neither `of_identity` nor `of_proxy` ever
+    /// builds one — both make [`Unreachable::Transport`] — so there is nothing
+    /// this can be prepended to.
+    pub fn with_context(self, said: &str) -> Self {
+        let join = |words: String| format!("{said}: {words}");
+        match self {
+            Outcome::AlreadyGone { explain } => Outcome::AlreadyGone {
+                explain: join(explain),
+            },
+            Outcome::Refused { explain } => Outcome::Refused {
+                explain: join(explain),
+            },
+            Outcome::Reauthenticate { explain } => Outcome::Reauthenticate {
+                explain: join(explain),
+            },
+            Outcome::Rejected { explain } => Outcome::Rejected {
+                explain: join(explain),
+            },
+            Outcome::Busy { after, explain } => Outcome::Busy {
+                after,
+                explain: join(explain),
+            },
+            Outcome::Vanished { explain } => Outcome::Vanished {
+                explain: join(explain),
+            },
+            Outcome::Malformed { explain } => Outcome::Malformed {
+                explain: join(explain),
+            },
+            Outcome::Unreachable(Unreachable::Transport { explain }) => {
+                Outcome::Unreachable(Unreachable::Transport {
+                    explain: join(explain),
+                })
+            }
+            Outcome::Unreachable(deadline) => Outcome::Unreachable(deadline),
+        }
+    }
+
     /// Read a proxy answer through what this call site knows.
     pub fn of_proxy(error: &ProxyError, reading: &Reading) -> Self {
         let explain = error.to_string();
@@ -353,6 +407,37 @@ fn read(
 
 #[cfg(test)]
 mod tests {
+    /// **The advice and the server's answer both survive**, in that order. A
+    /// caller that reads the outcome and shows `explain` is the reason the
+    /// advice is written at all; without this it would see the `403` body and
+    /// nothing about what to do.
+    #[test]
+    fn a_context_keeps_both_halves() {
+        let said = "this guest membership has ended";
+        let outcome = super::Outcome::Refused {
+            explain: "Identity API returned 403: {\"detail\":\"expired\"}".to_owned(),
+        }
+        .with_context(said);
+        let super::Outcome::Refused { explain } = outcome else {
+            panic!("the verdict must not change");
+        };
+        assert!(explain.starts_with(said), "{explain}");
+        assert!(explain.contains("403"), "{explain}");
+    }
+
+    /// A deadline is a duration and no words, so there is nothing to prepend —
+    /// and nothing that reads an answer builds one.
+    #[test]
+    fn a_deadline_passes_through_a_context() {
+        let waited = std::time::Duration::from_secs(30);
+        let outcome =
+            super::Outcome::Unreachable(super::Unreachable::Deadline { waited }).with_context("x");
+        assert_eq!(
+            outcome,
+            super::Outcome::Unreachable(super::Unreachable::Deadline { waited })
+        );
+    }
+
     use super::*;
 
     /// A call site that obtains its own credentials: a `403` here is settled.

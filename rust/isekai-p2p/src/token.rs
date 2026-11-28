@@ -79,6 +79,12 @@ impl TokenError {
     /// `auth0::RefreshingAuth0Token`). Reading it as `Unreachable` instead
     /// would tell a caller whose session is over to keep waiting.
     ///
+    /// **The words come with the verdict.** Every arm's `explain` carries what
+    /// this crate has to say about the failure, the `Identity` arm's in front
+    /// of the server's own answer. What it does *not* carry is the cause chain
+    /// under a transport failure — that is `anyhow`'s to print, as the type's
+    /// own documentation says.
+    ///
     /// **`Mismatched` is `Rejected` and not `Refused`**: `Refused` is
     /// "authorization refused it, and asking again asks the same rule", and no
     /// rule was consulted. `Rejected` says the request did not stand up and the
@@ -86,7 +92,13 @@ impl TokenError {
     /// `Credential`.
     pub fn outcome(&self) -> Outcome {
         match self {
-            TokenError::Identity { source, .. } => Outcome::of_identity(source, &ISSUING),
+            // **With the sentence this crate added**, which is the half a
+            // reader cannot reconstruct: `of_identity` builds `explain` from
+            // the server's answer alone, so without this the advice would reach
+            // a log (through `Display`) and not the decision.
+            TokenError::Identity { explain, source } => {
+                Outcome::of_identity(source, &ISSUING).with_context(explain)
+            }
             TokenError::Credential { explain, source } => Outcome::Reauthenticate {
                 explain: format!("{explain}: {source:#}"),
             },
@@ -165,10 +177,16 @@ mod tests {
     #[test]
     fn a_refusal_reads_as_refused() {
         let error = TokenError::identity("could not issue", api(403, "endpoint-revoked"));
-        assert!(
-            matches!(error.outcome(), Outcome::Refused { .. }),
-            "{error}"
-        );
+        match error.outcome() {
+            // **And the sentence reaches the verdict.** A caller that reads the
+            // outcome and shows `explain` — which is what these types are for —
+            // would otherwise get the problem body and nothing else.
+            Outcome::Refused { explain } => {
+                assert!(explain.starts_with("could not issue"), "{explain}");
+                assert!(explain.contains("endpoint-revoked"), "{explain}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// And Identity not answering stays a wait.
